@@ -1,0 +1,25 @@
+//! `stella-protocol` — serde types shared by every crate in the `stella-cli`
+//! workspace: agent events, tool schemas, trace records, and provider
+//! request/response envelopes.
+//!
+//! Zero logic, zero I/O. This is the stability contract of the whole
+//! workspace (`docs/specs/oxagen-rust-cli/02-architecture.md` §1.4, §2) — any
+//! type here that crosses a process/protocol boundary must round-trip through
+//! `serde_json` byte-for-byte (see the `roundtrip` tests in each module).
+
+pub mod completion;
+pub mod error;
+pub mod event;
+pub mod provider;
+pub mod role;
+pub mod tool;
+
+pub use completion::{
+    CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, MessageRole,
+    ReasoningEffort,
+};
+pub use error::ProviderError;
+pub use event::{AgentEvent, BudgetMode, StageKind};
+pub use provider::Provider;
+pub use role::{ModelRef, Role};
+pub use tool::{ToolCall, ToolOutput, ToolResult, ToolSchema};
