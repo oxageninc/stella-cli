@@ -73,7 +73,11 @@ async fn run(
             Err(_) => {
                 #[cfg(unix)]
                 unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
+                    // Guard on a real pid: kill(-0, …) would SIGKILL Stella's
+                    // OWN process group.
+                    if pid > 0 {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
                 }
                 return Err(format!("`{command}` timed out after {timeout_secs}s"));
             }
@@ -169,11 +173,38 @@ impl Tool for VerifyDone {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
-        // Every test file must resolve inside the workspace and exist.
-        let mut resolved: Vec<(String, std::path::PathBuf)> = Vec::new();
+        // The shadow-worktree copy destination must be derived from the
+        // canonical path *relative to the root*, never the raw model-supplied
+        // string: an absolute `file` would make `shadow.join(file)` discard the
+        // shadow prefix and resolve back to the real working-tree file, and
+        // `fs::copy(src, src)` truncates it — silently emptying the user's test
+        // file and violating the "NEVER mutates the working tree" contract.
+        let canon_root = match root.canonicalize() {
+            Ok(r) => r,
+            Err(e) => {
+                return ToolOutput::Error {
+                    message: format!("could not canonicalize the workspace root: {e}"),
+                };
+            }
+        };
+        // Every test file must resolve inside the workspace and exist. Each
+        // entry is `(display_name, canonical_src, root_relative_dst)`.
+        let mut resolved: Vec<(String, std::path::PathBuf, std::path::PathBuf)> = Vec::new();
         for file in &test_files {
             match crate::resolve_within_root(root, file) {
-                Some(path) if path.is_file() => resolved.push((file.clone(), path)),
+                Some(path) if path.is_file() => {
+                    let relpath = match path.strip_prefix(&canon_root) {
+                        Ok(r) => r.to_path_buf(),
+                        Err(_) => {
+                            return ToolOutput::Error {
+                                message: format!(
+                                    "test file `{file}` resolved outside the workspace root"
+                                ),
+                            };
+                        }
+                    };
+                    resolved.push((file.clone(), path, relpath));
+                }
                 Some(_) => {
                     return ToolOutput::Error {
                         message: format!("test file `{file}` does not exist in the workspace"),
@@ -249,8 +280,8 @@ impl Tool for VerifyDone {
         }
 
         // Layer ONLY the test files onto the previous version.
-        for (rel, src) in &resolved {
-            let dst = shadow.join(rel);
+        for (rel, src, relpath) in &resolved {
+            let dst = shadow.join(relpath);
             if let Some(parent) = dst.parent()
                 && let Err(e) = tokio::fs::create_dir_all(parent).await
             {

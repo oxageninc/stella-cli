@@ -320,6 +320,11 @@ pub fn render_rules_section(rules: &[Rule]) -> String {
 
 /// The permission-gate deny entry a guard produces, e.g.
 /// `Edit(migrations/**)` or a bare `Bash` (TS: `guardDenyEntry`).
+///
+/// Returns a single entry, preferring the path glob. A guard carrying BOTH a
+/// path and a command glob is lossy here (the command half is dropped) — use
+/// [`guards_to_deny`], which emits one entry per glob, when completeness
+/// against an external gate matters.
 pub fn guard_deny_entry(rule: &Rule) -> Option<String> {
     let guard = rule.guard.as_ref()?;
     let tool = guard.tool.as_deref().unwrap_or("*");
@@ -351,11 +356,33 @@ pub fn guards_to_deny(rules: &[Rule]) -> RuleDenies {
     let mut deny = Vec::new();
     let mut reasons = HashMap::new();
     for rule in rules {
-        let Some(entry) = guard_deny_entry(rule) else {
+        let Some(guard) = rule.guard.as_ref() else {
             continue;
         };
-        reasons.insert(entry.clone(), violation_reason(rule));
-        deny.push(entry);
+        let tool = guard.tool.as_deref().unwrap_or("*");
+        let reason = violation_reason(rule);
+        // Emit one entry PER configured glob. A guard may carry both a path and
+        // a command condition (`evaluate_guards` enforces both); the single
+        // `guard_deny_entry` only surfaces the path, so without this the
+        // external string-gate would silently miss the command half — the two
+        // enforcement surfaces would then disagree.
+        let mut pushed = false;
+        for pat in [
+            guard.deny_path_glob.as_deref(),
+            guard.deny_command_glob.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let entry = format!("{tool}({pat})");
+            reasons.insert(entry.clone(), reason.clone());
+            deny.push(entry);
+            pushed = true;
+        }
+        if !pushed {
+            reasons.insert(tool.to_string(), reason.clone());
+            deny.push(tool.to_string());
+        }
     }
     RuleDenies { deny, reasons }
 }
@@ -647,7 +674,12 @@ fn common_dir_prefix(paths: &[String]) -> Option<String> {
     }
     let mut prefix = dirs[0].to_string();
     for d in &dirs[1..] {
-        while !d.starts_with(prefix.as_str()) {
+        // Segment-aware containment. A raw `starts_with` treats `app/api2` as
+        // being under `app/api`, so the inferred guard `app/api/**` would MISS
+        // `app/api2/…` — one of the very files the guard was derived from. The
+        // prefix must be either the whole dir or a parent *segment* of it, which
+        // also makes the result independent of the input order.
+        while !(*d == prefix.as_str() || d.starts_with(&format!("{prefix}/"))) {
             let cut = prefix.rfind('/')?;
             prefix.truncate(cut);
         }
@@ -690,7 +722,15 @@ fn representative_text(cluster: &[RawObservation]) -> Option<String> {
     let mut best = cluster.first()?.text.as_str();
     let mut best_count = 0usize;
     for (text, count) in &counts {
-        if *count > best_count || (*count == best_count && text.len() > best.len()) {
+        // Most-frequent, then longest, then lexically smallest. The final
+        // lexical tiebreak is load-bearing: without it, two equal-count,
+        // equal-length texts resolve in HashMap iteration order (randomized
+        // per process), so re-mining the same observations could pick a
+        // different representative and mint a duplicate `<slug>-<hash>` file.
+        let better = *count > best_count
+            || (*count == best_count && text.len() > best.len())
+            || (*count == best_count && text.len() == best.len() && *text < best);
+        if better {
             best = text;
             best_count = *count;
         }
@@ -1182,6 +1222,36 @@ mod tests {
         let reason = denies.reasons.get("Edit(mig/*-applied/**)").unwrap();
         assert!(reason.contains("rule \"no-mig\""));
         assert!(reason.contains("Add a forward migration."));
+    }
+
+    #[test]
+    fn guards_to_deny_emits_both_globs_when_a_guard_sets_both() {
+        // A guard with BOTH a path and a command condition must surface BOTH to
+        // the external gate — dropping either lets the gate disagree with
+        // `evaluate_guards`.
+        let rules = vec![rule(
+            "locked",
+            "do not touch",
+            Some(RuleGuard {
+                tool: Some("Bash".to_string()),
+                deny_path_glob: Some("secrets/**".to_string()),
+                deny_command_glob: Some("rm -rf*".to_string()),
+            }),
+        )];
+        let denies = guards_to_deny(&rules);
+        assert!(denies.deny.contains(&"Bash(secrets/**)".to_string()));
+        assert!(denies.deny.contains(&"Bash(rm -rf*)".to_string()));
+        assert_eq!(denies.deny.len(), 2);
+    }
+
+    #[test]
+    fn common_dir_prefix_stops_on_a_segment_boundary_not_mid_segment() {
+        // `app/api2` is NOT under `app/api`; the common prefix must be `app`,
+        // and the result must not depend on input order.
+        let forward = common_dir_prefix(&["app/api/x.ts".into(), "app/api2/y.ts".into()]);
+        let reverse = common_dir_prefix(&["app/api2/y.ts".into(), "app/api/x.ts".into()]);
+        assert_eq!(forward.as_deref(), Some("app"));
+        assert_eq!(reverse.as_deref(), Some("app"));
     }
 
     // ---- enforce: evaluate_guards (Tier 2, the actual block decision) ----

@@ -236,7 +236,7 @@ impl Config {
                         })?;
                     return Self::resolve(
                         provider,
-                        model_id_override(model_spec),
+                        model_spec.to_string(),
                         api_key_override,
                         base_url_override,
                         &mut credentials_file,
@@ -296,10 +296,22 @@ impl Config {
             );
         }
 
+        // A bare `--api-key` with no `--model` is ambiguous: the key doesn't
+        // say which provider it belongs to, and threading it into detection
+        // would make the FIRST provider (zai) always "resolve" and get built
+        // with a key meant for someone else. Require an explicit provider.
+        if api_key_override.is_some() {
+            return Err("--api-key needs an explicit --model provider/model_id \
+                        (a bare key doesn't say which provider it is for), e.g. \
+                        stella --model anthropic/claude-fable-5 --api-key <key>"
+                .to_string());
+        }
+
         // No --model: pick the first provider with a resolvable credential
         // (env var/aliases or credentials file — never prompts here, since
         // prompting needs a specific provider in mind and the user hasn't
-        // named one).
+        // named one). `api_key_override` is `None` on this path (guarded
+        // above), so detection reflects only real ambient credentials.
         for provider in PROVIDERS {
             if resolve_provider_key(provider, api_key_override, &credentials_file, false).is_ok() {
                 return Self::resolve(
@@ -461,10 +473,6 @@ impl Config {
     }
 }
 
-fn model_id_override(slug: &str) -> String {
-    slug.to_string()
-}
-
 /// The provider-aware credential chain: CLI flag -> primary env var ->
 /// alias env vars -> credentials file -> interactive prompt. Wraps
 /// `ApiKey::resolve` (which owns everything except aliases) so alias env
@@ -579,7 +587,7 @@ mod tests {
     /// `stella_model::catalog::Catalog::seed()`, or `build_provider`'s
     /// catalog check (`agent.rs`) would hard-error on first use of a
     /// provider whose default was never added to the seed — exactly what
-    /// happened for 5 of these 7 rows before the catalog was completed.
+    /// happened for several of these rows before the catalog was completed.
     /// Uses the provider-scoped resolver, same as `build_provider`, so a
     /// default that only exists under a *different* provider's row still
     /// fails here.

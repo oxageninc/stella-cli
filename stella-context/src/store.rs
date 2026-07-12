@@ -28,8 +28,13 @@ use ocp_types::FrameKind;
 const SCHEMA_VERSION: i64 = 2;
 
 /// The v1 schema. Applied once, inside the migration transaction. Bi-temporal
-/// columns (`valid_from`/`valid_to`/`recorded_at`/`superseded_at`) live on both
-/// `node` and `edge`; supersession closes intervals, never deletes (`L-C3`).
+/// columns (`valid_from`/`valid_to`/`recorded_at`/`superseded_at`) exist on both
+/// `node` and `edge`, but only EDGES are actually versioned: `apply_fact`
+/// closes an edge's interval on supersession, never deleting (`L-C3`), and
+/// `facts_as_of` reads history back. NODES are mutable current-state —
+/// `upsert_node` overwrites content in place, so their time columns stay
+/// effectively unused and there is no point-in-time node reader. Fact history is
+/// recoverable; node content history is not.
 const MIGRATION_V1: &str = "\
 CREATE TABLE node (
     id            INTEGER PRIMARY KEY,

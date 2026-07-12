@@ -158,7 +158,17 @@ impl SkillRegistry {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let mut text = format!("{}\n{}", stdout.trim(), stderr.trim());
-        text.truncate(6000);
+        if text.len() > 6000 {
+            // Truncate on a char boundary — `String::truncate` panics if byte
+            // 6000 lands inside a multi-byte character (subprocess output can
+            // contain accents/emoji/box-drawing), which would unwind the whole
+            // CLI session.
+            let end = (0..=6000)
+                .rev()
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(0);
+            text.truncate(end);
+        }
         if output.status.success() {
             Ok(text.trim().to_string())
         } else {

@@ -21,11 +21,13 @@
 use async_trait::async_trait;
 use stella_protocol::{CompletionRequest, CompletionResult, ProviderError};
 
+use crate::catalog::{Catalog, Pricing};
 use crate::credential::ApiKey;
 use crate::gemini::{
     GeminiRequest, aggregate_gemini_stream, build_generation_config, classify_google_error,
     to_gemini_request_parts, to_gemini_tools,
 };
+use crate::http;
 use crate::provider::Provider;
 
 pub struct VertexProvider {
@@ -35,6 +37,10 @@ pub struct VertexProvider {
     project: String,
     location: String,
     base_url_override: Option<String>,
+    /// List pricing for `model`, resolved from the catalog at construction so
+    /// `cost_usd` is computed on the real request path — never a hard-coded
+    /// zero (which would silently disable budget enforcement for Vertex).
+    pricing: Option<Pricing>,
 }
 
 impl VertexProvider {
@@ -47,13 +53,19 @@ impl VertexProvider {
         project: impl Into<String>,
         location: impl Into<String>,
     ) -> Self {
+        let model = model.into();
+        let pricing = Catalog::seed()
+            .resolve_for("vertex", &model)
+            .ok()
+            .map(|e| e.pricing);
         Self {
-            client: reqwest::Client::new(),
+            client: http::client(),
             access_token,
-            model: model.into(),
+            model,
             project: project.into(),
             location: location.into(),
             base_url_override: None,
+            pricing,
         }
     }
 
@@ -106,13 +118,14 @@ impl Provider for VertexProvider {
             return Err(classify_google_error("Vertex AI", response).await);
         }
 
-        let (text, tool_calls, usage) = aggregate_gemini_stream(response).await?;
+        let (text, tool_calls, usage) = aggregate_gemini_stream("Vertex AI", response).await?;
+        let cost_usd = self.pricing.map(|p| p.cost_usd(&usage)).unwrap_or(0.0);
         Ok(CompletionResult {
             text,
             tool_calls,
             usage,
             model: self.model.clone(),
-            cost_usd: 0.0,
+            cost_usd,
         })
     }
 }

@@ -480,8 +480,9 @@ mod tests {
         let handle = f.dispatch(&task).await.unwrap();
 
         // An isolated task got a worktree, and the worker was handed its path.
+        // The branch carries a collision-free hash suffix (`fleet/t1-<hash>`).
         let wt = handle.worktree.expect("isolated task has a worktree");
-        assert_eq!(wt.branch, "fleet/t1");
+        assert!(wt.branch.starts_with("fleet/t1-"), "{}", wt.branch);
         let roots = seen.lock().unwrap();
         assert_eq!(roots[0].0, "t1");
         assert_eq!(roots[0].1, wt.path);

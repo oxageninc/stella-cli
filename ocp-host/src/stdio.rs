@@ -44,6 +44,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// process-group kill backstop fires (task deliverable 2).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
+/// Maximum bytes accepted for a single framed line before the child is treated
+/// as malformed. Guards the host against a provider that streams without ever
+/// emitting a newline (the timeouts bound time, not memory). 16 MiB is far
+/// above any legitimate framed message.
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 /// A raw, framed connection to a child-process OCP provider. The low-level
 /// primitive [`StdioProvider`] is built on; public so conformance tools can
 /// drive the wire directly.
@@ -167,18 +173,46 @@ impl RawStdioConnection {
     }
 
     /// Read the next raw line, or `None` at EOF (the child closed stdout).
+    ///
+    /// Bounded to [`MAX_LINE_BYTES`] via an incremental `fill_buf`/`consume`
+    /// loop: a buggy or hostile child that streams bytes without ever emitting
+    /// a newline would otherwise grow a single `String` without limit (the
+    /// handshake/query timeouts bound *time*, not *memory*) and OOM the host.
     pub async fn read_raw_line(&mut self) -> Result<Option<String>, HostError> {
         let label = self.label.clone();
-        let mut line = String::new();
-        let n = self
-            .stdout
-            .read_line(&mut line)
-            .await
-            .map_err(|e| HostError::Transport {
-                id: label,
-                message: e.to_string(),
-            })?;
-        if n == 0 { Ok(None) } else { Ok(Some(line)) }
+        let transport = |message: String| HostError::Transport {
+            id: label.clone(),
+            message,
+        };
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let buf = self
+                .stdout
+                .fill_buf()
+                .await
+                .map_err(|e| transport(e.to_string()))?;
+            if buf.is_empty() {
+                break; // EOF — deliver any final unterminated line, else None.
+            }
+            if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                bytes.extend_from_slice(&buf[..=pos]);
+                self.stdout.consume(pos + 1);
+                break;
+            }
+            bytes.extend_from_slice(buf);
+            let consumed = buf.len();
+            self.stdout.consume(consumed);
+            if bytes.len() > MAX_LINE_BYTES {
+                return Err(transport(format!(
+                    "provider emitted a line exceeding {MAX_LINE_BYTES} bytes without a newline"
+                )));
+            }
+        }
+        if bytes.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+        }
     }
 
     /// Read the next envelope. A closed stream (the child died) is

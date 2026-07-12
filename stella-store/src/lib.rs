@@ -196,10 +196,13 @@ impl Store {
     /// monotonically increasing counter (the event drain loop owns order).
     pub fn record_event(&self, execution_id: i64, seq: u64, event: &AgentEvent) -> Result<()> {
         let payload = serde_json::to_string(event).map_err(|e| StoreError(e.to_string()))?;
-        let event_type = payload
-            .split_once("\"type\":\"")
-            .and_then(|(_, rest)| rest.split_once('"'))
-            .map(|(t, _)| t.to_string())
+        // Read the internally-tagged `type` from the parsed value rather than
+        // string-scanning for the first `"type":"` literal — the scan silently
+        // yields the wrong tag (or "unknown") if serialization is ever
+        // pretty-printed, wrapped, or reordered.
+        let event_type = serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
             .unwrap_or_else(|| "unknown".into());
         self.lock().execute(
             "INSERT INTO events (execution_id, seq, event_type, payload) VALUES (?, ?, ?, ?)",
@@ -264,13 +267,18 @@ impl Store {
     /// now held.
     pub fn acquire_file_lock(&self, path: &str, holder: &str) -> Result<bool> {
         let conn = self.lock();
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT holder FROM file_locks WHERE path = ?",
-                params![path],
-                |row| row.get(0),
-            )
-            .ok();
+        // Only "no such lock row" means unclaimed. A genuine query error must
+        // propagate — `.ok()` would misread it as unclaimed and drive a
+        // spurious INSERT (then a PK conflict), corrupting lock state.
+        let existing: Option<String> = match conn.query_row(
+            "SELECT holder FROM file_locks WHERE path = ?",
+            params![path],
+            |row| row.get(0),
+        ) {
+            Ok(holder) => Some(holder),
+            Err(duckdb::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
         match existing {
             Some(current) => Ok(current == holder),
             None => {

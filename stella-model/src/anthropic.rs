@@ -202,6 +202,13 @@ struct AnthropicUsage {
     input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
+    /// Tokens served from the prompt cache. Anthropic reports these
+    /// *separately* from `input_tokens` (they are NOT already folded in, as
+    /// they are for OpenAI), so the adapter must add them back to keep the
+    /// normalized `cached_input_tokens` a subset of `input_tokens` and bill
+    /// them at the cheaper cache rate rather than dropping them.
+    #[serde(default)]
+    cache_read_input_tokens: u64,
 }
 
 fn to_anthropic_messages(
@@ -388,7 +395,8 @@ async fn aggregate_anthropic_stream(
                 }
                 Ok(AnthropicStreamEvent::MessageStart { message }) => {
                     if let Some(u) = message.usage {
-                        usage.input_tokens = u.input_tokens;
+                        usage.input_tokens = u.input_tokens + u.cache_read_input_tokens;
+                        usage.cached_input_tokens = u.cache_read_input_tokens;
                     }
                 }
                 Ok(AnthropicStreamEvent::ContentBlockStart {
@@ -415,7 +423,10 @@ async fn aggregate_anthropic_stream(
                 },
                 Ok(AnthropicStreamEvent::MessageDelta { usage: Some(u) }) => {
                     if u.input_tokens > 0 {
-                        usage.input_tokens = u.input_tokens;
+                        usage.input_tokens = u.input_tokens + u.cache_read_input_tokens;
+                    }
+                    if u.cache_read_input_tokens > 0 {
+                        usage.cached_input_tokens = u.cache_read_input_tokens;
                     }
                     usage.output_tokens = u.output_tokens;
                 }

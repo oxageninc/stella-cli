@@ -194,6 +194,31 @@ fn slugify(task_id: &str) -> String {
     }
 }
 
+/// A short, stable, deterministic hash of `s` as 8 lowercase hex chars.
+///
+/// [`slugify`] is lossy — `fix/the thing`, `fix the thing`, and `fix-the-thing`
+/// all map to `fix-the-thing`. `Plan::validate` guarantees unique task *ids*
+/// but not unique *slugs*, so two distinct tasks could otherwise collide on the
+/// same worktree directory and branch. Appending this hash of the full task id
+/// makes the slug injective. FNV-1a (not the stdlib's randomizable `Hasher`) so
+/// the result is identical across processes and Rust versions — a later wave
+/// must be able to recompute the exact branch name for the same task id.
+fn short_hash(s: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", hash as u32)
+}
+
+/// The worktree directory + branch slug for `task_id`: a human-readable
+/// [`slugify`] stem plus a [`short_hash`] suffix that keeps it collision-free
+/// even when two task ids slugify to the same stem.
+fn worktree_slug(task_id: &str) -> String {
+    format!("{}-{}", slugify(task_id), short_hash(task_id))
+}
+
 /// Manages the lifecycle of isolated task worktrees over a [`GitCli`].
 pub struct WorktreeManager<G: GitCli> {
     git: G,
@@ -232,9 +257,11 @@ impl<G: GitCli> WorktreeManager<G> {
     }
 
     /// Create an isolated worktree for `task_id`, branched from `base_ref`:
-    /// `git worktree add <dir> -b fleet/<slug> <base_ref>`.
+    /// `git worktree add <dir> -b fleet/<slug> <base_ref>`. The slug is a
+    /// human-readable stem plus a stable hash suffix so two task ids that
+    /// slugify to the same stem never collide on the same directory/branch.
     pub async fn create(&self, task_id: &str, base_ref: &str) -> Result<Worktree, WorktreeError> {
-        let slug = slugify(task_id);
+        let slug = worktree_slug(task_id);
         let dir = self.worktrees_root.join(&slug);
         let branch = format!("{}{slug}", self.branch_prefix);
         let dir_str = path_arg(&dir)?;
@@ -281,7 +308,11 @@ impl<G: GitCli> WorktreeManager<G> {
                 .git
                 .run(&self.repo_root, &["branch", "-D", &worktree.branch])
                 .await?;
-            out.success
+            // Surface a failed delete (e.g. the branch is checked out
+            // elsewhere) rather than silently reporting a clean no-delete,
+            // which would hide a leaked branch and the real git error.
+            ensure_ok(out, &format!("branch -D {}", worktree.branch))?;
+            true
         };
         Ok(RemoveOutcome {
             branch_deleted,
@@ -300,8 +331,9 @@ impl<G: GitCli> WorktreeManager<G> {
     }
 
     /// Stage exactly `paths` and commit them — **always** an explicit
-    /// pathspec (`git add -- <paths>`), then `git commit -m <message>`
-    /// (never `-a`). Returns the new commit sha. Rejects an empty pathspec
+    /// pathspec (`git add -- <paths>`, then `git commit -m <message> --
+    /// <paths>`), never `-a` and never a pathspec-less commit that would sweep
+    /// the whole index. Returns the new commit sha. Rejects an empty pathspec
     /// ([`WorktreeError::EmptyPathspec`]).
     pub async fn commit_paths(
         &self,
@@ -323,8 +355,18 @@ impl<G: GitCli> WorktreeManager<G> {
         let out = self.git.run(repo, &add_args).await?;
         ensure_ok(out, "add -- <paths>")?;
 
-        let out = self.git.run(repo, &["commit", "-m", message]).await?;
-        ensure_ok(out, "commit -m <message>")?;
+        // Scope the commit to the SAME pathspec. `git commit -m <msg>` with no
+        // pathspec commits the whole index — which in a shared-tree fleet would
+        // sweep another worker's concurrently-staged files (or a leftover
+        // staged file from a prior failed call) into this commit, the exact
+        // "staged sweep" this API exists to prevent. A pathspec-limited commit
+        // ignores anything else in the index.
+        let mut commit_args: Vec<&str> = vec!["commit", "-m", message, "--"];
+        for path in paths {
+            commit_args.push(path_arg(path)?);
+        }
+        let out = self.git.run(repo, &commit_args).await?;
+        ensure_ok(out, "commit -m <message> -- <paths>")?;
 
         let out = self.git.run(repo, &["rev-parse", "HEAD"]).await?;
         let out = ensure_ok(out, "rev-parse HEAD")?;
@@ -458,9 +500,17 @@ mod tests {
         let git = ScriptedGit::new(|_| GitOutput::ok(""));
         let mgr = manager(git);
         let wt = mgr.create("task-1", "HEAD").await.unwrap();
-        assert_eq!(wt.branch, "fleet/task-1");
+        // The branch/dir carry a stable hash suffix (collision-free slug), so
+        // assert the readable stem as a prefix rather than an exact match.
+        assert!(wt.branch.starts_with("fleet/task-1-"), "{}", wt.branch);
         assert_eq!(wt.base_ref, "HEAD");
-        assert!(wt.path.ends_with("task-1"));
+        assert!(
+            wt.path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("task-1-")
+        );
 
         let calls = mgr.git.calls();
         assert_eq!(calls.len(), 1);
@@ -468,8 +518,24 @@ mod tests {
         assert_eq!(add[0], "worktree");
         assert_eq!(add[1], "add");
         assert!(add.contains(&"-b".to_string()));
-        assert!(add.contains(&"fleet/task-1".to_string()));
+        assert!(add.iter().any(|a| a.starts_with("fleet/task-1-")));
         assert!(add.contains(&"HEAD".to_string()));
+    }
+
+    #[test]
+    fn worktree_slug_is_injective_for_ids_that_share_a_stem() {
+        // `slugify` alone maps these three distinct task ids to the same stem;
+        // the hash suffix must keep the full slugs distinct so their worktrees
+        // and branches never collide.
+        let a = worktree_slug("fix/the thing");
+        let b = worktree_slug("fix the thing");
+        let c = worktree_slug("fix-the-thing");
+        assert!(a.starts_with("fix-the-thing-"));
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        // Deterministic across calls.
+        assert_eq!(a, worktree_slug("fix/the thing"));
     }
 
     #[tokio::test]
@@ -535,6 +601,14 @@ mod tests {
             !commit.iter().any(|a| a == "-a" || a == "--all"),
             "commit must never use -a: {commit:?}"
         );
+        // And the commit must be scoped to the SAME explicit pathspec, so a
+        // stray staged file elsewhere in the index is never swept in.
+        assert!(
+            commit.contains(&"--".to_string()),
+            "commit must carry an explicit pathspec separator: {commit:?}"
+        );
+        assert!(commit.contains(&"src/a.rs".to_string()), "{commit:?}");
+        assert!(commit.contains(&"src/b.rs".to_string()), "{commit:?}");
     }
 
     #[tokio::test]
@@ -699,9 +773,15 @@ detached
 
         // list sees the base repo plus both task worktrees.
         let listed = mgr.list().await.unwrap();
-        let branches: Vec<Option<String>> = listed.iter().map(|e| e.branch.clone()).collect();
-        assert!(branches.contains(&Some("fleet/task-a".to_string())));
-        assert!(branches.contains(&Some("fleet/task-b".to_string())));
+        let branches: Vec<String> = listed.iter().filter_map(|e| e.branch.clone()).collect();
+        assert!(
+            branches.iter().any(|b| b.starts_with("fleet/task-a-")),
+            "{branches:?}"
+        );
+        assert!(
+            branches.iter().any(|b| b.starts_with("fleet/task-b-")),
+            "{branches:?}"
+        );
     }
 
     #[tokio::test]

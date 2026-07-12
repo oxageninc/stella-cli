@@ -257,16 +257,21 @@ pub struct JudgeVerdict {
 /// signal the caller uses to invoke the [`heuristic_fallback`] verdict rather
 /// than trusting an unparseable judge response.
 pub fn parse_judge_response(text: &str) -> Option<JudgeVerdict> {
-    let lower = text.to_ascii_lowercase();
+    // Only the FIRST non-empty line decides the verdict — the judge prompt asks
+    // for PASS/FAIL there. And the ambiguous "yes"/"no" synonyms are excluded:
+    // scanning the whole body for them misread a genuine PASS line like "no
+    // obvious issues. PASS" as a FAIL because "no" was hit first.
+    let first_line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let lower = first_line.to_ascii_lowercase();
     for raw in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
         match raw {
-            "pass" | "passed" | "approve" | "approved" | "yes" => {
+            "pass" | "passed" | "approve" | "approved" => {
                 return Some(JudgeVerdict {
                     passed: true,
                     reasoning: text.trim().to_string(),
                 });
             }
-            "fail" | "failed" | "reject" | "rejected" | "no" => {
+            "fail" | "failed" | "reject" | "rejected" => {
                 return Some(JudgeVerdict {
                     passed: false,
                     reasoning: text.trim().to_string(),
@@ -495,6 +500,17 @@ mod tests {
         assert_eq!(
             parse_judge_response("Verdict: approved").map(|v| v.passed),
             Some(true)
+        );
+        // A PASS line whose reasoning contains "no" must not be flipped to
+        // FAIL by an over-eager "no" match.
+        assert_eq!(
+            parse_judge_response("PASS — no obvious issues").map(|v| v.passed),
+            Some(true)
+        );
+        // Only the first non-empty line is authoritative.
+        assert_eq!(
+            parse_judge_response("FAIL\nthe change looks fine otherwise").map(|v| v.passed),
+            Some(false)
         );
     }
 

@@ -19,21 +19,27 @@
 //!
 //! # Sanitization rules (each documented, all tested)
 //! Because roxmltree is read-only, sanitization is a *re-serialization* pass:
-//! the validated tree is walked and only allowed nodes/attributes are
-//! emitted (whitelist by construction). The rules:
+//! the validated tree is walked and a **deny-list** of dangerous nodes and
+//! attributes is elided — the elements in [`is_dropped_element`], event-handler
+//! attributes, and external/script URL references are dropped; every other
+//! node/attribute is re-emitted verbatim (with text escaped). The rules:
 //!
 //! 1. **Drop `<script>`** (and subtree) — SVG script elements execute in a
 //!    rendering context; artifacts must be inert.
-//! 2. **Drop `<foreignObject>`** (and subtree) — it embeds arbitrary
-//!    (X)HTML, i.e. an escape hatch out of the SVG whitelist.
-//! 3. **Drop event-handler attributes** — any attribute whose name starts
+//! 2. **Drop `<style>`** (and subtree) — CSS `@import`/`url(…)` inside a
+//!    `<style>` block fetches off-host resources when the artifact is inlined
+//!    into an HTML context, the same remote-exfil vector as rule 5.
+//! 3. **Drop `<foreignObject>`** (and subtree) — it embeds arbitrary
+//!    (X)HTML, i.e. an escape hatch out of the SVG deny-list.
+//! 4. **Drop event-handler attributes** — any attribute whose name starts
 //!    with `on` (`onload`, `onclick`, …) is script.
-//! 4. **Drop external `href` / `xlink:href`** — only same-document fragment
+//! 5. **Drop external `href` / `xlink:href`** — only same-document fragment
 //!    references (`#id`) survive; `http(s):`, `data:`, `javascript:`,
 //!    protocol-relative, and every other target is stripped. This neutralizes
 //!    remote `<image>` exfil pixels and `javascript:` navigation.
-//! 5. **Drop attribute values that reference external resources** via a URL
-//!    scheme (`…://…`) or `javascript:` anywhere in the value — covers
+//! 6. **Drop attribute values that reference external resources** via a URL
+//!    scheme (`…://…`), a protocol-relative prefix (`//host/…`, including inside
+//!    `url(//…)`), or `javascript:` anywhere in the value — covers
 //!    `fill="url(http://…)"`, external paint servers, filters, and masks.
 //!
 //! # Optimization (light, `08-multimodal.md` §4 step 4)
@@ -150,9 +156,12 @@ impl SvgPipeline {
 // ── serialization (whitelist walk) ──────────────────────────────────────
 
 /// Elements dropped entirely, subtree and all. Case-insensitive so a
-/// `<SCRIPT>` variant can't slip through.
+/// `<SCRIPT>` variant can't slip through. `<style>` is dropped because its CSS
+/// can pull off-host resources via `@import`/`url(…)` — the same exfil vector
+/// [`references_external`] blocks in attribute values.
 fn is_dropped_element(local: &str) -> bool {
     local.eq_ignore_ascii_case("script")
+        || local.eq_ignore_ascii_case("style")
         || local.eq_ignore_ascii_case("foreignObject")
         || local.eq_ignore_ascii_case("metadata")
 }
@@ -174,11 +183,14 @@ fn keep_attribute(name_low: &str, value: &str) -> bool {
     true
 }
 
-/// Whether a value references an external resource: any URL scheme (`…://…`)
-/// or a `javascript:` pseudo-scheme, case-insensitive.
+/// Whether a value references an external resource: any absolute URL scheme
+/// (`…://…`), a protocol-relative URL (`//host/…`, including inside `url(//…)`),
+/// or a `javascript:` pseudo-scheme — case-insensitive. `://` is a subset of
+/// `//`, so the single `//` check covers both absolute and protocol-relative
+/// forms.
 fn references_external(value: &str) -> bool {
     let low = value.to_ascii_lowercase();
-    low.contains("://") || low.contains("javascript:")
+    low.contains("//") || low.contains("javascript:")
 }
 
 /// Does the subtree use any XLink-namespaced attribute? Governs whether the
@@ -396,6 +408,32 @@ mod tests {
         );
         assert!(!out.svg.contains("javascript"), "{}", out.svg);
         assert!(out.svg.contains("href=\"#icon\""), "{}", out.svg);
+    }
+
+    #[test]
+    fn style_element_with_remote_css_is_stripped() {
+        // CSS @import / url() inside <style> fetches off-host when the artifact
+        // is inlined into HTML — the same exfil class as an external href.
+        let out = process(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><style>@import url("http://attacker.example/x.css");</style><rect/></svg>"#,
+        );
+        assert!(!out.svg.contains("style"), "{}", out.svg);
+        assert!(!out.svg.contains("attacker.example"), "{}", out.svg);
+        assert!(!out.svg.contains("@import"), "{}", out.svg);
+        assert!(out.svg.contains("<rect"));
+        assert!(out.removed.iter().any(|r| r.contains("style")));
+    }
+
+    #[test]
+    fn protocol_relative_url_reference_is_stripped() {
+        // `//host/…` (protocol-relative) is external too — it inherits the
+        // page's scheme when inlined, so a paint-server pointing at it exfils.
+        let out = process(
+            r##"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="url(//attacker.example/x)" stroke="#000"/></svg>"##,
+        );
+        assert!(!out.svg.contains("attacker.example"), "{}", out.svg);
+        assert!(out.svg.contains("stroke=\"#000\""), "{}", out.svg);
+        assert!(out.removed.iter().any(|r| r.contains("fill")));
     }
 
     #[test]

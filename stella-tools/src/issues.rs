@@ -294,7 +294,11 @@ impl Tool for UpdateIssue {
             IssueBackend::GitHub => {
                 if let Some(comment) = comment {
                     let out = gh(
-                        format!("gh issue comment {issue} --body {}", quote(comment)),
+                        format!(
+                            "gh issue comment {} --body {}",
+                            quote(&issue),
+                            quote(comment)
+                        ),
                         root,
                     )
                     .await;
@@ -314,7 +318,7 @@ impl Tool for UpdateIssue {
                         content: format!("issue {issue} updated"),
                     };
                 }
-                gh(format!("gh issue edit {issue}{edits}"), root).await
+                gh(format!("gh issue edit {}{edits}", quote(&issue)), root).await
             }
             IssueBackend::Linear { api_key } => {
                 let (id, _team) = match linear_issue_id(api_key, &issue).await {
@@ -383,7 +387,7 @@ impl Tool for CloseIssue {
         };
         match self.0.as_ref() {
             IssueBackend::GitHub => {
-                let mut cmd = format!("gh issue close {issue}");
+                let mut cmd = format!("gh issue close {}", quote(&issue));
                 if let Some(comment) = input.get("comment").and_then(|v| v.as_str()) {
                     cmd.push_str(&format!(" --comment {}", quote(comment)));
                 }
@@ -544,7 +548,7 @@ impl Tool for StartWorkOnIssue {
         };
         match self.0.as_ref() {
             IssueBackend::GitHub => {
-                let mut cmd = format!("gh issue develop {issue} --checkout");
+                let mut cmd = format!("gh issue develop {} --checkout", quote(&issue));
                 if let Some(branch) = input.get("branch").and_then(|v| v.as_str()) {
                     cmd.push_str(&format!(" --name {}", quote(branch)));
                 }

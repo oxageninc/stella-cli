@@ -404,7 +404,14 @@ impl Provider for ZaiProvider {
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            // Both a bad key (401) and a permission-denied key (403) are
+            // credential failures: surface them as non-retryable Auth so the
+            // user is pointed at their key rather than shown a generic
+            // terminal error.
             return Err(ProviderError::Auth(format!(
                 "{} rejected the API key",
                 self.label
@@ -520,17 +527,30 @@ async fn aggregate_zai_stream(
         }
     }
 
-    let calls = tool_calls
-        .into_values()
-        .map(|acc| {
-            let input = serde_json::from_str(&acc.arguments).unwrap_or(Value::Null);
-            ToolCall {
-                call_id: acc.id,
-                name: acc.name,
-                input,
-            }
-        })
-        .collect();
+    let mut calls = Vec::with_capacity(tool_calls.len());
+    for acc in tool_calls.into_values() {
+        let trimmed = acc.arguments.trim();
+        // A no-argument tool call arrives as `arguments: ""`; that is an empty
+        // object, not null — a downstream tool deserializing its input as an
+        // object must not be handed `null`. A *non-empty* body that fails to
+        // parse is a genuine defect (truncated stream / bad provider output)
+        // and is surfaced rather than silently coerced to `null`.
+        let input = if trimmed.is_empty() {
+            Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(trimmed).map_err(|e| {
+                ProviderError::Malformed(format!(
+                    "tool call `{}` had unparseable arguments: {e}",
+                    acc.name
+                ))
+            })?
+        };
+        calls.push(ToolCall {
+            call_id: acc.id,
+            name: acc.name,
+            input,
+        });
+    }
 
     Ok((text, calls, usage))
 }

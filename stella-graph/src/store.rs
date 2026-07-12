@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use crate::error::GraphError;
@@ -298,13 +298,17 @@ fn prune_missing(tx: &Transaction, current: &HashSet<String>) -> Result<usize, G
 }
 
 fn file_sha(tx: &Transaction, rel: &str) -> Result<Option<String>, GraphError> {
+    // `.optional()` maps only "no row for this path" to `None`; any other DB
+    // error propagates as `GraphError` instead of being silently swallowed
+    // into a spurious "not previously indexed" (which would re-parse and mask
+    // a real store fault).
     let sha = tx
         .query_row(
             "SELECT content_sha256 FROM code_graph_files WHERE path = ?1",
             params![rel],
             |row| row.get::<_, String>(0),
         )
-        .ok();
+        .optional()?;
     Ok(sha)
 }
 

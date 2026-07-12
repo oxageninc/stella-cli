@@ -1312,14 +1312,14 @@ mod tests {
 
     #[test]
     fn existing_providers_still_route_to_their_current_adapter() {
-        // Regression: switching the catalog check to resolve_for and the
-        // (provider, id) dedup must NOT change selection for any provider that
-        // worked before. OpenAI keeps its Responses-API adapter and Anthropic
-        // its Messages adapter; Gemini now has its own native adapter. The
-        // remaining OpenAI-compatible providers share the Chat Completions
-        // implementation but are re-identified per provider via
-        // `with_identity`, so each reports its own id (not the bare "zai"
-        // shim id) for telemetry/attribution.
+        // Regression: switching the catalog check to resolve_for, the
+        // (provider, id) dedup, and the inserted vertex/bedrock arms must NOT
+        // change selection for any provider that worked before. `build_provider`
+        // dispatches on `cfg.provider.id`: OpenAI/Anthropic/Gemini each get
+        // their own native adapter, while the OpenAI-compatible gateways (xAI,
+        // DeepSeek, OpenRouter) share the ZaiProvider implementation but are
+        // re-identified via `with_identity`, so each adapter's `id()` is its own
+        // provider name — i.e. every provider reports itself.
         for (provider_id, expected_adapter) in [
             ("openai", "openai"),
             ("anthropic", "anthropic"),
@@ -1342,7 +1342,7 @@ mod tests {
     #[test]
     fn vertex_and_bedrock_route_to_their_native_adapters_not_a_fallthrough() {
         // The new providers must construct their own native adapter (not the
-        // openai_compatible shim, id "zai", nor the anthropic branch). Both
+        // shared ZaiProvider shim, id "zai", nor the anthropic branch). Both
         // arms read extra addressing/credentials from the environment; set
         // the minimum each requires. build_provider only constructs — no
         // network call. These env vars are read by no other test, so setting

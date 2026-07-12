@@ -389,6 +389,31 @@ impl<'a> Engine<'a> {
                     tool_calls: result.tool_calls.clone(),
                     tool_results: Vec::new(),
                 });
+                // The assistant message above may carry `tool_calls` that never
+                // ran (we abort before dispatching them). A recorded `tool_use`
+                // with no matching `tool_result` is a broken history: when a
+                // REPL caller reuses this `messages` vec, the next turn's first
+                // provider call is hard-rejected ("tool_use must be followed by
+                // tool_result"). Close the pairing with a synthetic error
+                // result per un-run call so resumption stays valid.
+                if !result.tool_calls.is_empty() {
+                    let tool_results = result
+                        .tool_calls
+                        .iter()
+                        .map(|call| ToolResult {
+                            call_id: call.call_id.clone(),
+                            output: ToolOutput::Error {
+                                message: "not executed — turn aborted on budget".to_string(),
+                            },
+                        })
+                        .collect();
+                    messages.push(CompletionMessage {
+                        role: MessageRole::Tool,
+                        content: String::new(),
+                        tool_calls: Vec::new(),
+                        tool_results,
+                    });
+                }
                 let reason = format!(
                     "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} limit"
                 );

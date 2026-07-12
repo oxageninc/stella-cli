@@ -43,7 +43,11 @@ pub(crate) async fn run(
             Err(_) => {
                 #[cfg(unix)]
                 unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
+                    // Guard on a real pid: kill(-0, …) would SIGKILL Stella's
+                    // OWN process group.
+                    if pid > 0 {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
                 }
                 return Err(format!("`{command}` timed out after {timeout_secs}s"));
             }

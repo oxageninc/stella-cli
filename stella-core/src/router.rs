@@ -11,8 +11,8 @@
 //! over a caller-supplied abstraction (`ProviderProfile`) instead of any
 //! concrete catalog type, and has no I/O of its own: `resolve` is a plain
 //! synchronous function over owned data. It returns *data* describing what
-//! happened (a `ModelRef` plus an optional `FallbackInfo`); the future
-//! `driver.rs` is the one place that turns a `FallbackInfo` into an
+//! happened (a `ModelRef` plus an optional `FallbackInfo`); the pipeline layer
+//! (`stella-pipeline`) is what turns a `FallbackInfo` into an
 //! `AgentEvent::ProviderFallback` and pushes it onto the event channel —
 //! there is no event channel here.
 //!
@@ -482,15 +482,10 @@ impl Router {
             return Err(RouterError::NoProvidersConfigured { role: Role::Judge });
         }
 
-        // What Worker actually resolves to right now (pin included) — the
-        // instance Judge must never repeat.
-        let worker_decision = self.resolve(Role::Worker)?;
-        let worker_family = self
-            .profiles
-            .iter()
-            .find(|p| p.worker_model == worker_decision.model_ref)
-            .map(|p| p.family.as_str());
-
+        // Availability is checked FIRST so an all-breakers-open state reports a
+        // `Judge` failure — resolving Worker up front would propagate its `?`
+        // as `AllProvidersUnavailable { role: Worker }`, mislabeling a Judge
+        // resolution with the wrong role.
         let available: Vec<&ProviderProfile> = self
             .profiles
             .iter()
@@ -499,6 +494,15 @@ impl Router {
         let Some(&first_healthy) = available.first() else {
             return Err(RouterError::AllProvidersUnavailable { role: Role::Judge });
         };
+
+        // What Worker actually resolves to right now (pin included) — the
+        // instance Judge must never repeat.
+        let worker_decision = self.resolve(Role::Worker)?;
+        let worker_family = self
+            .profiles
+            .iter()
+            .find(|p| p.worker_model == worker_decision.model_ref)
+            .map(|p| p.family.as_str());
 
         // Prefer a healthy provider whose family differs from worker's. If
         // worker's family is unknown (e.g. an explicit pin to a model no

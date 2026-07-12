@@ -207,6 +207,10 @@ fn parse_domains(raw: &str) -> Vec<String> {
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(trimmed);
+    // Dedup case-insensitively (keeping first occurrence) so a skill authored
+    // with a repeated tag (`domains: sql, sql`) doesn't get its domain boost
+    // double-counted in `select_skills` — matching `union_domains`.
+    let mut seen = std::collections::HashSet::new();
     inner
         .split(',')
         .map(|part| {
@@ -216,6 +220,7 @@ fn parse_domains(raw: &str) -> Vec<String> {
                 .to_string()
         })
         .filter(|d| !d.is_empty())
+        .filter(|d| seen.insert(d.to_ascii_lowercase()))
         .collect()
 }
 
@@ -908,7 +913,15 @@ fn representative_text(cluster: &[SkillObservation]) -> Option<String> {
     let mut best = cluster.first()?.text.as_str();
     let mut best_count = 0usize;
     for (text, count) in &counts {
-        if *count > best_count || (*count == best_count && text.len() > best.len()) {
+        // Most-frequent, then longest, then lexically smallest. The final
+        // lexical tiebreak is load-bearing: without it, two equal-count,
+        // equal-length texts resolve in HashMap iteration order (randomized
+        // per process), so re-mining the same observations could pick a
+        // different representative and mint a duplicate `<slug>-<hash>` file.
+        let better = *count > best_count
+            || (*count == best_count && text.len() > best.len())
+            || (*count == best_count && text.len() == best.len() && *text < best);
+        if better {
             best = text;
             best_count = *count;
         }

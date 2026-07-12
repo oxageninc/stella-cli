@@ -22,7 +22,9 @@ use stella_protocol::{
     ProviderError, ReasoningEffort, ToolCall,
 };
 
+use crate::catalog::{Catalog, Pricing};
 use crate::credential::ApiKey;
+use crate::http;
 use crate::provider::Provider;
 use crate::sse::SseDecoder;
 
@@ -47,17 +49,31 @@ pub struct GeminiProvider {
     api_key: ApiKey,
     base_url: String,
     model: String,
+    /// List pricing for `model`, resolved from the catalog at construction so
+    /// `cost_usd` is computed on the real request path (see `zai.rs`). `None`
+    /// only if the slug is absent from the catalog — the same posture as the
+    /// other adapters, never a silent hard-coded zero.
+    pricing: Option<Pricing>,
 }
 
 impl GeminiProvider {
     /// Build an adapter for `model` (a catalog-resolved slug, e.g.
     /// `gemini-3-pro` — never a literal chosen at the call site).
     pub fn new(api_key: ApiKey, model: impl Into<String>) -> Self {
+        let model = model.into();
+        // Scope the lookup to the `gemini` provider: `gemini-3-pro` is seeded
+        // under both `gemini` and `vertex`, so a bare `resolve` would be
+        // ambiguous (see `Catalog::resolve_for`).
+        let pricing = Catalog::seed()
+            .resolve_for("gemini", &model)
+            .ok()
+            .map(|e| e.pricing);
         Self {
-            client: reqwest::Client::new(),
+            client: http::client(),
             api_key,
             base_url: DEFAULT_BASE_URL.to_string(),
-            model: model.into(),
+            model,
+            pricing,
         }
     }
 
@@ -173,6 +189,45 @@ pub(crate) struct GeminiStreamChunk {
     pub(crate) candidates: Vec<GeminiCandidate>,
     #[serde(default)]
     pub(crate) usage_metadata: Option<GeminiUsageMetadata>,
+    /// An in-band error frame (`data: {"error": {...}}`). Google can emit one
+    /// mid-stream after a 200 status; without modelling it the frame would
+    /// deserialize into an otherwise-empty chunk and be silently dropped,
+    /// ending the turn as a truncated success.
+    #[serde(default)]
+    pub(crate) error: Option<GoogleApiError>,
+}
+
+/// The `error` object Google returns both in a non-2xx body and in a
+/// mid-stream SSE error frame. Only the fields this adapter classifies on are
+/// modelled; unknown fields are ignored.
+#[derive(Deserialize, Debug)]
+pub(crate) struct GoogleApiError {
+    #[serde(default)]
+    pub(crate) code: u16,
+    #[serde(default)]
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) status: String,
+}
+
+impl GoogleApiError {
+    /// Classify a mid-stream error frame. 5xx / `UNAVAILABLE` / `INTERNAL` are
+    /// transient (retryable `Transport`); `RESOURCE_EXHAUSTED` / 429 map to
+    /// `RateLimited`; everything else is `Terminal` — the same posture as
+    /// [`classify_google_error`] for non-2xx statuses.
+    fn into_provider_error(self, label: &str) -> ProviderError {
+        let msg = format!("{label} stream error [{}]: {}", self.status, self.message);
+        if self.code >= 500 || self.status == "UNAVAILABLE" || self.status == "INTERNAL" {
+            ProviderError::Transport(msg)
+        } else if self.code == 429 || self.status == "RESOURCE_EXHAUSTED" {
+            ProviderError::RateLimited {
+                message: msg,
+                retry_after_ms: None,
+            }
+        } else {
+            ProviderError::Terminal(msg)
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -409,6 +464,13 @@ pub(crate) async fn classify_google_error(
             retry_after_ms,
         };
     }
+    // 5xx (500 INTERNAL, 503 UNAVAILABLE, …) are transient load-shedding on
+    // Google's side — retryable Transport, not a permanent Terminal, matching
+    // `openai.rs`/`anthropic.rs`/`zai.rs`. Without this a momentary 503 aborts
+    // the whole turn (Terminal.is_retryable() == false).
+    if status.is_server_error() {
+        return ProviderError::Transport(format!("{label} HTTP {status}: {body}"));
+    }
     ProviderError::Terminal(format!("{label} HTTP {status}: {body}"))
 }
 
@@ -443,13 +505,14 @@ impl Provider for GeminiProvider {
             return Err(classify_google_error("Gemini", response).await);
         }
 
-        let (text, tool_calls, usage) = aggregate_gemini_stream(response).await?;
+        let (text, tool_calls, usage) = aggregate_gemini_stream("Gemini", response).await?;
+        let cost_usd = self.pricing.map(|p| p.cost_usd(&usage)).unwrap_or(0.0);
         Ok(CompletionResult {
             text,
             tool_calls,
             usage,
             model: self.model.clone(),
-            cost_usd: 0.0,
+            cost_usd,
         })
     }
 }
@@ -461,21 +524,24 @@ impl Provider for GeminiProvider {
 /// answer text; a part's `thoughtSignature` is preserved by riding inside
 /// the minted call id (see [`SIGNATURE_SEPARATOR`]).
 pub(crate) async fn aggregate_gemini_stream(
+    label: &str,
     response: reqwest::Response,
 ) -> Result<(String, Vec<ToolCall>, CompletionUsage), ProviderError> {
-    use futures_util::StreamExt;
-
     let mut decoder = SseDecoder::new();
     let mut text = String::new();
     let mut usage = CompletionUsage::default();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ProviderError::Transport(e.to_string()))?;
-        let chunk_str =
-            std::str::from_utf8(&chunk).map_err(|e| ProviderError::Malformed(e.to_string()))?;
-        decoder.push(chunk_str);
+    // `next_with_timeout` bounds each read by `STREAM_IDLE_TIMEOUT` (a silent
+    // stream surfaces as a retryable Transport error, not an unbounded hang)
+    // and `push_bytes` reassembles multi-byte UTF-8 characters split across
+    // chunk boundaries — decoding each chunk in isolation would spuriously
+    // abort a CJK/emoji stream with `Malformed`.
+    while let Some(chunk) = http::next_with_timeout(&mut stream, http::STREAM_IDLE_TIMEOUT).await? {
+        decoder
+            .push_bytes(&chunk)
+            .map_err(|e| ProviderError::Malformed(e.to_string()))?;
         for event in decoder.poll() {
             let data = event.data.trim();
             if data.is_empty() || data == "[DONE]" {
@@ -485,6 +551,9 @@ pub(crate) async fn aggregate_gemini_stream(
                 Ok(v) => v,
                 Err(_) => continue, // tolerate keep-alive/ping frames
             };
+            if let Some(err) = parsed.error {
+                return Err(err.into_provider_error(label));
+            }
             if let Some(u) = parsed.usage_metadata {
                 usage.input_tokens = u.prompt_token_count;
                 usage.output_tokens = u.candidates_token_count + u.thoughts_token_count;

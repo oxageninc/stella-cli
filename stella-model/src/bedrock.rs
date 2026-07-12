@@ -32,7 +32,9 @@ use stella_protocol::{
     ProviderError, ToolCall,
 };
 
+use crate::catalog::{Catalog, Pricing};
 use crate::credential::ApiKey;
+use crate::http;
 use crate::provider::Provider;
 
 pub struct BedrockProvider {
@@ -43,6 +45,10 @@ pub struct BedrockProvider {
     region: String,
     model: String,
     base_url_override: Option<String>,
+    /// List pricing for `model`, resolved from the catalog at construction so
+    /// `cost_usd` is computed on the real request path — never a hard-coded
+    /// zero (which would silently disable budget enforcement for Bedrock).
+    pricing: Option<Pricing>,
 }
 
 impl BedrockProvider {
@@ -56,14 +62,20 @@ impl BedrockProvider {
         region: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let model = model.into();
+        let pricing = Catalog::seed()
+            .resolve_for("bedrock", &model)
+            .ok()
+            .map(|e| e.pricing);
         Self {
-            client: reqwest::Client::new(),
+            client: http::client(),
             access_key,
             secret_key,
             session_token,
             region: region.into(),
-            model: model.into(),
+            model,
             base_url_override: None,
+            pricing,
         }
     }
 
@@ -401,10 +413,35 @@ impl Provider for BedrockProvider {
             )));
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Surface the server's own message and any Retry-After hint rather
+            // than a fixed string (matches `zai.rs`), so the driver can honor
+            // the provider's stated backoff.
+            let retry_after_ms = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(|s| s.saturating_mul(1000));
+            let text = response.text().await.unwrap_or_default();
+            let message = if text.trim().is_empty() {
+                "Bedrock throttled the request".to_string()
+            } else {
+                format!("Bedrock throttled the request: {text}")
+            };
             return Err(ProviderError::RateLimited {
-                message: "Bedrock throttled the request".into(),
-                retry_after_ms: None,
+                message,
+                retry_after_ms,
             });
+        }
+        // 5xx (500 InternalServerException, 503 ServiceUnavailableException,
+        // 529) are transient — retryable Transport, not a permanent Terminal,
+        // matching every sibling adapter. Without this a momentary blip aborts
+        // the whole turn (Terminal.is_retryable() == false).
+        if status.is_server_error() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(ProviderError::Transport(format!(
+                "Bedrock HTTP {status}: {text}"
+            )));
         }
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -435,17 +472,19 @@ impl Provider for BedrockProvider {
             }
         }
         let usage = parsed.usage.unwrap_or_default();
+        let usage = CompletionUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cache_read_input_tokens,
+        };
+        let cost_usd = self.pricing.map(|p| p.cost_usd(&usage)).unwrap_or(0.0);
 
         Ok(CompletionResult {
             text,
             tool_calls,
-            usage: CompletionUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cached_input_tokens: usage.cache_read_input_tokens,
-            },
+            usage,
             model: self.model.clone(),
-            cost_usd: 0.0,
+            cost_usd,
         })
     }
 }

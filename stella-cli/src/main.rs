@@ -228,15 +228,14 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Chat => {
             rt()?.block_on(agent::run_interactive(&cfg, cli.budget))?;
         }
-        Command::Init | Command::Tools => unreachable!("handled above"),
-        Command::Models => {
-            cfg.print_models();
+        // Models/Version (and Tools) short-circuit in the first match at the
+        // top of `run` before a provider is resolved; Init is handled by the
+        // caller. Reaching any of them here is impossible.
+        Command::Init | Command::Tools | Command::Models | Command::Version => {
+            unreachable!("handled before provider resolution")
         }
         Command::Config => {
             cfg.print_config();
-        }
-        Command::Version => {
-            println!("stella v{}", env!("CARGO_PKG_VERSION"));
         }
     }
     Ok(())
