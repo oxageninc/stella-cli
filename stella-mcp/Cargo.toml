@@ -32,3 +32,7 @@ wiremock = "0.6"
 [[bin]]
 name = "mcp-fixture-server"
 path = "src/bin/mcp-fixture-server.rs"
+
+# Integration-test fixture server only — never shipped, so keep it out of dist.
+[package.metadata.dist]
+dist = false

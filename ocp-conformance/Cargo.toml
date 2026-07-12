@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# Dev/fixture binaries (ocp-inspect debugger, ocp-example-docs test fixture) —
+# not part of the released product, so exclude them from dist artifacts.
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 ocp-types = { path = "../ocp-types" }
 ocp-host = { path = "../ocp-host" }

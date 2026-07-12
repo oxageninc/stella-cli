@@ -124,6 +124,36 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         // by the adapter.
         base_url: "https://bedrock-runtime.<AWS_REGION>.amazonaws.com",
     },
+    // Vertex and Bedrock are appended LAST so auto-detection (the no-`--model`
+    // path picks the first provider with a resolvable credential) never
+    // prefers them over an explicitly-configured provider — AWS_ACCESS_KEY_ID
+    // in particular is commonly present in a shell for unrelated reasons.
+    // Both speak a native, non-OpenAI wire shape, so `build_provider`
+    // (agent.rs) routes them to their own adapters rather than the generic
+    // Chat Completions client.
+    ProviderConfig {
+        id: "vertex",
+        env_var: "VERTEX_ACCESS_TOKEN",
+        env_var_aliases: &[],
+        display_name: "Google Vertex AI",
+        default_model: "gemini-3-pro",
+        // Native generateContent, project/location-scoped. The VertexProvider
+        // adapter builds its own addressing from VERTEX_PROJECT_ID /
+        // VERTEX_LOCATION, so this base_url is shown in `stella models` for
+        // reference only — build_provider does not pass it to the adapter.
+        base_url: "https://aiplatform.googleapis.com",
+    },
+    ProviderConfig {
+        id: "bedrock",
+        env_var: "AWS_ACCESS_KEY_ID",
+        env_var_aliases: &[],
+        display_name: "Amazon Bedrock",
+        default_model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        // Region-templated at request time by the BedrockProvider adapter
+        // (bedrock-runtime.<AWS_REGION>.amazonaws.com); shown here for
+        // reference only.
+        base_url: "https://bedrock-runtime.us-east-1.amazonaws.com",
+    },
 ];
 
 /// The `local` pseudo-provider: any OpenAI-compatible endpoint the user
