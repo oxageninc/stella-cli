@@ -55,6 +55,37 @@ _AGENT_LOG_PATH = "/tmp/stella-run.txt"
 # Environment variable prefixes
 _ENV_PREFIX = "STELLA_"
 
+# Provider credentials and provider-specific addressing vars that Stella's
+# provider registry reads directly (stella-model adapters + the credential
+# chain). One family per supported provider, plus the documented aliases —
+# kept in sync with the README's provider table so every BYOK provider can
+# authenticate inside the container.
+_PROVIDER_ENV_VARS = (
+    # Anthropic · OpenAI · xAI · DeepSeek · Z.ai · OpenRouter · Gemini
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "ZAI_API_KEY",
+    "ZAI_GLM_CODING_PLAN",
+    "OPENROUTER_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",  # documented Gemini alias
+    # Google Vertex AI
+    "VERTEX_ACCESS_TOKEN",
+    "VERTEX_PROJECT_ID",
+    "VERTEX_LOCATION",
+    "GOOGLE_CLOUD_PROJECT",
+    # Amazon Bedrock
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    # Local / any OpenAI-compatible gateway
+    "LOCAL_API_KEY",
+)
+
 
 def _is_truthy(value: str | None) -> bool:
     """Check if a string environment variable represents truth."""
@@ -180,28 +211,25 @@ class StellaAgent(BaseInstalledAgent):
     def _forwarded_env(self) -> dict[str, str]:
         """Collect host-side environment variables to forward into the container.
 
-        Forwards all `STELLA_*` variables, plus provider-specific keys
-        (ANTHROPIC_API_KEY, ZAI_API_KEY, etc.) so the agent can make LLM calls.
+        Forwards all `STELLA_*` variables, plus the provider credential and
+        addressing vars that Stella reads directly, so the agent can make LLM
+        calls for any of the supported providers.
         """
         forwarded = {}
 
-        # Forward all STELLA_* variables
-        for key, value in os.environ.items():
+        # Forward all STELLA_* variables (STELLA_MODEL, STELLA_BUDGET,
+        # STELLA_BASE_URL, STELLA_BINARY, STELLA_TIMEOUT, ...).
+        for key in os.environ:
             if key.startswith(_ENV_PREFIX):
-                forwarded[key] = value
+                forwarded[key] = os.environ[key]
 
-        # Forward provider API keys (Stella reads these directly)
-        provider_keys = [
-            "ANTHROPIC_API_KEY",
-            "ZAI_API_KEY",
-            "OPENAI_API_KEY",
-            "GEMINI_API_KEY",
-            "DEEPSEEK_API_KEY",
-            "OPENROUTER_API_KEY",
-        ]
-        for key in provider_keys:
+        # Forward provider credentials and provider-specific addressing vars.
+        # These mirror the env vars Stella's provider registry actually reads
+        # (stella-cli/src/config.rs PROVIDERS + agent.rs build_provider): one
+        # entry per supported provider, plus the documented aliases.
+        for key in _PROVIDER_ENV_VARS:
             if key in os.environ:
-                forwarded[key] = value
+                forwarded[key] = os.environ[key]
 
         # Forward model from Harbor's -m flag if not already set
         if "STELLA_MODEL" not in forwarded and "HARBOR_MODEL" in os.environ:

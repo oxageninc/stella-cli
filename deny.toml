@@ -1,0 +1,26 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+#
+# CI runs `cargo deny check advisories bans sources` as a REAL gate (no
+# `|| true`). We intentionally do NOT gate on `licenses` here: the workspace is
+# MIT OR Apache-2.0 and every dependency is a permissive OSS crate, but pinning
+# an exhaustive license allow-list is churn we track separately — advisories,
+# bans, and source provenance are the checks that catch supply-chain problems.
+
+[advisories]
+# A known vulnerability fails the build. (cargo-audit gates advisories too; this
+# is the belt to that suspenders and also covers unmaintained/yanked signals.)
+yanked = "warn"
+unmaintained = "workspace"
+
+[bans]
+# Multiple versions of the same crate is a warning, not a failure — the bundled
+# C deps (rusqlite, tree-sitter grammars) legitimately pull duplicate minor
+# versions. Tighten to "deny" here if the tree ever needs to be pinned flat.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Every dependency must come from a known registry (crates.io by default). An
+# unknown registry or an unvetted git source fails the build.
+unknown-registry = "deny"
+unknown-git = "deny"

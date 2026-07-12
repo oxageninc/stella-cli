@@ -1,6 +1,7 @@
 # Rust
 /target/
-/Cargo.lock
+# Cargo.lock IS tracked — Stella ships a binary and install.sh / release.yml
+# build with `--locked`, so the lockfile must be committed and reproducible.
 **/*.rs.bk
 *.pdb
 

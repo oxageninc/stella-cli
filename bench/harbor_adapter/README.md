@@ -8,23 +8,34 @@ This adapter integrates Stella with the [Harbor framework](https://www.harborfra
 
 ## Quick start
 
+This adapter registers a `stella` agent with your own [Harbor](https://www.harborframework.com/)
+install — that's the public path:
+
 ```bash
 cd bench/harbor_adapter
 
 # Install the adapter package
 pip install -e .
 
-# Run SWE-bench Verified (default model: anthropic/claude-fable-5)
+# Run SWE-bench Verified directly through Harbor (BYOK)
 export ANTHROPIC_API_KEY=...
-STELLA_MODEL=anthropic/claude-fable-5 ../../oxagen-platform/bench/swe-bench/run.sh
-
-# Or run directly with Harbor (after installing Harbor)
 harbor run \
   --agent stella \
   --dataset "swe-bench/swe-bench-verified" \
   --n-concurrent 4 \
+  -m anthropic/claude-fable-5 \
   --env ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
 ```
+
+No Harbor install? The repo root ships a standalone, no-Harbor harness:
+
+```bash
+python3 ../run_swebench.py --limit 25 --model anthropic/claude-fable-5 --budget 2.0
+```
+
+> `run.sh` in this directory wraps Oxagen's **internal** at-scale runner
+> (`oxagen-platform`) and is not usable without that private repo — it prints
+> the public alternatives above if the platform isn't present.
 
 ## Configuration
 

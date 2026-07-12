@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
-build-system = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "stella-harbor"
@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT OR Apache-2.0"}
 authors = [
-    {name = "Oxagen", email = "dev@oxagen.ai"}
+    {name = "Oxagen", email = "dev@oxagen.sh"}
 ]
 keywords = ["benchmark", "harbor", "stella", "swe-bench"]
 classifiers = [
@@ -36,8 +36,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/oxageninc/stella"
-Repository = "https://github.com/oxageninc/stella"
+Homepage = "https://github.com/oxageninc/stella-cli"
+Repository = "https://github.com/oxageninc/stella-cli"
 
 [tool.setuptools]
 packages = ["stella_harbor"]

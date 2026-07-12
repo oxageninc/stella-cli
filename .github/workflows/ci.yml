@@ -54,8 +54,11 @@ jobs:
       - name: Install cargo-deny + cargo-audit
         run: cargo install --locked cargo-deny cargo-audit
 
-      - name: cargo deny check advisories
-        run: cargo deny check advisories || true
+      # Real gate (no `|| true`): advisories + dependency bans + source
+      # provenance, configured in deny.toml. License checking is deliberately
+      # left to a separate track (see deny.toml).
+      - name: cargo deny check
+        run: cargo deny check advisories bans sources
 
       - name: cargo audit
         run: cargo audit

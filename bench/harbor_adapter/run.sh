@@ -26,6 +26,8 @@ fi
 
 # Configuration
 AGENT="${AGENT:-stella}"
+# Default model for this internal at-scale runner. Override with STELLA_MODEL
+# or Harbor's -m for any provider (e.g. STELLA_MODEL=anthropic/claude-fable-5).
 MODEL_SLUG="${STELLA_MODEL:-zai/glm-5.2}"
 DATASET="${DATASET:-swe-bench/swe-bench-verified}"
 N_CONCURRENT="${N_CONCURRENT:-4}"
@@ -36,7 +38,14 @@ JOBS_DIR="${JOBS_DIR:-./results-stella}"
 export STELLA_MODEL="$MODEL_SLUG"
 export STELLA_BUDGET="${STELLA_BUDGET:-5.0}"
 export STELLA_BINARY="$REPO_ROOT/target/release/stella"
-export STELLA_BASE_URL="${STELLA_BASE_URL:-https://api.z.ai/api/coding/paas/v4}"
+# Only pin a base URL if the caller explicitly set one. Do NOT force a
+# provider-specific endpoint by default — that silently routes e.g. Anthropic
+# traffic to a different vendor. For Z.ai's coding plan, either export
+# STELLA_BASE_URL=https://api.z.ai/api/coding/paas/v4 yourself or set
+# ZAI_GLM_CODING_PLAN=1 (Stella then resolves the coding endpoint itself).
+if [ -n "${STELLA_BASE_URL:-}" ]; then
+    export STELLA_BASE_URL
+fi
 
 # Ensure adapter is installed and importable
 echo "Setting up Stella Harbor adapter..."
@@ -60,13 +69,27 @@ if [ -n "${TASK_IDS:-}" ]; then
     done
 fi
 
-# Locate Harbor SWE-bench runner (oxagen-platform)
+# Locate the internal Harbor SWE-bench runner (oxagen-platform). This wrapper
+# targets Oxagen's private at-scale orchestration; it is NOT the public entry
+# point. Contributors without that repo should use one of the public paths.
 OXAGEN_PLATFORM="${OXAGEN_PLATFORM:-$HOME/Workspaces/oxagen-platform}"
 HARBOR_RUNNER="$OXAGEN_PLATFORM/bench/swe-bench/run.sh"
 
 if [ ! -f "$HARBOR_RUNNER" ]; then
-    echo "Error: Cannot find Harbor SWE-bench runner at $HARBOR_RUNNER"
-    echo "Set OXAGEN_PLATFORM to the oxagen-platform repo path."
+    cat >&2 <<'EOF'
+This script wraps Oxagen's internal at-scale Harbor runner, which isn't part of
+the public repo. Two public paths do not need it:
+
+  • Direct Harbor (containerized, per your own Harbor install):
+        harbor run --agent stella --dataset swe-bench/swe-bench-verified -m <model>
+    (this adapter registers the `stella` agent; see README.md here)
+
+  • The standalone, no-Harbor harness in the repo root:
+        python3 ../run_swebench.py --limit 25 --model anthropic/claude-fable-5 --budget 2.0
+
+To use THIS wrapper anyway, set OXAGEN_PLATFORM to a checkout that provides
+bench/swe-bench/run.sh.
+EOF
     exit 1
 fi
 

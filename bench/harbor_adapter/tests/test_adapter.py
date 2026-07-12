@@ -95,19 +95,31 @@ class TestStellaAgent:
         env = agent._forwarded_env()
         assert "STELLA" not in str(env)
 
-        # Set some vars
+        # Set some vars. Deliberately set the provider key FIRST, then set
+        # another env var afterwards, so the provider key's real value differs
+        # from "whatever os.environ iterated last". This is the regression
+        # guard for the leftover-`value` bug: forwarding `value` (the last
+        # loop binding) instead of `os.environ[key]` would fail here.
+        os.environ["ANTHROPIC_API_KEY"] = "sk-anthropic-real"
+        os.environ["OPENAI_API_KEY"] = "sk-openai-real"
         os.environ["STELLA_MODEL"] = "anthropic/claude-fable-5"
         os.environ["STELLA_BUDGET"] = "5.0"
-        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        os.environ["_ADAPTER_TEST_SENTINEL"] = "not-a-key"  # iterated after the keys
         env = agent._forwarded_env()
         assert env["STELLA_MODEL"] == "anthropic/claude-fable-5"
         assert env["STELLA_BUDGET"] == "5.0"
-        assert env["ANTHROPIC_API_KEY"] == "sk-test"
+        # Each provider key must carry its OWN value, not a leftover binding.
+        assert env["ANTHROPIC_API_KEY"] == "sk-anthropic-real"
+        assert env["OPENAI_API_KEY"] == "sk-openai-real"
+        # A non-provider var must never be forwarded as a credential.
+        assert "_ADAPTER_TEST_SENTINEL" not in env
 
         # Clean up
         del os.environ["STELLA_MODEL"]
         del os.environ["STELLA_BUDGET"]
         del os.environ["ANTHROPIC_API_KEY"]
+        del os.environ["OPENAI_API_KEY"]
+        del os.environ["_ADAPTER_TEST_SENTINEL"]
 
 
 @pytest.mark.asyncio
