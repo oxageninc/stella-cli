@@ -361,35 +361,13 @@ impl Config {
         })
     }
 
+    /// Print the provider/model table for an interactive session. The listing
+    /// depends only on `PROVIDERS` and the ambient environment, never on
+    /// `self`, so it delegates to the static [`Config::print_available_models`]
+    /// — one renderer backs both the `/models` REPL command and the top-level
+    /// `stella models` subcommand, and they can never drift apart.
     pub fn print_models(&self) {
-        println!(
-            "{}\n",
-            "Stella — Available Providers & Models".cyan().bold()
-        );
-        for p in PROVIDERS {
-            let has_key = std::iter::once(&p.env_var)
-                .chain(p.env_var_aliases)
-                .any(|var| env::var(var).map(|v| !v.is_empty()).unwrap_or(false));
-            let key_status = if has_key {
-                "✓ configured".green()
-            } else {
-                "✗ no key".dimmed()
-            };
-            println!(
-                "  {} {}/{}  {}  [{}]",
-                key_status,
-                p.id.bright_blue(),
-                p.default_model.bright_white(),
-                p.display_name,
-                p.base_url.dimmed(),
-            );
-        }
-        println!("\n  Use --model provider/model_id to pin a specific model.");
-        println!("  Example: stella --model zai/glm-5.2 run 'fix the failing test'");
-        println!(
-            "  Local endpoints (Ollama, vLLM, LM Studio): stella --model local/<model> \
-             --base-url http://localhost:11434/v1"
-        );
+        Self::print_available_models();
     }
 
     pub fn print_config(&self) {
