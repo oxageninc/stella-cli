@@ -29,6 +29,7 @@ stella-tools = { path = "../stella-tools" }
 stella-store = { path = "../stella-store" }
 stella-mcp = { path = "../stella-mcp" }
 stella-context = { path = "../stella-context" }
+stella-graph = { path = "../stella-graph" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }
@@ -40,3 +41,4 @@ toml.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile.workspace = true

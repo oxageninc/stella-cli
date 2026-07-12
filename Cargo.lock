@@ -2624,11 +2624,13 @@ dependencies = [
  "serde_json",
  "stella-context",
  "stella-core",
+ "stella-graph",
  "stella-mcp",
  "stella-model",
  "stella-protocol",
  "stella-store",
  "stella-tools",
+ "tempfile",
  "tokio",
  "toml",
 ]

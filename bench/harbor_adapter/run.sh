@@ -27,7 +27,9 @@ if [ ! -f "$REPO_ROOT/target/release/stella" ]; then
 fi
 
 # Configuration
-AGENT="${AGENT:-stella}"
+# Set AGENT=oxagen to use the Oxagen runner's Harbor infrastructure
+# We'll override the actual agent via HARBOR_EXTRA
+AGENT="oxagen"
 MODEL_SLUG="${STELLA_MODEL:-anthropic/claude-fable-5}"
 DATASET="${DATASET:-swe-bench/swe-bench-verified}"
 N_CONCURRENT="${N_CONCURRENT:-4}"
@@ -43,6 +45,9 @@ export STELLA_BINARY="$REPO_ROOT/target/release/stella"
 if [ -n "${STELLA_BASE_URL:-}" ]; then
     export STELLA_BASE_URL
 fi
+
+# Override Harbor to use Stella agent instead of Oxagen
+export HARBOR_EXTRA="--agent stella_harbor:StellaAgent ${HARBOR_EXTRA:-}"
 
 # Build task ID args
 TASK_ID_ARGS=()
@@ -78,9 +83,8 @@ echo "Jobs dir: $JOBS_DIR"
 echo ""
 
 # Build Harbor args
-# Harbor expects custom agents as module.path:ClassName
+# Note: We override the agent via HARBOR_EXTRA instead of here
 HARBOR_ARGS=(
-    --agent stella_harbor:StellaAgent
     --dataset "$DATASET"
     -m "$MODEL_SLUG"
     --n-concurrent "$N_CONCURRENT"
@@ -96,11 +100,28 @@ if [ -n "${HARBOR_EXTRA:-}" ]; then
     HARBOR_ARGS+=($HARBOR_EXTRA)
 fi
 
-# Ensure adapter is installed
-echo "Installing Stella Harbor adapter..."
-python3 -m pip install -e . --break-system-packages --quiet
+# Ensure adapter is available
+echo "Setting up Stella Harbor adapter..."
+ADAPTER_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Install to user site-packages (visible to most Python environments)
+python3 -m pip install --user -e "$ADAPTER_DIR" --break-system-packages --quiet
+
+# Get the user site-packages directory
+USER_SITE=$(python3 -c "import site; print(site.USER_SITE)")
+echo "User site-packages: $USER_SITE"
+
+# Verify it can be imported
+python3 -c "from stella_harbor import StellaAgent; print('✓ Stella agent importable')" 2>/dev/null || {
+    echo "Error: stella_harbor package not importable"
+    exit 1
+}
 
 # Run Harbor
 echo "Running Harbor..."
+echo "Adapter directory: $ADAPTER_DIR"
+
+# Need to pass PYTHONPATH through the uv run command
+# Add user site-packages where stella_harbor is installed
 cd "$REPO_ROOT"
-exec "$HARBOR_RUNNER" "${HARBOR_ARGS[@]}"
+PYTHONPATH="${PYTHONPATH:-}:${USER_SITE}" exec "$HARBOR_RUNNER" "${HARBOR_ARGS[@]}"

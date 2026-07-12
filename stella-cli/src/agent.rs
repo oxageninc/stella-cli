@@ -446,10 +446,67 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     Ok(())
 }
 
-/// `stella init` — infer the workspace's domain taxonomy and write
-/// `.stella/domains.toml` (see `crate::domains`). Model-assisted when a
-/// provider resolves; deterministic directory heuristic otherwise, so init
-/// always succeeds — offline included.
+/// Build the workspace code-graph index into `.stella/context.db` (the
+/// `stella-graph` tree-sitter indexer). This is the data side of `init`: the
+/// domain taxonomy tags graph nodes/edges, and the index makes the symbols +
+/// import edges queryable as `ContextFrame`s by the context plane.
+///
+/// Idempotent and best-effort: a failure degrades to a warning (init still
+/// succeeds, offline included) — the graph can always be rebuilt on a later
+/// `init` once a toolchain/parser is available.
+fn build_code_graph(workspace_root: &std::path::Path) {
+    let dot_stella = workspace_root.join(".stella");
+    if let Err(e) = std::fs::create_dir_all(&dot_stella) {
+        eprintln!(
+            "  {} could not create .stella for the code graph: {e} — skipped",
+            "!".yellow()
+        );
+        return;
+    }
+    let db_path = dot_stella.join("context.db");
+    println!("  {} indexing code graph…", "◈".cyan());
+    match stella_graph::CodeGraph::open(workspace_root, &db_path) {
+        Ok(graph) => match graph.index_all() {
+            Ok(stats) => {
+                println!(
+                    "  {} code graph: {} symbols, {} imports across {} file{} \
+                     ({} parsed, {} unchanged)",
+                    "✓".green(),
+                    stats.symbols,
+                    stats.imports,
+                    stats.files_parsed + stats.files_skipped_unchanged,
+                    if stats.files_parsed + stats.files_skipped_unchanged == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    stats.files_parsed,
+                    stats.files_skipped_unchanged,
+                );
+                graph.shutdown();
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} code-graph indexing failed: {e} — run `stella init` again to retry",
+                    "!".yellow()
+                );
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "  {} code-graph store unavailable: {e} — skipped",
+                "!".yellow()
+            );
+        }
+    }
+}
+
+/// `stella init` — infer the workspace's domain taxonomy, build the code-graph
+/// index, and write `.stella/domains.toml` (see `crate::domains`). Domain
+/// inference is model-assisted when a provider resolves, with a deterministic
+/// directory heuristic fallback, so init always succeeds — offline included.
+/// The code graph (`.stella/context.db`) is built unconditionally: it needs no
+/// provider, only the on-disk source tree.
 pub async fn run_init(
     model_override: Option<&str>,
     api_key_override: Option<&str>,
@@ -480,6 +537,10 @@ pub async fn run_init(
             heuristic_domains(&workspace_root)
         }
     };
+
+    // The code graph needs no provider — build it regardless of how the
+    // domains were inferred, so the index exists even fully offline.
+    build_code_graph(&workspace_root);
 
     let path = domains.save(&workspace_root)?;
     println!(
@@ -1479,6 +1540,37 @@ mod tests {
         assert!(
             resolve_cross_family_judge("zai", "glm-5.2", &configured).is_none(),
             "a judge adapter that fails to build must fall back to the worker provider"
+        );
+    }
+
+    #[test]
+    fn build_code_graph_indexes_a_workspace_into_context_db() {
+        // `stella init` must build the code-graph index into .stella/context.db
+        // — the data side of init that the domain taxonomy tags. This witness
+        // runs build_code_graph against a tempdir with one Rust file and asserts
+        // the symbol + import count landed in the store.
+        let ws = tempfile::TempDir::new().unwrap();
+        let src = ws.path().join("lib.rs");
+        std::fs::write(
+            &src,
+            "pub fn alpha() {}\npub fn beta() {}\nmod gamma;\n",
+        )
+        .unwrap();
+
+        build_code_graph(ws.path());
+
+        let db = ws.path().join(".stella/context.db");
+        assert!(db.exists(), "context.db must be created by init");
+        let graph =
+            stella_graph::CodeGraph::open(ws.path(), &db).expect("reopen the indexed store");
+        // The index is queryable: `alpha` is a defined symbol.
+        let alpha = graph
+            .definitions("alpha")
+            .expect("query the index");
+        assert!(
+            !alpha.is_empty(),
+            "`alpha` must be indexed as a definition — got {} frames",
+            alpha.len()
         );
     }
 }
