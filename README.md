@@ -99,7 +99,7 @@ and the harness to prove it ships in this repo.
 ```text
    STELLA ────────────────────⚔────────────────────  THE BIG BOYS
    your keys · 9 providers + local  │  one vendor, their account
-   telemetry in DuckDB, on your disk│  telemetry in their cloud
+   telemetry on your disk (DuckDB)  │  telemetry in their cloud
    WITNESS CONFIRMED                │  "looks done to me"
    hard --budget, aborts cleanly    │  runs until you notice the bill
    $ per resolved task              │  $ per vibe
