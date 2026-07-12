@@ -22,12 +22,15 @@
 <p align="center"><em>For everyone who is sick of token waste and average agent runners.</em></p>
 
 <p align="center">
+  <a href="https://github.com/oxageninc/stella-cli/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/oxageninc/stella-cli/ci.yml?branch=main&style=flat-square&logo=github&label=ci" alt="CI status"></a>
+  <a href="https://github.com/oxageninc/stella-cli/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/oxageninc/stella-cli/release.yml?style=flat-square&logo=github&label=release" alt="Release status"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-FFAC26?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/rust-1.90%2B-FFAC26?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.90+">
   <img src="https://img.shields.io/badge/providers-9%20%2B%20local-FFAC26?style=flat-square" alt="9 providers + local">
   <img src="https://img.shields.io/badge/phone--home-none-1f7a3d?style=flat-square" alt="No phone-home">
   <img src="https://img.shields.io/badge/telemetry-local%20DuckDB-1f7a3d?style=flat-square" alt="Local DuckDB telemetry">
   <a href="#the-arena"><img src="https://img.shields.io/badge/%E2%9A%94_arena-open_challenge-E5484D?style=flat-square" alt="Arena — open challenge"></a>
+  <a href="https://github.com/sponsors/macanderson"><img src="https://img.shields.io/badge/%E2%99%A5_sponsor-stella-EA4AAA?style=flat-square" alt="Sponsor Stella"></a>
 </p>
 
 <p align="center">
@@ -587,13 +590,37 @@ and meters usage. Stella is a standalone, open-source, BYOK coding agent with no
 platform attached. Want a terminal agent grounded in your org's graph? Use `oxagen`.
 Want a fast, self-contained agent in any repo? Use Stella.
 
-## Contributing
+## Contributing & community
 
-Issues and PRs welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). CI runs `fmt`,
-`clippy -D warnings`, tests, and a release build on every PR.
+```text
+   ·  .  ✦   ·   stella is built in the open — come build her with us   ·   ✦  .  ·
+```
 
-The single highest-value contribution right now is an **[arena run](#the-arena)** —
-an officially-scored, fully-receipted benchmark against another agent, win or lose.
+Stella is young, ambitious, and genuinely open — MIT OR Apache-2.0, DCO not CLA,
+no corporate gatekeeping. Every kind of contribution moves her forward:
+
+| You have… | Do this |
+|---|---|
+| ⏱ 10 seconds | **Star the repo** — stars are how other people find Stella |
+| 🐛 A bug | [File it with a repro](https://github.com/oxageninc/stella-cli/issues/new?template=bug_report.yml) — reproducible bugs get fixed fast |
+| 💡 An idea | [Open a feature request](https://github.com/oxageninc/stella-cli/issues/new?template=feature_request.yml) or start a [discussion](https://github.com/oxageninc/stella-cli/discussions) |
+| 🌙 An evening | Grab a [`good first issue`](https://github.com/oxageninc/stella-cli/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — [`CONTRIBUTING.md`](CONTRIBUTING.md) has the full map |
+| 🔑 An API budget | **The single highest-value contribution:** an [⚔ arena run](#the-arena) — officially scored, fully receipted, win or lose |
+
+New contributors: [`CONTRIBUTING.md`](CONTRIBUTING.md) walks you from
+`git clone` to merged PR — dev setup, a tour of all sixteen crates, the
+witness-test contract, and the style rules. CI runs `fmt`,
+`clippy -D warnings`, tests, and a release build on every PR; what you check
+locally is exactly what the gate checks.
+
+### Support Stella 💛
+
+Stella phones nothing home, sells nothing, and meters nothing — which also
+means she earns nothing. If she saves you tokens or time, consider
+[**sponsoring the project**](https://github.com/sponsors/macanderson):
+sponsorship pays for the arena runs, release infrastructure, and maintainer
+time that keep her sharp. Can't sponsor? A star, a receipted benchmark, or a
+war story in a bug report are worth just as much.
 
 ## License
 

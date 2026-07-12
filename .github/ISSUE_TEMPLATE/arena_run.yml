@@ -1,0 +1,82 @@
+name: "⚔ Arena run submission"
+description: "Submit an officially-scored, fully-receipted benchmark run for the leaderboard. Wins and losses both welcome."
+title: "arena: <agent A> vs <agent B> — <model> @ $<budget>"
+labels: ["arena"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Receipts or it didn't happen.** Every leaderboard row comes from a
+        community-submitted, officially-scored run — and the first entries are
+        permanent. Post your losses too: a loss with receipts is a bug report,
+        and bug reports get fixed. Full rules in the
+        [Arena section of the README](https://github.com/oxageninc/stella-cli#the-arena).
+  - type: dropdown
+    id: division
+    attributes:
+      label: Division
+      options:
+        - "🥇 Heavyweight — frontier model, $2/task cap"
+        - "🪶 Featherweight — any model, lowest $ per resolved task"
+        - "🔌 Off-grid — local models only, zero API keys"
+        - "⚔️ Cross-harness — same model, Stella vs. another agent CLI"
+    validations:
+      required: true
+  - type: input
+    id: matchup
+    attributes:
+      label: Match-up
+      placeholder: "Stella vs Claude Code · Stella solo run"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model (identical on both sides)
+      placeholder: anthropic/claude-fable-5
+    validations:
+      required: true
+  - type: input
+    id: budget
+    attributes:
+      label: Per-task budget
+      placeholder: "$2.00"
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Resolve rate, total cost, $ per resolved task — for each side if cross-harness.
+      placeholder: |
+        Stella: 18/25 resolved · $21.40 total · $1.19/resolved
+        <other agent>: 15/25 resolved · $38.90 total · $2.59/resolved
+    validations:
+      required: true
+  - type: textarea
+    id: receipts
+    attributes:
+      label: Receipts
+      description: |
+        Attach or link **everything needed to reproduce**: `predictions.jsonl`,
+        `summary.json`, per-instance logs, the official evaluator's output, and
+        token/cost numbers from your local telemetry. Runs scored with anything
+        other than the unmodified official evaluator can't be accepted.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes from the field
+      description: Anything surprising — where the harness won or lost the fight, failure patterns, ideas.
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: The rules
+      options:
+        - label: Same model on both sides (cross-harness) or model stated exactly (solo).
+          required: true
+        - label: Scored with the official SWE-bench evaluator, unmodified.
+          required: true
+        - label: All artifacts attached or linked — the run can be reproduced from what's here.
+          required: true

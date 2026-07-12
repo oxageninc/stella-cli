@@ -1,0 +1,5 @@
+# Sponsor button configuration — https://docs.github.com/sponsors
+# NOTE: the GitHub Sponsors listing for `macanderson` must be enabled at
+# https://github.com/sponsors for the button to render.
+github: [macanderson]
+custom: ["https://oxagen.sh"]
