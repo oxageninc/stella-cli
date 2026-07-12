@@ -15,13 +15,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use colored::Colorize;
-use stella_core::ports::ToolExecutor;
-use stella_core::{BudgetGuard, Engine, EngineConfig, GoalConfig, GoalOutcome, TurnOutcome};
+use stella_core::ports::{SystemClock, ToolExecutor};
+use stella_core::router::{CircuitBreaker, ProviderProfile};
+use stella_core::{
+    BudgetGuard, Engine, EngineConfig, GoalConfig, GoalOutcome, RoleTable, Router, TurnOutcome,
+};
 use stella_mcp::{McpConfig, McpToolSet};
 use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
 use stella_protocol::event::BudgetMode;
-use stella_protocol::{AgentEvent, CompletionMessage, ToolOutput};
+use stella_protocol::{AgentEvent, CompletionMessage, ModelRef, Role, ToolOutput};
 use stella_store::{Store, TelemetryRow};
 use stella_tools::ToolRegistry;
 use stella_tools::custom::{self, CustomTool, CustomToolSet};
@@ -195,11 +198,13 @@ pub async fn run_one_shot(
 
 /// Run a one-shot goal loop (non-interactive): work in judged rounds until
 /// a judge model assesses the goal as met (`stella goal "…"`, and `stella
-/// monitor` composed on top of it). The judge is the same configured
-/// provider/model in v1 — `Engine::run_goal` takes it as a separate
-/// `&dyn Provider`, so a cross-family judge is a config change away, not a
-/// redesign. The worker turns get the full tool stack (MCP + custom +
-/// interactive + skills), same as `run_one_shot`.
+/// monitor` composed on top of it). The judge is routed by role: when a
+/// second provider family is configured (BYOK), `run_goal_turn` builds a
+/// role `Router` and resolves `Role::Judge` to a DIFFERENT family than the
+/// worker for bias-resistant assessment (`07-model-matrix.md` §1); with a
+/// single family it stays the worker provider, identical to before. The
+/// worker turns get the full tool stack (MCP + custom + interactive +
+/// skills), same as `run_one_shot`.
 pub async fn run_goal_cmd(
     cfg: &Config,
     goal: &str,
@@ -888,8 +893,15 @@ fn spawn_renderer(
 /// interleaved with judge assessments until the judge passes it (or a
 /// backstop — rounds, budget, abort — ends it with a named reason). The
 /// worker gets the full tool stack (MCP + custom + interactive + skills) and
-/// the judge a read-only view of that same stack; the judge is the same
-/// provider in v1 (see `run_goal_cmd`). Text-mode rendering only — goal and
+/// the judge a read-only view of that same stack.
+///
+/// The judge is routed by role (`resolve_cross_family_judge`): when a second
+/// provider family is configured and the `Router` selects it, the judge runs
+/// on a DIFFERENT model family than the worker (bias-resistant assessment,
+/// `07-model-matrix.md` §1) and a one-line notice is printed. With a single
+/// configured family — or on any discovery/build failure — the judge is the
+/// worker provider itself, identical to before: no second provider is built
+/// and no extra cost is incurred. Text-mode rendering only — goal and
 /// monitor never take `--output-format`.
 #[allow(clippy::too_many_arguments)]
 async fn run_goal_turn(
@@ -905,6 +917,26 @@ async fn run_goal_turn(
 ) -> Result<(), String> {
     let turn_start = Instant::now();
     let execution = begin_execution(store, "goal", goal, cfg);
+
+    // Route the JUDGE role. `Some` only when a distinct-family judge was
+    // selected AND built; the boxed provider must outlive the `run_goal`
+    // call below, so it is bound here. `None` → the judge is the worker
+    // provider (single-family/failure fallback — the v1 behavior).
+    let configured = crate::config::discover_configured_providers();
+    let routed_judge = resolve_cross_family_judge(cfg.provider.id, &cfg.model_id, &configured);
+    if let Some((_, judge_id)) = &routed_judge {
+        println!(
+            "  {} cross-family judge: {} worker · {} judge — independent, bias-resistant \
+             assessment\n",
+            "◆".cyan(),
+            cfg.provider.id.bright_blue(),
+            judge_id.bright_green(),
+        );
+    }
+    let judge: &dyn Provider = match &routed_judge {
+        Some((boxed, _)) => &**boxed,
+        None => provider,
+    };
 
     let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let renderer = spawn_renderer(
@@ -924,14 +956,7 @@ async fn run_goal_turn(
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
         let engine = Engine::new(provider, &tools, EngineConfig::default());
         engine
-            .run_goal(
-                provider,
-                goal,
-                messages,
-                budget,
-                &tx,
-                &GoalConfig::default(),
-            )
+            .run_goal(judge, goal, messages, budget, &tx, &GoalConfig::default())
             .await
     };
     drop(tx);
@@ -1002,36 +1027,60 @@ async fn run_goal_turn(
 /// `Provider::id()` and error messages name the surface actually being
 /// called (an xAI 401 must never read "Z.ai rejected the API key").
 fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
-    if cfg.provider.id != "local" {
+    build_provider_parts(
+        cfg.provider.id,
+        cfg.provider.display_name,
+        &cfg.model_id,
+        // `cfg.api_key` is already an `ApiKey` (H3) — clone it rather than
+        // reconstructing one from a revealed string.
+        cfg.api_key.clone(),
+        cfg.effective_base_url().to_string(),
+        cfg.base_url_override.as_deref(),
+    )
+}
+
+/// The per-dialect provider factory, over already-resolved parts rather than
+/// a whole [`Config`]. Both the worker path ([`build_provider`]) and the
+/// goal loop's routed judge ([`resolve_cross_family_judge`]) go through this
+/// one match, so the wire-dialect selection — and the anti-phantom-slug
+/// catalog check — live in exactly one place. `effective_base_url` is the
+/// base URL requests go to (override-or-default); `base_url_override` is the
+/// raw `--base-url`, which only the Vertex/Bedrock arms consume (they build
+/// region/project-scoped URLs themselves). See [`build_provider`]'s note on
+/// the catalog check and the shared Chat Completions arm.
+fn build_provider_parts(
+    provider_id: &str,
+    display_name: &str,
+    model_id: &str,
+    api_key: ApiKey,
+    effective_base_url: String,
+    base_url_override: Option<&str>,
+) -> Result<Box<dyn Provider>, String> {
+    if provider_id != "local" {
         stella_model::catalog::Catalog::seed()
-            .resolve_for(cfg.provider.id, &cfg.model_id)
+            .resolve_for(provider_id, model_id)
             .map_err(|e| e.to_string())?;
     }
 
-    // `cfg.api_key` is already an `ApiKey` (H3) — clone it rather than
-    // reconstructing one from a revealed string.
-    let api_key = cfg.api_key.clone();
-    let base_url = cfg.effective_base_url().to_string();
-
-    match cfg.provider.id {
+    match provider_id {
         "openai" => {
-            let provider = stella_model::openai::OpenAiProvider::new(api_key, cfg.model_id.clone())
-                .with_base_url(base_url);
+            let provider = stella_model::openai::OpenAiProvider::new(api_key, model_id.to_string())
+                .with_base_url(effective_base_url);
             Ok(Box::new(provider))
         }
         "anthropic" => {
             let provider =
-                stella_model::anthropic::AnthropicProvider::new(api_key, cfg.model_id.clone())
-                    .with_base_url(base_url);
+                stella_model::anthropic::AnthropicProvider::new(api_key, model_id.to_string())
+                    .with_base_url(effective_base_url);
             Ok(Box::new(provider))
         }
         "gemini" => {
-            let provider = stella_model::gemini::GeminiProvider::new(api_key, cfg.model_id.clone())
-                .with_base_url(base_url);
+            let provider = stella_model::gemini::GeminiProvider::new(api_key, model_id.to_string())
+                .with_base_url(effective_base_url);
             Ok(Box::new(provider))
         }
         "vertex" => {
-            // The access token is cfg.api_key (VERTEX_ACCESS_TOKEN via the
+            // The access token is `api_key` (VERTEX_ACCESS_TOKEN via the
             // credential chain); project and location are Vertex-specific
             // addressing, resolved here with named errors rather than
             // burying a doomed request.
@@ -1050,18 +1099,18 @@ fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
                 .unwrap_or_else(|| "global".to_string());
             let mut provider = stella_model::vertex::VertexProvider::new(
                 api_key,
-                cfg.model_id.clone(),
+                model_id.to_string(),
                 project,
                 location,
             );
-            if let Some(override_url) = &cfg.base_url_override {
-                provider = provider.with_base_url(override_url.clone());
+            if let Some(override_url) = base_url_override {
+                provider = provider.with_base_url(override_url.to_string());
             }
             Ok(Box::new(provider))
         }
         "bedrock" => {
-            // cfg.api_key is AWS_ACCESS_KEY_ID via the credential chain;
-            // the rest of the standard AWS env set is read here. Secret
+            // `api_key` is AWS_ACCESS_KEY_ID via the credential chain; the
+            // rest of the standard AWS env set is read here. Secret
             // resolution failure is a named error pointing at the exact
             // var, not a doomed unsigned request.
             let secret = std::env::var("AWS_SECRET_ACCESS_KEY")
@@ -1084,10 +1133,10 @@ fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
                 ApiKey::new(secret),
                 session_token,
                 region,
-                cfg.model_id.clone(),
+                model_id.to_string(),
             );
-            if let Some(override_url) = &cfg.base_url_override {
-                provider = provider.with_base_url(override_url.clone());
+            if let Some(override_url) = base_url_override {
+                provider = provider.with_base_url(override_url.to_string());
             }
             Ok(Box::new(provider))
         }
@@ -1100,14 +1149,103 @@ fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
                 "deepseek" => "DeepSeek",
                 "openrouter" => "OpenRouter",
                 "local" => "the local endpoint",
-                _ => cfg.provider.display_name,
+                _ => display_name,
             };
-            let provider = stella_model::zai::ZaiProvider::new(api_key, cfg.model_id.clone())
-                .with_base_url(base_url)
+            let provider = stella_model::zai::ZaiProvider::new(api_key, model_id.to_string())
+                .with_base_url(effective_base_url)
                 .with_identity(other, label);
             Ok(Box::new(provider))
         }
     }
+}
+
+/// Cross-family grouping key for judge selection. Same-vendor providers must
+/// count as the SAME family so a routed judge is genuinely a different model
+/// (`07-model-matrix.md` §1): a Gemini judge assessing Gemini-via-Vertex work
+/// carries the same bias, as does an Anthropic Claude judge over Bedrock
+/// Claude. Anything without a known sibling is its own family (its id).
+fn provider_family(provider_id: &str) -> String {
+    match provider_id {
+        "gemini" | "vertex" => "google".to_string(),
+        "anthropic" | "bedrock" => "anthropic".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// A `ProviderProfile` for a discovered provider, using its `default_model`
+/// for all three role tiers (the finest model this layer knows without a
+/// per-role catalog) and [`provider_family`] for cross-family grouping.
+fn profile_for(config: &crate::config::ProviderConfig) -> ProviderProfile {
+    let model = ModelRef::new(config.id, config.default_model);
+    ProviderProfile::new(config.id, model.clone(), model.clone(), model)
+        .with_family(provider_family(config.id))
+}
+
+/// Resolve the JUDGE role for the goal loop. Builds a role [`Router`] whose
+/// most-preferred provider is the active worker (`worker_id`/`worker_model`,
+/// so the `--model` pin is honored) followed by every OTHER configured
+/// provider, then resolves `Role::Judge`. The router prefers a healthy
+/// provider whose family differs from the worker's (`resolve_judge`), so:
+///
+/// - Only the worker's family configured → the router degrades to the worker
+///   provider; `model_ref.provider == worker_id`, so we return `None` and no
+///   second provider is built (behavior identical to before).
+/// - A distinct family is selected → the concrete `ModelRef` is returned.
+///
+/// Returns `None` (→ caller reuses the worker as judge) on ANY failure —
+/// same-family degradation, a resolve error, an unknown judge provider, or a
+/// judge-adapter build failure — so judge routing can never break the loop.
+/// On success returns the built judge provider and its id (for the notice).
+fn resolve_cross_family_judge(
+    worker_id: &str,
+    worker_model: &str,
+    configured: &[crate::config::ConfiguredProvider],
+) -> Option<(Box<dyn Provider>, String)> {
+    let worker_ref = ModelRef::new(worker_id, worker_model);
+    let worker_profile = ProviderProfile::new(
+        worker_id,
+        worker_ref.clone(),
+        worker_ref.clone(),
+        worker_ref,
+    )
+    .with_family(provider_family(worker_id));
+
+    let mut profiles = vec![worker_profile];
+    for entry in configured {
+        if entry.config.id == worker_id {
+            continue; // the worker is already the preferred profile
+        }
+        profiles.push(profile_for(&entry.config));
+    }
+
+    let router = Router::new(
+        RoleTable::new(),
+        profiles,
+        CircuitBreaker::new(Box::new(SystemClock::new())),
+    );
+    let decision = router.resolve(Role::Judge).ok()?;
+
+    // Same provider as the worker → single-family/degraded: reuse the worker
+    // provider directly, never build a duplicate.
+    if decision.model_ref.provider == worker_id {
+        return None;
+    }
+
+    // Build the concrete judge from the discovered credential for the chosen
+    // provider. A missing entry or a build error falls back to the worker.
+    let entry = configured
+        .iter()
+        .find(|c| c.config.id == decision.model_ref.provider)?;
+    let judge = build_provider_parts(
+        entry.config.id,
+        entry.config.display_name,
+        &decision.model_ref.model_id,
+        entry.api_key.clone(),
+        entry.config.base_url.to_string(),
+        None,
+    )
+    .ok()?;
+    Some((judge, decision.model_ref.provider))
 }
 
 fn print_help() {
@@ -1150,7 +1288,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PROVIDERS;
+    use crate::config::{ConfiguredProvider, PROVIDERS, ProviderConfig};
     use stella_model::credential::ApiKey;
 
     /// A `Config` selecting `provider_id` at its default model, with a dummy
@@ -1168,25 +1306,28 @@ mod tests {
             model_id,
             api_key: ApiKey::new("dummy-key-unused-offline"),
             workspace_root: std::path::PathBuf::from("/tmp"),
+            base_url_override: None,
         }
     }
 
     #[test]
     fn existing_providers_still_route_to_their_current_adapter() {
-        // Regression: switching the catalog check to resolve_for, the
-        // (provider, id) dedup, and the inserted vertex/bedrock arms must NOT
-        // change selection for any provider that worked before. OpenAI keeps
-        // its Responses-API adapter ahead of the openai_compatible flag;
-        // every OpenAI-compatible provider still routes to the shared
-        // ZaiProvider shim (id "zai"); Anthropic keeps the Messages adapter.
+        // Regression: switching the catalog check to resolve_for and the
+        // (provider, id) dedup must NOT change selection for any provider that
+        // worked before. OpenAI keeps its Responses-API adapter and Anthropic
+        // its Messages adapter; Gemini now has its own native adapter. The
+        // remaining OpenAI-compatible providers share the Chat Completions
+        // implementation but are re-identified per provider via
+        // `with_identity`, so each reports its own id (not the bare "zai"
+        // shim id) for telemetry/attribution.
         for (provider_id, expected_adapter) in [
             ("openai", "openai"),
             ("anthropic", "anthropic"),
             ("zai", "zai"),
-            ("xai", "zai"),
-            ("deepseek", "zai"),
-            ("gemini", "zai"),
-            ("openrouter", "zai"),
+            ("xai", "xai"),
+            ("deepseek", "deepseek"),
+            ("gemini", "gemini"),
+            ("openrouter", "openrouter"),
         ] {
             let provider = build_provider(&cfg_for(provider_id))
                 .unwrap_or_else(|e| panic!("build_provider({provider_id}) failed: {e}"));
@@ -1241,5 +1382,89 @@ mod tests {
         unsafe {
             std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         }
+    }
+
+    /// A `ConfiguredProvider` for `provider_id` at its default model with a
+    /// dummy key — the offline analogue of `cfg_for` for judge routing. The
+    /// key is never sent anywhere: routing only constructs adapters and
+    /// reads `.id()`.
+    fn configured_provider(provider_id: &str) -> ConfiguredProvider {
+        let config = PROVIDERS
+            .iter()
+            .find(|p| p.id == provider_id)
+            .unwrap_or_else(|| panic!("provider `{provider_id}` not in PROVIDERS"))
+            .clone();
+        ConfiguredProvider {
+            config,
+            api_key: ApiKey::new("dummy-key-unused-offline"),
+        }
+    }
+
+    #[test]
+    fn single_configured_provider_reuses_the_worker_as_judge() {
+        // (a) Only the worker's own provider is configured: no distinct
+        // family exists, so the router degrades to the worker and we build no
+        // second provider — the judge IS the worker (identical to the
+        // pre-routing behavior, no extra cost).
+        let configured = vec![configured_provider("zai")];
+        assert!(
+            resolve_cross_family_judge("zai", "glm-5.2", &configured).is_none(),
+            "a single configured family must leave the judge as the worker provider"
+        );
+    }
+
+    #[test]
+    fn same_family_providers_reuse_the_worker_as_judge() {
+        // Two providers but ONE family (Gemini and Gemini-via-Vertex both
+        // group under `google`): still no bias-resistant judge available, so
+        // it stays the worker — proves `provider_family` grouping gates the
+        // cross-family judge, not the raw provider count.
+        let configured = vec![configured_provider("gemini"), configured_provider("vertex")];
+        assert!(
+            resolve_cross_family_judge("gemini", "gemini-3-pro", &configured).is_none(),
+            "same-vendor providers share a family and must not route a cross-family judge"
+        );
+    }
+
+    #[test]
+    fn distinct_families_route_a_cross_family_judge() {
+        // (b) Worker on Z.ai with Anthropic also configured: the router picks
+        // the distinct family and we build that concrete adapter. No network
+        // — only construction and `.id()`.
+        let configured = vec![configured_provider("zai"), configured_provider("anthropic")];
+        let (judge, judge_id) = resolve_cross_family_judge("zai", "glm-5.2", &configured)
+            .expect("a distinct family must route a cross-family judge");
+        assert_eq!(judge_id, "anthropic", "judge must be the distinct family");
+        assert_eq!(judge.id(), "anthropic", "judge adapter must be Anthropic's");
+        assert_ne!(
+            judge.id(),
+            "zai",
+            "judge must differ from the worker's family"
+        );
+    }
+
+    #[test]
+    fn judge_build_failure_falls_back_to_the_worker() {
+        // (c) The router selects a distinct family, but building that judge
+        // adapter fails (an unknown model slug the catalog rejects). Judge
+        // routing must never break the loop: it falls back to the worker
+        // provider (`None`). Fully offline and race-free — no shared env, no
+        // network — unlike an env-gated Vertex/Bedrock build failure.
+        let faux = ConfiguredProvider {
+            config: ProviderConfig {
+                id: "faux",
+                env_var: "STELLA_TEST_FAUX_KEY",
+                env_var_aliases: &[],
+                display_name: "Faux (unbuildable)",
+                default_model: "faux-model-not-in-catalog",
+                base_url: "http://localhost:0",
+            },
+            api_key: ApiKey::new("dummy-key-unused-offline"),
+        };
+        let configured = vec![configured_provider("zai"), faux];
+        assert!(
+            resolve_cross_family_judge("zai", "glm-5.2", &configured).is_none(),
+            "a judge adapter that fails to build must fall back to the worker provider"
+        );
     }
 }

@@ -16,35 +16,26 @@ A fast, BYOK, model-agnostic terminal coding agent built in Rust, from the maker
 
 ## Install
 
-### Homebrew (macOS / Linux)
+**Prebuilt binary (curl | sh)** — installs the latest tagged release for your
+platform (macOS/Linux, x86_64/arm64), verifying its SHA-256, and falls back to
+`cargo install` where no prebuilt binary is published:
 
 ```bash
-brew install oxageninc/stella/stella
-# equivalently: brew tap oxageninc/stella && brew install stella
+curl -fsSL https://raw.githubusercontent.com/oxageninc/stella-cli/main/install.sh | sh
 stella --version
 ```
 
-### Shell installer (macOS / Linux, no Homebrew)
+**Homebrew** — the formula in `packaging/homebrew/stella.rb` builds from source
+(`brew install --build-from-source ./packaging/homebrew/stella.rb`).
 
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/oxageninc/stella-cli/releases/latest/download/stella-cli-installer.sh | sh
-```
-
-Both install a prebuilt binary — no Rust toolchain needed. Prebuilt archives
-and checksums for each release are on the
-[Releases page](https://github.com/oxageninc/stella-cli/releases).
-
-### From source (cargo)
-
-Requires Rust 1.90+ (via [rustup](https://rustup.rs)) and git:
+**From cargo** (requires Rust 1.90+ via [rustup](https://rustup.rs) and git):
 
 ```bash
 cargo install --locked --git https://github.com/oxageninc/stella-cli stella-cli
 stella --version
 ```
 
-Or build the workspace directly:
+**From source:**
 
 ```bash
 git clone https://github.com/oxageninc/stella-cli.git
@@ -53,8 +44,9 @@ cargo build --release
 ./target/release/stella --version
 ```
 
-> Maintainers: the Homebrew formula and installer are produced automatically on
-> each version tag — see [RELEASING.md](RELEASING.md).
+> The `curl | sh` and Homebrew paths fetch binaries published by the release
+> workflow (`.github/workflows/release.yml`), which runs on `v*` tags. Until the
+> first tagged release, use the cargo or from-source path above.
 
 ## Set your API key
 

@@ -524,6 +524,52 @@ fn resolve_provider_key(
     }
 }
 
+/// A provider whose BYOK credential currently resolves, paired with the
+/// resolved key. Produced by [`discover_configured_providers`] and consumed
+/// by the goal loop's role Router: the `config` supplies the id/family/model
+/// for a `stella_core::router::ProviderProfile`, the `api_key` builds the
+/// concrete judge adapter when this provider is routed as judge. `api_key`
+/// is an [`ApiKey`] (H3) so the derived `Debug` never leaks the secret.
+#[derive(Debug, Clone)]
+pub struct ConfiguredProvider {
+    pub config: ProviderConfig,
+    pub api_key: ApiKey,
+}
+
+/// Enumerate every provider in [`PROVIDERS`] whose credential currently
+/// resolves, in preference order, pairing each with its resolved key. Uses
+/// the SAME credential chain [`Config::load`] uses ([`resolve_provider_key`],
+/// non-interactively — env var / alias / credentials file, never a prompt),
+/// so a provider is "configured" here iff `Config` could have auto-selected
+/// it. Never fails: an unreadable credentials file degrades to whatever the
+/// environment alone provides.
+///
+/// The goal loop calls this to build a role Router that can pick a
+/// cross-family JUDGE (`07-model-matrix.md` §1); with one configured family
+/// it returns a single entry and the judge stays the worker provider.
+pub fn discover_configured_providers() -> Vec<ConfiguredProvider> {
+    // A corrupt/unreadable credentials file must not break judge routing —
+    // degrade to env-only discovery via an empty in-memory file (an empty
+    // path reads as "no file"). If even that fails, discover nothing: the
+    // goal loop then simply keeps the worker as judge.
+    let Ok(credentials_file) = CredentialsFile::load_default()
+        .or_else(|_| CredentialsFile::load(std::path::PathBuf::new()))
+    else {
+        return Vec::new();
+    };
+    PROVIDERS
+        .iter()
+        .filter_map(|provider| {
+            resolve_provider_key(provider, None, &credentials_file, false)
+                .ok()
+                .map(|(api_key, _source)| ConfiguredProvider {
+                    config: provider.clone(),
+                    api_key,
+                })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

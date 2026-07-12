@@ -697,8 +697,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
-                ResponseTemplate::new(429)
-                    .set_body_string(r#"{"error":{"code":"1302","message":"API rate limit reached"}}"#),
+                ResponseTemplate::new(429).set_body_string(
+                    r#"{"error":{"code":"1302","message":"API rate limit reached"}}"#,
+                ),
             )
             .mount(&server)
             .await;

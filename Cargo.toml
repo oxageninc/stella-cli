@@ -46,6 +46,7 @@ toml = "0.9"
 rpassword = "7"
 base64 = "0.22"
 crossterm = "0.28"
+hmac = "0.12"
 notify = "8"
 ratatui = "0.29"
 roxmltree = "0.20"
@@ -86,7 +87,19 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# The profile that 'dist' will build with
-[profile.dist]
-inherits = "release"
-lto = "thin"
+# Config for a future migration to cargo-dist (https://opensource.axo.dev/cargo-dist/).
+# Today releases are cut by the hand-rolled .github/workflows/release.yml; this
+# section lets a maintainer run `cargo dist init` and adopt cargo-dist without
+# re-declaring targets/installers. `allow-dirty = ["ci"]` keeps our hand-written
+# release workflow from being overwritten by `cargo dist generate`.
+[workspace.metadata.dist]
+cargo-dist-version = "0.28.0"
+ci = "github"
+installers = ["shell", "homebrew"]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+]
+allow-dirty = ["ci"]

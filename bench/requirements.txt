@@ -1,0 +1,9 @@
+# Optional dependencies for bench/run_swebench.py
+#
+# These are ONLY needed for the HuggingFace-dataset path (i.e. when you do NOT
+# pass --instances <path.jsonl> and instead let the harness pull instances from
+# `princeton-nlp/SWE-bench_Verified`). The local-JSONL path and --dry-run use
+# only the Python 3 standard library and require nothing here.
+#
+# Install with:  pip install -r bench/requirements.txt
+datasets>=2.14
