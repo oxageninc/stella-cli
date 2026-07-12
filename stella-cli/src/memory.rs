@@ -359,6 +359,28 @@ pub fn inject_recall_block(messages: &mut Vec<CompletionMessage>, block: Option<
     }
 }
 
+/// Whether a completed turn is even worth a post-turn reflection model call.
+///
+/// Reflection ([`SessionMemory::reflect_and_record`]) mines lessons from WORK
+/// — tool calls, file edits, multi-step problem solving. A turn that invoked
+/// no tools produced no observable agent behavior to critique, and the
+/// reflection prompt itself notes that "most turns have nothing worth
+/// recording." Gating on tool use deterministically skips a model call (and
+/// its latency and dollars) that would almost always return `[]`: the biggest
+/// per-turn saving available, and the skipped turns are exactly the trivial
+/// ones (greetings, quick questions, refusals). The trade is that a durable
+/// preference revealed in pure conversation, with no tool call, is not
+/// mined — an intentional bias toward determinism and cost over a rare,
+/// speculative capture.
+///
+/// `turn_messages` must be ONLY the messages added during the turn being
+/// judged (in the accumulating REPL transcript, the slice past the pre-turn
+/// length) — otherwise a tool call from an earlier turn would keep
+/// re-triggering reflection on every later tool-free turn.
+pub fn turn_warrants_reflection(turn_messages: &[CompletionMessage]) -> bool {
+    turn_messages.iter().any(|m| !m.tool_calls.is_empty())
+}
+
 /// One cheap reflection call (triage-tier discipline: single attempt, any
 /// failure -> empty). The model critiques the completed turn and returns
 /// 0-3 short forward-looking lessons tagged with domains FROM THE SUPPLIED
@@ -546,5 +568,30 @@ mod tests {
         assert!(parse_lessons("no json here", &[]).is_empty());
         assert!(parse_lessons("[]", &[]).is_empty());
         assert!(parse_lessons("[{\"lesson\": \"   \"}]", &[]).is_empty());
+    }
+
+    #[test]
+    fn reflection_gate_fires_on_tool_use_and_skips_tool_free_turns() {
+        use stella_protocol::ToolCall;
+
+        // A pure conversational turn — no tool calls — is not worth a
+        // reflection model call (the common, cheap-to-skip case).
+        let chat_only = vec![
+            msg(MessageRole::User, "what does this crate do?"),
+            msg(MessageRole::Assistant, "it is a terminal coding agent"),
+        ];
+        assert!(!turn_warrants_reflection(&chat_only));
+
+        // A turn where the assistant called a tool DID work worth mining.
+        let mut worked = msg(MessageRole::Assistant, "reading the file first");
+        worked.tool_calls = vec![ToolCall {
+            call_id: "c1".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({ "path": "src/main.rs" }),
+        }];
+        assert!(turn_warrants_reflection(&[worked]));
+
+        // An empty turn slice (nothing happened) is trivially skippable.
+        assert!(!turn_warrants_reflection(&[]));
     }
 }

@@ -124,36 +124,6 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         // by the adapter.
         base_url: "https://bedrock-runtime.<AWS_REGION>.amazonaws.com",
     },
-    // Vertex and Bedrock are appended LAST so auto-detection (the no-`--model`
-    // path picks the first provider with a resolvable credential) never
-    // prefers them over an explicitly-configured provider — AWS_ACCESS_KEY_ID
-    // in particular is commonly present in a shell for unrelated reasons.
-    // Both speak a native, non-OpenAI wire shape, so `build_provider`
-    // (agent.rs) routes them to their own adapters rather than the generic
-    // Chat Completions client.
-    ProviderConfig {
-        id: "vertex",
-        env_var: "VERTEX_ACCESS_TOKEN",
-        env_var_aliases: &[],
-        display_name: "Google Vertex AI",
-        default_model: "gemini-3-pro",
-        // Native generateContent, project/location-scoped. The VertexProvider
-        // adapter builds its own addressing from VERTEX_PROJECT_ID /
-        // VERTEX_LOCATION, so this base_url is shown in `stella models` for
-        // reference only — build_provider does not pass it to the adapter.
-        base_url: "https://aiplatform.googleapis.com",
-    },
-    ProviderConfig {
-        id: "bedrock",
-        env_var: "AWS_ACCESS_KEY_ID",
-        env_var_aliases: &[],
-        display_name: "Amazon Bedrock",
-        default_model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        // Region-templated at request time by the BedrockProvider adapter
-        // (bedrock-runtime.<AWS_REGION>.amazonaws.com); shown here for
-        // reference only.
-        base_url: "https://bedrock-runtime.us-east-1.amazonaws.com",
-    },
 ];
 
 /// The `local` pseudo-provider: any OpenAI-compatible endpoint the user
@@ -384,35 +354,13 @@ impl Config {
         })
     }
 
+    /// Print the provider/model table for an interactive session. The listing
+    /// depends only on `PROVIDERS` and the ambient environment, never on
+    /// `self`, so it delegates to the static [`Config::print_available_models`]
+    /// — one renderer backs both the `/models` REPL command and the top-level
+    /// `stella models` subcommand, and they can never drift apart.
     pub fn print_models(&self) {
-        println!(
-            "{}\n",
-            "Stella — Available Providers & Models".cyan().bold()
-        );
-        for p in PROVIDERS {
-            let has_key = std::iter::once(&p.env_var)
-                .chain(p.env_var_aliases)
-                .any(|var| env::var(var).map(|v| !v.is_empty()).unwrap_or(false));
-            let key_status = if has_key {
-                "✓ configured".green()
-            } else {
-                "✗ no key".dimmed()
-            };
-            println!(
-                "  {} {}/{}  {}  [{}]",
-                key_status,
-                p.id.bright_blue(),
-                p.default_model.bright_white(),
-                p.display_name,
-                p.base_url.dimmed(),
-            );
-        }
-        println!("\n  Use --model provider/model_id to pin a specific model.");
-        println!("  Example: stella --model zai/glm-5.2 run 'fix the failing test'");
-        println!(
-            "  Local endpoints (Ollama, vLLM, LM Studio): stella --model local/<model> \
-             --base-url http://localhost:11434/v1"
-        );
+        Self::print_available_models();
     }
 
     pub fn print_config(&self) {

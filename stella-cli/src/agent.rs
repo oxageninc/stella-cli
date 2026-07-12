@@ -34,7 +34,7 @@ use crate::OutputFormat;
 use crate::config::Config;
 use crate::domains::{heuristic_domains, infer_domains};
 use crate::interactive::{InteractiveToolSet, SkillRegistry, default_ask_io};
-use crate::memory::{SessionMemory, inject_recall_block};
+use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
 use crate::tui;
 
 const SYSTEM_PROMPT: &str = r#"You are Stella, a fast terminal coding agent. You help the user with software engineering tasks by reading files, writing code, running commands, and searching the codebase.
@@ -183,8 +183,11 @@ pub async fn run_one_shot(
     .await;
     // …and reflect on the completed turn, recording domain-tagged lessons
     // (recurring ones auto-promote to SKILL.md files). Best-effort: never
-    // fails or slows the turn that just ran.
+    // fails or slows the turn that just ran. Gated on `turn_warrants_reflection`
+    // so a tool-free turn never spends a model call to mine lessons it can't
+    // have produced (the whole one-shot transcript IS this turn).
     if outcome.is_ok()
+        && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
         m.reflect_and_record(&*provider, &messages, format != OutputFormat::Text)
@@ -246,6 +249,7 @@ pub async fn run_goal_cmd(
     )
     .await;
     if outcome.is_ok()
+        && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
         m.reflect_and_record(&*provider, &messages, false).await;
@@ -376,6 +380,9 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                 let block = m.recall_block(goal).await;
                 inject_recall_block(&mut messages, block);
             }
+            // Everything the goal loop appends past here is this turn's work,
+            // gating reflection on it (see `turn_warrants_reflection`).
+            let turn_start = messages.len();
             if let Err(e) = run_goal_turn(
                 &*provider,
                 base_tools,
@@ -390,7 +397,9 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             .await
             {
                 eprintln!("  {} {}\n", "Error:".red().bold(), e);
-            } else if let Some(m) = &mut memory {
+            } else if turn_warrants_reflection(&messages[turn_start..])
+                && let Some(m) = &mut memory
+            {
                 m.reflect_and_record(&*provider, &messages, false).await;
             }
             continue;
@@ -404,6 +413,9 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             inject_recall_block(&mut messages, block);
         }
 
+        // Everything `run_turn` appends past here is this turn's work; the
+        // reflection gate reads only that slice (see `turn_warrants_reflection`).
+        let turn_start = messages.len();
         if let Err(e) = run_turn(
             &*provider,
             base_tools,
@@ -420,7 +432,9 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         .await
         {
             eprintln!("  {} {}\n", "Error:".red().bold(), e);
-        } else if let Some(m) = &mut memory {
+        } else if turn_warrants_reflection(&messages[turn_start..])
+            && let Some(m) = &mut memory
+        {
             m.reflect_and_record(&*provider, &messages, false).await;
         }
     }

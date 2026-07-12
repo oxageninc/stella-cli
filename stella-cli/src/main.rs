@@ -203,11 +203,7 @@ fn run(cli: Cli) -> Result<(), String> {
             ))?;
         }
         Command::Goal { goal } => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("failed to start runtime: {e}"))?;
-            rt.block_on(agent::run_goal_cmd(&cfg, &goal, cli.budget))?;
+            rt()?.block_on(agent::run_goal_cmd(&cfg, &goal, cli.budget))?;
         }
         Command::Monitor { target } => {
             let target = target.unwrap_or_else(|| "main".to_string());
@@ -219,11 +215,7 @@ fn run(cli: Cli) -> Result<(), String> {
                  code, commit and push the fix, then re-check. The goal is met only when the \
                  latest CI run for `{target}` has completed with every check successful."
             );
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("failed to start runtime: {e}"))?;
-            rt.block_on(agent::run_goal_cmd(&cfg, &goal, cli.budget))?;
+            rt()?.block_on(agent::run_goal_cmd(&cfg, &goal, cli.budget))?;
         }
         Command::Chat => {
             rt()?.block_on(agent::run_interactive(&cfg, cli.budget))?;
