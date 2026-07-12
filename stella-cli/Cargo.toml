@@ -6,11 +6,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 publish.workspace = true
 
 [[bin]]
 name = "stella"
 path = "src/main.rs"
+
+# This is the only shipped binary. `publish = false` is inherited from the
+# workspace (we don't publish to crates.io), so dist needs an explicit opt-in.
+# `formula = "stella"` names the Homebrew formula after the `stella` binary
+# (not the `stella-cli` crate), so users run `brew install .../stella`.
+[package.metadata.dist]
+dist = true
+formula = "stella"
 
 [dependencies]
 stella-protocol = { path = "../stella-protocol" }

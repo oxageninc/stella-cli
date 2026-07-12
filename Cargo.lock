@@ -2651,23 +2651,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "stella-context"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "ocp-types",
- "proptest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "stella-protocol",
- "tempfile",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "stella-core"
 version = "0.1.0"
 dependencies = [
@@ -2840,7 +2823,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "toml",
 ]
 
 [[package]]
@@ -3304,6 +3286,12 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.1.14",
 ]
+
+[[package]]
+name = "unicode-width"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"

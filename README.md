@@ -16,32 +16,35 @@ A fast, BYOK, model-agnostic terminal coding agent built in Rust, from the maker
 
 ## Install
 
-The fastest way — downloads a prebuilt binary for your platform, verifies its
-checksum, and adds `stella` to your PATH:
+### Homebrew (macOS / Linux)
 
 ```bash
-curl -fsSL https://oxagen.sh/install | sh
+brew install oxageninc/stella/stella
+# equivalently: brew tap oxageninc/stella && brew install stella
 stella --version
 ```
 
-The installer takes options via env vars or `sh -s --`:
+### Shell installer (macOS / Linux, no Homebrew)
 
 ```bash
-# Pin a version, or change the install dir
-curl -fsSL https://oxagen.sh/install | sh -s -- --version v0.1.0
-curl -fsSL https://oxagen.sh/install | STELLA_INSTALL_DIR=/usr/local/bin sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/oxageninc/stella-cli/releases/latest/download/stella-cli-installer.sh | sh
 ```
 
-It falls back to a source build when no prebuilt binary exists for your
-platform. To install with cargo instead (requires Rust 1.90+ via
-[rustup](https://rustup.rs) and git):
+Both install a prebuilt binary — no Rust toolchain needed. Prebuilt archives
+and checksums for each release are on the
+[Releases page](https://github.com/oxageninc/stella-cli/releases).
+
+### From source (cargo)
+
+Requires Rust 1.90+ (via [rustup](https://rustup.rs)) and git:
 
 ```bash
 cargo install --locked --git https://github.com/oxageninc/stella-cli stella-cli
 stella --version
 ```
 
-Or build from source:
+Or build the workspace directly:
 
 ```bash
 git clone https://github.com/oxageninc/stella-cli.git
@@ -49,6 +52,9 @@ cd stella-cli
 cargo build --release
 ./target/release/stella --version
 ```
+
+> Maintainers: the Homebrew formula and installer are produced automatically on
+> each version tag — see [RELEASING.md](RELEASING.md).
 
 ## Set your API key
 
@@ -237,19 +243,3 @@ cargo run -p stella-cli -- models
 ## License
 
 MIT OR Apache-2.0
-
-## Roadmap
-- Phase 0: Workspace skeleton + provider spike (done)
-- Phase 1: Built-in tools (done)
-- CLI binary: stella with agent loop, REPL, TUI (done)
-- Phase 2: Step-driver, role router, budget, model matrix, goal loop,
-  parallel tools, witness verification, DuckDB telemetry (done — Bedrock/
-  Vertex/native-Gemini/GGUF adapters and wiring the router+hooks into the
-  turn path are the tracked follow-ups)
-- Phase 3: Local context plane — embeddings for md/mdx/txt/doc/docx into
-  the DuckDB graph tables, code graph, OCP host + conformance
-- Phase 5: Fleet, TUI polish, media generation (vision-grade judge
-  evidence: screenshots attached to judge calls)
-- Phase 6: Benchmark proof (SWE-bench Verified)
-- Phase 7: OSS release — curl|sh installer (`install.sh`) + tagged release
-  workflow shipping prebuilt binaries (done); Homebrew tap and cargo-dist next

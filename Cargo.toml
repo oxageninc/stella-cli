@@ -17,13 +17,6 @@ members = [
   "stella-fleet",
   "stella-tui",
   "stella-cli",
-  "stella-context",
-  "stella-graph",
-  "stella-pipeline",
-  "stella-mcp",
-  "stella-media",
-  "stella-fleet",
-  "stella-tui",
 ]
 
 [workspace.package]
@@ -32,6 +25,7 @@ edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/oxageninc/stella-cli"
+homepage = "https://docs.oxagen.sh/stella"
 publish = false
 
 [workspace.dependencies]
@@ -56,6 +50,7 @@ notify = "8"
 ratatui = "0.29"
 roxmltree = "0.20"
 rusqlite = { version = "0.32", features = ["bundled"] }
+hmac = "0.12"
 sha2 = "0.10"
 tempfile = "3"
 tree-sitter = "0.25"
@@ -64,8 +59,34 @@ tree-sitter-python = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-typescript = "0.23"
 
+# Config for 'dist'
+[workspace.metadata.dist]
+# The installers to generate for each app
+installers = ["shell", "homebrew"]
+# A GitHub repo to push Homebrew formulas to
+tap = "oxageninc/homebrew-stella"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+
 [profile.release]
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
