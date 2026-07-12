@@ -27,7 +27,7 @@
 use std::future::Future;
 
 use async_trait::async_trait;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use stella_protocol::ProviderError;
 
 /// The delay port `retry_with_backoff` sleeps through between attempts.
