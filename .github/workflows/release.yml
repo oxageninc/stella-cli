@@ -1,0 +1,149 @@
+name: release
+
+# Cut a release by pushing a tag, e.g.
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# This builds the `stella` binary for every target in the matrix, packages a
+# `stella-<version>-<target>.tar.gz` (binary + licenses + README), and — on a
+# tag push — publishes a GitHub Release with all tarballs and a SHA256SUMS.
+#
+# This is a hand-rolled matrix workflow: it does NOT require cargo-dist to be
+# installed on the runner. A future maintainer can migrate to cargo-dist using
+# the `[workspace.metadata.dist]` section already declared in Cargo.toml.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # Release builds use full LTO + codegen-units=1 (see [profile.release] in
+    # Cargo.toml) and compile bundled C/C++ deps (rusqlite, tree-sitter), so
+    # give each build room on a cold cache.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            cross: false
+          # Cross-compiled from the Apple Silicon runner: Apple's clang/ld is a
+          # universal toolchain, so `rustup target add x86_64-apple-darwin`
+          # (via the `targets:` input below) builds the x86_64 slice — bundled
+          # C deps included — without needing a (now-retired) Intel runner.
+          - target: x86_64-apple-darwin
+            os: macos-14
+            cross: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: ${{ matrix.cross }}
+        run: cargo install cross --locked
+
+      - name: Build stella
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked \
+              --target ${{ matrix.target }} \
+              --package stella-cli --bin stella
+          else
+            cargo build --release --locked \
+              --target ${{ matrix.target }} \
+              --package stella-cli --bin stella
+          fi
+
+      - name: Package tarball
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            # workflow_dispatch (no tag): fall back to the workspace version.
+            version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
+          target="${{ matrix.target }}"
+          stem="stella-${version}-${target}"
+          bin="target/${target}/release/stella"
+
+          mkdir -p "dist/${stem}"
+          cp "${bin}" "dist/${stem}/stella"
+          cp LICENSE-MIT LICENSE-APACHE README.md "dist/${stem}/"
+          tar -C dist -czf "${stem}.tar.gz" "${stem}"
+
+          echo "asset=${stem}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stella-${{ matrix.target }}
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: stella-*
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum stella-*.tar.gz > SHA256SUMS
+          echo "----- SHA256SUMS -----"
+          cat SHA256SUMS
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/stella-*.tar.gz
+            artifacts/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
