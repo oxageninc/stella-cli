@@ -36,8 +36,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/oxageninc/stella-cli"
-Repository = "https://github.com/oxageninc/stella-cli"
+Homepage = "https://github.com/oxageninc/stella"
+Repository = "https://github.com/oxageninc/stella"
 
 [tool.setuptools]
 packages = ["stella_harbor"]

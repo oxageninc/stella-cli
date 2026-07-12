@@ -15,11 +15,11 @@
 # formula into a `homebrew-tap` repo that CI updates automatically.
 class Stella < Formula
   desc "Fast, BYOK, model-agnostic terminal coding agent"
-  homepage "https://github.com/oxageninc/stella-cli"
-  url "https://github.com/oxageninc/stella-cli.git", tag: "v0.1.0"
+  homepage "https://github.com/oxageninc/stella"
+  url "https://github.com/oxageninc/stella.git", tag: "v0.1.0"
   version "0.1.0"
   license "MIT OR Apache-2.0"
-  head "https://github.com/oxageninc/stella-cli.git", branch: "main"
+  head "https://github.com/oxageninc/stella.git", branch: "main"
 
   depends_on "rust" => :build
 

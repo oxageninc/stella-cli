@@ -10,7 +10,7 @@ body:
         community-submitted, officially-scored run — and the first entries are
         permanent. Post your losses too: a loss with receipts is a bug report,
         and bug reports get fixed. Full rules in the
-        [Arena section of the README](https://github.com/oxageninc/stella-cli#the-arena).
+        [Arena section of the README](https://github.com/oxageninc/stella#the-arena).
   - type: dropdown
     id: division
     attributes:

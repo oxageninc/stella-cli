@@ -9,7 +9,7 @@ researchers who help keep it tight.
 **Please do not open a public issue for security problems.**
 
 Report privately via
-[GitHub's private vulnerability reporting](https://github.com/oxageninc/stella-cli/security/advisories/new)
+[GitHub's private vulnerability reporting](https://github.com/oxageninc/stella/security/advisories/new)
 — it goes straight to the maintainers, and you get credit in the advisory when
 it's published.
 

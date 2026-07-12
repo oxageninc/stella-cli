@@ -77,7 +77,7 @@ STELLA_MODEL=zai/glm-5.2
 Build the release binary before running benchmarks:
 
 ```bash
-# From the stella-cli repo root
+# From the stella repo root
 cargo build --release -p stella-cli
 
 # The binary will be at ./target/release/stella

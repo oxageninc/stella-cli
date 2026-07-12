@@ -2,7 +2,7 @@
 # Stella CLI installer.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/oxageninc/stella-cli/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/oxageninc/stella/main/install.sh | sh
 #
 # Environment overrides:
 #   STELLA_VERSION      install a specific version (e.g. "0.1.0" or "v0.1.0")
@@ -18,7 +18,7 @@
 
 set -eu
 
-REPO="oxageninc/stella-cli"
+REPO="oxageninc/stella"
 BIN="stella"
 INSTALL_DIR="${STELLA_INSTALL_DIR:-$HOME/.local/bin}"
 API="https://api.github.com/repos/${REPO}"

@@ -28,8 +28,8 @@ Every one of these is genuinely valued — pick the one that fits your energy:
 
 | Contribution | Where to start | Effort |
 |---|---|---|
-| ⚔ **An Arena run** — the single highest-value contribution: an officially-scored, fully-receipted benchmark of Stella vs. another agent, **win or lose** | [The Arena](README.md#the-arena) → open an [Arena run issue](https://github.com/oxageninc/stella-cli/issues/new?template=arena_run.yml) | An evening + API budget |
-| 🐛 **A bug report with a repro** | [Bug report form](https://github.com/oxageninc/stella-cli/issues/new?template=bug_report.yml) | 10 minutes |
+| ⚔ **An Arena run** — the single highest-value contribution: an officially-scored, fully-receipted benchmark of Stella vs. another agent, **win or lose** | [The Arena](README.md#the-arena) → open an [Arena run issue](https://github.com/oxageninc/stella/issues/new?template=arena_run.yml) | An evening + API budget |
+| 🐛 **A bug report with a repro** | [Bug report form](https://github.com/oxageninc/stella/issues/new?template=bug_report.yml) | 10 minutes |
 | 🧭 **Docs & examples** — fix a lie in the README before it fools someone else | Any `*.md` file, `--help` text, doc comments | Small |
 | 🔌 **A new provider adapter** — Stella is BYOK; every model provider we speak makes it more useful | `stella-model/src/` — copy the shape of an existing adapter | Medium |
 | 🛠 **A new built-in tool** | `stella-tools/src/` — implement the tool trait, register it | Medium |
@@ -48,8 +48,8 @@ and [`fd`](https://github.com/sharkdp/fd) (the agent's `grep`/`glob` tools shell
 out to them at runtime).
 
 ```bash
-git clone https://github.com/oxageninc/stella-cli.git
-cd stella-cli
+git clone https://github.com/oxageninc/stella.git
+cd stella
 
 cargo build --workspace          # first build compiles bundled DuckDB — go get coffee
 cargo test  --workspace          # the full suite
@@ -191,9 +191,9 @@ normal part of the loop here, not a rejection.
 
 ## Issues and labels
 
-- **[Bug report](https://github.com/oxageninc/stella-cli/issues/new?template=bug_report.yml)** — include `stella --version`, OS, provider/model, and a repro.
-- **[Feature request](https://github.com/oxageninc/stella-cli/issues/new?template=feature_request.yml)** — say what you're trying to do, not just what to add.
-- **[⚔ Arena run](https://github.com/oxageninc/stella-cli/issues/new?template=arena_run.yml)** — submit a scored run for the leaderboard. Receipts required. Losses welcome — a loss with receipts is a bug report, and bug reports get fixed.
+- **[Bug report](https://github.com/oxageninc/stella/issues/new?template=bug_report.yml)** — include `stella --version`, OS, provider/model, and a repro.
+- **[Feature request](https://github.com/oxageninc/stella/issues/new?template=feature_request.yml)** — say what you're trying to do, not just what to add.
+- **[⚔ Arena run](https://github.com/oxageninc/stella/issues/new?template=arena_run.yml)** — submit a scored run for the leaderboard. Receipts required. Losses welcome — a loss with receipts is a bug report, and bug reports get fixed.
 
 Labels you'll see: `area:*` routes an issue to a crate; `P0`–`P2` is priority;
 `good first issue` and `help wanted` mean what they say; `needs-witness` means

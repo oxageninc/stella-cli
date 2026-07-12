@@ -10,28 +10,28 @@
 # this installs the prebuilt binary directly — no Rust toolchain required.
 class Stella < Formula
   desc "Fast, BYOK, model-agnostic terminal coding agent"
-  homepage "https://github.com/oxageninc/stella-cli"
+  homepage "https://github.com/oxageninc/stella"
   version "@VERSION@"
   license "MIT OR Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/oxageninc/stella-cli/releases/download/v@VERSION@/stella-@VERSION@-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/oxageninc/stella/releases/download/v@VERSION@/stella-@VERSION@-aarch64-apple-darwin.tar.gz"
       sha256 "@SHA_AARCH64_DARWIN@"
     end
     on_intel do
-      url "https://github.com/oxageninc/stella-cli/releases/download/v@VERSION@/stella-@VERSION@-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/oxageninc/stella/releases/download/v@VERSION@/stella-@VERSION@-x86_64-apple-darwin.tar.gz"
       sha256 "@SHA_X86_64_DARWIN@"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/oxageninc/stella-cli/releases/download/v@VERSION@/stella-@VERSION@-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/oxageninc/stella/releases/download/v@VERSION@/stella-@VERSION@-aarch64-unknown-linux-gnu.tar.gz"
       sha256 "@SHA_AARCH64_LINUX@"
     end
     on_intel do
-      url "https://github.com/oxageninc/stella-cli/releases/download/v@VERSION@/stella-@VERSION@-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/oxageninc/stella/releases/download/v@VERSION@/stella-@VERSION@-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "@SHA_X86_64_LINUX@"
     end
   end

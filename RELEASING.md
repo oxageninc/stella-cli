@@ -25,7 +25,7 @@ This has to exist and be writable before the first release:
    PAT with `repo`. The default `GITHUB_TOKEN` can't push to another repo, so a
    dedicated one is required.
 
-3. **Add it as a secret** on **this** repo (`oxageninc/stella-cli`):
+3. **Add it as a secret** on **this** repo (`oxageninc/stella`):
    Settings → Secrets and variables → Actions → New repository secret →
    name `HOMEBREW_TAP_TOKEN`, value the token from step 2.
 
@@ -70,7 +70,7 @@ brew install oxageninc/stella/stella
 Shell installer (macOS/Linux, no Homebrew):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oxageninc/stella-cli/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/oxageninc/stella/main/install.sh | sh
 ```
 
 The installer detects the platform, downloads the matching tarball from the
