@@ -65,6 +65,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::budget::{BudgetGuard, BudgetOutcome};
 use crate::compaction::compact;
+use crate::hooks::{HookPayload, HookRunner, Hooks, run_hooks};
 use crate::loop_detect::{LoopDetectionConfig, detect_loop};
 use crate::ports::ToolExecutor;
 use crate::retry::{RetryOutcome, RetryPolicy, Sleeper, TokioSleeper, retry_with_backoff};
@@ -86,6 +87,14 @@ pub struct EngineConfig {
     /// and suspenders, never the *primary* stuck-loop defense (that's
     /// `crate::loop_detect`).
     pub max_steps: usize,
+    /// Working directory reported to lifecycle hooks (`crate::hooks`) as the
+    /// `cwd` of every [`HookPayload`]. Kept here — rather than sniffed via
+    /// `std::env::current_dir()` inside the engine — so `stella-core`
+    /// performs no I/O of its own (`02-architecture.md` §1.3): the caller
+    /// (which already knows the workspace root) supplies the real path, and
+    /// the `"."` default keeps hook-free turns unaffected. Only read when
+    /// hooks are actually configured.
+    pub cwd: String,
 }
 
 impl Default for EngineConfig {
@@ -98,6 +107,7 @@ impl Default for EngineConfig {
             loop_detection: LoopDetectionConfig::default(),
             compaction_budget_tokens: 150_000,
             max_steps: 200,
+            cwd: ".".to_string(),
         }
     }
 }
@@ -114,6 +124,19 @@ pub enum TurnOutcome {
     Aborted { reason: String },
 }
 
+/// The two references a turn needs to fire lifecycle hooks: the parsed
+/// workspace [`Hooks`] config and the [`HookRunner`] execution port that
+/// actually spawns the commands (the real process I/O `stella-core` never
+/// performs — see `crate::hooks`). Bundled so the engine carries a single
+/// `Option`: `None` means hooks are entirely off and the turn path is
+/// byte-for-byte the same as before this seam existed. `Copy` because both
+/// fields are shared references.
+#[derive(Clone, Copy)]
+struct HooksHandle<'a> {
+    hooks: &'a Hooks,
+    runner: &'a dyn HookRunner,
+}
+
 /// The step-driver. Holds no conversation state of its own — `run_turn`
 /// takes the message history by `&mut` reference so callers (one-shot CLI,
 /// REPL, fleet worker) own persistence and can inspect history after an
@@ -123,6 +146,10 @@ pub struct Engine<'a> {
     pub(crate) tools: &'a dyn ToolExecutor,
     pub(crate) sleeper: &'a dyn Sleeper,
     pub(crate) config: EngineConfig,
+    /// Lifecycle hooks, off by default. Attached via [`Engine::with_hooks`]
+    /// so `new`/`with_sleeper` keep their existing signatures. When `None`,
+    /// no hook is ever consulted and the turn path adds zero work.
+    hooks: Option<HooksHandle<'a>>,
 }
 
 /// Upper bound on tool calls from one step executing concurrently. Tools
@@ -155,6 +182,47 @@ impl<'a> Engine<'a> {
             tools,
             sleeper,
             config,
+            hooks: None,
+        }
+    }
+
+    /// Attach lifecycle hooks (`crate::hooks`) to an engine, opt-in. Kept a
+    /// builder so [`Engine::new`]/[`Engine::with_sleeper`] retain their
+    /// signatures and every existing call site is unchanged — an engine
+    /// built without this is exactly the pre-hooks engine. Takes both the
+    /// parsed [`Hooks`] config and the [`HookRunner`] that executes the
+    /// commands, because [`crate::hooks::run_hooks`] needs the port to run
+    /// anything (the config alone spawns nothing).
+    pub fn with_hooks(mut self, hooks: &'a Hooks, runner: &'a dyn HookRunner) -> Self {
+        self.hooks = Some(HooksHandle { hooks, runner });
+        self
+    }
+
+    /// Fire `SessionStart` hooks once and return any stdout they produced —
+    /// the additional system-prompt context described in `crate::hooks`.
+    ///
+    /// This is deliberately NOT called from [`Engine::run_turn`].
+    /// `SessionStart` is a session-level event ("runs once before the
+    /// turn"), but `run_turn` is per-turn and a REPL or fleet worker calls
+    /// it many times per session — firing it inside would re-run session
+    /// setup on every turn. Prompt assembly is the caller's concern anyway
+    /// (`run_turn` takes history by `&mut` and never owns the system
+    /// prompt), so the caller invokes this once, before the first turn, and
+    /// folds the returned context into the system message it builds.
+    /// Returns `None` when no hooks are attached or the hooks printed
+    /// nothing.
+    pub async fn run_session_start_hooks(&self) -> Option<String> {
+        let handle = self.hooks?;
+        let outcome = run_hooks(
+            handle.runner,
+            Some(handle.hooks),
+            &HookPayload::session_start(self.config.cwd.clone()),
+        )
+        .await;
+        if outcome.output.is_empty() {
+            None
+        } else {
+            Some(outcome.output)
         }
     }
 
@@ -467,6 +535,13 @@ impl<'a> Engine<'a> {
     /// sentinel every adapter's stream aggregator falls back to (see module
     /// docs) rather than handing a tool `Null` and getting back a confusing
     /// tool-specific error.
+    ///
+    /// The malformed-input check comes *before* any hook fires: a `Null`
+    /// call is the model's own broken JSON, structurally short-circuited —
+    /// it never reaches the executor, so it is not a real tool invocation
+    /// and no `PreToolUse`/`PostToolUse` hook is fired for it. When no hooks
+    /// are attached this is exactly the previous body:
+    /// `self.tools.execute(...)`.
     async fn execute_with_repair(&self, call: &ToolCall) -> ToolOutput {
         if call.input.is_null() {
             return ToolOutput::Error {
@@ -478,7 +553,62 @@ impl<'a> Engine<'a> {
                 ),
             };
         }
-        self.tools.execute(&call.name, &call.input).await
+        match self.hooks {
+            None => self.tools.execute(&call.name, &call.input).await,
+            Some(handle) => self.execute_with_hooks(handle, call).await,
+        }
+    }
+
+    /// Wrap a single (well-formed) executor invocation in its `PreToolUse` /
+    /// `PostToolUse` hooks. Only reached when hooks are attached.
+    ///
+    /// `PreToolUse` fires first: if it blocks (a hook exited non-zero, or
+    /// failed to even run — per `crate::hooks`'s contract), the tool is NOT
+    /// executed and the model instead sees a `ToolOutput::Error` naming the
+    /// block, exactly as the engine surfaces every other tool failure as
+    /// model-visible data rather than an engine error. Otherwise the tool
+    /// runs and `PostToolUse` fires as a pure observation — its outcome is
+    /// discarded (it can never block or alter the result), so a failing
+    /// post-hook cannot abort the turn.
+    async fn execute_with_hooks(&self, handle: HooksHandle<'a>, call: &ToolCall) -> ToolOutput {
+        let pre = run_hooks(
+            handle.runner,
+            Some(handle.hooks),
+            &HookPayload::pre_tool_use(self.config.cwd.clone(), &call.name, call.input.clone()),
+        )
+        .await;
+        if pre.blocked {
+            let message = match pre.reason {
+                Some(reason) => format!(
+                    "tool `{}` was blocked by a PreToolUse hook: {reason}",
+                    call.name
+                ),
+                None => format!("tool `{}` was blocked by a PreToolUse hook", call.name),
+            };
+            return ToolOutput::Error { message };
+        }
+
+        let output = self.tools.execute(&call.name, &call.input).await;
+
+        let result_str = match &output {
+            ToolOutput::Ok { content } => content.clone(),
+            ToolOutput::Error { message } => message.clone(),
+        };
+        // Observation only — the outcome is intentionally ignored so a
+        // non-zero PostToolUse exit never blocks or rewrites the result.
+        let _ = run_hooks(
+            handle.runner,
+            Some(handle.hooks),
+            &HookPayload::post_tool_use(
+                self.config.cwd.clone(),
+                &call.name,
+                call.input.clone(),
+                result_str,
+            ),
+        )
+        .await;
+
+        output
     }
 }
 
@@ -524,6 +654,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::hooks::{HookAction, HookExecError, HookExecResult, HookMatcher};
     use crate::retry::Sleeper;
 
     /// A `Sleeper` that records but never actually waits.
@@ -1294,5 +1425,272 @@ mod tests {
         );
         assert_eq!(usages[0], (0, 1000, 800, 1, 1, 0.0001));
         assert_eq!(usages[1], (1, 1000, 800, 0, 0, 0.0001));
+    }
+
+    // ---- Lifecycle hooks wired into the turn path -------------------------
+
+    /// A no-I/O [`HookRunner`] test double: returns a fixed exit code +
+    /// stdout/stderr for every command and records the JSON payload of each
+    /// call, so a test can assert which lifecycle event fired and what it
+    /// carried — the same fake-runner discipline as `hooks.rs`'s own tests,
+    /// but here driven end-to-end through `run_turn`.
+    struct RecordingHookRunner {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        payloads: Arc<TokioMutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl HookRunner for RecordingHookRunner {
+        async fn run(
+            &self,
+            _action: &HookAction,
+            payload_json: &str,
+            _cwd: &str,
+        ) -> Result<HookExecResult, HookExecError> {
+            self.payloads.lock().await.push(payload_json.to_string());
+            Ok(HookExecResult {
+                exit_code: self.exit_code,
+                stdout: self.stdout.clone(),
+                stderr: self.stderr.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_hook_nonzero_exit_blocks_the_tool_and_model_sees_it() {
+        let provider = ScriptedProvider {
+            id: "scripted".into(),
+            script: TokioMutex::new(vec![
+                Ok(tool_call_result("call_1", "bash")),
+                Ok(text_result("done")),
+            ]),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let tool_calls = Arc::new(AtomicU32::new(0));
+        let tools = CountingTools {
+            calls: tool_calls.clone(),
+        };
+        let sleeper = NoopSleeper;
+        let payloads = Arc::new(TokioMutex::new(Vec::new()));
+        let runner = RecordingHookRunner {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "blocked by policy".into(),
+            payloads: payloads.clone(),
+        };
+        let hooks = Hooks {
+            pre_tool_use: Some(vec![HookMatcher {
+                matcher: Some("*".into()),
+                hooks: vec![HookAction::new("exit 1")],
+            }]),
+            ..Hooks::default()
+        };
+        let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper)
+            .with_hooks(&hooks, &runner);
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("hi"),
+        ];
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+
+        // A blocking PreToolUse hook (non-zero exit) must keep the tool from
+        // ever reaching the executor.
+        assert_eq!(
+            tool_calls.load(Ordering::SeqCst),
+            0,
+            "a PreToolUse hook that exits non-zero must block the tool from executing"
+        );
+        // ...and the model must see the block as a tool-result error, so it
+        // can react — never an engine error.
+        let tool_message = messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("a tool message was appended");
+        match &tool_message.tool_results[0].output {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("blocked by a PreToolUse hook"));
+                assert!(
+                    message.contains("blocked by policy"),
+                    "the hook's own reason must be surfaced to the model: {message}"
+                );
+            }
+            other => panic!("expected a hook-blocked error, got {other:?}"),
+        }
+        // Only PreToolUse fired — a blocked tool never runs, so no
+        // PostToolUse observation follows.
+        let payloads = payloads.lock().await.clone();
+        assert_eq!(payloads.len(), 1);
+        assert!(payloads[0].contains("\"event\":\"PreToolUse\""));
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_hook_runs_after_the_tool_and_never_blocks() {
+        let provider = ScriptedProvider {
+            id: "scripted".into(),
+            script: TokioMutex::new(vec![
+                Ok(tool_call_result("call_1", "bash")),
+                Ok(text_result("done")),
+            ]),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let tool_calls = Arc::new(AtomicU32::new(0));
+        let tools = CountingTools {
+            calls: tool_calls.clone(),
+        };
+        let sleeper = NoopSleeper;
+        let payloads = Arc::new(TokioMutex::new(Vec::new()));
+        // Exit 3 (non-zero) proves a *failing* PostToolUse hook is still a
+        // pure observation — it can neither block nor abort the turn.
+        let runner = RecordingHookRunner {
+            exit_code: 3,
+            stdout: String::new(),
+            stderr: String::new(),
+            payloads: payloads.clone(),
+        };
+        let hooks = Hooks {
+            post_tool_use: Some(vec![HookMatcher {
+                matcher: Some("*".into()),
+                hooks: vec![HookAction::new("exit 3")],
+            }]),
+            ..Hooks::default()
+        };
+        let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper)
+            .with_hooks(&hooks, &runner);
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("hi"),
+        ];
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        assert_eq!(
+            outcome,
+            TurnOutcome::Completed {
+                text: "done".into(),
+                cost_usd: 0.0002
+            }
+        );
+        // The tool ran — PostToolUse never gates execution.
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        // Exactly one PostToolUse hook fired, and it ran AFTER the tool: it
+        // carries the tool's own result ("ok" from CountingTools).
+        let payloads = payloads.lock().await.clone();
+        assert_eq!(payloads.len(), 1);
+        assert!(payloads[0].contains("\"event\":\"PostToolUse\""));
+        assert!(
+            payloads[0].contains("\"toolResult\":\"ok\""),
+            "PostToolUse must fire after the tool and carry its result: {}",
+            payloads[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_hooks_configured_leaves_the_turn_path_unchanged() {
+        // With no hooks attached the tool executes normally and the turn
+        // completes exactly as it did before the hooks seam existed — the
+        // `None` branch is `self.tools.execute(...)` verbatim.
+        let provider = ScriptedProvider {
+            id: "scripted".into(),
+            script: TokioMutex::new(vec![
+                Ok(tool_call_result("call_1", "bash")),
+                Ok(text_result("done")),
+            ]),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let tool_calls = Arc::new(AtomicU32::new(0));
+        let tools = CountingTools {
+            calls: tool_calls.clone(),
+        };
+        let sleeper = NoopSleeper;
+        // Built WITHOUT `with_hooks` — `hooks` stays `None`.
+        let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("hi"),
+        ];
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        assert_eq!(
+            outcome,
+            TurnOutcome::Completed {
+                text: "done".into(),
+                cost_usd: 0.0002
+            }
+        );
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        // The recorded result is the tool's own output, never a hook block.
+        let tool_message = messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("a tool message was appended");
+        assert_eq!(
+            tool_message.tool_results[0].output,
+            ToolOutput::Ok {
+                content: "ok".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_hooks_run_via_the_helper_not_per_turn() {
+        // SessionStart is exposed as an explicit once-per-session helper
+        // (Engine::run_session_start_hooks); run_turn must never fire it, so
+        // a REPL calling run_turn repeatedly does not re-run session setup.
+        let provider = ScriptedProvider {
+            id: "scripted".into(),
+            script: TokioMutex::new(vec![Ok(text_result("hi there"))]),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let tools = CountingTools {
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let sleeper = NoopSleeper;
+        let payloads = Arc::new(TokioMutex::new(Vec::new()));
+        let runner = RecordingHookRunner {
+            exit_code: 0,
+            stdout: "on-call: alice".into(),
+            stderr: String::new(),
+            payloads: payloads.clone(),
+        };
+        let hooks = Hooks {
+            session_start: Some(vec![HookMatcher {
+                matcher: None,
+                hooks: vec![HookAction::new("echo on-call: alice")],
+            }]),
+            ..Hooks::default()
+        };
+        let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper)
+            .with_hooks(&hooks, &runner);
+
+        // The helper fires SessionStart once and returns its stdout as the
+        // additional system-prompt context.
+        let context = engine.run_session_start_hooks().await;
+        assert_eq!(context.as_deref(), Some("on-call: alice"));
+
+        // A full turn must NOT fire SessionStart a second time.
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("hi"),
+        ];
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+
+        let payloads = payloads.lock().await.clone();
+        assert_eq!(
+            payloads.len(),
+            1,
+            "run_turn must not fire SessionStart — only the helper does"
+        );
+        assert!(payloads[0].contains("\"event\":\"SessionStart\""));
     }
 }
