@@ -6,4 +6,4 @@
 # only the Python 3 standard library and require nothing here.
 #
 # Install with:  pip install -r bench/requirements.txt
-datasets>=2.14
+datasets>=5.0.0
