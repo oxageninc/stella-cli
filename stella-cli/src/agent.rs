@@ -735,3 +735,100 @@ fn print_help() {
     println!("  {}         Exit Stella", "Ctrl+D".dimmed());
     println!();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PROVIDERS;
+    use stella_model::credential::ApiKey;
+
+    /// A `Config` selecting `provider_id` at its default model, with a dummy
+    /// key. `build_provider` only constructs the adapter (no network call),
+    /// so the key is never used.
+    fn cfg_for(provider_id: &str) -> Config {
+        let provider = PROVIDERS
+            .iter()
+            .find(|p| p.id == provider_id)
+            .unwrap_or_else(|| panic!("provider `{provider_id}` not in PROVIDERS"))
+            .clone();
+        let model_id = provider.default_model.to_string();
+        Config {
+            provider,
+            model_id,
+            api_key: ApiKey::new("dummy-key-unused-offline"),
+            workspace_root: std::path::PathBuf::from("/tmp"),
+        }
+    }
+
+    #[test]
+    fn existing_providers_still_route_to_their_current_adapter() {
+        // Regression: switching the catalog check to resolve_for, the
+        // (provider, id) dedup, and the inserted vertex/bedrock arms must NOT
+        // change selection for any provider that worked before. OpenAI keeps
+        // its Responses-API adapter ahead of the openai_compatible flag;
+        // every OpenAI-compatible provider still routes to the shared
+        // ZaiProvider shim (id "zai"); Anthropic keeps the Messages adapter.
+        for (provider_id, expected_adapter) in [
+            ("openai", "openai"),
+            ("anthropic", "anthropic"),
+            ("zai", "zai"),
+            ("xai", "zai"),
+            ("deepseek", "zai"),
+            ("gemini", "zai"),
+            ("openrouter", "zai"),
+        ] {
+            let provider = build_provider(&cfg_for(provider_id))
+                .unwrap_or_else(|e| panic!("build_provider({provider_id}) failed: {e}"));
+            assert_eq!(
+                provider.id(),
+                expected_adapter,
+                "provider `{provider_id}` must still route to the `{expected_adapter}` adapter"
+            );
+        }
+    }
+
+    #[test]
+    fn vertex_and_bedrock_route_to_their_native_adapters_not_a_fallthrough() {
+        // The new providers must construct their own native adapter (not the
+        // openai_compatible shim, id "zai", nor the anthropic branch). Both
+        // arms read extra addressing/credentials from the environment; set
+        // the minimum each requires. build_provider only constructs — no
+        // network call. These env vars are read by no other test, so setting
+        // them here is race-free within the test binary; the missing-project
+        // error case shares this test so the set/remove stays serialized.
+        unsafe {
+            std::env::set_var("VERTEX_PROJECT_ID", "test-project");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        }
+
+        let vertex = build_provider(&cfg_for("vertex")).expect("vertex builds");
+        assert_eq!(vertex.id(), "vertex", "vertex must route to VertexProvider");
+
+        let bedrock = build_provider(&cfg_for("bedrock")).expect("bedrock builds");
+        assert_eq!(
+            bedrock.id(),
+            "bedrock",
+            "bedrock must route to BedrockProvider"
+        );
+
+        // A vertex selection with no project id must fail loudly with a named
+        // error, never silently fall through to another adapter.
+        unsafe {
+            std::env::remove_var("VERTEX_PROJECT_ID");
+            std::env::remove_var("GOOGLE_CLOUD_PROJECT");
+        }
+        // `.err()` (not `.unwrap_err()`) so the Ok type `Box<dyn Provider>`,
+        // which is not `Debug`, is never required to be printed.
+        let err = build_provider(&cfg_for("vertex"))
+            .err()
+            .expect("vertex without a project id must be an error");
+        assert!(
+            err.contains("VERTEX_PROJECT_ID"),
+            "expected a named VERTEX_PROJECT_ID error, got: {err}"
+        );
+
+        unsafe {
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        }
+    }
+}
