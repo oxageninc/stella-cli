@@ -20,6 +20,7 @@ pub mod ports;
 pub mod retry;
 pub mod router;
 pub mod rules;
+pub mod skills;
 
 pub use budget::{BudgetGuard, BudgetOutcome};
 pub use driver::{Engine, EngineConfig, TurnOutcome};
@@ -32,4 +33,10 @@ pub use router::{RoleTable, Router};
 pub use rules::{
     GuardCheck, LoadRulesOptions, ProposedAction, Rule, RuleGuard, RuleSource, evaluate_guards,
     load_rules,
+};
+pub use skills::{
+    AutoCreateConfig, AutoCreateDecision, AutoCreateSkip, InstallDecision, LoadSkillsOptions,
+    SelectedSkill, SelectionConfig, Skill, SkillCandidate, SkillInstallProposal, SkillMineConfig,
+    SkillObservation, SkillOrigin, SkillSource, decide_auto_creation, load_skills,
+    mine_skill_candidates, render_skills_section, select_skills,
 };
