@@ -1,0 +1,22 @@
+[package]
+name = "stella-tui"
+description = "ratatui event-log REPL per ADR-023 concepts: streaming render, diff view + files-touched panel, scope review card, HUD with live budget. Renders exclusively from AgentEvents."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+stella-protocol = { path = "../stella-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true

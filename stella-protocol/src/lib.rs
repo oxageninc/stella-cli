@@ -19,7 +19,10 @@ pub use completion::{
     ReasoningEffort,
 };
 pub use error::ProviderError;
-pub use event::{AgentEvent, BudgetMode, StageKind};
+pub use event::{
+    AgentEvent, BudgetMode, ContextFrameRef, FileChangeKind, JudgeEvidence, MediaArtifactRef,
+    MediaJobState, MediaKind, PrStatus, ProviderShare, ScopeProposal, StageKind,
+};
 pub use provider::Provider;
 pub use role::{ModelRef, Role};
 pub use tool::{ToolCall, ToolOutput, ToolResult, ToolSchema};

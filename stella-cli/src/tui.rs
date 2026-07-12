@@ -427,6 +427,82 @@ pub fn render_event(event: &AgentEvent) {
                 reason.dimmed()
             );
         }
+        AgentEvent::FileChange { path, kind, .. } => {
+            let (icon, verb) = match kind {
+                stella_protocol::FileChangeKind::Created => ("＋".green(), "created"),
+                stella_protocol::FileChangeKind::Modified => ("✎".cyan(), "modified"),
+                stella_protocol::FileChangeKind::Deleted => ("－".red(), "deleted"),
+            };
+            println!("  {icon} {} {path}", verb.dimmed());
+        }
+        AgentEvent::ContextRecall { frames, tokens, .. } => {
+            println!(
+                "  {} recalled {} frame{} ({tokens} tokens)",
+                "⋯".dimmed(),
+                frames.len(),
+                if frames.len() == 1 { "" } else { "s" },
+            );
+        }
+        AgentEvent::ContextWrite {
+            provider,
+            upserts,
+            superseded,
+        } => {
+            println!(
+                "  {} context write [{}]: {upserts} upserted, {superseded} superseded",
+                "⋯".dimmed(),
+                provider.dimmed(),
+            );
+        }
+        AgentEvent::JudgeVerdict { passed, evidence } => {
+            let icon = if *passed {
+                "✓".green().bold()
+            } else {
+                "✗".red().bold()
+            };
+            println!("  {icon} judge: {}", evidence.summary);
+        }
+        AgentEvent::ScopeReview { proposal } => {
+            println!(
+                "  {} scope review: {} ({} step{}, ~{} file{})",
+                "⚑".yellow().bold(),
+                proposal.summary,
+                proposal.steps.len(),
+                if proposal.steps.len() == 1 { "" } else { "s" },
+                proposal.estimated_files,
+                if proposal.estimated_files == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            );
+        }
+        AgentEvent::AskUser {
+            question, options, ..
+        } => {
+            println!("  {} {question}", "?".bright_blue().bold());
+            for (i, opt) in options.iter().enumerate() {
+                println!("      {}. {}", i + 1, opt.dimmed());
+            }
+        }
+        AgentEvent::MediaProgress { kind, state, .. } => {
+            println!("  {} media {kind:?}: {state:?}", "◧".dimmed());
+        }
+        AgentEvent::MediaComplete { artifact } => {
+            println!(
+                "  {} media ready: {} → {}",
+                "✓".green(),
+                artifact.label,
+                artifact.path.dimmed(),
+            );
+        }
+        AgentEvent::Commit { sha, message } => {
+            let short = sha.chars().take(7).collect::<String>();
+            println!("  {} commit {} {message}", "●".magenta(), short.yellow());
+        }
+        AgentEvent::Pr { url, status } => {
+            println!("  {} pull request {status:?}: {}", "⇅".cyan(), url.dimmed());
+        }
         AgentEvent::Error { message, retryable } => {
             let label = if *retryable { "warning" } else { "error" };
             eprintln!("  {} {}: {}", "✗".red(), label.red().bold(), message);

@@ -1,0 +1,22 @@
+[package]
+name = "stella-pipeline"
+description = "evaluate -> enhance -> route -> execute -> judge -> revise orchestration; triage fast paths; scope-review gate; flip-oracle + deterministic verification ladder; evidence-based judge; best-of-N."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+stella-protocol = { path = "../stella-protocol" }
+stella-core = { path = "../stella-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true

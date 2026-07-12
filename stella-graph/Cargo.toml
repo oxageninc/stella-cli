@@ -1,0 +1,28 @@
+[package]
+name = "stella-graph"
+description = "Code-graph indexer: tree-sitter parsers (native), symbol + import-edge extraction, incremental re-index on file change. Implemented AS a built-in OCP provider feeding stella-context."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ocp-types = { path = "../ocp-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+notify.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-javascript.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

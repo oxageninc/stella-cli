@@ -8,6 +8,13 @@ members = [
   "stella-store",
   "stella-tools",
   "stella-cli",
+  "stella-context",
+  "stella-graph",
+  "stella-pipeline",
+  "stella-mcp",
+  "stella-media",
+  "stella-fleet",
+  "stella-tui",
 ]
 
 [workspace.package]
@@ -22,7 +29,7 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "fs", "io-util", "sync"] }
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures-util = "0.3"
@@ -34,6 +41,19 @@ rand = "0.9"
 proptest = "1"
 toml = "0.9"
 rpassword = "7"
+base64 = "0.22"
+crossterm = "0.28"
+notify = "8"
+ratatui = "0.29"
+roxmltree = "0.20"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+tempfile = "3"
+tree-sitter = "0.25"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
 
 [profile.release]
 lto = true

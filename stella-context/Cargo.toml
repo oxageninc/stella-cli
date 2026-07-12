@@ -1,0 +1,24 @@
+[package]
+name = "stella-context"
+description = "THE CONTEXT PLANE: bi-temporal knowledge graph, embedding index, episodic memory, hybrid retrieval, context-frame assembly + token budgeting — one SQLite file, one engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+stella-protocol = { path = "../stella-protocol" }
+ocp-types = { path = "../ocp-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true

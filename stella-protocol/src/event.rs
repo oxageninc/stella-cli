@@ -27,6 +27,11 @@ pub enum StageKind {
     Execute,
     Verify,
     Judge,
+    /// Post-turn self-reflection: the agent reviews its own performance on
+    /// the completed turn and records improvement memories into the context
+    /// plane, tagged with the workspace's inferred domains, for recall on
+    /// future relevant turns.
+    Reflect,
     ContextWrite,
     Complete,
 }
@@ -126,6 +131,83 @@ pub enum AgentEvent {
         to: String,
         reason: String,
     },
+    /// A file was created/modified/deleted by the agent, carrying the diff
+    /// so the TUI's files-touched panel renders per-edit diffs without a
+    /// second data path (L-T5: in TS, the `onFileEdit` callback had to be
+    /// patched into two pipeline switches — here there is one emission
+    /// point by construction).
+    FileChange {
+        path: String,
+        kind: FileChangeKind,
+        diff: Option<String>,
+    },
+    /// Context recall completed (`06-context-protocol.md`): which frames
+    /// reached the prompt, from which providers, at what token cost. Every
+    /// frame carries a human `citation_label`, never a raw id (L-C4).
+    ContextRecall {
+        frames: Vec<ContextFrameRef>,
+        provider_mix: Vec<ProviderShare>,
+        tokens: u32,
+    },
+    /// Context write-back completed: episode summaries, fact upserts,
+    /// supersession (`06-context-protocol.md` §2.2 — bi-temporal,
+    /// close-not-delete per L-C3).
+    ContextWrite {
+        provider: String,
+        upserts: u32,
+        superseded: u32,
+    },
+    /// A verification verdict — from the deterministic ladder (flip oracle,
+    /// touched-tests-green) or the model judge (L-E11: deterministic-first;
+    /// model judges handle only inconclusive evidence).
+    JudgeVerdict {
+        passed: bool,
+        evidence: JudgeEvidence,
+    },
+    /// Interactive gate before large plans execute (L-E5): the pipeline
+    /// pauses on this event and waits for approval above configured
+    /// thresholds; headless requires a flag to bypass.
+    ScopeReview {
+        proposal: ScopeProposal,
+    },
+    /// The agent asked the user a multiple-choice question (the `ask_user`
+    /// tool). BINDING renderer contract: present the structured `options`
+    /// AND always exactly one additional free-text option — the user can
+    /// always answer in their own words, on every question, without the
+    /// model having to list that affordance itself. The answer returns as
+    /// the tool call's ordinary `ToolResult`; there is no separate answer
+    /// event. Headless runs fail this tool with a named error instead of
+    /// hanging on input that will never arrive.
+    AskUser {
+        /// Correlates the eventual answer (the ToolResult's `call_id`)
+        /// back to this question.
+        id: String,
+        question: String,
+        options: Vec<String>,
+    },
+    /// A media generation job changed state (`08-multimodal.md`). Video
+    /// jobs are async and long-lived; this event is how the TUI shows
+    /// progress without polling shared state (L-T1).
+    MediaProgress {
+        artifact_id: String,
+        kind: MediaKind,
+        state: MediaJobState,
+    },
+    /// A media artifact landed under `.stella/artifacts/` with a manifest
+    /// row.
+    MediaComplete {
+        artifact: MediaArtifactRef,
+    },
+    /// A commit landed (fleet ledger / pipeline execute stage).
+    Commit {
+        sha: String,
+        message: String,
+    },
+    /// A pull request was opened or changed status (fleet PR/CI monitor).
+    Pr {
+        url: String,
+        status: PrStatus,
+    },
     Error {
         message: String,
         retryable: bool,
@@ -134,6 +216,107 @@ pub enum AgentEvent {
         model: String,
         cost_usd: f64,
     },
+}
+
+/// What happened to a file in a `FileChange` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeKind {
+    Created,
+    Modified,
+    Deleted,
+}
+
+/// A context frame as cited in a `ContextRecall` event. `citation_label`
+/// is mandatory and human-readable; the raw `id` (when the frame is
+/// materialized at all) belongs only in inspectable detail views, never as
+/// the primary identifier (L-C4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextFrameRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub citation_label: String,
+    /// Which provider produced the frame (e.g. `"code-graph"`, `"memory"`,
+    /// `"git-history"`, or an external OCP provider id).
+    pub source: String,
+    pub token_cost: u32,
+}
+
+/// One provider's share of a recall's frame mix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderShare {
+    pub provider: String,
+    pub frames: u32,
+}
+
+/// Evidence backing a `JudgeVerdict`. `deterministic` distinguishes the
+/// flip-oracle/tests ladder from a model judge's opinion — the two are
+/// never conflated (L-E11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgeEvidence {
+    pub summary: String,
+    /// `true` when the verdict came from the deterministic ladder (a
+    /// fail→pass flip of the same normalized test command, touched-tests
+    /// green, diff budget) rather than a model judge.
+    pub deterministic: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+}
+
+/// What a `ScopeReview` gate presents for approval before a large plan
+/// executes (L-E5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopeProposal {
+    pub summary: String,
+    pub steps: Vec<String>,
+    pub estimated_files: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+}
+
+/// Which kind of media artifact a job produces (`08-multimodal.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    Image,
+    Svg,
+    Video,
+}
+
+/// Lifecycle of an async media job. `Failed` carries the reason inline —
+/// a failed job must never be distinguishable only by the absence of a
+/// success event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MediaJobState {
+    Queued,
+    Running,
+    Succeeded,
+    Failed { reason: String },
+}
+
+/// A completed media artifact: id + kind + where it landed on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaArtifactRef {
+    pub id: String,
+    pub kind: MediaKind,
+    /// Path under `.stella/artifacts/` (the generation tools may never
+    /// write outside it — `02-architecture.md` §8).
+    pub path: String,
+    /// Human label for citation/display.
+    pub label: String,
+}
+
+/// A pull request's status as observed by the fleet monitor. Reconciled
+/// against the live source before rendering, never served from cache
+/// alone (L-V3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrStatus {
+    Draft,
+    Open,
+    Merged,
+    Closed,
 }
 
 #[cfg(test)]

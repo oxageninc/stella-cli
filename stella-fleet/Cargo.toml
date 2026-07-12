@@ -1,0 +1,24 @@
+[package]
+name = "stella-fleet"
+description = "Multi-agent fleet: planner DAG, git-worktree isolation (isolate-by-default), SQLite commit ledger, PR/CI monitor with capped deferred waits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+stella-protocol = { path = "../stella-protocol" }
+stella-core = { path = "../stella-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+rusqlite.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
