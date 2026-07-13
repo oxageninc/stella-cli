@@ -88,6 +88,22 @@ cargo search ocp-conformance
 temp dir, then uploads) before it ever touches the registry, so each step is
 self-checking — but it's still a one-way action (see below).
 
+### One-shot alternative (cargo ≥ 1.90)
+
+Modern cargo can co-publish an interdependent set in one command, computing
+the dependency order and resolving the siblings through a temporary local
+registry — no manual index-wait between steps:
+
+```bash
+cargo publish -p ocp-types -p ocp-host -p ocp-conformance
+```
+
+Add `--dry-run` to rehearse the whole set without uploading; that dry-run is
+the definitive publishability proof used to validate this checklist (it
+packages, resolves each sibling, and compiles all three in order). Prefer the
+explicit three-step sequence above if you want to eyeball each crate landing
+on crates.io before the next goes up.
+
 ## After publishing
 
 - **docs.rs builds automatically** on a successful publish, typically within
