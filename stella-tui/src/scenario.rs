@@ -126,7 +126,7 @@ pub fn demo_inbound(started_ms: u64, self_pid: u32) -> Vec<Inbound> {
         }),
         ev(lead, AgentEvent::Stage { name: StageKind::Plan }),
         ev(lead, AgentEvent::Text { delta: "Planning the automations cluster: list, editor, triggers, workflows.".into() }),
-        ev(lead, AgentEvent::StepUsage { step: 1, model: "glm-5.2".into(), input_tokens: 12_400, output_tokens: 640, cached_input_tokens: 9_000, cost_usd: 0.021, duration_ms: 1830, retries: 0, tool_calls: 0 }),
+        ev(lead, AgentEvent::StepUsage { step: 1, model: "glm-5.2".into(), input_tokens: 12_400, output_tokens: 640, cached_input_tokens: 9_000, estimated_input_tokens: 12_000, cost_usd: 0.021, duration_ms: 1830, retries: 0, tool_calls: 0 }),
         ev(lead, AgentEvent::BudgetTick { spent_usd: 0.021, limit_usd: Some(2.5), mode: stella_protocol::BudgetMode::Observed }),
 
         // ── two subagents are dispatched ────────────────────────────────
@@ -140,14 +140,14 @@ pub fn demo_inbound(started_ms: u64, self_pid: u32) -> Vec<Inbound> {
         ev(lead, tool_start("c1", "read_file", json!({ "path": "apps/app/automations/page.tsx" }))),
         ev(lead, AgentEvent::ToolResult { call_id: "c1".into(), output: ToolOutput::Ok { content: "312 lines".into() }, duration_ms: 42 }),
         ev(lead, AgentEvent::FileChange { path: "apps/app/automations/page.tsx".into(), kind: FileChangeKind::Modified, diff: Some("@@ -10,3 +10,7 @@\n-  const items = []\n+  const items = useAutomations()\n+  const [q, setQ] = useState(\"\")\n+  const filtered = filter(items, q)\n+  const onNew = () => open()\n".into()) }),
-        ev(lead, AgentEvent::StepUsage { step: 2, model: "glm-5.2".into(), input_tokens: 8_200, output_tokens: 900, cached_input_tokens: 6_000, cost_usd: 0.018, duration_ms: 2100, retries: 0, tool_calls: 1 }),
+        ev(lead, AgentEvent::StepUsage { step: 2, model: "glm-5.2".into(), input_tokens: 8_200, output_tokens: 900, cached_input_tokens: 6_000, estimated_input_tokens: 8_000, cost_usd: 0.018, duration_ms: 2100, retries: 0, tool_calls: 1 }),
         ev(lead, AgentEvent::BudgetTick { spent_usd: 0.039, limit_usd: Some(2.5), mode: stella_protocol::BudgetMode::Observed }),
 
         // ── auth subagent creates a file, then asks a question ──────────
         ev(auth, AgentEvent::Stage { name: StageKind::Execute }),
         ev(auth, tool_start("c2", "grep", json!({ "pattern": "trigger" }))),
         ev(auth, AgentEvent::FileChange { path: "apps/api/routes/v1/automations.ts".into(), kind: FileChangeKind::Created, diff: Some("+export const triggers = router()\n+  .post(\"/\", create)\n+  .get(\"/\", list)\n".into()) }),
-        ev(auth, AgentEvent::StepUsage { step: 1, model: "glm-5.2".into(), input_tokens: 5_100, output_tokens: 420, cached_input_tokens: 3_000, cost_usd: 0.011, duration_ms: 1400, retries: 0, tool_calls: 1 }),
+        ev(auth, AgentEvent::StepUsage { step: 1, model: "glm-5.2".into(), input_tokens: 5_100, output_tokens: 420, cached_input_tokens: 3_000, estimated_input_tokens: 5_000, cost_usd: 0.011, duration_ms: 1400, retries: 0, tool_calls: 1 }),
         ev(auth, AgentEvent::BudgetTick { spent_usd: 0.011, limit_usd: Some(1.0), mode: stella_protocol::BudgetMode::Observed }),
         ev(auth, AgentEvent::AskUser { id: "q1".into(), question: "Which auth guard should the triggers route use?".into(), options: vec!["assertOrgMember".into(), "assertBillingManager".into()] }),
 
@@ -156,7 +156,7 @@ pub fn demo_inbound(started_ms: u64, self_pid: u32) -> Vec<Inbound> {
         ev(ci, AgentEvent::JudgeVerdict { passed: true, evidence: JudgeEvidence { summary: "flip oracle: fail→pass on `pnpm --filter app test:unit`".into(), deterministic: true, evidence_refs: vec![] } }),
         ev(ci, AgentEvent::Commit { sha: "a1b2c3d".into(), message: "feat(automations): triggers + workflows UI".into() }),
         ev(ci, AgentEvent::Pr { url: "https://github.com/oxageninc/stella/pull/981".into(), status: PrStatus::Open }),
-        ev(ci, AgentEvent::StepUsage { step: 1, model: "glm-5.2-air".into(), input_tokens: 3_000, output_tokens: 180, cached_input_tokens: 0, cost_usd: 0.004, duration_ms: 900, retries: 0, tool_calls: 0 }),
+        ev(ci, AgentEvent::StepUsage { step: 1, model: "glm-5.2-air".into(), input_tokens: 3_000, output_tokens: 180, cached_input_tokens: 0, estimated_input_tokens: 2_900, cost_usd: 0.004, duration_ms: 900, retries: 0, tool_calls: 0 }),
 
         // ── lead proposes a larger scope change (gate) ──────────────────
         ev(lead, AgentEvent::ScopeReview { proposal: ScopeProposal {

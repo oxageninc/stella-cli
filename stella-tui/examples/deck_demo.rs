@@ -167,6 +167,7 @@ async fn mini_run(tx: &mpsc::UnboundedSender<Inbound>, id: &str) {
             input_tokens: 4_000,
             output_tokens: 260,
             cached_input_tokens: 2_000,
+            estimated_input_tokens: 3_900,
             cost_usd: 0.008,
             duration_ms: 1_100,
             retries: 0,
