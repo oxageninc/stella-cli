@@ -41,20 +41,21 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-14
-            cross: false
           # Cross-compiled from the Apple Silicon runner: Apple's clang/ld is a
           # universal toolchain, so `rustup target add x86_64-apple-darwin`
           # (via the `targets:` input below) builds the x86_64 slice — bundled
           # C deps included — without needing a (now-retired) Intel runner.
           - target: x86_64-apple-darwin
             os: macos-14
-            cross: false
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            cross: false
+          # Built natively on GitHub's arm64 runner (free for public repos).
+          # Cross-compiling this target via `cross` fails: its default docker
+          # image ships g++ 5, far too old for libduckdb-sys's bundled C++.
+          # The native runner uses the same modern toolchain that already
+          # builds duckdb fine on x86_64 ubuntu-latest.
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: true
+            os: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
 
@@ -66,10 +67,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-
-      - name: Install cross
-        if: ${{ matrix.cross }}
-        run: cargo install cross --locked
 
       # Stamp the release version (from the tag) into the workspace manifest so
       # the compiled binary reports it — `stella --version` == the release tag.
@@ -92,15 +89,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release \
-              --target ${{ matrix.target }} \
-              --package stella-cli --bin stella
-          else
-            cargo build --release \
-              --target ${{ matrix.target }} \
-              --package stella-cli --bin stella
-          fi
+          cargo build --release \
+            --target ${{ matrix.target }} \
+            --package stella-cli --bin stella
 
       - name: Package tarball
         id: package
@@ -219,9 +210,11 @@ jobs:
   # Renders .github/homebrew/stella.rb.tmpl with the real version + per-target
   # SHA-256 sums and commits it as Formula/stella.rb to the tap repo
   # (oxageninc/homebrew-stella). Runs only after the GitHub Release exists, so
-  # the formula's release-asset URLs resolve. Requires the HOMEBREW_TAP_TOKEN
-  # secret (see the one-time setup in RELEASING.md); skips gracefully without it
-  # so a release is never blocked on the tap being wired.
+  # the formula's release-asset URLs resolve. Auth: HOMEBREW_TAP_DEPLOY_KEY
+  # (an SSH deploy key with write access to the tap repo — scoped to exactly
+  # that one repo, unlike a PAT), with HOMEBREW_TAP_TOKEN (https) honored as a
+  # fallback. Skips gracefully when neither is set so a release is never
+  # blocked on the tap being wired.
   homebrew:
     name: publish Homebrew formula
     needs: release
@@ -240,14 +233,15 @@ jobs:
 
       - name: Render formula and push to tap
         env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
-            echo "::warning::HOMEBREW_TAP_TOKEN is not set — skipping Homebrew tap publish."
-            echo "One-time setup (create the tap repo + add the secret) is documented in RELEASING.md."
+          if [ -z "${HOMEBREW_TAP_DEPLOY_KEY:-}" ] && [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::warning::neither HOMEBREW_TAP_DEPLOY_KEY nor HOMEBREW_TAP_TOKEN is set — skipping Homebrew tap publish."
+            echo "One-time setup (create the tap repo + add the credential) is documented in RELEASING.md."
             exit 0
           fi
 
@@ -282,8 +276,18 @@ jobs:
           echo "----- rendered Formula/stella.rb -----"
           cat rendered/stella.rb
 
-          git clone --depth 1 \
-            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/oxageninc/homebrew-stella.git" tap
+          if [ -n "${HOMEBREW_TAP_DEPLOY_KEY:-}" ]; then
+            # SSH with the tap-scoped deploy key. The key file lives outside
+            # the workspace and is chmod 600, as ssh requires.
+            keyfile="${RUNNER_TEMP}/tap_deploy_key"
+            printf '%s\n' "${HOMEBREW_TAP_DEPLOY_KEY}" > "${keyfile}"
+            chmod 600 "${keyfile}"
+            export GIT_SSH_COMMAND="ssh -i ${keyfile} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+            git clone --depth 1 "git@github.com:oxageninc/homebrew-stella.git" tap
+          else
+            git clone --depth 1 \
+              "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/oxageninc/homebrew-stella.git" tap
+          fi
 
           mkdir -p tap/Formula
           cp rendered/stella.rb tap/Formula/stella.rb

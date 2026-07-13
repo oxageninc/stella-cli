@@ -16,6 +16,10 @@ thiserror.workspace = true
 tokio.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+ratatui-comfy-tabs = "0.5.12"
+tachyonfx = "0.25.1"
+sysinfo = "0.38.4"
+tui-big-text = "0.8.8"
 
 [dev-dependencies]
 tempfile.workspace = true

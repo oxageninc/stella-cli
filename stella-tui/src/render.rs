@@ -174,7 +174,7 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
 }
 
 /// The usable interior height of a single-border panel.
-fn inner_height(area: Rect) -> usize {
+pub(crate) fn inner_height(area: Rect) -> usize {
     area.height.saturating_sub(2) as usize
 }
 
@@ -248,7 +248,7 @@ fn error_card(area: Rect, label: &str, message: &str) -> Buffer {
 // Panels
 // ---------------------------------------------------------------------------
 
-fn render_hud(hud: &Hud, area: Rect, buf: &mut Buffer) {
+pub(crate) fn render_hud(hud: &Hud, area: Rect, buf: &mut Buffer) {
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled("stage: ", Style::new().fg(Color::DarkGray)),
         Span::styled(
@@ -281,7 +281,7 @@ fn render_hud(hud: &Hud, area: Rect, buf: &mut Buffer) {
         .render(area, buf);
 }
 
-fn render_transcript(
+pub(crate) fn render_transcript(
     lines: &[Line<'static>],
     window: Range<usize>,
     following: bool,
@@ -355,7 +355,7 @@ fn render_diff(
         .render(area, buf);
 }
 
-fn render_scope_review(
+pub(crate) fn render_scope_review(
     proposal: &stella_protocol::ScopeProposal,
     answered: bool,
     area: Rect,
@@ -414,7 +414,12 @@ fn render_scope_review(
         .render(area, buf);
 }
 
-fn render_ask_user(prompt: &AskUserPrompt, answered: bool, area: Rect, buf: &mut Buffer) {
+pub(crate) fn render_ask_user(
+    prompt: &AskUserPrompt,
+    answered: bool,
+    area: Rect,
+    buf: &mut Buffer,
+) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
         prompt.question.clone(),
@@ -512,7 +517,7 @@ pub(crate) fn transcript_lines(model: &SessionModel) -> Vec<Line<'static>> {
     out
 }
 
-fn entry_lines(entry: &TranscriptEntry, out: &mut Vec<Line<'static>>) {
+pub(crate) fn entry_lines(entry: &TranscriptEntry, out: &mut Vec<Line<'static>>) {
     match entry {
         TranscriptEntry::Stage(name) => out.push(Line::from(Span::styled(
             format!("── {} ──", stage_label(*name)),

@@ -35,6 +35,23 @@ pub mod scroll;
 pub mod shell;
 pub mod ui;
 
+// ── Command Deck: the multi-tab, multi-agent operations workspace ───────────
+// Extends the single-session REPL above into a tabbed deck (Session · Agents ·
+// Traces · Graph · Files) while preserving the pure-core / thin-shell design.
+// See `COMMAND_DECK_DESIGN.md`.
+pub mod deck;
+pub mod deck_render;
+pub mod deck_shell;
+pub mod deck_ui;
+pub mod envelope;
+pub mod fx;
+pub mod graph;
+pub mod resource;
+pub mod scenario;
+pub mod splash;
+pub mod theme;
+pub mod views;
+
 pub use composer::{
     Composer, ComposerEntry, DEFAULT_PASTE_LINE_THRESHOLD, SlashCommand, SlashMenu,
 };
@@ -44,3 +61,16 @@ pub use render::render;
 pub use scroll::ScrollState;
 pub use shell::{DebugLog, RunOptions, run};
 pub use ui::{PanelFocus, ShellAction, UiState, ViewportMetrics, handle_key, ingest};
+
+// Command Deck public surface.
+pub use deck::{
+    AgentEntry, DeckTab, FileLedger, FileRecord, ResourceSample, RouteLog, TraceKind, TraceLog,
+    TraceRow, WorkspaceModel,
+};
+pub use deck_render::render_deck;
+pub use deck_shell::{DeckOptions, run_deck};
+pub use deck_ui::{DeckAction, DeckUi, handle_deck_key, ingest_inbound};
+pub use envelope::{AgentControl, AgentId, AgentMeta, AgentStatus, Inbound, WorkspaceInput};
+pub use graph::{GraphEdge, GraphNode, GraphSnapshot};
+pub use resource::ResourceMonitor;
+pub use splash::SplashState;
