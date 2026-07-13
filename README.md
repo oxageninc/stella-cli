@@ -127,7 +127,7 @@ and the harness to prove it ships in this repo.
 |---|---|---|
 | 🥇 **Heavyweight** | Frontier model, $2/task cap | Highest resolve rate |
 | 🪶 **Featherweight** | Any model, any cap | Lowest **$ per resolved task** |
-| 🔌 **Off-grid** | Local models only (`--base-url`, zero API keys) | Resolve rate at $0 marginal cost |
+| 🔌 **Off-grid** | Local models only (`--base-url`, zero API keys) — [the guide](docs/off-grid.md) | Resolve rate at $0 marginal cost |
 | ⚔️ **Cross-harness** | Same model, Stella vs. any other agent CLI | Biggest head-to-head gap |
 
 ### Enter
