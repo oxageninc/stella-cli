@@ -1,0 +1,21 @@
+{
+  "//": "Drift-gate thresholds for .github/workflows/agent-regression-gate.yml (oxageninc/arena `arena gate`). CLI flags override these.",
+
+  "//accuracyMaxDropPoints": "Max allowed resolve-rate drop in points 0-1. 0 = any drop fails (subject to significance below).",
+  "accuracyMaxDropPoints": 0,
+
+  "//accuracyRequireSignificant": "Only fail accuracy once the drop clears 95% CI noise (baseline lower bound above the new run's upper bound) — no red checks from small-sample jitter.",
+  "accuracyRequireSignificant": true,
+
+  "//tokensMaxIncreasePct": "Fail if median total tokens rose more than this %.",
+  "tokensMaxIncreasePct": 10,
+
+  "//costMaxIncreasePct": "Fail if median computed cost rose more than this %.",
+  "costMaxIncreasePct": 15,
+
+  "//speedMaxIncreasePct": "Report-only: wall clock on shared CI runners is environment noise, not a gate.",
+  "speedMaxIncreasePct": null,
+
+  "//allowTaskMismatch": "Never compare resolve rates across different task sets.",
+  "allowTaskMismatch": false
+}

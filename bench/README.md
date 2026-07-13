@@ -170,3 +170,21 @@ instance is capped by `--budget` USD (also honored via the `STELLA_BUDGET` env
 var). Worst-case spend for a run is roughly `--budget x number-of-instances`, so
 start with `--limit 1` and a small `--budget` before scaling up. `--dry-run`
 spends nothing.
+
+## The CI drift gate
+
+`.github/workflows/agent-regression-gate.yml` keeps Stella from silently
+getting worse: on agent-behavior PRs and nightly, it builds the branch's
+`stella`, benchmarks it with the [oxageninc/arena](https://github.com/oxageninc/arena)
+calibration suite (same model both sides, pinned harness commit), and runs
+`arena gate` against the committed `bench/arena-baseline.json` — a
+statistically significant resolve-rate drop, or a token/cost blow-up past the
+thresholds in `arena-gate.json`, is a red check the day it lands. Full
+receipts (transcripts, diffs, report) upload as artifacts on every run.
+
+Arming it takes a provider secret (`ANTHROPIC_API_KEY` or `ZAI_API_KEY`) and
+one baseline bootstrap — run the workflow with `mode: save-baseline`, commit
+the resulting artifact. Until then the gate skips green with a warning, so it
+can be a required check from day one. The nightly `swebench-smoke` job also
+pushes the committed sample instances through `run_swebench.py` end to end and
+uploads those receipts.

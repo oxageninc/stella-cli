@@ -1,0 +1,251 @@
+# The agent drift gate (issue #17): benchmark Stella against a committed
+# baseline on every agent-behavior PR and nightly, and fail the check when
+# resolve rate regresses beyond CI noise (or tokens/cost blow past their
+# thresholds). Powered by oxageninc/arena's `arena gate` — same model on
+# both sides, Wilson CIs via --require-significant, full receipts uploaded
+# as artifacts.
+#
+# Setup (once):
+#   1. Add a provider key as a repo secret (ANTHROPIC_API_KEY or
+#      ZAI_API_KEY). Optionally set repo variables ARENA_GATE_MODEL
+#      (default anthropic/claude-fable-5) and ARENA_GATE_TRIALS (default 5).
+#   2. Bootstrap the baseline: Actions → agent-regression-gate → Run
+#      workflow → mode: save-baseline. Download the arena-baseline
+#      artifact, commit it at bench/arena-baseline.json.
+#   3. (Optional) Mark the `arena drift gate` job as a required check.
+#
+# Until the baseline is committed, the gate job succeeds with a notice —
+# it can be a required check from day one without blocking unrelated PRs.
+# Without a provider secret (e.g. fork PRs), the benchmark is skipped the
+# same way: this gate measures the repo's own agents with the repo's keys.
+#
+# Thresholds live in arena-gate.json at the repo root. The arena harness
+# is pinned by commit; bump ARENA_REF deliberately, it is part of the
+# measurement apparatus.
+
+name: agent-regression-gate
+
+on:
+  pull_request:
+    # Only paths that can change agent behavior or the gate itself — doc
+    # and packaging changes should not spend benchmark dollars.
+    paths:
+      - "stella-core/**"
+      - "stella-model/**"
+      - "stella-cli/**"
+      - "stella-tools/**"
+      - "stella-protocol/**"
+      - "stella-context/**"
+      - "Cargo.lock"
+      - "arena-gate.json"
+      - "bench/arena-baseline.json"
+      - ".github/workflows/agent-regression-gate.yml"
+  schedule:
+    # Nightly, off the top of the hour to dodge the scheduled-run stampede.
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "gate = compare against the committed baseline; save-baseline = snapshot a new baseline artifact"
+        type: choice
+        options: [gate, save-baseline]
+        default: gate
+      trials:
+        description: "Trials per task (overrides ARENA_GATE_TRIALS)"
+        required: false
+      model:
+        description: "provider/model for BOTH sides (overrides ARENA_GATE_MODEL)"
+        required: false
+
+concurrency:
+  group: agent-gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # The measurement apparatus, pinned. Bump deliberately.
+  ARENA_REF: 5122005775e87aad8ac9c2d624784fb4b017a657
+
+jobs:
+  arena-gate:
+    name: arena drift gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+      BENCH_MODEL: ${{ inputs.model || vars.ARENA_GATE_MODEL || 'anthropic/claude-fable-5' }}
+      TRIALS: ${{ inputs.trials || vars.ARENA_GATE_TRIALS || '5' }}
+      MODE: ${{ inputs.mode || 'gate' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Decide what this run can actually do, loudly. Skips are green so the
+      # job can be a required check before the repo is fully configured.
+      - name: Preflight
+        id: preflight
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$ZAI_API_KEY" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::agent-regression-gate: no provider secret (ANTHROPIC_API_KEY / ZAI_API_KEY) — benchmark skipped. Fork PRs skip by design; for this repo, add a secret to arm the gate."
+            echo "### ⚠ Drift gate skipped — no provider secret" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$MODE" = "gate" ] && [ ! -f bench/arena-baseline.json ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::agent-regression-gate: no committed baseline (bench/arena-baseline.json) — run this workflow with mode=save-baseline, commit the artifact, and the gate arms itself."
+            echo "### ⚠ Drift gate skipped — no committed baseline yet" >> "$GITHUB_STEP_SUMMARY"
+            echo "Run **agent-regression-gate → Run workflow → save-baseline**, download the \`arena-baseline\` artifact, commit it at \`bench/arena-baseline.json\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE, model=$BENCH_MODEL, trials=$TRIALS"
+
+      - name: Install Rust stable
+        if: steps.preflight.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.preflight.outputs.run == 'true'
+
+      - name: Build the contender
+        if: steps.preflight.outputs.run == 'true'
+        run: cargo build --release -p stella-cli
+
+      - name: Check out the arena harness (pinned)
+        if: steps.preflight.outputs.run == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: oxageninc/arena
+          ref: ${{ env.ARENA_REF }}
+          path: arena
+
+      - uses: pnpm/action-setup@v4
+        if: steps.preflight.outputs.run == 'true'
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        if: steps.preflight.outputs.run == 'true'
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: arena/pnpm-lock.yaml
+
+      - name: Install arena
+        if: steps.preflight.outputs.run == 'true'
+        working-directory: arena
+        run: pnpm install --frozen-lockfile
+
+      # Same model, same budget, same timeout on every trial — the harness
+      # (this PR's Stella build) is the only variable being measured.
+      - name: Benchmark Stella
+        if: steps.preflight.outputs.run == 'true'
+        working-directory: arena
+        env:
+          ARENA_STELLA_BIN: ${{ github.workspace }}/target/release/stella
+        run: >
+          pnpm arena run
+          --agents stella
+          --model "$BENCH_MODEL"
+          --trials "$TRIALS"
+          --budget 2
+          --out results
+
+      - name: Gate against the committed baseline
+        if: steps.preflight.outputs.run == 'true' && env.MODE == 'gate'
+        working-directory: arena
+        run: >
+          pnpm arena gate results/run-*
+          --agent stella
+          --require-significant
+          --baseline "$GITHUB_WORKSPACE/bench/arena-baseline.json"
+          --config "$GITHUB_WORKSPACE/arena-gate.json"
+
+      - name: Snapshot a new baseline
+        if: steps.preflight.outputs.run == 'true' && env.MODE == 'save-baseline'
+        working-directory: arena
+        run: |
+          pnpm arena baseline save results/run-* --agent stella --out "$GITHUB_WORKSPACE/bench/arena-baseline.json"
+          {
+            echo "### Baseline snapshotted"
+            echo ""
+            echo "Download the \`arena-baseline\` artifact and commit it at \`bench/arena-baseline.json\` to arm the gate:"
+            echo ""
+            echo '```bash'
+            echo "gh run download ${{ github.run_id }} -n arena-baseline -D bench/"
+            echo "git add bench/arena-baseline.json && git commit -m 'bench: arena drift-gate baseline'"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload baseline artifact
+        if: steps.preflight.outputs.run == 'true' && env.MODE == 'save-baseline'
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-baseline
+          path: bench/arena-baseline.json
+
+      # Receipts or it didn't happen — transcripts, per-trial diffs, the
+      # report, and the manifest, win or lose.
+      - name: Upload receipts
+        if: always() && steps.preflight.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-run-receipts
+          path: arena/results/
+
+  # Nightly wiring smoke of the SWE-bench harness itself: the committed
+  # sample instances through bench/run_swebench.py, receipts uploaded. Kept
+  # off PRs — repo clones + real model calls per instance. Scale this to a
+  # pinned SWE-bench Verified subset by swapping --instances/--limit.
+  swebench-smoke:
+    name: swe-bench harness smoke (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+      BENCH_MODEL: ${{ inputs.model || vars.ARENA_GATE_MODEL || 'anthropic/claude-fable-5' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Preflight
+        id: preflight
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$ZAI_API_KEY" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::swebench-smoke: no provider secret — skipped."
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust stable
+        if: steps.preflight.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.preflight.outputs.run == 'true'
+
+      - name: Build stella
+        if: steps.preflight.outputs.run == 'true'
+        run: cargo build --release -p stella-cli
+
+      - name: Run the sample through the harness
+        if: steps.preflight.outputs.run == 'true'
+        run: >
+          python3 bench/run_swebench.py
+          --instances bench/instances.sample.jsonl
+          --model "$BENCH_MODEL"
+          --budget 1
+          --timeout 900
+          --stella-bin ${{ github.workspace }}/target/release/stella
+
+      - name: Upload receipts
+        if: always() && steps.preflight.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: swebench-smoke-receipts
+          path: bench/results/
