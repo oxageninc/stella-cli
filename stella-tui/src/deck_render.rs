@@ -3,6 +3,8 @@
 //! overlay until it finishes. This is the tab dispatcher and the one place the
 //! deck's chrome is drawn.
 
+use std::time::Duration;
+
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -12,7 +14,11 @@ use ratatui_comfy_tabs::{TabNav, TabNavState};
 
 use crate::deck::{DeckTab, WorkspaceModel};
 use crate::deck_ui::DeckUi;
-use crate::{splash, theme, views};
+use crate::{fx, splash, theme, views};
+
+/// Duration of the tab-switch sweep. Brisk — long enough to read as motion,
+/// short enough never to feel in the way when tabbing quickly.
+const TAB_SWITCH_MS: u32 = 180;
 
 pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
     let area = frame.area();
@@ -43,6 +49,22 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
         DeckTab::Traces => views::traces::render(model, ui, content, buf),
         DeckTab::Graph => views::graph::render(model, ui, content, buf),
         DeckTab::Files => views::files::render(model, ui, content, buf),
+    }
+
+    // Tab-switch sweep: scrub a fresh effect from the change timestamp (persist
+    // a time, not a live `Effect` — the splash's approach) so the new view
+    // sweeps in over the content band; the chrome stays put. `now_ms` only
+    // advances on the deck tick, so the sweep progresses on the ~30 fps
+    // heartbeat and clears once its window elapses, leaving steady-state frames
+    // free of any effect work.
+    if let Some(started) = ui.tab_switch_ms {
+        let elapsed = model.now_ms.saturating_sub(started);
+        if elapsed < TAB_SWITCH_MS as u64 {
+            let mut effect = fx::tab_switch(TAB_SWITCH_MS);
+            fx::apply(&mut effect, Duration::from_millis(elapsed), content, buf);
+        } else {
+            ui.tab_switch_ms = None;
+        }
     }
 
     render_composer(ui, bands[2], buf);

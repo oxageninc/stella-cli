@@ -240,6 +240,13 @@ impl WorkspaceModel {
                     model,
                     ..
                 } => {
+                    // Tokens only — `StepUsage.cost_usd` is intentionally NOT
+                    // read here. The driver emits a `BudgetTick` carrying the
+                    // cumulative `spent_usd` immediately after every `StepUsage`
+                    // (stella-core/src/driver.rs — same committed step, same
+                    // `result.cost_usd`), so `cost_usd` is already both
+                    // authoritative and current; folding the per-step cost too
+                    // would double-count it. See the `cost_usd` field doc.
                     entry.tokens_in += input_tokens;
                     entry.tokens_out += output_tokens;
                     entry.meta.model = Some(model.clone());

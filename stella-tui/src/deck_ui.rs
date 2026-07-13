@@ -43,6 +43,11 @@ pub struct DeckMetrics {
 #[derive(Debug, Clone)]
 pub struct DeckUi {
     pub tab: DeckTab,
+    /// Deck-clock ms of the last tab change, or `None` when no sweep is
+    /// running. [`crate::deck_render`] scrubs the [`crate::fx::tab_switch`]
+    /// sweep from this — persist a timestamp, not a live `Effect`, mirroring
+    /// the splash — and clears it once the sweep's window elapses.
+    pub tab_switch_ms: Option<u64>,
     /// The one global composer — typing works from any tab.
     pub composer: Composer,
     pub splash: SplashState,
@@ -66,6 +71,7 @@ impl Default for DeckUi {
     fn default() -> Self {
         Self {
             tab: DeckTab::Session,
+            tab_switch_ms: None,
             composer: Composer::new(),
             splash: SplashState::new(),
             help_open: false,
@@ -150,15 +156,18 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
     // Deck-global tab navigation (Tab / Shift-Tab always; digits when empty).
     match key.code {
         KeyCode::Tab => {
-            ui.tab = ui.tab.next();
+            let next = ui.tab.next();
+            switch_tab(ui, model.now_ms, next);
             return DeckAction::Handled;
         }
         KeyCode::BackTab => {
-            ui.tab = ui.tab.prev();
+            let prev = ui.tab.prev();
+            switch_tab(ui, model.now_ms, prev);
             return DeckAction::Handled;
         }
         KeyCode::Char(d @ '1'..='5') if composer_empty => {
-            ui.tab = DeckTab::from_index((d as usize) - ('1' as usize));
+            let tab = DeckTab::from_index((d as usize) - ('1' as usize));
+            switch_tab(ui, model.now_ms, tab);
             return DeckAction::Handled;
         }
         KeyCode::Char('?') if composer_empty => {
@@ -185,6 +194,16 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         DeckTab::Session => handle_session_key(key, ui),
     }
     .unwrap_or_else(|| handle_composer_key(key, ui))
+}
+
+/// Switch the active tab and arm the tab-switch sweep (scrubbed from this
+/// timestamp by [`crate::deck_render`]). Stamps the clock only when the tab
+/// actually changes, so re-selecting the current tab doesn't re-trigger motion.
+fn switch_tab(ui: &mut DeckUi, now_ms: u64, tab: DeckTab) {
+    if ui.tab != tab {
+        ui.tab = tab;
+        ui.tab_switch_ms = Some(now_ms);
+    }
 }
 
 /// The id of the focused agent, if any.
@@ -271,7 +290,7 @@ fn handle_agents_key(
             Some(DeckAction::Handled)
         }
         KeyCode::Enter if composer_empty => {
-            ui.tab = DeckTab::Session;
+            switch_tab(ui, model.now_ms, DeckTab::Session);
             Some(DeckAction::Handled)
         }
         // Agent controls — only when the composer is empty (else they type).
@@ -495,6 +514,35 @@ mod tests {
         handle_deck_key(ch('2'), &model, &mut ui);
         assert_eq!(ui.tab, DeckTab::Traces, "digit typed, tab unchanged");
         assert_eq!(ui.composer.buffer(), "h2");
+    }
+
+    #[test]
+    fn switching_tabs_arms_the_sweep_clock_only_on_a_real_change() {
+        let mut model = model_with(&["lead"]);
+        model.now_ms = 7_000;
+        let mut ui = ready_ui();
+        assert_eq!(ui.tab, DeckTab::Session);
+        assert_eq!(ui.tab_switch_ms, None, "no sweep before any switch");
+
+        // Tab → a real change arms the sweep at the current deck clock.
+        handle_deck_key(key(KeyCode::Tab), &model, &mut ui);
+        assert_eq!(ui.tab, DeckTab::Agents);
+        assert_eq!(ui.tab_switch_ms, Some(7_000));
+
+        // Re-selecting the current tab (digit '2' == Agents) must NOT re-arm it.
+        model.now_ms = 9_000;
+        handle_deck_key(ch('2'), &model, &mut ui);
+        assert_eq!(ui.tab, DeckTab::Agents);
+        assert_eq!(
+            ui.tab_switch_ms,
+            Some(7_000),
+            "same-tab reselect leaves the clock untouched"
+        );
+
+        // A genuine change (digit '4' == Graph) re-stamps it.
+        handle_deck_key(ch('4'), &model, &mut ui);
+        assert_eq!(ui.tab, DeckTab::Graph);
+        assert_eq!(ui.tab_switch_ms, Some(9_000));
     }
 
     #[test]
