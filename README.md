@@ -406,12 +406,50 @@ stella --model local/llama3.3 --base-url http://localhost:11434/v1 chat
 > route through the dedicated coding endpoint (`https://api.z.ai/api/coding/paas/v4`).
 
 **The credential chain** (first hit wins): `--api-key` flag → provider env var →
-`~/.config/stella/credentials.toml` → interactive prompt.
+`settings.json` `api_key` → `~/.config/stella/credentials.toml` → interactive prompt.
 
 ```bash
 stella models    # every provider, its models, and key status
 stella config    # the fully resolved configuration
 ```
+
+### Custom providers via `settings.json`
+
+Point Stella at **any** OpenAI-compatible (or Anthropic/Gemini-dialect) endpoint —
+Together, Fireworks, Groq, a private gateway — without a code change, and override
+built-in provider defaults, from a `settings.json`:
+
+| Scope | Path | Wins over |
+|---|---|---|
+| Project | `<workspace>/.stella/settings.json` | org-managed, user |
+| Org-managed | `/Library/Application Support/stella/settings.json` (macOS) · `/etc/stella/settings.json` (Linux) · `$STELLA_MANAGED_SETTINGS` | user |
+| User | `~/.config/stella/settings.json` | — |
+
+```jsonc
+{
+  "providers": {
+    // A brand-new provider: base_url is required, dialect defaults to
+    // "openai-compatible" ("anthropic" and "gemini" also available).
+    "together": {
+      "name": "Together AI",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "default_model": "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    },
+    // Overriding a built-in's defaults (e.g. the Z.ai coding plan):
+    "zai": {
+      "base_url": "https://api.z.ai/api/coding/paas/v4"
+    }
+  }
+}
+```
+
+Then: `stella --model together/meta-llama/Llama-3.3-70B-Instruct-Turbo run "…"`.
+Config-defined providers join auto-detection (after the built-ins) and judge
+routing, and show up in `stella models`. Prefer `api_key_env` over a literal
+`api_key` — settings files get committed, credentials should not. Entries merge
+per field across scopes, so an org-managed `base_url` and a user-scope
+`api_key_env` compose.
 
 <div align="center">
 

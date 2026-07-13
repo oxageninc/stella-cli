@@ -23,6 +23,53 @@ pub struct ProviderConfig {
     pub display_name: &'static str,
     pub default_model: &'static str,
     pub base_url: &'static str,
+    /// Which wire adapter serves this provider. `build_provider_parts`
+    /// (agent.rs) dispatches on this — never on a hard-coded id match — so
+    /// config-defined providers (settings.json) reach the right adapter too.
+    pub dialect: Dialect,
+    /// Whether this provider's models are curated in the catalog seed.
+    /// `true` for the built-in rows (an unknown slug is a hard, named error
+    /// — the anti-phantom-slug check exists to catch drift in OUR seed
+    /// data); `false` for `local` and settings.json-defined providers,
+    /// whose models are whatever the user's endpoint actually serves.
+    pub seeded: bool,
+}
+
+/// The wire dialect a provider speaks — which `stella_model` adapter is
+/// constructed for it. Serialized form is the settings.json `dialect` field
+/// (kebab-case, e.g. `"openai-compatible"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Dialect {
+    /// OpenAI Chat Completions shape (`stella_model::zai::ZaiProvider`,
+    /// re-identified per provider) — Z.ai, xAI, DeepSeek, OpenRouter,
+    /// local endpoints, and the default for config-defined providers.
+    OpenaiCompatible,
+    /// OpenAI Responses API (`stella_model::openai::OpenAiProvider`).
+    OpenaiResponses,
+    /// Anthropic Messages API (`stella_model::anthropic::AnthropicProvider`).
+    Anthropic,
+    /// Gemini generateContent (`stella_model::gemini::GeminiProvider`).
+    Gemini,
+    /// Vertex generateContent with project/location addressing. Built-in
+    /// only: it needs `VERTEX_PROJECT_ID`/`VERTEX_LOCATION` resolution that
+    /// a settings.json entry has no way to express.
+    Vertex,
+    /// Bedrock Converse with SigV4. Built-in only, same reasoning.
+    Bedrock,
+}
+
+impl Dialect {
+    /// Human-readable label for `stella config` / `stella models`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Dialect::OpenaiCompatible => "OpenAI-compatible",
+            Dialect::OpenaiResponses => "OpenAI Responses",
+            Dialect::Anthropic => "Anthropic Messages",
+            Dialect::Gemini | Dialect::Vertex => "Gemini generateContent",
+            Dialect::Bedrock => "Bedrock Converse",
+        }
+    }
 }
 
 /// All supported providers, in preference order. Order matters twice over:
@@ -39,6 +86,8 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         display_name: "Z.ai (GLM 5.2)",
         default_model: "glm-5.2",
         base_url: "https://api.z.ai/api/paas/v4",
+        dialect: Dialect::OpenaiCompatible,
+        seeded: true,
     },
     ProviderConfig {
         id: "anthropic",
@@ -47,6 +96,8 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         display_name: "Anthropic (Claude)",
         default_model: "claude-fable-5",
         base_url: "https://api.anthropic.com",
+        dialect: Dialect::Anthropic,
+        seeded: true,
     },
     ProviderConfig {
         id: "openai",
@@ -55,6 +106,8 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         display_name: "OpenAI (GPT)",
         default_model: "gpt-5.5",
         base_url: "https://api.openai.com/v1",
+        dialect: Dialect::OpenaiResponses,
+        seeded: true,
     },
     ProviderConfig {
         id: "xai",
@@ -63,6 +116,8 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         display_name: "xAI (Grok)",
         default_model: "grok-4",
         base_url: "https://api.x.ai/v1",
+        dialect: Dialect::OpenaiCompatible,
+        seeded: true,
     },
     ProviderConfig {
         id: "deepseek",
@@ -71,6 +126,8 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         display_name: "DeepSeek",
         default_model: "deepseek-chat",
         base_url: "https://api.deepseek.com/v1",
+        dialect: Dialect::OpenaiCompatible,
+        seeded: true,
     },
     ProviderConfig {
         id: "gemini",
@@ -86,6 +143,8 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         // (`…/v1beta/openai`) served by the generic Chat Completions
         // adapter as a stand-in until the native adapter existed.
         base_url: "https://generativelanguage.googleapis.com/v1beta",
+        dialect: Dialect::Gemini,
+        seeded: true,
     },
     ProviderConfig {
         id: "openrouter",
@@ -94,6 +153,8 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         display_name: "OpenRouter",
         default_model: "auto",
         base_url: "https://openrouter.ai/api/v1",
+        dialect: Dialect::OpenaiCompatible,
+        seeded: true,
     },
     // Vertex and Bedrock are appended LAST so auto-detection (the no-`--model`
     // path picks the first provider with a resolvable credential) never
@@ -116,6 +177,8 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         // Display anchor: the real endpoint is project/location-scoped and
         // built per request by the adapter.
         base_url: "https://aiplatform.googleapis.com",
+        dialect: Dialect::Vertex,
+        seeded: true,
     },
     ProviderConfig {
         id: "bedrock",
@@ -130,6 +193,8 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         // (`bedrock-runtime.<AWS_REGION>.amazonaws.com`), built per request
         // by the adapter.
         base_url: "https://bedrock-runtime.<AWS_REGION>.amazonaws.com",
+        dialect: Dialect::Bedrock,
+        seeded: true,
     },
 ];
 
@@ -147,7 +212,138 @@ pub static LOCAL_PROVIDER: ProviderConfig = ProviderConfig {
     display_name: "Local (OpenAI-compatible)",
     default_model: "",
     base_url: "",
+    dialect: Dialect::OpenaiCompatible,
+    seeded: false,
 };
+
+/// Leak a string into a `&'static str`. `ProviderConfig` is `&'static str`
+/// throughout (it is almost always one of the static [`PROVIDERS`] rows);
+/// settings-defined providers are synthesized ONCE at startup, so leaking
+/// their handful of strings trades a few bytes for keeping every downstream
+/// consumer of `ProviderConfig` untouched.
+fn leak(s: &str) -> &'static str {
+    Box::leak(s.to_owned().into_boxed_str())
+}
+
+/// The env var a config-defined provider reads its credential from when the
+/// entry doesn't name one: `<ID>_API_KEY`, uppercased, with anything outside
+/// `[A-Za-z0-9]` folded to `_` (`my-gateway` → `MY_GATEWAY_API_KEY`).
+fn derived_env_var(id: &str) -> String {
+    let mut var: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    var.push_str("_API_KEY");
+    var
+}
+
+/// A built-in provider with any settings.json override applied: display
+/// name, base URL, and default model swap in place; `api_key_env` becomes
+/// the primary credential var (the original demotes to an alias, so plain
+/// `ANTHROPIC_API_KEY` keeps working). `dialect` on a built-in override is
+/// ignored — a built-in's dialect is fixed by its adapter — and the catalog
+/// check stays on (`seeded` is untouched).
+fn effective_builtin(
+    provider: &ProviderConfig,
+    settings: &crate::settings::Settings,
+) -> ProviderConfig {
+    let Some(entry) = settings.providers.get(provider.id) else {
+        return provider.clone();
+    };
+    let mut effective = provider.clone();
+    if let Some(name) = &entry.name {
+        effective.display_name = leak(name);
+    }
+    if let Some(base_url) = &entry.base_url {
+        effective.base_url = leak(base_url);
+    }
+    if let Some(default_model) = &entry.default_model {
+        effective.default_model = leak(default_model);
+    }
+    if let Some(api_key_env) = &entry.api_key_env {
+        let mut aliases = vec![provider.env_var];
+        aliases.extend_from_slice(provider.env_var_aliases);
+        effective.env_var = leak(api_key_env);
+        effective.env_var_aliases = Box::leak(aliases.into_boxed_slice());
+    }
+    effective
+}
+
+/// Synthesize a [`ProviderConfig`] for a settings.json entry whose id is NOT
+/// a built-in provider — the "define a brand-new provider" half of issue
+/// #44. `base_url` is required (there is no default to fall back to);
+/// `dialect` defaults to OpenAI-compatible; the model catalog check is off
+/// (`seeded: false`) because the user's endpoint, not our seed data, is the
+/// authority on which models exist.
+fn custom_provider(
+    id: &str,
+    entry: &crate::settings::ProviderSettings,
+) -> Result<ProviderConfig, String> {
+    if id.is_empty() || id.contains('/') || id.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "settings.json: `{id}` is not a valid provider id (no slashes or whitespace)"
+        ));
+    }
+    if id == LOCAL_PROVIDER.id {
+        return Err(
+            "settings.json: `local` is reserved for --model local/<model> --base-url <url> \
+             and cannot be redefined"
+                .to_string(),
+        );
+    }
+    let dialect = entry.dialect.unwrap_or(Dialect::OpenaiCompatible);
+    if matches!(dialect, Dialect::Vertex | Dialect::Bedrock) {
+        return Err(format!(
+            "settings.json: provider `{id}` requests the `{}` dialect, which is reserved for \
+             the built-in provider (it needs credentials a settings entry cannot express)",
+            if dialect == Dialect::Vertex {
+                "vertex"
+            } else {
+                "bedrock"
+            }
+        ));
+    }
+    let base_url = entry.base_url.as_deref().ok_or_else(|| {
+        format!("settings.json: provider `{id}` is not built-in, so it must declare `base_url`")
+    })?;
+    Ok(ProviderConfig {
+        id: leak(id),
+        env_var: leak(
+            entry
+                .api_key_env
+                .clone()
+                .unwrap_or_else(|| derived_env_var(id))
+                .as_str(),
+        ),
+        env_var_aliases: &[],
+        display_name: leak(entry.name.as_deref().unwrap_or(id)),
+        default_model: leak(entry.default_model.as_deref().unwrap_or("")),
+        base_url: leak(base_url),
+        dialect,
+        seeded: false,
+    })
+}
+
+/// Every selectable provider id, for error messages: built-ins, `local`,
+/// then config-defined ids.
+fn all_provider_ids(settings: &crate::settings::Settings) -> Vec<&str> {
+    let mut ids: Vec<&str> = PROVIDERS.iter().map(|p| p.id).collect();
+    ids.push(LOCAL_PROVIDER.id);
+    ids.extend(
+        settings
+            .providers
+            .keys()
+            .map(String::as_str)
+            .filter(|id| !PROVIDERS.iter().any(|p| p.id == *id) && *id != LOCAL_PROVIDER.id),
+    );
+    ids
+}
 
 /// Resolved configuration: which provider, which model, which API key.
 ///
@@ -199,6 +395,26 @@ impl Config {
     ) -> Result<Self, String> {
         let workspace_root =
             env::current_dir().map_err(|e| format!("cannot determine workspace root: {e}"))?;
+        let settings = crate::settings::Settings::load(&workspace_root)?;
+        Self::load_with_settings(
+            model_override,
+            api_key_override,
+            base_url_override,
+            &settings,
+            workspace_root,
+        )
+    }
+
+    /// [`Config::load`] over an already-merged [`Settings`] value — the
+    /// seam tests use to exercise provider resolution without touching
+    /// `$HOME`, `/etc`, or the real scope chain.
+    fn load_with_settings(
+        model_override: Option<&str>,
+        api_key_override: Option<&str>,
+        base_url_override: Option<&str>,
+        settings: &crate::settings::Settings,
+        workspace_root: std::path::PathBuf,
+    ) -> Result<Self, String> {
         let mut credentials_file = CredentialsFile::load_default().map_err(|e| {
             format!("~/.config/stella/credentials.toml exists but could not be read: {e}")
         })?;
@@ -210,25 +426,46 @@ impl Config {
             let (provider_id, model_id) = match model_spec.split_once('/') {
                 Some((p, m)) => (p, m.to_string()),
                 None => {
-                    // Just a model slug — find which provider has it.
-                    let provider = PROVIDERS
-                        .iter()
-                        .find(|p| p.default_model == model_spec)
-                        .ok_or_else(|| {
-                            format!(
-                                "model `{model_spec}` not recognized — use provider/model_id format (e.g. zai/glm-5.2)\navailable providers: {}",
-                                { let v: Vec<&str> = PROVIDERS.iter().map(|p| p.id).collect(); v.join(", ") }
-                            )
-                        })?;
-                    return Self::resolve(
-                        provider,
-                        model_spec.to_string(),
-                        api_key_override,
-                        base_url_override,
-                        &mut credentials_file,
-                        &workspace_root,
-                        true,
-                    );
+                    // Just a model slug — find which provider has it:
+                    // built-in defaults first, then config-defined ones.
+                    if let Some(provider) = PROVIDERS.iter().find(|p| p.default_model == model_spec)
+                    {
+                        let provider = effective_builtin(provider, settings);
+                        let settings_key = settings
+                            .providers
+                            .get(provider.id)
+                            .and_then(|e| e.api_key.clone());
+                        return Self::resolve(
+                            &provider,
+                            model_spec.to_string(),
+                            api_key_override,
+                            base_url_override,
+                            settings_key.as_deref(),
+                            &mut credentials_file,
+                            &workspace_root,
+                            true,
+                        );
+                    }
+                    if let Some((id, entry)) = settings.providers.iter().find(|(id, e)| {
+                        !PROVIDERS.iter().any(|p| p.id == id.as_str())
+                            && e.default_model.as_deref() == Some(model_spec)
+                    }) {
+                        let provider = custom_provider(id, entry)?;
+                        return Self::resolve(
+                            &provider,
+                            model_spec.to_string(),
+                            api_key_override,
+                            base_url_override,
+                            entry.api_key.as_deref(),
+                            &mut credentials_file,
+                            &workspace_root,
+                            true,
+                        );
+                    }
+                    return Err(format!(
+                        "model `{model_spec}` not recognized — use provider/model_id format (e.g. zai/glm-5.2)\navailable providers: {}",
+                        all_provider_ids(settings).join(", ")
+                    ));
                 }
             };
 
@@ -260,26 +497,45 @@ impl Config {
                 });
             }
 
-            let provider = PROVIDERS
-                .iter()
-                .find(|p| p.id == provider_id)
-                .ok_or_else(|| {
-                    format!("unknown provider `{provider_id}` — available: {}", {
-                        let mut v: Vec<&str> = PROVIDERS.iter().map(|p| p.id).collect();
-                        v.push(LOCAL_PROVIDER.id);
-                        v.join(", ")
-                    })
-                })?;
+            if let Some(provider) = PROVIDERS.iter().find(|p| p.id == provider_id) {
+                let provider = effective_builtin(provider, settings);
+                let settings_key = settings
+                    .providers
+                    .get(provider_id)
+                    .and_then(|e| e.api_key.clone());
+                return Self::resolve(
+                    &provider,
+                    model_id,
+                    api_key_override,
+                    base_url_override,
+                    settings_key.as_deref(),
+                    &mut credentials_file,
+                    &workspace_root,
+                    true,
+                );
+            }
 
-            return Self::resolve(
-                provider,
-                model_id,
-                api_key_override,
-                base_url_override,
-                &mut credentials_file,
-                &workspace_root,
-                true,
-            );
+            // Not built-in: a settings.json entry can define it outright
+            // (issue #44 — Together, Fireworks, a private gateway, …).
+            if let Some(entry) = settings.providers.get(provider_id) {
+                let provider = custom_provider(provider_id, entry)?;
+                return Self::resolve(
+                    &provider,
+                    model_id,
+                    api_key_override,
+                    base_url_override,
+                    entry.api_key.as_deref(),
+                    &mut credentials_file,
+                    &workspace_root,
+                    true,
+                );
+            }
+
+            return Err(format!(
+                "unknown provider `{provider_id}` — available: {}\n(define new providers in \
+                 settings.json under `providers.<id>` with a `base_url`)",
+                all_provider_ids(settings).join(", ")
+            ));
         }
 
         // A bare `--api-key` with no `--model` is ambiguous: the key doesn't
@@ -294,17 +550,66 @@ impl Config {
         }
 
         // No --model: pick the first provider with a resolvable credential
-        // (env var/aliases or credentials file — never prompts here, since
-        // prompting needs a specific provider in mind and the user hasn't
-        // named one). `api_key_override` is `None` on this path (guarded
-        // above), so detection reflects only real ambient credentials.
+        // (env var/aliases, credentials file, or a settings.json `api_key`
+        // — never prompts here, since prompting needs a specific provider
+        // in mind and the user hasn't named one). Built-ins keep their
+        // preference order; config-defined providers follow, alphabetically
+        // (`--model <id>/<model>` pins one regardless). `api_key_override`
+        // is `None` on this path (guarded above), so detection reflects
+        // only real ambient credentials.
         for provider in PROVIDERS {
-            if resolve_provider_key(provider, api_key_override, &credentials_file, false).is_ok() {
+            let provider = effective_builtin(provider, settings);
+            let settings_key = settings
+                .providers
+                .get(provider.id)
+                .and_then(|e| e.api_key.clone());
+            if resolve_provider_key(
+                &provider,
+                api_key_override,
+                settings_key.as_deref(),
+                &credentials_file,
+                false,
+            )
+            .is_ok()
+            {
+                let default_model = provider.default_model.to_string();
                 return Self::resolve(
-                    provider,
-                    provider.default_model.to_string(),
+                    &provider,
+                    default_model,
                     api_key_override,
                     base_url_override,
+                    settings_key.as_deref(),
+                    &mut credentials_file,
+                    &workspace_root,
+                    false,
+                );
+            }
+        }
+        for (id, entry) in &settings.providers {
+            if PROVIDERS.iter().any(|p| p.id == id.as_str()) || id == LOCAL_PROVIDER.id {
+                continue;
+            }
+            // Auto-detection needs a model to pick; an entry without
+            // `default_model` is reachable only via --model <id>/<model>.
+            let Some(default_model) = entry.default_model.clone() else {
+                continue;
+            };
+            let provider = custom_provider(id, entry)?;
+            if resolve_provider_key(
+                &provider,
+                api_key_override,
+                entry.api_key.as_deref(),
+                &credentials_file,
+                false,
+            )
+            .is_ok()
+            {
+                return Self::resolve(
+                    &provider,
+                    default_model,
+                    api_key_override,
+                    base_url_override,
+                    entry.api_key.as_deref(),
                     &mut credentials_file,
                     &workspace_root,
                     false,
@@ -330,18 +635,24 @@ impl Config {
         model_id: String,
         api_key_override: Option<&str>,
         base_url_override: Option<&str>,
+        settings_key: Option<&str>,
         credentials_file: &mut CredentialsFile,
         workspace_root: &std::path::Path,
         interactive: bool,
     ) -> Result<Self, String> {
-        let (key, source) =
-            resolve_provider_key(provider, api_key_override, credentials_file, interactive)
-                .map_err(|e| {
-                    format!(
-                        "could not resolve a credential for {}: {e}",
-                        provider.display_name
-                    )
-                })?;
+        let (key, source) = resolve_provider_key(
+            provider,
+            api_key_override,
+            settings_key,
+            credentials_file,
+            interactive,
+        )
+        .map_err(|e| {
+            format!(
+                "could not resolve a credential for {}: {e}",
+                provider.display_name
+            )
+        })?;
         // "Interactive prompt on first use" (01-product-spec.md §4) implies
         // exactly that — first use. Persist so next invocation resolves via
         // the config-file step instead of prompting again. Best-effort: a
@@ -390,42 +701,88 @@ impl Config {
         println!("  API Key:    {}", self.api_key.redacted_preview().dimmed());
         println!("  Base URL:   {}", self.effective_base_url().dimmed());
         println!("  Workspace:  {}", self.workspace_root.display());
-        println!(
-            "  Dialect:    {}",
-            match self.provider.id {
-                "openai" => "OpenAI Responses",
-                "anthropic" => "Anthropic Messages",
-                "gemini" | "vertex" => "Gemini generateContent",
-                "bedrock" => "Bedrock Converse",
-                _ => "OpenAI-compatible",
-            }
-        );
+        println!("  Dialect:    {}", self.provider.dialect.label());
     }
 }
 
 impl Config {
-    /// Print all available providers/models without needing a resolved config.
+    /// Print all available providers/models without needing a resolved
+    /// config: the built-in table (with any settings.json overrides
+    /// applied), then the config-defined providers. A malformed settings
+    /// file degrades to a warning here — a listing command should still
+    /// list the built-ins.
     pub fn print_available_models() {
+        let settings = match env::current_dir()
+            .map_err(|e| e.to_string())
+            .and_then(|ws| crate::settings::Settings::load(&ws))
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  {} {e}", "warning:".yellow());
+                crate::settings::Settings::default()
+            }
+        };
         println!(
             "{}\n",
             "Stella — Available Providers & Models".cyan().bold()
         );
-        for p in PROVIDERS {
-            let has_key = std::iter::once(&p.env_var)
-                .chain(p.env_var_aliases)
-                .any(|var| env::var(var).map(|v| !v.is_empty()).unwrap_or(false));
-            let key_status = if has_key {
+        let key_status = |p: &ProviderConfig, settings_key: bool| {
+            let has_key = settings_key
+                || std::iter::once(&p.env_var)
+                    .chain(p.env_var_aliases)
+                    .any(|var| env::var(var).map(|v| !v.is_empty()).unwrap_or(false));
+            if has_key {
                 "✓ configured".green()
             } else {
                 "✗ no key".dimmed()
-            };
+            }
+        };
+        for p in PROVIDERS {
+            let p = effective_builtin(p, &settings);
+            let settings_key = settings
+                .providers
+                .get(p.id)
+                .and_then(|e| e.api_key.as_deref())
+                .is_some_and(|k| !k.is_empty());
             println!(
                 "  {} {}/{}  {}  [{}]",
-                key_status,
+                key_status(&p, settings_key),
                 p.id.bright_blue(),
                 p.default_model.bright_white(),
                 p.display_name,
                 p.base_url.dimmed(),
+            );
+        }
+        let mut printed_header = false;
+        for (id, entry) in &settings.providers {
+            if PROVIDERS.iter().any(|p| p.id == id.as_str()) || id == LOCAL_PROVIDER.id {
+                continue;
+            }
+            let p = match custom_provider(id, entry) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("  {} {e}", "warning:".yellow());
+                    continue;
+                }
+            };
+            if !printed_header {
+                println!("\n  {}", "Config-defined providers (settings.json):".bold());
+                printed_header = true;
+            }
+            let settings_key = entry.api_key.as_deref().is_some_and(|k| !k.is_empty());
+            println!(
+                "  {} {}/{}  {}  [{}] ({})",
+                key_status(&p, settings_key),
+                p.id.bright_blue(),
+                if p.default_model.is_empty() {
+                    "<model>"
+                } else {
+                    p.default_model
+                }
+                .bright_white(),
+                p.display_name,
+                p.base_url.dimmed(),
+                p.dialect.label().dimmed(),
             );
         }
         println!("\n  Use --model provider/model_id to pin a specific model.");
@@ -438,13 +795,17 @@ impl Config {
 }
 
 /// The provider-aware credential chain: CLI flag -> primary env var ->
-/// alias env vars -> credentials file -> interactive prompt. Wraps
-/// `ApiKey::resolve` (which owns everything except aliases) so alias env
-/// vars slot in at exactly env-var precedence — after the primary var,
-/// before the credentials file.
+/// alias env vars -> settings.json `api_key` -> credentials file ->
+/// interactive prompt. Wraps `ApiKey::resolve` (which owns everything
+/// except aliases and the settings literal) so alias env vars slot in at
+/// exactly env-var precedence — after the primary var, before the settings
+/// literal. A settings `api_key` outranks the credentials file because it
+/// is explicit, scope-merged configuration; the credentials file is the
+/// store interactive prompts write into.
 fn resolve_provider_key(
     provider: &ProviderConfig,
     api_key_override: Option<&str>,
+    settings_key: Option<&str>,
     credentials_file: &CredentialsFile,
     interactive: bool,
 ) -> Result<(ApiKey, stella_model::credential::CredentialSource), CredentialError> {
@@ -463,12 +824,15 @@ fn resolve_provider_key(
             Ok((key, source))
         }
         // The chain fell through to the credentials file — but an alias env
-        // var still outranks the file.
+        // var, or a settings.json literal, still outranks the file.
         Ok((key, source)) => {
             for alias in provider.env_var_aliases {
                 if let Ok(alias_key) = ApiKey::from_env(alias) {
                     return Ok((alias_key, CredentialSource::EnvVar));
                 }
+            }
+            if let Some(settings_key) = settings_key.filter(|k| !k.is_empty()) {
+                return Ok((ApiKey::new(settings_key), CredentialSource::ConfigFile));
             }
             Ok((key, source))
         }
@@ -481,6 +845,9 @@ fn resolve_provider_key(
                     Err(err @ CredentialError::Empty { .. }) => return Err(err),
                     Err(_) => {}
                 }
+            }
+            if let Some(settings_key) = settings_key.filter(|k| !k.is_empty()) {
+                return Ok((ApiKey::new(settings_key), CredentialSource::ConfigFile));
             }
             // Nothing anywhere — rerun the full chain with the caller's
             // interactivity so the prompt step can fire when allowed.
@@ -529,17 +896,62 @@ pub fn discover_configured_providers() -> Vec<ConfiguredProvider> {
     else {
         return Vec::new();
     };
-    PROVIDERS
+    // Same degradation posture for settings: judge routing is best-effort,
+    // so an unreadable settings.json costs the config-defined providers,
+    // never the built-ins. (`Config::load` is where a bad file is loud.)
+    let settings = env::current_dir()
+        .ok()
+        .and_then(|ws| crate::settings::Settings::load(&ws).ok())
+        .unwrap_or_default();
+
+    let mut configured: Vec<ConfiguredProvider> = PROVIDERS
         .iter()
         .filter_map(|provider| {
-            resolve_provider_key(provider, None, &credentials_file, false)
-                .ok()
-                .map(|(api_key, _source)| ConfiguredProvider {
-                    config: provider.clone(),
-                    api_key,
-                })
+            let provider = effective_builtin(provider, &settings);
+            let settings_key = settings
+                .providers
+                .get(provider.id)
+                .and_then(|e| e.api_key.clone());
+            resolve_provider_key(
+                &provider,
+                None,
+                settings_key.as_deref(),
+                &credentials_file,
+                false,
+            )
+            .ok()
+            .map(|(api_key, _source)| ConfiguredProvider {
+                config: provider,
+                api_key,
+            })
         })
-        .collect()
+        .collect();
+    for (id, entry) in &settings.providers {
+        if PROVIDERS.iter().any(|p| p.id == id.as_str()) || id == LOCAL_PROVIDER.id {
+            continue;
+        }
+        // The judge router needs a model to route to — an entry without
+        // `default_model` can't serve as a judge.
+        if entry.default_model.as_deref().unwrap_or("").is_empty() {
+            continue;
+        }
+        let Ok(provider) = custom_provider(id, entry) else {
+            continue;
+        };
+        if let Ok((api_key, _)) = resolve_provider_key(
+            &provider,
+            None,
+            entry.api_key.as_deref(),
+            &credentials_file,
+            false,
+        ) {
+            configured.push(ConfiguredProvider {
+                config: provider,
+                api_key,
+            });
+        }
+    }
+    configured
 }
 
 #[cfg(test)]
@@ -592,6 +1004,8 @@ mod tests {
             display_name: "Alias Test",
             default_model: "m",
             base_url: "",
+            dialect: Dialect::OpenaiCompatible,
+            seeded: false,
         };
         // SAFETY: test-only env mutation, unique var names per test.
         unsafe {
@@ -604,7 +1018,7 @@ mod tests {
         )))
         .unwrap();
 
-        let (key, source) = resolve_provider_key(&provider, None, &file, false).unwrap();
+        let (key, source) = resolve_provider_key(&provider, None, None, &file, false).unwrap();
         assert_eq!(key.reveal(), "sk-from-alias");
         assert_eq!(source, stella_model::credential::CredentialSource::EnvVar);
 
@@ -628,6 +1042,200 @@ mod tests {
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains(secret), "Config Debug leaked the key: {dbg}");
         assert!(dbg.contains("redacted"));
+    }
+
+    /// Helper: a Settings value parsed from JSON, as the scope-merge would
+    /// produce it — the seam for exercising resolution without touching
+    /// `$HOME`, `/etc`, or a real workspace.
+    fn settings_from(json: &str) -> crate::settings::Settings {
+        serde_json::from_str(json).expect("test settings JSON must parse")
+    }
+
+    #[test]
+    fn a_settings_defined_provider_resolves_via_model_flag_with_its_literal_key() {
+        // The issue #44 acceptance criterion: a provider that is NOT
+        // built-in, added purely via settings.json, usable via
+        // --model <id>/<model> with no code change.
+        let settings = settings_from(
+            r#"{"providers": {"together": {
+                "name": "Together AI",
+                "base_url": "https://api.together.xyz/v1",
+                "api_key": "sk-together-test",
+                "default_model": "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+            }}}"#,
+        );
+        let cfg = Config::load_with_settings(
+            Some("together/meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+            None,
+            None,
+            &settings,
+            std::path::PathBuf::from("/tmp/ws"),
+        )
+        .expect("config-defined provider should resolve");
+        assert_eq!(cfg.provider.id, "together");
+        assert_eq!(cfg.provider.display_name, "Together AI");
+        assert_eq!(cfg.model_id, "meta-llama/Llama-3.3-70B-Instruct-Turbo");
+        assert_eq!(cfg.effective_base_url(), "https://api.together.xyz/v1");
+        assert_eq!(cfg.api_key.reveal(), "sk-together-test");
+        assert_eq!(cfg.provider.dialect, Dialect::OpenaiCompatible);
+        assert!(
+            !cfg.provider.seeded,
+            "config-defined providers must bypass the catalog check"
+        );
+    }
+
+    #[test]
+    fn a_custom_provider_without_base_url_is_a_named_error() {
+        let settings = settings_from(r#"{"providers": {"fireworks": {"api_key": "sk-x"}}}"#);
+        let err = Config::load_with_settings(
+            Some("fireworks/some-model"),
+            None,
+            None,
+            &settings,
+            std::path::PathBuf::from("/tmp/ws"),
+        )
+        .unwrap_err();
+        assert!(err.contains("fireworks"), "{err}");
+        assert!(err.contains("base_url"), "{err}");
+    }
+
+    #[test]
+    fn custom_providers_cannot_claim_the_vertex_or_bedrock_dialects() {
+        let settings = settings_from(
+            r#"{"providers": {"myvertex": {
+                "base_url": "https://example.com",
+                "dialect": "vertex"
+            }}}"#,
+        );
+        let err = Config::load_with_settings(
+            Some("myvertex/some-model"),
+            None,
+            None,
+            &settings,
+            std::path::PathBuf::from("/tmp/ws"),
+        )
+        .unwrap_err();
+        assert!(err.contains("reserved for the built-in provider"), "{err}");
+    }
+
+    #[test]
+    fn a_settings_override_reshapes_a_builtin_without_changing_its_dialect() {
+        // The pre-#44 override use case (e.g. the Z.ai coding plan): move a
+        // built-in's base URL and key out of provider-specific env vars.
+        let settings = settings_from(
+            r#"{"providers": {"zai": {
+                "name": "ZAI Provider",
+                "base_url": "https://api.z.ai/api/coding/paas/v4"
+            }}}"#,
+        );
+        // Key via --api-key (outranks everything) so this test can't be
+        // perturbed by an ambient ZAI_API_KEY on the host.
+        let cfg = Config::load_with_settings(
+            Some("zai/glm-5.2"),
+            Some("sk-cli-flag"),
+            None,
+            &settings,
+            std::path::PathBuf::from("/tmp/ws"),
+        )
+        .expect("built-in override should resolve");
+        assert_eq!(cfg.provider.id, "zai");
+        assert_eq!(cfg.provider.display_name, "ZAI Provider");
+        assert_eq!(
+            cfg.effective_base_url(),
+            "https://api.z.ai/api/coding/paas/v4"
+        );
+        assert_eq!(cfg.api_key.reveal(), "sk-cli-flag");
+        assert_eq!(cfg.provider.dialect, Dialect::OpenaiCompatible);
+        assert!(
+            cfg.provider.seeded,
+            "built-in overrides keep the catalog check"
+        );
+    }
+
+    #[test]
+    fn env_var_outranks_the_settings_literal_key() {
+        // Chain order: env var above settings.json api_key. Unique var name
+        // so parallel tests can't race on shared env state.
+        let settings = settings_from(
+            r#"{"providers": {"envrank": {
+                "base_url": "https://envrank.example/v1",
+                "api_key": "sk-from-settings",
+                "api_key_env": "STELLA_TEST_ENVRANK_KEY",
+                "default_model": "m1"
+            }}}"#,
+        );
+        // SAFETY: test-only env mutation, unique var name per test.
+        unsafe {
+            std::env::set_var("STELLA_TEST_ENVRANK_KEY", "sk-from-env");
+        }
+        let cfg = Config::load_with_settings(
+            Some("envrank/m1"),
+            None,
+            None,
+            &settings,
+            std::path::PathBuf::from("/tmp/ws"),
+        )
+        .unwrap();
+        assert_eq!(cfg.api_key.reveal(), "sk-from-env");
+        unsafe {
+            std::env::remove_var("STELLA_TEST_ENVRANK_KEY");
+        }
+    }
+
+    #[test]
+    fn a_bare_slug_matches_a_custom_providers_default_model() {
+        let settings = settings_from(
+            r#"{"providers": {"slugmatch": {
+                "base_url": "https://slugmatch.example/v1",
+                "api_key": "sk-slug",
+                "default_model": "totally-custom-slug"
+            }}}"#,
+        );
+        let cfg = Config::load_with_settings(
+            Some("totally-custom-slug"),
+            None,
+            None,
+            &settings,
+            std::path::PathBuf::from("/tmp/ws"),
+        )
+        .unwrap();
+        assert_eq!(cfg.provider.id, "slugmatch");
+        assert_eq!(cfg.model_id, "totally-custom-slug");
+    }
+
+    #[test]
+    fn discovery_style_resolution_accepts_the_settings_literal_key() {
+        // resolve_provider_key with a settings literal and nothing else:
+        // resolves non-interactively as ConfigFile — this is what puts
+        // config-defined providers into auto-detection and judge discovery.
+        let provider = ProviderConfig {
+            id: "settings-key-test",
+            env_var: "STELLA_TEST_SETTINGS_KEY_UNSET",
+            env_var_aliases: &[],
+            display_name: "Settings Key Test",
+            default_model: "m",
+            base_url: "https://x.example/v1",
+            dialect: Dialect::OpenaiCompatible,
+            seeded: false,
+        };
+        let file = CredentialsFile::load(std::env::temp_dir().join(format!(
+            "stella-test-settings-key-credentials-{}.toml",
+            std::process::id()
+        )))
+        .unwrap();
+        let (key, source) =
+            resolve_provider_key(&provider, None, Some("sk-settings"), &file, false).unwrap();
+        assert_eq!(key.reveal(), "sk-settings");
+        assert_eq!(
+            source,
+            stella_model::credential::CredentialSource::ConfigFile
+        );
+    }
+
+    #[test]
+    fn derived_env_var_uppercases_and_folds_punctuation() {
+        assert_eq!(derived_env_var("together"), "TOGETHER_API_KEY");
+        assert_eq!(derived_env_var("my-gateway"), "MY_GATEWAY_API_KEY");
     }
 
     #[test]

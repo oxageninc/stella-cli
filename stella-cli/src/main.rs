@@ -22,6 +22,7 @@ mod config;
 mod domains;
 mod interactive;
 mod memory;
+mod settings;
 mod tui;
 
 use std::process::ExitCode;

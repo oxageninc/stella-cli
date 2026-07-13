@@ -1138,8 +1138,7 @@ async fn run_goal_turn(
 /// called (an xAI 401 must never read "Z.ai rejected the API key").
 fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
     build_provider_parts(
-        cfg.provider.id,
-        cfg.provider.display_name,
+        &cfg.provider,
         &cfg.model_id,
         // `cfg.api_key` is already an `ApiKey` (H3) — clone it rather than
         // reconstructing one from a revealed string.
@@ -1159,37 +1158,44 @@ fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
 /// region/project-scoped URLs themselves). See [`build_provider`]'s note on
 /// the catalog check and the shared Chat Completions arm.
 fn build_provider_parts(
-    provider_id: &str,
-    display_name: &str,
+    provider_config: &crate::config::ProviderConfig,
     model_id: &str,
     api_key: ApiKey,
     effective_base_url: String,
     base_url_override: Option<&str>,
 ) -> Result<Box<dyn Provider>, String> {
-    if provider_id != "local" {
+    use crate::config::Dialect;
+
+    let provider_id = provider_config.id;
+    let display_name = provider_config.display_name;
+    // `seeded` is false for `local` and for settings.json-defined providers
+    // (issue #44): their models are whatever the user's endpoint serves —
+    // the anti-phantom-slug rule exists to catch drift in OUR seed data,
+    // not to veto the user's own endpoint.
+    if provider_config.seeded {
         stella_model::catalog::Catalog::seed()
             .resolve_for(provider_id, model_id)
             .map_err(|e| e.to_string())?;
     }
 
-    match provider_id {
-        "openai" => {
+    match provider_config.dialect {
+        Dialect::OpenaiResponses => {
             let provider = stella_model::openai::OpenAiProvider::new(api_key, model_id.to_string())
                 .with_base_url(effective_base_url);
             Ok(Box::new(provider))
         }
-        "anthropic" => {
+        Dialect::Anthropic => {
             let provider =
                 stella_model::anthropic::AnthropicProvider::new(api_key, model_id.to_string())
                     .with_base_url(effective_base_url);
             Ok(Box::new(provider))
         }
-        "gemini" => {
+        Dialect::Gemini => {
             let provider = stella_model::gemini::GeminiProvider::new(api_key, model_id.to_string())
                 .with_base_url(effective_base_url);
             Ok(Box::new(provider))
         }
-        "vertex" => {
+        Dialect::Vertex => {
             // The access token is `api_key` (VERTEX_ACCESS_TOKEN via the
             // credential chain); project and location are Vertex-specific
             // addressing, resolved here with named errors rather than
@@ -1218,7 +1224,7 @@ fn build_provider_parts(
             }
             Ok(Box::new(provider))
         }
-        "bedrock" => {
+        Dialect::Bedrock => {
             // `api_key` is AWS_ACCESS_KEY_ID via the credential chain; the
             // rest of the standard AWS env set is read here. Secret
             // resolution failure is a named error pointing at the exact
@@ -1250,10 +1256,12 @@ fn build_provider_parts(
             }
             Ok(Box::new(provider))
         }
-        // Z.ai, xAI, DeepSeek, OpenRouter, local — the shared Chat
-        // Completions adapter, re-identified per provider.
-        other => {
-            let label = match other {
+        // Z.ai, xAI, DeepSeek, OpenRouter, local, and config-defined
+        // providers (settings.json) — the shared Chat Completions adapter,
+        // re-identified per provider so its `Provider::id()` and error
+        // messages name the surface actually being called.
+        Dialect::OpenaiCompatible => {
+            let label = match provider_id {
                 "zai" => "Z.ai",
                 "xai" => "xAI",
                 "deepseek" => "DeepSeek",
@@ -1263,7 +1271,7 @@ fn build_provider_parts(
             };
             let provider = stella_model::zai::ZaiProvider::new(api_key, model_id.to_string())
                 .with_base_url(effective_base_url)
-                .with_identity(other, label);
+                .with_identity(provider_id, label);
             Ok(Box::new(provider))
         }
     }
@@ -1347,8 +1355,7 @@ fn resolve_cross_family_judge(
         .iter()
         .find(|c| c.config.id == decision.model_ref.provider)?;
     let judge = build_provider_parts(
-        entry.config.id,
-        entry.config.display_name,
+        &entry.config,
         &decision.model_ref.model_id,
         entry.api_key.clone(),
         entry.config.base_url.to_string(),
@@ -1568,6 +1575,11 @@ mod tests {
                 display_name: "Faux (unbuildable)",
                 default_model: "faux-model-not-in-catalog",
                 base_url: "http://localhost:0",
+                dialect: crate::config::Dialect::OpenaiCompatible,
+                // Seeded on purpose: the catalog check must reject the
+                // phantom slug, which is exactly the build failure this
+                // test needs.
+                seeded: true,
             },
             api_key: ApiKey::new("dummy-key-unused-offline"),
         };
