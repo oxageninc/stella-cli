@@ -40,7 +40,7 @@ clap = { version = "4", features = ["derive", "env"] }
 colored = "3"
 indicatif = "0.18"
 libc = "0.2"
-rand = "0.9"
+rand = "0.10"
 proptest = "1"
 toml = "0.9"
 rpassword = "7"
