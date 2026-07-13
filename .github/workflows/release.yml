@@ -80,10 +80,14 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          sed -i.bak -E "0,/^version = \"[^\"]*\"/s//version = \"${version}\"/" Cargo.toml
-          rm -f Cargo.toml.bak
+          # Stamp the single [workspace.package] version line. Uses perl, not
+          # `sed -i "0,/re/"`: that address form is GNU-only and SILENTLY
+          # no-ops on the macOS runners (BSD sed), which would ship macOS
+          # binaries reporting the placeholder 0.1.0 version.
+          perl -pi -e "s/^version = \"[^\"]*\"/version = \"${version}\"/" Cargo.toml
           echo "workspace version set to ${version}"
-          grep -m1 '^version = ' Cargo.toml
+          grep -m1 '^version = ' Cargo.toml | grep -q "\"${version}\"" \
+            || { echo "::error::version stamp did not take"; exit 1; }
 
       - name: Build stella
         shell: bash
