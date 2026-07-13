@@ -24,12 +24,18 @@
 //!
 //! # Resilience
 //!
-//! Every MCP call is bounded by a per-call timeout. A dead, hung, or erroring
-//! server yields a `ToolOutput::Error` that *names the server*; it never
-//! poisons sibling servers or the native tools, and it is never an `Err` out
-//! of `execute` (tool failures are model-visible data). There is **no
-//! auto-reconnect**: a server that dies mid-session stays down and its tools
-//! return errors for the rest of the session (see [`crate::stdio`]).
+//! Every MCP call is bounded by a per-call timeout ([`McpClient`] owns it, so
+//! a hang is observable rather than merely cancelled). A dead, hung, or
+//! erroring server yields a `ToolOutput::Error` that *names the server*; it
+//! never poisons sibling servers or the native tools, and it is never an `Err`
+//! out of `execute` (tool failures are model-visible data).
+//!
+//! **Auto-reconnect (bounded backoff).** A server that drops mid-session is
+//! not written off: the next call transparently respawns it (a single blip
+//! self-heals within the turn), and repeated failures back off on an
+//! increasing, capped interval so a long-dead server degrades gracefully
+//! instead of aborting the agent. Per-server state is surfaced by
+//! [`McpToolSet::health`] for a non-fatal CLI/TUI/telemetry diagnostic.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -40,7 +46,7 @@ use serde_json::Value;
 use stella_core::ports::ToolExecutor;
 use stella_protocol::{ToolOutput, ToolSchema};
 
-use crate::client::McpClient;
+use crate::client::{McpClient, ServerHealth};
 use crate::config::McpServerConfig;
 
 /// The tool-namespace prefix.
@@ -60,7 +66,6 @@ pub struct McpToolSet {
     /// reason)`. They advertise no tools but never block the rest.
     failed: Vec<(String, String)>,
     native: Option<Arc<dyn ToolExecutor>>,
-    call_timeout: Duration,
 }
 
 impl McpToolSet {
@@ -102,7 +107,6 @@ impl McpToolSet {
             routes: HashMap::new(),
             failed,
             native: None,
-            call_timeout: timeout,
         };
         set.rebuild_routes();
         set
@@ -137,7 +141,6 @@ impl McpToolSet {
             routes: HashMap::new(),
             failed,
             native: None,
-            call_timeout: DEFAULT_CALL_TIMEOUT,
         };
         set.rebuild_routes();
         set
@@ -150,10 +153,24 @@ impl McpToolSet {
         self
     }
 
-    /// Override the per-call timeout (default [`DEFAULT_CALL_TIMEOUT`]).
+    /// Override the per-call timeout (default [`DEFAULT_CALL_TIMEOUT`]),
+    /// propagating it to every connected server so the client owns the bound
+    /// (and can treat a hang as a reconnect trigger).
     pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
-        self.call_timeout = timeout;
+        for client in &mut self.clients {
+            client.set_call_timeout(timeout);
+        }
         self
+    }
+
+    /// Per-server connection health, for a non-fatal CLI/TUI/telemetry
+    /// diagnostic (which servers are live, reconnecting, or backing off).
+    pub async fn health(&self) -> Vec<ServerHealth> {
+        let mut out = Vec::with_capacity(self.clients.len());
+        for client in &self.clients {
+            out.push(client.health().await);
+        }
+        out
     }
 
     /// Servers that were not connected, as `(name, reason)`.
@@ -185,24 +202,18 @@ impl McpToolSet {
         }
     }
 
-    /// Route one MCP call, bounded by the per-call timeout, mapping every
-    /// failure mode to a server-named `ToolOutput::Error`.
+    /// Route one MCP call, mapping every failure mode to a server-named
+    /// `ToolOutput::Error`. The per-call timeout and auto-reconnect now live in
+    /// [`McpClient::call_tool`] (so a hang can trigger a reconnect); this layer
+    /// only names the server and turns an `Err` into model-visible data.
     async fn execute_mcp(&self, client: &McpClient, raw_tool: &str, input: &Value) -> ToolOutput {
-        let call = client.call_tool(raw_tool, input.clone());
-        match tokio::time::timeout(self.call_timeout, call).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) => ToolOutput::Error {
+        match client.call_tool(raw_tool, input.clone()).await {
+            Ok(output) => output,
+            Err(err) => ToolOutput::Error {
                 message: format!(
                     "mcp server `{}` failed calling `{raw_tool}`: {}",
                     client.name(),
                     err.user_message()
-                ),
-            },
-            Err(_) => ToolOutput::Error {
-                message: format!(
-                    "mcp server `{}` timed out after {}ms calling `{raw_tool}`",
-                    client.name(),
-                    self.call_timeout.as_millis()
                 ),
             },
         }

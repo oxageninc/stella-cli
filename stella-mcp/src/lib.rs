@@ -43,7 +43,10 @@
 //!   child ([`stdio`]).
 //! - **Resilience.** Per-call timeouts; a dead/hung server yields a
 //!   server-named `ToolOutput::Error` and never poisons its siblings or the
-//!   native tools ([`toolset`]).
+//!   native tools. A dropped connection **auto-reconnects with bounded
+//!   backoff** — a single blip self-heals within the turn, and a long-dead
+//!   server degrades gracefully instead of aborting the agent ([`toolset`],
+//!   [`client`]). Per-server status is exposed via [`McpToolSet::health`].
 
 pub mod client;
 pub mod config;
@@ -55,7 +58,7 @@ pub mod stdio;
 pub mod toolset;
 pub mod transport;
 
-pub use client::{McpClient, McpToolInfo, render_content};
+pub use client::{HealthState, McpClient, McpToolInfo, ServerHealth, render_content};
 pub use config::{McpConfig, McpServerConfig, McpTransport};
 pub use error::McpError;
 pub use http::HttpTransport;
