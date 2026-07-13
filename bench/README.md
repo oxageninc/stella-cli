@@ -102,6 +102,8 @@ Run `python3 bench/run_swebench.py --help` for the full list. Key options:
 | `--instance-id ID` | — | Only this instance id (repeatable). |
 | `--model M` | `anthropic/claude-fable-5` | Passed to `stella --model`. |
 | `--budget USD` | `2.0` | Per-instance USD cap (`stella --budget`). |
+| `--base-url URL` | — | Passed to `stella --base-url`; required for `local/<model>` (Ollama, vLLM, LM Studio, llama.cpp — see [docs/off-grid.md](../docs/off-grid.md)). |
+| `--division D` | auto | Arena division stamped into `summary.json` (`heavyweight`, `featherweight`, `off-grid`, `cross-harness`). `local/<model>` runs auto-stamp `off-grid`. |
 | `--timeout SEC` | `1800` | Per-instance timeout. |
 | `--stella-bin PATH` | auto | `stella` on PATH, else `./target/release/stella`. |
 | `--run-id ID` | auto | Run identifier (default: model + timestamp). |

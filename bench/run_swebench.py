@@ -263,8 +263,27 @@ def collect_patch(workdir: str, exclude_paths: List[str]) -> str:
 # --------------------------------------------------------------------------- #
 # Per-instance execution
 # --------------------------------------------------------------------------- #
-def build_stella_cmd(stella_bin: str, model: str, budget: float, prompt: str) -> List[str]:
-    return [stella_bin, "--model", model, "--budget", str(budget), "run", prompt]
+def build_stella_cmd(
+    stella_bin: str, model: str, budget: float, prompt: str, base_url: Optional[str] = None
+) -> List[str]:
+    cmd = [stella_bin, "--model", model, "--budget", str(budget)]
+    if base_url:
+        cmd.extend(["--base-url", base_url])
+    cmd.extend(["run", prompt])
+    return cmd
+
+
+def detect_division(model: str, base_url: Optional[str]) -> Optional[str]:
+    """The Arena division a run's receipts belong to, when derivable.
+
+    Only Off-grid is mechanically detectable: the `local/<model>` pseudo-
+    provider (any OpenAI-compatible server via --base-url, zero API keys,
+    $0 marginal cost). Heavyweight/Featherweight are model-class claims the
+    harness cannot infer — pass --division explicitly for those.
+    """
+    if model.startswith("local/") and base_url:
+        return "off-grid"
+    return None
 
 
 def describe_plan(
@@ -272,6 +291,7 @@ def describe_plan(
     stella_bin: Optional[str],
     model: str,
     budget: float,
+    base_url: Optional[str],
     timeout: int,
     logs_dir: Path,
     repo_cache: Optional[str],
@@ -287,7 +307,9 @@ def describe_plan(
         if repo_cache
         else f"git clone {clone_url(repo)}"
     )
-    cmd = build_stella_cmd(stella_bin or "<stella-bin>", model, budget, "<problem_statement>")
+    cmd = build_stella_cmd(
+        stella_bin or "<stella-bin>", model, budget, "<problem_statement>", base_url
+    )
     print(f"--- instance: {iid}")
     print(f"    repo         : {repo}")
     print(f"    base_commit  : {base}")
@@ -305,6 +327,7 @@ def run_instance(
     stella_bin: str,
     model: str,
     budget: float,
+    base_url: Optional[str],
     timeout: int,
     logs_dir: Path,
     repo_cache: Optional[str],
@@ -341,7 +364,7 @@ def run_instance(
                     "prediction": None}
 
         # 2) run stella
-        cmd = build_stella_cmd(stella_bin, model, budget, prompt)
+        cmd = build_stella_cmd(stella_bin, model, budget, prompt, base_url)
         env = os.environ.copy()
         env.setdefault("STELLA_BUDGET", str(budget))
         try:
@@ -420,6 +443,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     run = p.add_argument_group("stella invocation")
     run.add_argument("--model", default=DEFAULT_MODEL, help="Provider/model passed to `stella --model`.")
     run.add_argument("--budget", type=float, default=DEFAULT_BUDGET, help="USD budget cap per instance (`stella --budget`).")
+    run.add_argument(
+        "--base-url",
+        default=None,
+        help="Endpoint passed to `stella --base-url` — required for the local/"
+        "<model> pseudo-provider (Ollama, vLLM, LM Studio, llama.cpp server); "
+        "an optional override for hosted providers.",
+    )
+    run.add_argument(
+        "--division",
+        choices=["heavyweight", "featherweight", "off-grid", "cross-harness"],
+        default=None,
+        help="Arena division to stamp into summary.json for the results track. "
+        "Default: auto — `local/<model>` runs are stamped off-grid, hosted "
+        "runs carry no division.",
+    )
     run.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Per-instance timeout in seconds.")
     run.add_argument(
         "--stella-bin",
@@ -469,6 +507,12 @@ def validate_instances(instances: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
+    if args.model.startswith("local/") and not args.base_url:
+        log("error: --model local/<model> needs --base-url "
+            "(e.g. --base-url http://localhost:11434/v1) — see docs/off-grid.md")
+        return 2
+    division = args.division or detect_division(args.model, args.base_url)
+
     run_id = args.run_id or default_run_id(args.model)
     out_base = Path(args.output_dir) / run_id
     logs_dir = out_base / "logs"
@@ -499,12 +543,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"         stella-bin : {stella_bin or '<not found; set --stella-bin>'}")
         print(f"         model      : {args.model}")
         print(f"         budget     : ${args.budget} per instance")
+        print(f"         base-url   : {args.base_url or '<provider default>'}")
+        print(f"         division   : {division or '<none>'}")
         print(f"         instances  : {len(instances)}")
         print()
         for inst in instances:
             describe_plan(
-                inst, stella_bin, args.model, args.budget, args.timeout,
-                logs_dir, args.repo_cache,
+                inst, stella_bin, args.model, args.budget, args.base_url,
+                args.timeout, logs_dir, args.repo_cache,
             )
         print()
         print("DRY RUN complete: no repos cloned, no stella invocations, no files written.")
@@ -537,6 +583,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 stella_bin=stella_bin,
                 model=args.model,
                 budget=args.budget,
+                base_url=args.base_url,
                 timeout=args.timeout,
                 logs_dir=logs_dir,
                 repo_cache=args.repo_cache,
@@ -560,6 +607,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     summary = {
         "run_id": run_id,
         "model_name_or_path": args.model,
+        # The Arena results track: off-grid is auto-stamped for local/<model>
+        # runs; heavyweight/featherweight are explicit claims (--division).
+        "division": division,
+        "base_url": args.base_url,
         "dataset": args.instances or f"{args.dataset_name}:{args.split}",
         "total_selected": total,
         **counts,
