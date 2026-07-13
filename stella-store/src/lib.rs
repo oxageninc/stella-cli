@@ -796,6 +796,7 @@ mod tests {
 
     /// Test-only shorthand: a telemetry row with just the analytics-relevant
     /// fields set.
+    #[allow(clippy::too_many_arguments)]
     fn telemetry(
         step: u64,
         provider: &str,
@@ -812,6 +813,10 @@ mod tests {
             provider: provider.into(),
             model: model.into(),
             input_tokens: input,
+            // This fixture predates drift correction and exercises
+            // usage_stats, which ignores the estimate; 0 = "no estimate
+            // taken".
+            estimated_input_tokens: 0,
             output_tokens: output,
             cache_read_tokens: cache_read,
             cache_miss_tokens: input.saturating_sub(cache_read),
