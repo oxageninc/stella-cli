@@ -16,7 +16,7 @@ use crate::error::ContextError;
 use crate::store::{
     ContextStore, NodeInput, NodeKind, close_edge, currently_valid_edge, edges_as_of,
     embedding_exists, insert_edge, insert_episode, insert_memory, node_by_id, sha256_hex,
-    store_embedding, tag_edge_domains, tag_node_domains, upsert_domain, upsert_node,
+    store_embedding, tag_edge_domains, tag_node_domains, to_hex, upsert_domain, upsert_node,
 };
 
 /// How an episode turned out. Stored as its `as_str` form.
@@ -91,7 +91,7 @@ impl EpisodeInput {
         h.update(self.started_at.as_bytes());
         h.update([0u8]);
         h.update(self.ended_at.as_bytes());
-        format!("epi_{}", &format!("{:x}", h.finalize())[..24])
+        format!("epi_{}", &to_hex(&h.finalize())[..24])
     }
 
     /// The retrievable Episode node mirroring this episode (carries its domains).
@@ -225,7 +225,7 @@ impl MemoryInput {
         h.update(self.kind.as_str().as_bytes());
         h.update([0u8]);
         h.update(self.content.as_bytes());
-        format!("mem_{}", &format!("{:x}", h.finalize())[..24])
+        format!("mem_{}", &to_hex(&h.finalize())[..24])
     }
 
     /// The retrievable Memory node mirroring this memory (carries its domains).

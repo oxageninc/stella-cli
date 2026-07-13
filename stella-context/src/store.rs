@@ -556,11 +556,24 @@ async fn warm_index(
 // batch many of them inside a single transaction.
 // ---------------------------------------------------------------------------
 
+/// Lowercase hex of raw bytes. Replaces `format!("{:x}", digest)`: digest
+/// 0.11 (sha2 0.11) returns an `Output` array that no longer implements
+/// `LowerHex`. Byte-for-byte identical to the old rendering — these hashes
+/// are persisted stable ids, so the encoding must not drift.
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// sha256 hex of a string — the content hash keying embeddings (`L-C2`).
 pub(crate) fn sha256_hex(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
-    format!("{:x}", h.finalize())
+    to_hex(&h.finalize())
 }
 
 fn node_public_id(kind: NodeKind, natural_key: &str) -> String {
@@ -568,7 +581,7 @@ fn node_public_id(kind: NodeKind, natural_key: &str) -> String {
     h.update(kind.as_str().as_bytes());
     h.update([0u8]);
     h.update(natural_key.as_bytes());
-    let hex = format!("{:x}", h.finalize());
+    let hex = to_hex(&h.finalize());
     format!("nod_{}", &hex[..24])
 }
 
