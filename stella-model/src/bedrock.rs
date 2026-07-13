@@ -495,7 +495,7 @@ impl Provider for BedrockProvider {
 /// needs is implemented (POST, empty query string, four signed headers);
 /// growing it further should extend the golden-vector suite in lockstep.
 pub(crate) mod sigv4 {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::{Digest, Sha256};
 
     type HmacSha256 = Hmac<Sha256>;

@@ -50,7 +50,7 @@ notify = "8"
 ratatui = "0.29"
 roxmltree = "0.20"
 rusqlite = { version = "0.32", features = ["bundled"] }
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.11"
 tempfile = "3"
 tree-sitter = "0.25"
