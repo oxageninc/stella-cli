@@ -22,8 +22,8 @@ mod config;
 mod domains;
 mod interactive;
 mod memory;
-mod stats;
 mod settings;
+mod stats;
 mod tui;
 
 use std::process::ExitCode;
@@ -195,7 +195,10 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Some(Command::Stats { format, provider }) => {
             // Reads local telemetry only — works with zero API keys.
-            return stats::run_stats(format, provider.as_deref());
+            // `*format`: this match borrows `&cli.command` (the Tools arm
+            // needs `validate` by ref), so `format` binds as `&StatsFormat`;
+            // it is `Copy`, so deref rather than move.
+            return stats::run_stats(*format, provider.as_deref());
         }
         Some(Command::Version) => {
             println!("stella v{}", env!("CARGO_PKG_VERSION"));
@@ -255,10 +258,14 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Chat => {
             rt()?.block_on(agent::run_interactive(&cfg, cli.budget))?;
         }
-        // Models/Version (and Tools) short-circuit in the first match at the
-        // top of `run` before a provider is resolved; Init is handled by the
-        // caller. Reaching any of them here is impossible.
-        Command::Init | Command::Tools { .. } | Command::Models | Command::Version => {
+        // Models/Stats/Version (and Tools) short-circuit in the first match
+        // at the top of `run` before a provider is resolved; Init is handled
+        // by the caller. Reaching any of them here is impossible.
+        Command::Init
+        | Command::Tools { .. }
+        | Command::Stats { .. }
+        | Command::Models
+        | Command::Version => {
             unreachable!("handled before provider resolution")
         }
         Command::Config => {
