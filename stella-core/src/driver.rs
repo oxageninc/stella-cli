@@ -65,6 +65,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::budget::{BudgetGuard, BudgetOutcome};
 use crate::compaction::compact;
+use crate::estimator::{CalibrationMap, estimate_conversation_tokens};
 use crate::hooks::{HookPayload, HookRunner, Hooks, run_hooks};
 use crate::loop_detect::{LoopDetectionConfig, detect_loop};
 use crate::ports::ToolExecutor;
@@ -81,7 +82,10 @@ pub struct EngineConfig {
     pub retry_policy: RetryPolicy,
     pub loop_detection: LoopDetectionConfig,
     /// Compaction fires once the estimated conversation size exceeds this
-    /// many tokens (`crate::estimator`).
+    /// many tokens (`crate::estimator`). When calibration is attached
+    /// ([`Engine::with_calibration`]) the comparison uses the
+    /// drift-corrected estimate, so this budget is honored in the model's
+    /// own observed tokens rather than raw heuristic tokens.
     pub compaction_budget_tokens: u64,
     /// Hard backstop on step count, independent of loop detection — belt
     /// and suspenders, never the *primary* stuck-loop defense (that's
@@ -150,6 +154,14 @@ pub struct Engine<'a> {
     /// so `new`/`with_sleeper` keep their existing signatures. When `None`,
     /// no hook is ever consulted and the turn path adds zero work.
     hooks: Option<HooksHandle<'a>>,
+    /// Token-drift calibration (`crate::estimator::CalibrationMap`), off by
+    /// default. Attached via [`Engine::with_calibration`]; the caller owns
+    /// the map across turns (and seeds it from persisted telemetry at
+    /// session start), the engine feeds it every committed step's
+    /// (estimated, actual) pair and reads the correction back into the
+    /// compaction decision. When `None` the turn path is exactly the
+    /// uncalibrated engine.
+    pub(crate) calibration: Option<&'a CalibrationMap>,
 }
 
 /// Upper bound on tool calls from one step executing concurrently. Tools
@@ -183,6 +195,7 @@ impl<'a> Engine<'a> {
             sleeper,
             config,
             hooks: None,
+            calibration: None,
         }
     }
 
@@ -195,6 +208,16 @@ impl<'a> Engine<'a> {
     /// anything (the config alone spawns nothing).
     pub fn with_hooks(mut self, hooks: &'a Hooks, runner: &'a dyn HookRunner) -> Self {
         self.hooks = Some(HooksHandle { hooks, runner });
+        self
+    }
+
+    /// Attach token-drift calibration, opt-in and by reference for the same
+    /// reason `run_turn` borrows `messages`: the caller (CLI session, REPL,
+    /// fleet worker) owns state that outlives any single turn — engines are
+    /// constructed per turn, calibration accumulates per session. An engine
+    /// built without this estimates exactly as before.
+    pub fn with_calibration(mut self, calibration: &'a CalibrationMap) -> Self {
+        self.calibration = Some(calibration);
         self
     }
 
@@ -243,12 +266,36 @@ impl<'a> Engine<'a> {
         });
 
         let mut total_cost_usd = 0.0f64;
+        // The model string of the last committed step, for reading the
+        // per-model drift correction. `None` until the first result lands —
+        // `CalibrationMap::factor` then falls back to the session's single
+        // seeded entry.
+        let mut calibration_model: Option<String> = None;
 
         for step in 0..self.config.max_steps {
             // ---- Compaction (before every model call, per the running
             // ---- estimate; L-E3 dedup+evict, stable system prefix — the
             // ---- system message is index 0 and compact() never touches it).
-            if let Some(report) = compact(messages, self.config.compaction_budget_tokens) {
+            //
+            // Drift correction enters here: `compact` compares the RAW
+            // estimate against the budget it is given, so dividing the
+            // configured budget by the correction factor is exactly
+            // comparing the CALIBRATED estimate (raw × factor) against the
+            // configured budget — including the eviction loop's stopping
+            // condition — without threading a factor through compaction's
+            // incremental bookkeeping. A factor > 1 (we under-estimate this
+            // model's tokenizer) shrinks the effective budget and compacts
+            // earlier; the factor's clamp (`crate::estimator`) bounds how
+            // far either way a noisy sample can move this.
+            let compaction_budget = match self.calibration {
+                Some(calibration) => {
+                    (self.config.compaction_budget_tokens as f64
+                        / calibration.factor(calibration_model.as_deref()))
+                        as u64
+                }
+                None => self.config.compaction_budget_tokens,
+            };
+            if let Some(report) = compact(messages, compaction_budget) {
                 let _ = events.send(AgentEvent::Compaction {
                     before_tokens: report.before_tokens,
                     after_tokens: report.after_tokens,
@@ -298,6 +345,12 @@ impl<'a> Engine<'a> {
                 .filter(|s| s.read_only)
                 .map(|s| s.name.clone())
                 .collect();
+            // The raw (uncalibrated) estimate of exactly what this step
+            // sends — recorded against the provider's reported usage below.
+            // Raw, not calibrated: the drift ratio is actual/raw, and
+            // recording a corrected estimate would compound corrections on
+            // every feedback pass.
+            let estimated_input_tokens = estimate_conversation_tokens(messages);
             let messages_snapshot = messages.clone();
             let req_config = &self.config;
             let attempt: RetryAttemptFn = Box::new(move || {
@@ -343,6 +396,21 @@ impl<'a> Engine<'a> {
                 });
             }
 
+            // ---- Drift feedback for the call that just committed: the
+            // ---- provider's reported input tokens (total, cached included
+            // ---- — cached tokens were still real prompt tokens) against
+            // ---- the raw estimate, keyed by the model that actually
+            // ---- served the call. `record` ignores zero-sided pairs, so a
+            // ---- provider omitting usage never poisons the state.
+            if let Some(calibration) = self.calibration {
+                calibration.record(
+                    &result.model,
+                    estimated_input_tokens,
+                    result.usage.input_tokens,
+                );
+            }
+            calibration_model = Some(result.model.clone());
+
             // ---- Telemetry for the call that just committed: exactly one
             // ---- StepUsage per landed step — the metering record.
             let _ = events.send(AgentEvent::StepUsage {
@@ -351,6 +419,7 @@ impl<'a> Engine<'a> {
                 input_tokens: result.usage.input_tokens,
                 output_tokens: result.usage.output_tokens,
                 cached_input_tokens: result.usage.cached_input_tokens,
+                estimated_input_tokens,
                 cost_usd: result.cost_usd,
                 duration_ms: call_duration_ms,
                 retries: retries.len() as u32,
@@ -1450,6 +1519,177 @@ mod tests {
         );
         assert_eq!(usages[0], (0, 1000, 800, 1, 1, 0.0001));
         assert_eq!(usages[1], (1, 1000, 800, 0, 0, 0.0001));
+    }
+
+    // ---- Token-drift calibration -------------------------------------------
+
+    use crate::estimator::CalibrationMap;
+
+    /// A conversation with one old, evictable tool output — the shape
+    /// compaction acts on (the LAST tool message is protected).
+    fn compactable_history() -> Vec<CompletionMessage> {
+        let tool_msg = |call_id: &str, content: String| CompletionMessage {
+            role: MessageRole::Tool,
+            content: String::new(),
+            tool_calls: vec![],
+            tool_results: vec![ToolResult {
+                call_id: call_id.into(),
+                output: ToolOutput::Ok { content },
+            }],
+        };
+        let assistant_with_call = |call_id: &str| CompletionMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                call_id: call_id.into(),
+                name: "bash".into(),
+                input: serde_json::json!({"cmd": call_id}),
+            }],
+            tool_results: vec![],
+        };
+        vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("do things"),
+            assistant_with_call("c1"),
+            tool_msg("c1", "old ".repeat(1000)),
+            assistant_with_call("c2"),
+            tool_msg("c2", "new ".repeat(1000)),
+        ]
+    }
+
+    /// Witness for the feedback loop's read side: the SAME conversation
+    /// under the SAME configured budget compacts only when calibration says
+    /// the raw estimate runs low against this model's tokenizer — the
+    /// compaction decision demonstrably consumes the calibrated estimate,
+    /// not the raw one.
+    #[tokio::test]
+    async fn calibrated_estimate_changes_the_compaction_decision() {
+        let run = |calibrate: bool| async move {
+            let provider = ScriptedProvider {
+                id: "scripted".into(),
+                script: TokioMutex::new(vec![Ok(text_result("done"))]),
+                calls: Arc::new(AtomicU32::new(0)),
+            };
+            let tools = CountingTools {
+                calls: Arc::new(AtomicU32::new(0)),
+            };
+            let sleeper = NoopSleeper;
+            let mut messages = compactable_history();
+            // A budget the RAW estimate just fits under: uncalibrated, no
+            // compaction can fire.
+            let raw = crate::estimator::estimate_conversation_tokens(&messages);
+            let config = EngineConfig {
+                compaction_budget_tokens: raw + 10,
+                ..EngineConfig::default()
+            };
+            // Observed drift: this model's tokenizer reports 2× the char
+            // heuristic (three samples — the minimum for the factor to
+            // apply). Calibrated, the same conversation reads as ~2×(budget)
+            // and must compact.
+            let calibration = CalibrationMap::new();
+            if calibrate {
+                calibration.seed("scripted", &[(1000, 2000), (1000, 2000), (1000, 2000)]);
+            }
+            let engine = Engine::with_sleeper(&provider, &tools, config, &sleeper)
+                .with_calibration(&calibration);
+            let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            drain_events(&mut rx)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compaction { .. }))
+        };
+
+        assert!(
+            !run(false).await,
+            "uncalibrated, the conversation fits the budget — no compaction"
+        );
+        assert!(
+            run(true).await,
+            "with observed 2× drift the calibrated estimate exceeds the budget — \
+             compaction must fire before the model call"
+        );
+    }
+
+    /// Witness for the feedback loop's write side: every committed step
+    /// records its (estimated, actual) pair into the attached calibration —
+    /// keyed by the model that served it — and emits the raw estimate on
+    /// `StepUsage` for persistence.
+    #[tokio::test]
+    async fn each_committed_step_feeds_the_calibration_and_reports_its_estimate() {
+        let with_real_usage = |result: CompletionResultAlias| {
+            let mut result = result;
+            result.usage = CompletionUsage {
+                input_tokens: 4_000,
+                output_tokens: 50,
+                cached_input_tokens: 0,
+            };
+            // Vary each call's input: `tool_call_result` reuses one command,
+            // and three byte-identical bash calls are exactly what
+            // `loop_detect` exists to abort — this test is about the
+            // calibration feed, not the loop breaker.
+            if let Some(call) = result.tool_calls.first_mut() {
+                call.input = serde_json::json!({ "cmd": format!("echo {}", call.call_id) });
+            }
+            result
+        };
+        let provider = ScriptedProvider {
+            id: "scripted".into(),
+            script: TokioMutex::new(vec![
+                Ok(with_real_usage(tool_call_result("call_1", "bash"))),
+                Ok(with_real_usage(tool_call_result("call_2", "bash"))),
+                Ok(with_real_usage(tool_call_result("call_3", "bash"))),
+                Ok(with_real_usage(text_result("done"))),
+            ]),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let tools = CountingTools {
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let sleeper = NoopSleeper;
+        let calibration = CalibrationMap::new();
+        let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper)
+            .with_calibration(&calibration);
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("hi"),
+        ];
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+
+        // Every StepUsage carries the raw pre-call estimate (> 0: the
+        // conversation is never empty).
+        let estimates: Vec<u64> = drain_events(&mut rx)
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::StepUsage {
+                    estimated_input_tokens,
+                    ..
+                } => Some(*estimated_input_tokens),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(estimates.len(), 4);
+        assert!(estimates.iter().all(|&e| e > 0), "{estimates:?}");
+
+        // Four samples of a model reporting far more tokens than the tiny
+        // history estimates: the correction engaged (past min-samples),
+        // pushed up, and stayed inside its clamp — a noisy run can shift
+        // budgeting by at most 2× in either direction.
+        let factor = calibration.factor(Some("scripted"));
+        assert!(
+            factor > 1.0 && factor <= 2.0,
+            "factor must be engaged and bounded, got {factor}"
+        );
+        assert_eq!(
+            calibration.factor(Some("some-other-model")),
+            1.0,
+            "drift is keyed by the model that served the call"
+        );
     }
 
     // ---- Lifecycle hooks wired into the turn path -------------------------

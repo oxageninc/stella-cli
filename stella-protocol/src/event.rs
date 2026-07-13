@@ -103,6 +103,16 @@ pub enum AgentEvent {
         input_tokens: u64,
         output_tokens: u64,
         cached_input_tokens: u64,
+        /// The engine's RAW (uncalibrated) pre-call estimate of the input it
+        /// sent — paired with `input_tokens` this is one drift sample, the
+        /// feedback that calibrates future estimates per model
+        /// (`stella-core::estimator::Calibration`). Raw by contract:
+        /// consumers rebuild the correction from these pairs, and a
+        /// corrected estimate here would compound the correction on every
+        /// round trip. `0` means no estimate was taken (pre-drift emitters —
+        /// hence `serde(default)`, so old streams still parse).
+        #[serde(default)]
+        estimated_input_tokens: u64,
         cost_usd: f64,
         duration_ms: u64,
         retries: u32,
@@ -535,6 +545,7 @@ mod tests {
             input_tokens: 12_000,
             output_tokens: 450,
             cached_input_tokens: 9_000,
+            estimated_input_tokens: 11_200,
             cost_usd: 0.0042,
             duration_ms: 1_830,
             retries: 1,
@@ -547,14 +558,39 @@ mod tests {
             AgentEvent::StepUsage {
                 step,
                 cached_input_tokens,
+                estimated_input_tokens,
                 retries,
                 tool_calls,
                 ..
             } => {
                 assert_eq!(step, 3);
                 assert_eq!(cached_input_tokens, 9_000);
+                assert_eq!(estimated_input_tokens, 11_200);
                 assert_eq!(retries, 1);
                 assert_eq!(tool_calls, 4);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_usage_from_a_pre_drift_stream_still_parses() {
+        // Backward compatibility: a `step_usage` line serialized before
+        // `estimated_input_tokens` existed must deserialize with the field
+        // defaulting to 0 ("no estimate was taken") — the stream-json wire
+        // format is versioned by being additive-only.
+        let legacy = r#"{"type":"step_usage","step":3,"model":"glm-5.2","input_tokens":12000,
+            "output_tokens":450,"cached_input_tokens":9000,"cost_usd":0.0042,
+            "duration_ms":1830,"retries":1,"tool_calls":4}"#;
+        let back: AgentEvent = serde_json::from_str(legacy).unwrap();
+        match back {
+            AgentEvent::StepUsage {
+                estimated_input_tokens,
+                input_tokens,
+                ..
+            } => {
+                assert_eq!(estimated_input_tokens, 0);
+                assert_eq!(input_tokens, 12_000);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

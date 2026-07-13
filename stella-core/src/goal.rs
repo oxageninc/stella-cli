@@ -236,7 +236,7 @@ impl Engine<'_> {
             )),
         ];
         let read_only = ReadOnlyTools::new(self.tools);
-        let judge_engine = Engine::with_sleeper(
+        let mut judge_engine = Engine::with_sleeper(
             judge,
             &read_only,
             EngineConfig {
@@ -249,6 +249,11 @@ impl Engine<'_> {
             },
             self.sleeper,
         );
+        // Share the session's drift calibration: the map is keyed per model
+        // (`crate::estimator::CalibrationMap`), so a cross-family judge
+        // learns its own model's drift without ever blending into the
+        // worker's.
+        judge_engine.calibration = self.calibration;
 
         match judge_engine
             .run_turn(&mut judge_messages, budget, events)

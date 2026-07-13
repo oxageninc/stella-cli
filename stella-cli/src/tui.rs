@@ -376,6 +376,9 @@ pub fn render_event(event: &AgentEvent) {
             duration_ms,
             retries,
             tool_calls,
+            // `estimated_input_tokens` is calibration feedback for the
+            // estimator (stella-core), not HUD material.
+            ..
         } => {
             // One dimmed telemetry line per committed model call: the live
             // HUD a metering consumer would reconstruct from this event.

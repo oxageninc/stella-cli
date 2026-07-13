@@ -10,9 +10,11 @@
 //!   row per event in order, including `Reasoning` deltas — the full chain
 //!   of thought is replayable against its execution.
 //! - **telemetry** — one row per committed model call (from `StepUsage`):
-//!   provider, model, tokens in/out, cache read hits, cache misses, cache
-//!   writes, cost (computed from the model card's pricing × token counts
-//!   in the adapter), duration, retries, tool-call count.
+//!   provider, model, tokens in/out, the engine's pre-call input estimate
+//!   (the drift sample [`Store::drift_samples`] serves back to calibrate
+//!   future estimates), cache read hits, cache misses, cache writes, cost
+//!   (computed from the model card's pricing × token counts in the
+//!   adapter), duration, retries, tool-call count.
 //! - **files_touched** — the CRUD ledger per execution.
 //! - **file_locks** — schema + API for cooperative file claims in multi-agent
 //!   work. Reserved: no shipping command acquires locks yet.
@@ -68,6 +70,10 @@ pub struct TelemetryRow {
     pub provider: String,
     pub model: String,
     pub input_tokens: u64,
+    /// The engine's raw pre-call estimate of `input_tokens` — paired they
+    /// are one drift sample ([`Store::drift_samples`]); 0 means no estimate
+    /// was taken (rows persisted before drift correction existed).
+    pub estimated_input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_miss_tokens: u64,
@@ -179,6 +185,7 @@ impl Store {
                provider TEXT NOT NULL,
                model TEXT NOT NULL,
                input_tokens BIGINT NOT NULL,
+               estimated_input_tokens BIGINT NOT NULL DEFAULT 0,
                output_tokens BIGINT NOT NULL,
                cache_read_tokens BIGINT NOT NULL,
                cache_miss_tokens BIGINT NOT NULL,
@@ -209,6 +216,16 @@ impl Store {
                edge_type TEXT NOT NULL,
                properties JSON NOT NULL DEFAULT '{}'
              );",
+        )?;
+        // Additive migration for databases created before drift correction
+        // landed: `CREATE TABLE IF NOT EXISTS` above is a no-op on them, so
+        // the column arrives via ALTER. Old rows default to 0 = "no estimate
+        // was taken", which `drift_samples` excludes as signal-free. (No NOT
+        // NULL here — DuckDB can't retrofit the constraint onto a non-empty
+        // table; the DEFAULT keeps new writes non-null in practice.)
+        conn.execute_batch(
+            "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS \
+             estimated_input_tokens BIGINT DEFAULT 0;",
         )?;
         Ok(())
     }
@@ -263,14 +280,16 @@ impl Store {
     pub fn record_telemetry(&self, execution_id: i64, row: &TelemetryRow) -> Result<()> {
         self.lock().execute(
             "INSERT INTO telemetry (execution_id, step, provider, model, input_tokens, \
-             output_tokens, cache_read_tokens, cache_miss_tokens, cache_write_tokens, cost_usd, \
-             duration_ms, retries, tool_calls) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             estimated_input_tokens, output_tokens, cache_read_tokens, cache_miss_tokens, \
+             cache_write_tokens, cost_usd, duration_ms, retries, tool_calls) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 execution_id,
                 row.step as i64,
                 row.provider,
                 row.model,
                 row.input_tokens as i64,
+                row.estimated_input_tokens as i64,
                 row.output_tokens as i64,
                 row.cache_read_tokens as i64,
                 row.cache_miss_tokens as i64,
@@ -282,6 +301,47 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// The most recent `limit` (estimated, actual) input-token pairs for one
+    /// provider/model — the drift samples that seed a new session's
+    /// `Calibration` (`stella-core::estimator`) from prior sessions'
+    /// telemetry. Returned OLDEST FIRST, so replaying them through an EWMA
+    /// in order weights the most recent step highest. Rows without a
+    /// recorded estimate (`estimated_input_tokens` 0 or NULL: pre-drift
+    /// sessions, migrated databases) or without reported usage carry no
+    /// drift signal and are excluded. Keyed by (provider, model), never
+    /// model alone — the same slug on two providers is two tokenizers.
+    pub fn drift_samples(
+        &self,
+        provider: &str,
+        model: &str,
+        limit: usize,
+    ) -> Result<Vec<(u64, u64)>> {
+        let conn = self.lock();
+        // execution ids come from a monotonic sequence and steps count up
+        // within one execution, so (execution_id, step) is insertion order —
+        // unlike ts, whose second-level granularity ties within a turn.
+        let mut stmt = conn.prepare(
+            "SELECT estimated_input_tokens, input_tokens FROM (
+               SELECT estimated_input_tokens, input_tokens, execution_id, step
+               FROM telemetry
+               WHERE provider = ? AND model = ?
+                 AND estimated_input_tokens > 0 AND input_tokens > 0
+               ORDER BY execution_id DESC, step DESC
+               LIMIT ?
+             ) ORDER BY execution_id ASC, step ASC",
+        )?;
+        let rows = stmt.query_map(params![provider, model, limit as i64], |row| {
+            let estimated: i64 = row.get(0)?;
+            let actual: i64 = row.get(1)?;
+            Ok((estimated as u64, actual as u64))
+        })?;
+        let mut samples = Vec::new();
+        for row in rows {
+            samples.push(row?);
+        }
+        Ok(samples)
     }
 
     /// Persist the CRUD ledger for an execution.
@@ -520,6 +580,7 @@ mod tests {
                     provider: "zai".into(),
                     model: "glm-5.2".into(),
                     input_tokens: 12_000,
+                    estimated_input_tokens: 11_000,
                     output_tokens: 400,
                     cache_read_tokens: 9_000,
                     cache_miss_tokens: 3_000,
@@ -539,6 +600,158 @@ mod tests {
         assert_eq!(store.count("telemetry").unwrap(), 1);
         assert_eq!(store.count("files_touched").unwrap(), 1);
         assert_eq!(store.count("executions").unwrap(), 1);
+    }
+
+    /// A telemetry row shaped for drift tests — only the sample-relevant
+    /// fields vary.
+    fn drift_row(
+        step: u64,
+        provider: &str,
+        model: &str,
+        estimated: u64,
+        actual: u64,
+    ) -> TelemetryRow {
+        TelemetryRow {
+            step,
+            provider: provider.into(),
+            model: model.into(),
+            input_tokens: actual,
+            estimated_input_tokens: estimated,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_miss_tokens: actual,
+            cache_write_tokens: 0,
+            cost_usd: 0.001,
+            duration_ms: 500,
+            retries: 0,
+            tool_calls: 1,
+        }
+    }
+
+    #[test]
+    fn drift_samples_roundtrip_the_estimated_column_oldest_first() {
+        let store = Store::in_memory().unwrap();
+        let id = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_telemetry(id, &drift_row(0, "zai", "glm-5.2", 1_000, 1_400))
+            .unwrap();
+        store
+            .record_telemetry(id, &drift_row(1, "zai", "glm-5.2", 2_000, 2_900))
+            .unwrap();
+
+        let samples = store.drift_samples("zai", "glm-5.2", 10).unwrap();
+        assert_eq!(
+            samples,
+            vec![(1_000, 1_400), (2_000, 2_900)],
+            "oldest first — EWMA replay order"
+        );
+    }
+
+    #[test]
+    fn drift_samples_are_keyed_by_provider_and_model_and_skip_signal_free_rows() {
+        let store = Store::in_memory().unwrap();
+        let id = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_telemetry(id, &drift_row(0, "zai", "glm-5.2", 1_000, 1_400))
+            .unwrap();
+        // Same model slug on a DIFFERENT provider: a different tokenizer,
+        // never the same calibration.
+        store
+            .record_telemetry(id, &drift_row(1, "other", "glm-5.2", 1_000, 9_000))
+            .unwrap();
+        // Different model, same provider.
+        store
+            .record_telemetry(id, &drift_row(2, "zai", "glm-4", 1_000, 9_000))
+            .unwrap();
+        // No estimate recorded (pre-drift row) and no reported usage: both
+        // signal-free.
+        store
+            .record_telemetry(id, &drift_row(3, "zai", "glm-5.2", 0, 1_400))
+            .unwrap();
+        store
+            .record_telemetry(id, &drift_row(4, "zai", "glm-5.2", 1_000, 0))
+            .unwrap();
+
+        let samples = store.drift_samples("zai", "glm-5.2", 10).unwrap();
+        assert_eq!(samples, vec![(1_000, 1_400)]);
+    }
+
+    #[test]
+    fn drift_samples_limit_keeps_the_most_recent_rows() {
+        let store = Store::in_memory().unwrap();
+        // Across two executions, so the ordering key spans sessions.
+        let first = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        for step in 0..3u64 {
+            store
+                .record_telemetry(first, &drift_row(step, "zai", "glm-5.2", 100 + step, 200))
+                .unwrap();
+        }
+        let second = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        for step in 0..3u64 {
+            store
+                .record_telemetry(second, &drift_row(step, "zai", "glm-5.2", 500 + step, 600))
+                .unwrap();
+        }
+
+        let samples = store.drift_samples("zai", "glm-5.2", 4).unwrap();
+        assert_eq!(
+            samples,
+            vec![(102, 200), (500, 600), (501, 600), (502, 600)],
+            "the limit trims the OLDEST rows and keeps replay order"
+        );
+    }
+
+    #[test]
+    fn migrate_adds_the_estimated_column_to_a_pre_drift_database() {
+        let root = std::env::temp_dir().join(format!(
+            "stella_store_migrate_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(root.join(".stella")).unwrap();
+        // Simulate a database created before drift correction: the telemetry
+        // table exists WITHOUT estimated_input_tokens and already has a row.
+        {
+            let conn = Connection::open(root.join(".stella/stella.duckdb")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE telemetry (
+                   execution_id BIGINT NOT NULL,
+                   step BIGINT NOT NULL,
+                   ts TIMESTAMP NOT NULL DEFAULT current_timestamp,
+                   provider TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   input_tokens BIGINT NOT NULL,
+                   output_tokens BIGINT NOT NULL,
+                   cache_read_tokens BIGINT NOT NULL,
+                   cache_miss_tokens BIGINT NOT NULL,
+                   cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+                   cost_usd DOUBLE NOT NULL,
+                   duration_ms BIGINT NOT NULL,
+                   retries INTEGER NOT NULL,
+                   tool_calls BIGINT NOT NULL
+                 );
+                 INSERT INTO telemetry (execution_id, step, provider, model, input_tokens,
+                   output_tokens, cache_read_tokens, cache_miss_tokens, cost_usd, duration_ms,
+                   retries, tool_calls)
+                 VALUES (1, 0, 'zai', 'glm-5.2', 1400, 100, 0, 1400, 0.001, 500, 0, 1);",
+            )
+            .unwrap();
+        }
+        // Store::open runs migrate() against the old schema…
+        let store = Store::open(&root).unwrap();
+        // …after which new-schema writes and reads work,
+        let id = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_telemetry(id, &drift_row(0, "zai", "glm-5.2", 1_000, 1_400))
+            .unwrap();
+        // and the legacy row (estimated defaulted, no signal) is excluded.
+        assert_eq!(store.count("telemetry").unwrap(), 2);
+        assert_eq!(
+            store.drift_samples("zai", "glm-5.2", 10).unwrap(),
+            vec![(1_000, 1_400)]
+        );
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub mod skills;
 
 pub use budget::{BudgetGuard, BudgetOutcome};
 pub use driver::{Engine, EngineConfig, TurnOutcome};
+pub use estimator::{Calibration, CalibrationMap};
 pub use goal::{GoalConfig, GoalOutcome};
 pub use hooks::{HookEvent, HookPayload, HookRunOutcome, HookRunner, Hooks, run_hooks};
 pub use loop_detect::{LoopDetectionConfig, LoopVerdict, detect_loop};
