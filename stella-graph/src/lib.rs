@@ -59,6 +59,8 @@ pub use import::{ImportEdge, ImportKind};
 pub use lang::Language;
 pub use store::IndexStats;
 pub use symbol::{Symbol, SymbolKind};
+#[doc(hidden)]
+pub use watch::WatchInjector;
 
 // Re-export the OCP wire types this provider produces so downstream callers
 // need not also depend on `ocp-types` directly for the return shapes.

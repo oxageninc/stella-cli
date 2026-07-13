@@ -1,11 +1,14 @@
-//! Watcher smoke test — mount, then create a file and see it indexed live.
+//! Watcher smoke test — mount, then create a file and see it indexed live
+//! through the real OS event source (`notify`).
 //!
-//! `#[ignore]`d by default: filesystem-event delivery timing is
+//! `#[ignore]`d by default: filesystem-event *delivery* timing is
 //! environment-dependent (CI containers, network filesystems, and macOS
-//! FSEvents coalescing all vary), so this would be a flaky gate. The
-//! *deterministic* guarantees — catch-up at mount and transactional
-//! re-index — are covered by `store.rs` and `languages.rs`. Run it locally
-//! with `cargo test -p stella-graph -- --ignored`.
+//! FSEvents coalescing all vary), so this would be a flaky gate. It stays as
+//! an opt-in end-to-end smoke of the `notify` wiring only — the live-index
+//! pipeline itself (debounce → transactional apply, add/modify/delete,
+//! batching) is covered deterministically in `live_index.rs` by injecting
+//! events below the OS watcher. Run this one locally with
+//! `cargo test -p stella-graph -- --ignored`.
 
 use std::fs;
 use std::time::{Duration, Instant};
@@ -25,7 +28,7 @@ async fn poll_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool 
 }
 
 #[tokio::test]
-#[ignore = "fs-event timing is environment-dependent; deterministic paths are covered elsewhere"]
+#[ignore = "real fs-event delivery is environment-dependent; deterministic live-index coverage lives in live_index.rs"]
 async fn watcher_indexes_a_newly_created_file() {
     let ws = TempDir::new().unwrap();
     let dbdir = TempDir::new().unwrap();

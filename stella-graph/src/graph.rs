@@ -159,6 +159,20 @@ impl CodeGraph {
         &self.inner.root
     }
 
+    /// Test seam: start the live-index pipeline (debounce → transactional
+    /// apply) **without** an OS filesystem watcher, returning a
+    /// [`crate::WatchInjector`] that feeds synthetic events straight into the
+    /// pipeline channel. Deterministic live-index tests write real files into
+    /// the workspace, inject the paths, and await the injector's applied-batch
+    /// signal — no dependence on OS event delivery timing.
+    ///
+    /// Hidden from docs: test-facing only, `pub` so integration tests in
+    /// `tests/` can reach it. Must be called from within a tokio runtime.
+    #[doc(hidden)]
+    pub fn watch_pipeline_for_tests(&self, debounce: std::time::Duration) -> watch::WatchInjector {
+        watch::spawn_injectable(self.inner.clone(), debounce)
+    }
+
     /// Run a full incremental index pass now (walk, re-parse only changed
     /// files, prune deleted). One transaction (L-L1). Synchronous — callers
     /// in an async context should wrap it in `spawn_blocking`.

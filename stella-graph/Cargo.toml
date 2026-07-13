@@ -26,3 +26,7 @@ tree-sitter-javascript.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `test-util` enables tokio's paused clock (`start_paused`), which makes the
+# live-index pipeline tests deterministic: the debounce window auto-advances
+# only while every task is idle, so a burst can never be split by scheduling.
+tokio = { workspace = true, features = ["test-util"] }
