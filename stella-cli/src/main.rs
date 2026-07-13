@@ -22,6 +22,7 @@ mod config;
 mod domains;
 mod interactive;
 mod memory;
+mod stats;
 mod tui;
 
 use std::process::ExitCode;
@@ -120,6 +121,19 @@ enum Command {
     /// List configured providers and available models
     Models,
 
+    /// Summarize cost, tokens, and resolve rate per provider/model from
+    /// local telemetry (.stella/stella.duckdb) — $/resolved-task receipts
+    Stats {
+        /// Output format: table (aligned, with TOTAL row), json, or csv
+        #[arg(long, value_enum, default_value = "table")]
+        format: stats::StatsFormat,
+
+        /// Only show executions for this provider id (e.g. zai, anthropic,
+        /// local)
+        #[arg(long)]
+        provider: Option<String>,
+    },
+
     /// Show current configuration
     Config,
 
@@ -155,7 +169,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
-    // Models and Version don't need a configured provider/key.
+    // Models, Stats, and Version don't need a configured provider/key.
     match cli.command {
         Some(Command::Models) => {
             config::Config::print_available_models();
@@ -163,6 +177,10 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Some(Command::Tools) => {
             return agent::run_tools_listing();
+        }
+        Some(Command::Stats { format, provider }) => {
+            // Reads local telemetry only — works with zero API keys.
+            return stats::run_stats(format, provider.as_deref());
         }
         Some(Command::Version) => {
             println!("stella v{}", env!("CARGO_PKG_VERSION"));
@@ -222,10 +240,14 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Chat => {
             rt()?.block_on(agent::run_interactive(&cfg, cli.budget))?;
         }
-        // Models/Version (and Tools) short-circuit in the first match at the
-        // top of `run` before a provider is resolved; Init is handled by the
-        // caller. Reaching any of them here is impossible.
-        Command::Init | Command::Tools | Command::Models | Command::Version => {
+        // Models/Stats/Version (and Tools) short-circuit in the first match
+        // at the top of `run` before a provider is resolved; Init is handled
+        // by the caller. Reaching any of them here is impossible.
+        Command::Init
+        | Command::Tools
+        | Command::Models
+        | Command::Stats { .. }
+        | Command::Version => {
             unreachable!("handled before provider resolution")
         }
         Command::Config => {

@@ -461,6 +461,8 @@ stella monitor main          # drive a branch/PR's CI to green as a judged goal
 ```bash
 stella init      # infer this workspace's domain taxonomy (.stella/domains.toml)
 stella tools     # list every tool available to the agent this session
+stella stats     # cost, tokens, and $/resolved task per provider/model from
+                 # local telemetry (--format table|json|csv, --provider <id>)
 ```
 
 ### Global flags
