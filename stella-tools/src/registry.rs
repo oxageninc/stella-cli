@@ -1,7 +1,7 @@
 //! Tool trait + registry. The agent loop drives every tool through
 //! `ToolRegistry::execute` — no tool-specific code lives outside this crate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -50,6 +50,17 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     root: PathBuf,
     touched: std::sync::Mutex<Vec<(String, Vec<FileOp>)>>,
+    schema_index: std::sync::Mutex<SchemaIndex>,
+}
+
+/// The known schema objects in the workspace, used by the schema gate to
+/// prevent duplicate table/type/view creation. Populated from the code graph
+/// or empty when no graph is open.
+#[derive(Debug, Clone, Default)]
+pub struct SchemaIndex {
+    pub tables: HashSet<String>,
+    pub types: HashSet<String>,
+    pub views: HashSet<String>,
 }
 
 impl ToolRegistry {
@@ -100,6 +111,7 @@ impl ToolRegistry {
             tools,
             root,
             touched: std::sync::Mutex::new(Vec::new()),
+            schema_index: std::sync::Mutex::new(SchemaIndex::default()),
         }
     }
 
@@ -114,6 +126,31 @@ impl ToolRegistry {
         // Classify the file op BEFORE executing: create-vs-update depends
         // on whether the file exists now, not after the write.
         let pending_op = self.classify_file_op(name, input);
+
+        // Schema gate: if the target is a SQL file and we have a schema
+        // index, check for conflicts before the write/edit lands.
+        if let Some(path) = input.get("path").and_then(|v| v.as_str())
+            && matches!(name, "write_file" | "edit_file")
+            && crate::schema_gate::is_schema_file(path)
+            && let Some(content) = input.get("content").and_then(|v| v.as_str())
+        {
+            let proposed = crate::schema_gate::extract_ddl_objects(content);
+            if !proposed.is_empty() {
+                let index = self.schema_index.lock().unwrap_or_else(|p| p.into_inner());
+                let conflicts = crate::schema_gate::find_conflicts(
+                    &proposed,
+                    &index.tables,
+                    &index.types,
+                    &index.views,
+                );
+                if !conflicts.is_empty() {
+                    return ToolOutput::Error {
+                        message: crate::schema_gate::format_conflicts(&conflicts),
+                    };
+                }
+            }
+        }
+
         let output = match self.tools.get(name) {
             Some(tool) => tool.execute(input, &self.root).await,
             None => ToolOutput::Error {
@@ -198,6 +235,16 @@ impl ToolRegistry {
     /// The workspace root this registry resolves paths against.
     pub fn root(&self) -> &PathBuf {
         &self.root
+    }
+
+    /// Update the known schema index from the code graph. Called at session
+    /// start and whenever schema files are re-indexed. The schema gate uses
+    /// this to prevent duplicate table/type/view creation.
+    pub fn update_schema_index(&self, tables: HashSet<String>, types: HashSet<String>, views: HashSet<String>) {
+        let mut index = self.schema_index.lock().unwrap_or_else(|p| p.into_inner());
+        index.tables = tables;
+        index.types = types;
+        index.views = views;
     }
 }
 
@@ -297,5 +344,85 @@ mod tests {
                 schema.name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn schema_gate_blocks_duplicate_table_on_write() {
+        let dir = std::env::temp_dir().join(format!("stella_gate_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
+
+        // Populate the schema index with a known table.
+        let mut tables = HashSet::new();
+        tables.insert("users".to_string());
+        reg.update_schema_index(tables, HashSet::new(), HashSet::new());
+
+        // Attempt to write a SQL file that creates `users` again.
+        let result = reg
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": "migrations/002.sql",
+                    "content": "CREATE TABLE users (id INT);\n"
+                }),
+            )
+            .await;
+        assert!(result.is_error());
+        match result {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("Table `users` already exists"));
+                assert!(message.contains("ALTER"));
+            }
+            _ => panic!("expected error"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn schema_gate_allows_new_table_on_write() {
+        let dir = std::env::temp_dir().join(format!("stella_gate_ok_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
+
+        let mut tables = HashSet::new();
+        tables.insert("users".to_string());
+        reg.update_schema_index(tables, HashSet::new(), HashSet::new());
+
+        // Write a SQL file with a genuinely new table.
+        let result = reg
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": "migrations/003.sql",
+                    "content": "CREATE TABLE orders (id INT);\n"
+                }),
+            )
+            .await;
+        assert!(!result.is_error(), "new table should pass the gate");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn schema_gate_allows_non_sql_write() {
+        let dir = std::env::temp_dir().join(format!("stella_gate_nosql_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
+
+        let mut tables = HashSet::new();
+        tables.insert("users".to_string());
+        reg.update_schema_index(tables, HashSet::new(), HashSet::new());
+
+        // Writing a Rust file should never trigger the schema gate.
+        let result = reg
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": "src/main.rs",
+                    "content": "fn main() {}\n"
+                }),
+            )
+            .await;
+        assert!(!result.is_error());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

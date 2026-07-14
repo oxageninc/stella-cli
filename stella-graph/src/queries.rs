@@ -106,3 +106,29 @@ pub const TS_SYMBOLS: &str = r#"
 /// Same import surface as JavaScript (the specifier node shapes are
 /// identical); shared by `typescript` and `tsx`.
 pub const TS_IMPORTS: &str = JS_IMPORTS;
+
+// ---- SQL -----------------------------------------------------------------
+
+/// SQL DDL: tables (with their columns), views, and custom enum/composite
+/// types. SQL has no import concept, so there is no `SQL_IMPORTS`.
+///
+/// `tree-sitter-sequel` node types:
+/// - `create_table` wraps `object_reference` (table name) and
+///   `column_definitions` (a list of `column_definition` children).
+/// - `column_definition` has a `name` field.
+/// - `create_type` is used for `CREATE TYPE foo AS ENUM (...)` and composite
+///   types — the name is the first `identifier` child.
+/// - `create_view` wraps a `column_definitions` optional + `select`.
+pub const SQL_SYMBOLS: &str = r#"
+(create_table
+  (object_reference (identifier) @name) @table)
+(column_definition name: (_) @name) @column
+(create_type
+  (object_reference (identifier) @name) @schema_enum)
+(create_view
+  (object_reference) @name) @view
+"#;
+
+/// SQL has no imports — this empty string keeps the `LangPack` two-query
+/// shape uniform without introducing a conditional in `parse_file`.
+pub const SQL_IMPORTS: &str = "";

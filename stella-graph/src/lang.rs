@@ -18,6 +18,7 @@ pub enum Language {
     JavaScript,
     TypeScript,
     Tsx,
+    Sql,
 }
 
 impl Language {
@@ -32,6 +33,7 @@ impl Language {
             "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
             "ts" | "mts" | "cts" => Language::TypeScript,
             "tsx" => Language::Tsx,
+            "sql" => Language::Sql,
             _ => return None,
         })
     }
@@ -45,6 +47,7 @@ impl Language {
             Language::JavaScript => "javascript",
             Language::TypeScript => "typescript",
             Language::Tsx => "tsx",
+            Language::Sql => "sql",
         }
     }
 
@@ -56,6 +59,7 @@ impl Language {
             Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Language::Sql => tree_sitter_sequel::LANGUAGE.into(),
         }
     }
 
@@ -66,6 +70,7 @@ impl Language {
             Language::Python => queries::PYTHON_SYMBOLS,
             Language::JavaScript => queries::JS_SYMBOLS,
             Language::TypeScript | Language::Tsx => queries::TS_SYMBOLS,
+            Language::Sql => queries::SQL_SYMBOLS,
         }
     }
 
@@ -76,6 +81,7 @@ impl Language {
             Language::Python => queries::PYTHON_IMPORTS,
             Language::JavaScript => queries::JS_IMPORTS,
             Language::TypeScript | Language::Tsx => queries::TS_IMPORTS,
+            Language::Sql => queries::SQL_IMPORTS,
         }
     }
 }
@@ -108,6 +114,10 @@ mod tests {
             Some(Language::TypeScript)
         );
         assert_eq!(Language::from_path(Path::new("x.tsx")), Some(Language::Tsx));
+        assert_eq!(
+            Language::from_path(Path::new("migrations/001.sql")),
+            Some(Language::Sql)
+        );
         assert_eq!(Language::from_path(Path::new("README.md")), None);
         assert_eq!(Language::from_path(Path::new("noext")), None);
     }

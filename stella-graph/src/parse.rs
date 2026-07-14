@@ -32,6 +32,7 @@ pub(crate) struct Grammars {
     javascript: LangPack,
     typescript: LangPack,
     tsx: LangPack,
+    sql: LangPack,
 }
 
 struct LangPack {
@@ -74,6 +75,7 @@ impl Grammars {
             javascript: LangPack::load(Language::JavaScript)?,
             typescript: LangPack::load(Language::TypeScript)?,
             tsx: LangPack::load(Language::Tsx)?,
+            sql: LangPack::load(Language::Sql)?,
         })
     }
 
@@ -84,6 +86,7 @@ impl Grammars {
             Language::JavaScript => &self.javascript,
             Language::TypeScript => &self.typescript,
             Language::Tsx => &self.tsx,
+            Language::Sql => &self.sql,
         }
     }
 }
@@ -113,6 +116,7 @@ pub(crate) fn parse_file(grammars: &Grammars, lang: Language, source: &str) -> O
         Language::JavaScript | Language::TypeScript | Language::Tsx => {
             extract_ts_imports(&pack.imports, root, src)
         }
+        Language::Sql => Vec::new(), // SQL has no imports
     };
     Some(Parsed { symbols, imports })
 }
@@ -496,5 +500,53 @@ class R { go() {} }
         let parsed = parse(Language::Rust, src);
         assert!(parsed.symbols.iter().any(|s| s.name == "good"));
         assert!(parsed.symbols.iter().any(|s| s.name == "Ok"));
+    }
+
+    #[test]
+    fn sql_create_table_extracts_table_and_columns() {
+        let src = "\
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE payments (
+    id SERIAL PRIMARY KEY,
+    amount NUMERIC(10,2) NOT NULL,
+    user_id INTEGER REFERENCES users(id)
+);
+
+CREATE TYPE payment_status AS ENUM ('pending', 'completed', 'failed');
+
+CREATE VIEW active_payments AS SELECT * FROM payments WHERE amount > 0;
+";
+        let parsed = parse(Language::Sql, src);
+
+        // Tables
+        assert_eq!(kinds(&parsed, "users"), vec![SymbolKind::Table]);
+        assert_eq!(kinds(&parsed, "payments"), vec![SymbolKind::Table]);
+
+        // Columns
+        assert!(parsed.symbols.iter().any(|s| {
+            s.name == "email" && s.kind == SymbolKind::Column
+        }));
+        assert!(parsed.symbols.iter().any(|s| {
+            s.name == "amount" && s.kind == SymbolKind::Column
+        }));
+
+        // Custom enum type
+        assert_eq!(
+            kinds(&parsed, "payment_status"),
+            vec![SymbolKind::SchemaEnum]
+        );
+
+        // View
+        assert!(parsed.symbols.iter().any(|s| {
+            s.name == "active_payments" && s.kind == SymbolKind::View
+        }));
+
+        // SQL has no imports.
+        assert!(parsed.imports.is_empty());
     }
 }

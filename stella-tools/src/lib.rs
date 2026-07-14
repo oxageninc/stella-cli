@@ -21,6 +21,7 @@ pub mod project;
 pub mod read;
 pub mod registry;
 pub mod screenshot;
+pub mod schema_gate;
 pub mod validate;
 pub mod verify;
 pub mod write;
