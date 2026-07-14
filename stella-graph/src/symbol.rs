@@ -14,8 +14,12 @@ pub enum SymbolKind {
     Enum,
     Trait,
     Interface,
+    // Schema objects (SQL DDL + ORM models):
+    Table,
+    Column,
+    SchemaEnum,
+    View,
 }
-
 impl SymbolKind {
     /// Map a query kind-capture name (see [`crate::queries`]) to a kind.
     pub(crate) fn from_capture(capture: &str) -> Option<SymbolKind> {
@@ -27,6 +31,10 @@ impl SymbolKind {
             "enum" => SymbolKind::Enum,
             "trait" => SymbolKind::Trait,
             "interface" => SymbolKind::Interface,
+            "table" => SymbolKind::Table,
+            "column" => SymbolKind::Column,
+            "schema_enum" => SymbolKind::SchemaEnum,
+            "view" => SymbolKind::View,
             _ => return None,
         })
     }
@@ -41,6 +49,10 @@ impl SymbolKind {
             SymbolKind::Enum => "enum",
             SymbolKind::Trait => "trait",
             SymbolKind::Interface => "interface",
+            SymbolKind::Table => "table",
+            SymbolKind::Column => "column",
+            SymbolKind::SchemaEnum => "schema_enum",
+            SymbolKind::View => "view",
         }
     }
 
@@ -53,6 +65,10 @@ impl SymbolKind {
             "enum" => SymbolKind::Enum,
             "trait" => SymbolKind::Trait,
             "interface" => SymbolKind::Interface,
+            "table" => SymbolKind::Table,
+            "column" => SymbolKind::Column,
+            "schema_enum" => SymbolKind::SchemaEnum,
+            "view" => SymbolKind::View,
             // "function" and any unknown/forward-compat tag read back as a
             // plain function — the least-surprising, never-panicking default.
             _ => SymbolKind::Function,
@@ -70,6 +86,10 @@ impl SymbolKind {
             SymbolKind::Enum => "enum",
             SymbolKind::Trait => "trait",
             SymbolKind::Interface => "interface",
+            SymbolKind::Table => "table",
+            SymbolKind::Column => "column",
+            SymbolKind::SchemaEnum => "enum",
+            SymbolKind::View => "view",
         }
     }
 
