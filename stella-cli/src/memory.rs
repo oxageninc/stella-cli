@@ -32,6 +32,7 @@ use stella_core::skills::{
     self, AutoCreateConfig, AutoCreateDecision, LoadSkillsOptions, SelectionConfig, Skill,
     SkillMineConfig, SkillObservation, SkillSource,
 };
+use stella_pipeline::{ContextRecallPort, RecalledFrame};
 use stella_protocol::{CompletionMessage, CompletionRequest, MessageRole, Provider};
 
 use crate::domains::Domains;
@@ -327,6 +328,48 @@ impl SessionMemory {
                 AutoCreateDecision::Skip { .. } => {}
             }
         }
+    }
+}
+
+/// The pipeline's context-recall port over the workspace memory store: the
+/// split-context planner (L-E6) receives the same durable lessons the
+/// worker's injected recall block carries, as structured frames instead of a
+/// rendered string. Frames without a citation label are dropped (L-C4), and
+/// a failed recall degrades to no frames, never an error (L-C6).
+#[async_trait::async_trait]
+impl ContextRecallPort for SessionMemory {
+    async fn recall(&self, goal: &str) -> Vec<RecalledFrame> {
+        let query = ContextQuery {
+            goal: goal.to_string(),
+            query_text: Some(goal.to_string()),
+            embedding: None,
+            kinds: vec![],
+            anchors: vec![],
+            max_frames: 5,
+            max_tokens: 1200,
+            as_of: None,
+        };
+        let Ok(result) = self
+            .store
+            .recall_scoped(&query, &self.domains.names())
+            .await
+        else {
+            return Vec::new();
+        };
+        result
+            .frames
+            .into_iter()
+            .filter_map(|f| {
+                let citation_label = f.citation_label.clone()?;
+                Some(RecalledFrame {
+                    citation_label,
+                    source: "memory".to_string(),
+                    content: f.content.trim().to_string(),
+                    token_cost: f.token_cost,
+                    id: Some(f.id),
+                })
+            })
+            .collect()
     }
 }
 

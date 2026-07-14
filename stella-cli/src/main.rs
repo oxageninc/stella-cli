@@ -83,12 +83,6 @@ struct Cli {
     #[arg(long, env = "STELLA_BUDGET", value_parser = parse_budget)]
     budget: Option<f64>,
 
-    /// Use the raw step-loop instead of the staged pipeline (triage, plan,
-    /// execute, verify, judge). The pipeline is the default; this flag
-    /// falls back to the direct Engine::run_turn path.
-    #[arg(long)]
-    no_pipeline: bool,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -99,6 +93,12 @@ enum Command {
     Run {
         /// The prompt to send
         prompt: String,
+
+        /// Use the raw step-loop instead of the staged pipeline (triage, plan,
+        /// execute, verify, judge). The pipeline is the default; this flag
+        /// falls back to the direct Engine::run_turn path.
+        #[arg(long)]
+        no_pipeline: bool,
     },
 
     /// Work in judged rounds until a judge model confirms the goal is met
@@ -238,13 +238,16 @@ fn run(cli: Cli) -> Result<(), String> {
     )?;
 
     match cli.command.unwrap_or(Command::Chat) {
-        Command::Run { prompt } => {
+        Command::Run {
+            prompt,
+            no_pipeline,
+        } => {
             rt()?.block_on(agent::run_one_shot(
                 &cfg,
                 &prompt,
                 cli.budget,
                 cli.output_format,
-                !cli.no_pipeline,
+                !no_pipeline,
             ))?;
         }
         Command::Goal { goal } => {

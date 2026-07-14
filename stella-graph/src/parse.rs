@@ -528,12 +528,18 @@ CREATE VIEW active_payments AS SELECT * FROM payments WHERE amount > 0;
         assert_eq!(kinds(&parsed, "payments"), vec![SymbolKind::Table]);
 
         // Columns
-        assert!(parsed.symbols.iter().any(|s| {
-            s.name == "email" && s.kind == SymbolKind::Column
-        }));
-        assert!(parsed.symbols.iter().any(|s| {
-            s.name == "amount" && s.kind == SymbolKind::Column
-        }));
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| { s.name == "email" && s.kind == SymbolKind::Column })
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| { s.name == "amount" && s.kind == SymbolKind::Column })
+        );
 
         // Custom enum type
         assert_eq!(
@@ -542,11 +548,52 @@ CREATE VIEW active_payments AS SELECT * FROM payments WHERE amount > 0;
         );
 
         // View
-        assert!(parsed.symbols.iter().any(|s| {
-            s.name == "active_payments" && s.kind == SymbolKind::View
-        }));
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| { s.name == "active_payments" && s.kind == SymbolKind::View })
+        );
 
         // SQL has no imports.
         assert!(parsed.imports.is_empty());
+    }
+
+    #[test]
+    fn sql_schema_qualified_names_index_the_bare_object_name() {
+        // `object_reference` carries qualifiers in grammar fields
+        // (`database:`/`schema:`/`name:`); only the `name:` field is the
+        // object's identifier. Capturing any other child would index the
+        // schema (`public`) as a table and miss lookups by bare name.
+        let src = "\
+CREATE TABLE public.users (
+    id SERIAL PRIMARY KEY
+);
+
+CREATE TYPE public.payment_status AS ENUM ('pending', 'completed');
+
+CREATE VIEW public.active_users AS SELECT * FROM public.users;
+
+CREATE TABLE warehouse.analytics.events (id BIGINT);
+";
+        let parsed = parse(Language::Sql, src);
+
+        assert_eq!(kinds(&parsed, "users"), vec![SymbolKind::Table]);
+        assert_eq!(
+            kinds(&parsed, "payment_status"),
+            vec![SymbolKind::SchemaEnum]
+        );
+        assert_eq!(kinds(&parsed, "active_users"), vec![SymbolKind::View]);
+        assert_eq!(kinds(&parsed, "events"), vec![SymbolKind::Table]);
+
+        // Neither the qualifiers nor the dotted reference may become symbols.
+        assert!(
+            parsed.symbols.iter().all(|s| !s.name.contains('.')
+                && s.name != "public"
+                && s.name != "warehouse"
+                && s.name != "analytics"),
+            "schema qualifiers leaked into the symbol index: {:?}",
+            parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
     }
 }

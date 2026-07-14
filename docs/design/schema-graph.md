@@ -291,8 +291,9 @@ async fn execute(&self, input: &Value, root: &Path) -> ToolOutput {
 }
 ```
 
-The `ToolRegistry` holds an `Option<Arc<SchemaIndex>>` — `None` when no code
-graph is open (the gate is a no-op), `Some` when the graph is live.
+The `ToolRegistry` holds a `Mutex<SchemaIndex>` that defaults to empty — an
+empty index makes the gate a no-op; `update_schema_index` refreshes it when
+schema objects are known.
 
 ### What the model sees
 
@@ -324,16 +325,22 @@ catches the error before it lands.
 
 ### Scope control
 
-The gate is opt-in per workspace via `.stella/settings.json`:
+The gate is unconditional and blocking: whenever `write_file` or `edit_file`
+targets a `.sql` file (`schema_gate::is_schema_file`) and the proposed content
+creates a table, type, or view whose name is already in the schema index, the
+tool call fails with the conflict error above. There is no enable/disable
+flag and no warn mode.
 
-```json
-{
-  "schema_gate": {
-    "enabled": true,
-    "strictness": "block"  // "block" (error) or "warn" (tool succeeds with warning)
-  }
-}
-```
+Scope is bounded by the index rather than by configuration: when the schema
+index is empty — no schema objects known for the workspace — `find_conflicts`
+returns nothing and every write proceeds, so workspaces without SQL schemas
+never see the gate.
+
+A per-workspace override in `.stella/settings.json` (a `schema_gate.enabled`
+flag, or a `"warn"` strictness where the tool succeeds with a warning) is a
+possible future extension — the three-scope settings loader in
+`stella-cli/src/settings.rs` is the natural parse point — but it is
+deliberately not implemented today.
 
 ---
 
