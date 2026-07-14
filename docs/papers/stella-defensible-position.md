@@ -89,7 +89,7 @@ We identify seven such properties in Stella's design.
 
 | # | Property | Core invariant | Enforced by |
 |---|---|---|---|
-| I | Ports, not concretions | The engine (`stella-core`) never imports a provider SDK, filesystem API, or terminal library | Crate-level dependency boundary; `Provider` and `ToolExecutor` traits (`stella-core::ports`) |
+| I | Ports, not concretions | The engine (`stella-core`) never imports a provider SDK, filesystem API, or terminal library | Crate-level dependency boundary; `Provider` trait (`stella-protocol`) and `ToolExecutor` trait (`stella-core::ports`) |
 | II | No I/O in the engine | All decision logic is synchronous functions over owned data | Architectural discipline; property-tested in `stella-core` |
 | III | Witness-test contract | A task is done only when a test fails on old code and passes on new | `verify_done` tool (`stella-tools::verify`) |
 | IV | BYOK + no phone-home | The only outbound network traffic is to the user's chosen provider; all telemetry is local | Architectural invariant; local DuckDB (`stella-store`) |
