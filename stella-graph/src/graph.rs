@@ -24,6 +24,7 @@
 //! transaction, an abrupt process kill mid-index commits nothing and reopening
 //! finds a consistent store.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -221,6 +222,17 @@ impl CodeGraph {
     /// query it.
     pub fn query(&self, q: &ContextQuery) -> Result<Vec<ContextFrame>, GraphError> {
         frames::query(&self.inner.read_guard(), &self.inner.root, q)
+    }
+
+    /// All known table, type, and view names (lowercased) from the index.
+    /// Used by the schema gate to populate the known-schema set at session
+    /// start. Returns empty sets if the index is empty or unreadable.
+    pub fn schema_names(&self) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+        let conn = self.inner.read_guard();
+        let tables = store::names_of_kind(&conn, "table").unwrap_or_default();
+        let types = store::names_of_kind(&conn, "schema_enum").unwrap_or_default();
+        let views = store::names_of_kind(&conn, "view").unwrap_or_default();
+        (tables, types, views)
     }
 
     /// Stop the watcher and background tasks. Idempotent. Dropping the watcher

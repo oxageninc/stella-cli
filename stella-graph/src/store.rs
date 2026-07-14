@@ -377,6 +377,16 @@ pub(crate) fn file_count(conn: &Connection) -> Result<usize, GraphError> {
     Ok(count as usize)
 }
 
+/// All distinct symbol names of the given kind tag (e.g. `"table"`,
+/// `"schema_enum"`, `"view"`). Used by the schema gate to populate the
+/// known-schema index at session start.
+pub(crate) fn names_of_kind(conn: &Connection, kind: &str) -> Result<HashSet<String>, GraphError> {
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT LOWER(name) FROM code_graph_symbols WHERE kind = ?")?;
+    let rows = stmt.query_map(params![kind], |row| row.get::<_, String>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 fn map_def_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DefRow> {
     Ok(DefRow {
         path: row.get(0)?,

@@ -26,8 +26,9 @@ use stella_mcp::{McpConfig, McpToolSet};
 use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
 use stella_pipeline::{
-    AutoApproveGate, CmdOutcome, CommandRunner, NoContextRecall, Pipeline, PipelineConfig,
-    PipelinePorts, PipelineStatus, ProviderResolver, RepoStructurePort, StdioApprovalGate,
+    AutoApproveGate, CmdOutcome, CommandRunner, ContextRecallPort, NoContextRecall, Pipeline,
+    PipelineConfig, PipelinePorts, PipelineStatus, ProviderResolver, RepoStructurePort,
+    StdioApprovalGate,
 };
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{AgentEvent, CompletionMessage, ModelRef, Role, ToolOutput};
@@ -214,6 +215,7 @@ async fn run_pipeline_one_shot(
     let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
 
     let registry: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(cfg.workspace_root.clone()));
+    populate_schema_index(&registry, &cfg.workspace_root);
     let mcp = connect_mcp(cfg, registry.clone(), format == OutputFormat::Text).await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
@@ -287,14 +289,25 @@ async fn run_pipeline_one_shot(
 
         let stdio_gate = StdioApprovalGate;
         let no_recall = NoContextRecall;
+        // The workspace memory doubles as the pipeline's recall port so the
+        // split-context planner sees the same durable lessons the worker's
+        // recall block carries; no open store -> no frames (L-C6).
+        let recall: &dyn ContextRecallPort = match &memory {
+            Some(m) => m,
+            None => &no_recall,
+        };
         let ports = PipelinePorts {
             router: &router,
             providers: &resolver,
             tools: &tools,
-            recall: &no_recall,
+            recall,
             repo: &repo_structure,
             commands: &command_runner,
-            approvals: if is_text { &stdio_gate } else { &AutoApproveGate },
+            approvals: if is_text {
+                &stdio_gate
+            } else {
+                &AutoApproveGate
+            },
             sleeper: &TokioSleeper,
         };
 
@@ -556,6 +569,7 @@ async fn run_raw_one_shot(
     // hides it. It still coerces to `&dyn ToolExecutor` for the engine.
     let registry: std::sync::Arc<ToolRegistry> =
         std::sync::Arc::new(ToolRegistry::new(cfg.workspace_root.clone()));
+    populate_schema_index(&registry, &cfg.workspace_root);
     let mcp = connect_mcp(cfg, registry.clone(), format == OutputFormat::Text).await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
@@ -633,6 +647,7 @@ pub async fn run_goal_cmd(
     let provider = build_provider(cfg)?;
     let registry: std::sync::Arc<ToolRegistry> =
         std::sync::Arc::new(ToolRegistry::new(cfg.workspace_root.clone()));
+    populate_schema_index(&registry, &cfg.workspace_root);
     let mcp = connect_mcp(cfg, registry.clone(), true).await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
@@ -688,6 +703,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     let registry: std::sync::Arc<ToolRegistry> =
         std::sync::Arc::new(ToolRegistry::new(cfg.workspace_root.clone()));
     let mcp = connect_mcp(cfg, registry.clone(), true).await;
+    populate_schema_index(&registry, &cfg.workspace_root);
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -927,6 +943,24 @@ fn build_code_graph(workspace_root: &std::path::Path) {
             );
         }
     }
+}
+
+/// Open the code graph (read-only) and populate the tool registry's schema
+/// index with all known table/type/view names. Best-effort: if the graph
+/// can't open (no `.stella/codegraph.db`), the schema gate runs with an
+/// empty index — it just won't catch conflicts until `stella init` runs.
+fn populate_schema_index(registry: &ToolRegistry, workspace_root: &std::path::Path) {
+    let db_path = workspace_root.join(".stella").join("codegraph.db");
+    if !db_path.exists() {
+        return;
+    }
+    let graph = match stella_graph::CodeGraph::open(workspace_root, &db_path) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let (tables, types, views) = graph.schema_names();
+    registry.update_schema_index(tables, types, views);
+    graph.shutdown();
 }
 
 /// `stella init` — infer the workspace's domain taxonomy, build the code-graph
