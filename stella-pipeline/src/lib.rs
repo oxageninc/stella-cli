@@ -62,7 +62,7 @@ pub use pipeline::{
 pub use ports::{
     AlwaysAbortGate, ApprovalGate, AutoApproveGate, CmdOutcome, CommandRunner, ContextRecallPort,
     NoContextRecall, NoRepoStructure, ProviderResolver, RecalledFrame, RepoStructurePort,
-    ScopeDecision,
+    ScopeDecision, StdioApprovalGate,
 };
 pub use triage::TaskClass;
 pub use verify::{FlipOracle, FlipState, LadderDecision, LadderInputs};

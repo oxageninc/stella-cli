@@ -22,8 +22,10 @@ publish = true
 dist = false
 
 [dependencies]
-ocp-types = { path = "../ocp-types", version = "0.1.0" }
-ocp-host = { path = "../ocp-host", version = "0.1.0" }
+# Floor requirements — see the note in ocp-host/Cargo.toml: caret reqs break
+# the release version stamp at the first minor bump.
+ocp-types = { path = "../ocp-types", version = ">=0.1.0" }
+ocp-host = { path = "../ocp-host", version = ">=0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

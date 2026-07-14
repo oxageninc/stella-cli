@@ -213,6 +213,41 @@ impl ApprovalGate for AlwaysAbortGate {
     }
 }
 
+/// An [`ApprovalGate`] that prints the proposal to stdout and reads a
+/// y/n/trim response from stdin. For interactive text mode only — headless
+/// runs use [`AutoApproveGate`] or [`AlwaysAbortGate`].
+pub struct StdioApprovalGate;
+
+#[async_trait]
+impl ApprovalGate for StdioApprovalGate {
+    async fn review(&self, proposal: &ScopeProposal) -> ScopeDecision {
+        use std::io::{self, BufRead, Write};
+
+        println!();
+        println!("  ┌─ Scope Review ──────────────────────────────");
+        println!("  │ {}", proposal.summary);
+        for (i, step) in proposal.steps.iter().enumerate() {
+            println!("  │   {}. {}", i + 1, step);
+        }
+        if let Some(cost) = proposal.estimated_cost_usd {
+            println!("  │ est. cost: ${cost:.4}");
+        }
+        println!("  └──────────────────────────────────────────────");
+        print!("  Approve? [y/N/a=bort]: ");
+        let _ = io::stdout().flush();
+
+        let stdin = io::stdin();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_err() {
+            return ScopeDecision::Abort;
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => ScopeDecision::Approve,
+            _ => ScopeDecision::Abort,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -99,7 +99,11 @@ bold ""
 # The one `^version = ` line is [workspace.package].version. (The CI workflow's
 # `sed "0,/re/"` is GNU-only and silently no-ops on macOS — perl is portable.)
 cp Cargo.toml .Cargo.toml.relbak
-restore_manifest() { [ -f .Cargo.toml.relbak ] && mv .Cargo.toml.relbak Cargo.toml || true; }
+cp Cargo.lock .Cargo.lock.relbak   # cargo rewrites workspace-member versions in the lock during the stamped build
+restore_manifest() {
+  [ -f .Cargo.toml.relbak ] && mv .Cargo.toml.relbak Cargo.toml || true
+  [ -f .Cargo.lock.relbak ] && mv .Cargo.lock.relbak Cargo.lock || true
+}
 trap 'restore_manifest' EXIT
 perl -pi -e "s/^version = \"[^\"]*\"/version = \"${VERSION}\"/" Cargo.toml
 grep -m1 '^version = ' Cargo.toml | grep -q "\"${VERSION}\"" || die "version stamp failed"
@@ -162,7 +166,9 @@ sed \
   -e "s/@SHA_AARCH64_LINUX@/$(sha_of aarch64-unknown-linux-gnu)/g" \
   -e "s/@SHA_X86_64_LINUX@/$(sha_of x86_64-unknown-linux-gnu)/g" \
   "$TMPL" > "$rendered"
-grep -q '@SHA\|@VERSION' "$rendered" && die "formula still has unrendered placeholders"
+# Match only real placeholder tokens: the template's own comment contains the
+# literal "@SHA_*@", which a bare '@SHA' grep false-positives on.
+grep -qE '@(VERSION|SHA_[A-Z0-9_]+)@' "$rendered" && die "formula still has unrendered placeholders"
 
 tap="$(mktemp -d)/tap"
 gh repo clone "$TAP_REPO" "$tap" -- --depth 1 --quiet

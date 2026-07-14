@@ -89,23 +89,6 @@ jobs:
           grep -m1 '^version = ' Cargo.toml | grep -q "\"${version}\"" \
             || { echo "::error::version stamp did not take"; exit 1; }
 
-      # Stamp the release version (from the tag) into the workspace manifest so
-      # the compiled binary reports it — `stella --version` == the release tag.
-      # No commit lands on main; this edit is ephemeral to the build runner.
-      # `--locked` is dropped because bumping the workspace-member version would
-      # otherwise be rejected as a stale lockfile; registry deps stay pinned by
-      # the existing Cargo.lock (cargo only rewrites the workspace entries).
-      - name: Stamp release version
-        if: ${{ github.ref_type == 'tag' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          sed -i.bak -E "0,/^version = \"[^\"]*\"/s//version = \"${version}\"/" Cargo.toml
-          rm -f Cargo.toml.bak
-          echo "workspace version set to ${version}"
-          grep -m1 '^version = ' Cargo.toml
-
       - name: Build stella
         shell: bash
         run: |

@@ -127,26 +127,53 @@ impl ToolRegistry {
         // on whether the file exists now, not after the write.
         let pending_op = self.classify_file_op(name, input);
 
-        // Schema gate: if the target is a SQL file and we have a schema
-        // index, check for conflicts before the write/edit lands.
+        // Schema gate: if the target is a SQL file, parse the proposed
+        // content for DDL objects and check them against the known schema
+        // index before the write/edit lands. Objects the target file already
+        // defines on disk are exempt — rewriting an existing migration in
+        // place is not a duplicate.
+        let mut pending_schema: Vec<crate::schema_gate::DdlObject> = Vec::new();
         if let Some(path) = input.get("path").and_then(|v| v.as_str())
             && matches!(name, "write_file" | "edit_file")
             && crate::schema_gate::is_schema_file(path)
-            && let Some(content) = input.get("content").and_then(|v| v.as_str())
         {
-            let proposed = crate::schema_gate::extract_ddl_objects(content);
+            // write_file carries the full file in `content`; edit_file
+            // introduces new DDL only through `new_string`.
+            let proposed_src = match name {
+                "write_file" => input.get("content").and_then(|v| v.as_str()),
+                _ => input.get("new_string").and_then(|v| v.as_str()),
+            };
+            let proposed = proposed_src
+                .map(crate::schema_gate::extract_ddl_objects)
+                .unwrap_or_default();
             if !proposed.is_empty() {
-                let index = self.schema_index.lock().unwrap_or_else(|p| p.into_inner());
-                let conflicts = crate::schema_gate::find_conflicts(
-                    &proposed,
-                    &index.tables,
-                    &index.types,
-                    &index.views,
-                );
-                if !conflicts.is_empty() {
-                    return ToolOutput::Error {
-                        message: crate::schema_gate::format_conflicts(&conflicts),
-                    };
+                let own: HashSet<String> = crate::resolve_within_root(&self.root, path)
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|current| {
+                        crate::schema_gate::extract_ddl_objects(&current)
+                            .into_iter()
+                            .map(|o| o.name.to_lowercase())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let fresh: Vec<crate::schema_gate::DdlObject> = proposed
+                    .into_iter()
+                    .filter(|o| !own.contains(&o.name.to_lowercase()))
+                    .collect();
+                if !fresh.is_empty() {
+                    let index = self.schema_index.lock().unwrap_or_else(|p| p.into_inner());
+                    let conflicts = crate::schema_gate::find_conflicts(
+                        &fresh,
+                        &index.tables,
+                        &index.types,
+                        &index.views,
+                    );
+                    if !conflicts.is_empty() {
+                        return ToolOutput::Error {
+                            message: crate::schema_gate::format_conflicts(&conflicts),
+                        };
+                    }
+                    pending_schema = fresh;
                 }
             }
         }
@@ -160,12 +187,32 @@ impl ToolRegistry {
                 ),
             },
         };
-        if !output.is_error()
-            && let Some((path, op)) = pending_op
-        {
-            self.record_touch(path, op);
+        if !output.is_error() {
+            // The write landed, so the objects it creates now exist: grow
+            // the index so a duplicate later this session conflicts even
+            // before any re-index from the code graph.
+            if !pending_schema.is_empty() {
+                self.record_schema_objects(&pending_schema);
+            }
+            if let Some((path, op)) = pending_op {
+                self.record_touch(path, op);
+            }
         }
         output
+    }
+
+    /// Merge just-created DDL objects into the schema index (lowercased —
+    /// `find_conflicts` matches case-insensitively against lowercase names).
+    fn record_schema_objects(&self, objects: &[crate::schema_gate::DdlObject]) {
+        let mut index = self.schema_index.lock().unwrap_or_else(|p| p.into_inner());
+        for obj in objects {
+            let name = obj.name.to_lowercase();
+            match obj.kind {
+                crate::schema_gate::DdlKind::Table => index.tables.insert(name),
+                crate::schema_gate::DdlKind::Type => index.types.insert(name),
+                crate::schema_gate::DdlKind::View => index.views.insert(name),
+            };
+        }
     }
 
     /// `[C|R|U|D]`-classify a call: reads → R, writes → C (new) or U
@@ -240,7 +287,12 @@ impl ToolRegistry {
     /// Update the known schema index from the code graph. Called at session
     /// start and whenever schema files are re-indexed. The schema gate uses
     /// this to prevent duplicate table/type/view creation.
-    pub fn update_schema_index(&self, tables: HashSet<String>, types: HashSet<String>, views: HashSet<String>) {
+    pub fn update_schema_index(
+        &self,
+        tables: HashSet<String>,
+        types: HashSet<String>,
+        views: HashSet<String>,
+    ) {
         let mut index = self.schema_index.lock().unwrap_or_else(|p| p.into_inner());
         index.tables = tables;
         index.types = types;
@@ -399,6 +451,99 @@ mod tests {
             )
             .await;
         assert!(!result.is_error(), "new table should pass the gate");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn schema_gate_exempts_rewriting_a_files_own_objects() {
+        let dir = std::env::temp_dir().join(format!("stella_gate_own_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("migrations")).unwrap();
+        std::fs::write(
+            dir.join("migrations/001.sql"),
+            "CREATE TABLE users (id INT);\n",
+        )
+        .unwrap();
+        let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
+
+        let mut tables = HashSet::new();
+        tables.insert("users".to_string());
+        reg.update_schema_index(tables, HashSet::new(), HashSet::new());
+
+        // Rewriting the file that defines `users` is an in-place change to
+        // the existing object, not a duplicate creation.
+        let result = reg
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": "migrations/001.sql",
+                    "content": "CREATE TABLE users (id INT, email TEXT);\n"
+                }),
+            )
+            .await;
+        assert!(!result.is_error(), "same-file rewrite must pass the gate");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn schema_gate_grows_the_index_after_a_successful_write() {
+        let dir = std::env::temp_dir().join(format!("stella_gate_grow_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
+
+        // Empty index: the first migration passes and registers `users`.
+        let first = reg
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": "migrations/001.sql",
+                    "content": "CREATE TABLE users (id INT);\n"
+                }),
+            )
+            .await;
+        assert!(!first.is_error());
+
+        // A second file re-creating `users` now conflicts — caught by the
+        // in-session index growth, no graph re-index needed.
+        let second = reg
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": "migrations/002.sql",
+                    "content": "CREATE TABLE users (id INT);\n"
+                }),
+            )
+            .await;
+        assert!(second.is_error(), "in-session duplicate must be caught");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn schema_gate_checks_edit_file_new_string() {
+        let dir = std::env::temp_dir().join(format!("stella_gate_edit_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("migrations")).unwrap();
+        std::fs::write(dir.join("migrations/002.sql"), "-- add payments\n").unwrap();
+        let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
+
+        let mut tables = HashSet::new();
+        tables.insert("users".to_string());
+        reg.update_schema_index(tables, HashSet::new(), HashSet::new());
+
+        // An edit whose replacement introduces a duplicate CREATE is gated
+        // exactly like a write.
+        let result = reg
+            .execute(
+                "edit_file",
+                &serde_json::json!({
+                    "path": "migrations/002.sql",
+                    "old_string": "-- add payments",
+                    "new_string": "CREATE TABLE users (id INT);"
+                }),
+            )
+            .await;
+        assert!(
+            result.is_error(),
+            "edit introducing a duplicate must be gated"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -149,9 +149,7 @@ pub fn format_conflicts(conflicts: &[SchemaConflict]) -> String {
             c.proposed_line
         ));
     }
-    out.push_str(
-        "\nDid you mean to ALTER the existing object instead? Or use a different name?",
-    );
+    out.push_str("\nDid you mean to ALTER the existing object instead? Or use a different name?");
     out
 }
 
