@@ -157,7 +157,7 @@ impl ToolRegistry {
     }
 
     fn record_touch(&self, path: String, op: FileOp) {
-        let mut touched = self.touched.lock().expect("files-touched lock poisoned");
+        let mut touched = self.touched.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((_, ops)) = touched.iter_mut().find(|(p, _)| *p == path) {
             if !ops.contains(&op) {
                 ops.push(op);
@@ -170,7 +170,7 @@ impl ToolRegistry {
     /// Snapshot of every file touched this session, insertion-ordered,
     /// with its ops as a compact CRUD string (e.g. `"RU"`).
     pub fn files_touched(&self) -> Vec<(String, String)> {
-        let touched = self.touched.lock().expect("files-touched lock poisoned");
+        let touched = self.touched.lock().unwrap_or_else(|p| p.into_inner());
         touched
             .iter()
             .map(|(path, ops)| {
@@ -187,12 +187,15 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Comma-separated sorted list of registered tool names, for error
+    /// messages.
     pub fn available_names(&self) -> String {
         let mut names: Vec<&str> = self.tools.keys().map(|s| s.as_str()).collect();
         names.sort();
         names.join(", ")
     }
 
+    /// The workspace root this registry resolves paths against.
     pub fn root(&self) -> &PathBuf {
         &self.root
     }

@@ -2262,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "ocp-conformance"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "ocp-host"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2295,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "ocp-types"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3370,11 +3370,12 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stella-cli"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
  "colored",
+ "libc",
  "serde",
  "serde_json",
  "stella-context",
@@ -3382,6 +3383,7 @@ dependencies = [
  "stella-graph",
  "stella-mcp",
  "stella-model",
+ "stella-pipeline",
  "stella-protocol",
  "stella-store",
  "stella-tools",
@@ -3392,7 +3394,7 @@ dependencies = [
 
 [[package]]
 name = "stella-context"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "ocp-types",
@@ -3409,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "stella-core"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3424,7 +3426,7 @@ dependencies = [
 
 [[package]]
 name = "stella-fleet"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3441,7 +3443,7 @@ dependencies = [
 
 [[package]]
 name = "stella-graph"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "notify",
@@ -3462,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "stella-mcp"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3480,7 +3482,7 @@ dependencies = [
 
 [[package]]
 name = "stella-media"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -3499,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "stella-model"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3518,7 +3520,7 @@ dependencies = [
 
 [[package]]
 name = "stella-pipeline"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "proptest",
@@ -3533,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "stella-protocol"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -3543,7 +3545,7 @@ dependencies = [
 
 [[package]]
 name = "stella-store"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "duckdb",
  "serde",
@@ -3553,7 +3555,7 @@ dependencies = [
 
 [[package]]
 name = "stella-tools"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "libc",
@@ -3570,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "stella-tui"
-version = "0.1.17"
+version = "0.1.0"
 dependencies = [
  "crossterm 0.29.0",
  "proptest",

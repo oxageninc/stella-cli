@@ -22,7 +22,7 @@ toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-wiremock = "0.6"
+wiremock.workspace = true
 
 # A tiny, self-contained MCP server used only by the integration tests. It
 # reads newline-delimited JSON-RPC on stdin and answers with canned responses;

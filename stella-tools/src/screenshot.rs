@@ -68,7 +68,10 @@ impl Tool for Screenshot {
         };
         match exec::run(&command, root, 30).await {
             Ok((0, _)) => {
-                let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+                let size = tokio::fs::metadata(&file)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 if size == 0 {
                     return ToolOutput::Error {
                         message: "capture produced an empty file — is screen recording \

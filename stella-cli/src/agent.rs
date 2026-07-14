@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use colored::Colorize;
 use stella_core::ports::{SystemClock, ToolExecutor};
+use stella_core::retry::TokioSleeper;
 use stella_core::router::{CircuitBreaker, ProviderProfile};
 use stella_core::{
     BudgetGuard, CalibrationMap, Engine, EngineConfig, GoalConfig, GoalOutcome, RoleTable, Router,
@@ -24,6 +25,10 @@ use stella_core::{
 use stella_mcp::{McpConfig, McpToolSet};
 use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
+use stella_pipeline::{
+    AutoApproveGate, CmdOutcome, CommandRunner, NoContextRecall, Pipeline, PipelineConfig,
+    PipelinePorts, PipelineStatus, ProviderResolver, RepoStructurePort,
+};
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{AgentEvent, CompletionMessage, ModelRef, Role, ToolOutput};
 use stella_store::{Store, TelemetryRow};
@@ -66,22 +71,52 @@ Rules:
 - If a task requires multiple steps, work through them systematically.
 - When a choice is ambiguous AND getting it wrong would be costly, use ask_user rather than guessing; otherwise proceed with your best judgment."#;
 
+/// The pipeline-mode system prompt: encodes a reproduce, localize, minimal
+/// fix, verify methodology and rewards the fewest changed lines. Static
+/// text so it rides the prompt cache (L-E8).
+const PIPELINE_SYSTEM_PROMPT: &str = r#"You are Stella, a software engineering agent that fixes bugs and builds features with surgical precision.
+
+You have these tools available:
+- read_file: Read a file with line numbers (supports offset/limit for ranges)
+- write_file: Create or overwrite a file (creates parent dirs)
+- edit_file: Replace an exact substring in a file (use replace_all for multiple)
+- delete_file: Delete a file within the workspace
+- bash: Run a shell command in the workspace root (with timeout)
+- grep: Search file contents with regex (shells to ripgrep)
+- glob: Find files matching a glob pattern
+- build_project: Build with the workspace's own toolchain (cargo/npm/go/make)
+- run_tests: Run the workspace's test suite
+- verify_done: The definition of done, replays a new test against the previous code in a shadow worktree; it must fail there and pass on your change (WITNESS CONFIRMED). Use it to prove a change actually works, not just that the suite is green.
+- ask_user: Ask the user a multiple-choice question when a decision is genuinely theirs to make (2-6 options; the UI always adds a free-text option automatically, never add an "Other" option yourself)
+- search_skills: Search the public skills registry for reusable skills you don't have locally
+- install_skill: Install a registry skill into the project (always requires the user's confirmation)
+
+Some tools have prerequisites: issue tracking (create_issue/update_issue/close_issue/search_issues/start_work_on_issue) appears only when configured; ci_status requires the gh CLI. Use them when present.
+
+Methodology (always follow in order):
+1. REPRODUCE: Run the failing test or reproduce the bug before touching any file. Never edit blind, you must see the actual error first.
+2. LOCALIZE: Trace the error to its root cause. Read the failing code path. Use grep and glob to navigate precisely.
+3. MINIMAL FIX: Make the smallest change that resolves the issue. No refactoring. No style changes. No "while I'm here" edits. One logical change.
+4. VERIFY: Run the target test. If it passes, use verify_done to witness the change. If it fails, read the error and adjust.
+
+Rules:
+- Never change test files unless the task explicitly requires it.
+- Never create backup files, scratch files, or debug artifacts.
+- Prefer edit_file (surgical) over write_file (full rewrite).
+- Always read a file before editing it, never edit blind.
+- If you are editing more than 3 files for a single-task fix, you are overcomplicating it.
+- Be concise in your responses. Show the user what you changed and why.
+- When a choice is ambiguous AND getting it wrong would be costly, use ask_user rather than guessing; otherwise proceed with your best judgment."#;
+
 /// Cap on memory characters appended to the system prompt — memories ride
 /// the prompt cache on every call, so they must stay dense.
 const MEMORY_PROMPT_BUDGET_CHARS: usize = 16_000;
 
-/// Assemble the session's system prompt: the static instructions plus the
-/// workspace's saved memories (`.stella/memories/*.md`, the write side is
-/// the `save_memory` tool). Memories are loaded ONCE per session and
+/// Assemble the session's system prompt from a `base` instruction set plus
+/// the workspace's saved memories. Memories are loaded ONCE per session and
 /// concatenated in filename order so the resulting prefix is byte-stable
-/// across every model call — that stability is what lets the whole prompt
-/// (instructions + memories) ride the provider's prompt cache instead of
-/// being re-billed. Memories saved mid-session deliberately do NOT appear
-/// until the next session: hot-injecting them would invalidate the cached
-/// prefix on every save. This coexists with `SessionMemory`'s per-turn
-/// recall block (memory.rs) — the baked prefix carries durable lessons, the
-/// recall block carries turn-relevant memories and skills.
-fn build_system_prompt(workspace_root: &std::path::Path) -> String {
+/// across every model call — that stability preserves prompt-cache hits.
+fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> String {
     let dir = workspace_root.join(".stella/memories");
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .map(|entries| {
@@ -92,7 +127,7 @@ fn build_system_prompt(workspace_root: &std::path::Path) -> String {
         })
         .unwrap_or_default();
     if files.is_empty() {
-        return SYSTEM_PROMPT.to_string();
+        return base.to_string();
     }
     files.sort();
 
@@ -107,7 +142,13 @@ fn build_system_prompt(workspace_root: &std::path::Path) -> String {
             .file_stem()
             .and_then(|n| n.to_str())
             .unwrap_or("memory");
-        let entry = format!("\n### {name}\n{}\n", body.trim());
+        let entry = format!(
+            "
+### {name}
+{}
+",
+            body.trim()
+        );
         let cost = entry.chars().count();
         if used + cost > MEMORY_PROMPT_BUDGET_CHARS {
             dropped += 1;
@@ -117,27 +158,391 @@ fn build_system_prompt(workspace_root: &std::path::Path) -> String {
         memories.push_str(&entry);
     }
     if memories.is_empty() {
-        return SYSTEM_PROMPT.to_string();
+        return base.to_string();
     }
     let mut prompt = format!(
-        "{SYSTEM_PROMPT}\n\nWorkspace memories (lessons from previous sessions — apply them):\n{memories}"
+        "{base}
+
+Workspace memories (lessons from previous sessions — apply them):
+{memories}"
     );
     if dropped > 0 {
         prompt.push_str(&format!(
-            "\n({dropped} additional memories exceeded the prompt budget and were omitted — \
-             consolidate .stella/memories/ to bring them back)"
+            "
+({dropped} additional memories exceeded the prompt budget and were omitted —              consolidate .stella/memories/ to bring them back)"
         ));
     }
     prompt
 }
 
-/// Run a one-shot prompt. `budget_limit` is `--budget` (`main.rs`):
-/// `Some(n)` enforces a hard per-turn USD cap, `None` meters spend for the
-/// cost summary without ever blocking. `format` selects human rendering vs
-/// the two headless modes (json / stream-json) — headless runs also get the
-/// headless `ask_user` io, which fails the tool with a named error instead
-/// of waiting on stdin.
+/// Shortcut: the raw step-loop system prompt plus workspace memories.
+fn build_system_prompt(workspace_root: &std::path::Path) -> String {
+    assemble_system_prompt(SYSTEM_PROMPT, workspace_root)
+}
+
+/// Shortcut: the pipeline-mode system prompt plus workspace memories.
+fn build_pipeline_system_prompt(workspace_root: &std::path::Path) -> String {
+    assemble_system_prompt(PIPELINE_SYSTEM_PROMPT, workspace_root)
+}
+
+/// Run a one-shot prompt. `use_pipeline` selects the staged pipeline (the
+/// default) vs the raw step-loop (`--no-pipeline`).
 pub async fn run_one_shot(
+    cfg: &Config,
+    prompt: &str,
+    budget_limit: Option<f64>,
+    format: OutputFormat,
+    use_pipeline: bool,
+) -> Result<(), String> {
+    if use_pipeline {
+        run_pipeline_one_shot(cfg, prompt, budget_limit, format).await
+    } else {
+        run_raw_one_shot(cfg, prompt, budget_limit, format).await
+    }
+}
+
+/// Run a one-shot prompt through the staged pipeline: triage fast-paths,
+/// split-context planning, repo-structure injection, the deterministic
+/// verification ladder, and bounded revision.
+async fn run_pipeline_one_shot(
+    cfg: &Config,
+    prompt: &str,
+    budget_limit: Option<f64>,
+    format: OutputFormat,
+) -> Result<(), String> {
+    let provider = build_provider(cfg)?;
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+
+    let registry: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(cfg.workspace_root.clone()));
+    let mcp = connect_mcp(cfg, registry.clone(), format == OutputFormat::Text).await;
+    let base_tools: &dyn ToolExecutor = match &mcp {
+        Some(set) => set,
+        None => &*registry,
+    };
+    let custom_tools = discover_custom_tools(cfg, format == OutputFormat::Text);
+    let store = open_store(&cfg.workspace_root);
+
+    if format == OutputFormat::Text {
+        tui::section_header("Stella (pipeline)");
+        println!(
+            "  {}
+",
+            prompt.dimmed()
+        );
+    }
+
+    let turn_start = Instant::now();
+    let execution = begin_execution(&store, "pipeline", prompt, cfg);
+
+    let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let renderer = spawn_renderer(rx, format, execution.clone(), cfg.provider.id.to_string());
+
+    let resolver = SingleProviderResolver {
+        provider,
+        model_ref: model_ref.clone(),
+    };
+
+    let mut messages = vec![CompletionMessage::system(build_pipeline_system_prompt(
+        &cfg.workspace_root,
+    ))];
+    let mut memory = SessionMemory::open(&cfg.workspace_root, format == OutputFormat::Text);
+    if let Some(m) = &memory {
+        inject_recall_block(&mut messages, m.recall_block(prompt).await);
+    }
+    let mut budget = build_budget_guard(budget_limit);
+    budget.begin_turn();
+
+    let result = {
+        let customs = CustomToolSet::new(base_tools, custom_tools, cfg.workspace_root.clone());
+        let tools = InteractiveToolSet::new(
+            &customs,
+            tx.clone(),
+            default_ask_io(format == OutputFormat::Text),
+        )
+        .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
+
+        let repo_structure = GitRepoStructure {
+            root: cfg.workspace_root.clone(),
+        };
+        let command_runner = ShellCommandRunner {
+            root: cfg.workspace_root.clone(),
+        };
+
+        let profile = ProviderProfile::new(
+            cfg.provider.id,
+            model_ref.clone(),
+            model_ref.clone(),
+            model_ref,
+        );
+        let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
+        let router = Router::new(RoleTable::new(), vec![profile], breaker);
+
+        let pipeline_config = PipelineConfig {
+            engine: EngineConfig::default(),
+            headless: format != OutputFormat::Text,
+            headless_bypass_scope_review: true,
+            ..Default::default()
+        };
+
+        let no_recall = NoContextRecall;
+        let ports = PipelinePorts {
+            router: &router,
+            providers: &resolver,
+            tools: &tools,
+            recall: &no_recall,
+            repo: &repo_structure,
+            commands: &command_runner,
+            approvals: &AutoApproveGate,
+            sleeper: &TokioSleeper,
+        };
+
+        let pipeline = Pipeline::new(ports, tx.clone(), pipeline_config);
+        pipeline.run(prompt, &mut messages, &mut budget).await
+    };
+
+    drop(tx);
+    let collected = renderer.await.unwrap_or_default();
+
+    let files = registry.files_touched();
+    if let Some((store, id)) = &execution {
+        let _ = store.record_files_touched(*id, &files);
+        let (outcome_label, cost) = match &result {
+            Ok(outcome) => {
+                let label = match outcome.status {
+                    PipelineStatus::Completed => "completed",
+                    PipelineStatus::Aborted { .. } => "aborted",
+                };
+                (label, outcome.total_cost_usd)
+            }
+            Err(_) => ("error", 0.0),
+        };
+        let _ = store.finish_execution(*id, outcome_label, cost);
+    }
+
+    if result.is_ok()
+        && turn_warrants_reflection(&messages)
+        && let Some(m) = &mut memory
+    {
+        m.reflect_and_record(resolver.provider(), &messages, format != OutputFormat::Text)
+            .await;
+    }
+
+    if let Some(set) = &mcp {
+        set.close_all().await;
+    }
+
+    match &result {
+        Ok(outcome) => {
+            if format == OutputFormat::Json {
+                let status_str = match outcome.status {
+                    PipelineStatus::Completed => "completed",
+                    PipelineStatus::Aborted { .. } => "aborted",
+                };
+                let reason_str = match &outcome.status {
+                    PipelineStatus::Completed => None,
+                    PipelineStatus::Aborted { reason } => Some(reason.clone()),
+                };
+                let summary = serde_json::json!({
+                    "status": status_str,
+                    "text": outcome.final_text,
+                    "cost_usd": outcome.total_cost_usd,
+                    "reason": reason_str,
+                    "task_class": format!("{:?}", outcome.task_class),
+                    "verdict": outcome.verdict.as_ref().map(|v| serde_json::json!({
+                        "passed": v.passed,
+                        "deterministic": v.deterministic,
+                        "summary": v.summary,
+                    })),
+                    "revisions": outcome.revisions,
+                    "candidates_run": outcome.candidates_run,
+                    "model": format!("{}/{}", cfg.provider.id, cfg.model_id),
+                    "events": collected,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&summary).unwrap_or_else(|e| format!(
+                        "{{\"status\":\"error\",\"reason\":\"serialize: {e}\"}}"
+                    ))
+                );
+            }
+
+            if format == OutputFormat::Text {
+                tui::files_touched_panel(&files);
+                tui::cost_summary(
+                    outcome.total_cost_usd,
+                    &format!("{}/{}", cfg.provider.id, cfg.model_id),
+                    turn_start.elapsed(),
+                );
+                println!();
+            }
+
+            match &outcome.status {
+                PipelineStatus::Completed => Ok(()),
+                PipelineStatus::Aborted { reason } => Err(reason.clone()),
+            }
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// -----------------------------------------------------------------------
+// Pipeline port adapters
+// -----------------------------------------------------------------------
+
+/// Owns the boxed provider so the reference returned to the pipeline is
+/// valid for the pipeline's entire lifetime.
+struct SingleProviderResolver {
+    provider: Box<dyn Provider>,
+    model_ref: ModelRef,
+}
+
+impl SingleProviderResolver {
+    fn provider(&self) -> &dyn Provider {
+        &*self.provider
+    }
+}
+
+impl ProviderResolver for SingleProviderResolver {
+    fn provider_for(&self, model: &ModelRef) -> Option<&dyn Provider> {
+        if model == &self.model_ref {
+            Some(&*self.provider)
+        } else {
+            None
+        }
+    }
+}
+
+/// Repo-structure summary via `git ls-files` for the planner's split context.
+struct GitRepoStructure {
+    root: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl RepoStructurePort for GitRepoStructure {
+    async fn structure_summary(&self) -> String {
+        let output = tokio::process::Command::new("git")
+            .args(["ls-files"])
+            .current_dir(&self.root)
+            .output()
+            .await;
+        match output {
+            Ok(out) if out.status.success() => {
+                render_file_tree(&String::from_utf8_lossy(&out.stdout), 200)
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+fn render_file_tree(files: &str, max_lines: usize) -> String {
+    let mut paths: Vec<&str> = files.lines().filter(|l| !l.is_empty()).collect();
+    paths.sort_unstable();
+    if paths.is_empty() {
+        return String::new();
+    }
+    let total = paths.len();
+    let mut out: String = paths
+        .iter()
+        .take(max_lines)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+    if total > max_lines {
+        out.push_str(&format!(
+            "
+... ({} more files)",
+            total - max_lines
+        ));
+    }
+    out
+}
+
+/// Runs shell commands for the verification ladder (flip oracle tests, diff).
+struct ShellCommandRunner {
+    root: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl CommandRunner for ShellCommandRunner {
+    async fn run(&self, command: &str) -> CmdOutcome {
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg("-c").arg(command);
+        cmd.current_dir(&self.root);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return CmdOutcome {
+                    exit_code: -1,
+                    stdout_tail: String::new(),
+                    stderr_tail: format!("failed to spawn: {e}"),
+                };
+            }
+        };
+        #[cfg(unix)]
+        let pid = child.id().unwrap_or(0) as i32;
+
+        let timeout = Duration::from_secs(300);
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                return CmdOutcome {
+                    exit_code: -1,
+                    stdout_tail: String::new(),
+                    stderr_tail: format!("command failed: {e}"),
+                };
+            }
+            Err(_) => {
+                #[cfg(unix)]
+                unsafe {
+                    if pid > 0 {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                return CmdOutcome {
+                    exit_code: -1,
+                    stdout_tail: String::new(),
+                    stderr_tail: format!("command timed out after {}s", timeout.as_secs()),
+                };
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        CmdOutcome {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout_tail: truncate_tail(&stdout, 100_000),
+            stderr_tail: truncate_tail(&stderr, 20_000),
+        }
+    }
+}
+
+fn truncate_tail(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let start = s.len() - max_bytes;
+    let mut idx = start;
+    while !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    s[idx..].to_string()
+}
+
+/// Run a one-shot prompt through the raw step-loop (Engine::run_turn).
+/// Selected via `--no-pipeline`.
+async fn run_raw_one_shot(
     cfg: &Config,
     prompt: &str,
     budget_limit: Option<f64>,
@@ -484,7 +889,7 @@ fn build_code_graph(workspace_root: &std::path::Path) {
         );
         return;
     }
-    let db_path = dot_stella.join("context.db");
+    let db_path = dot_stella.join("codegraph.db");
     println!("  {} indexing code graph…", "◈".cyan());
     match stella_graph::CodeGraph::open(workspace_root, &db_path) {
         Ok(graph) => match graph.index_all() {
