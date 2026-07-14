@@ -19,7 +19,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::composer::{Composer, SlashCommand};
+use crate::composer::{
+    Composer, SlashCommand, SlashPopupOutcome, handle_slash_popup_key, slash_popup_matches,
+};
 use crate::deck::{DeckTab, WorkspaceModel};
 use crate::envelope::{AgentControl, AgentId, Inbound, WorkspaceInput};
 use crate::graph::GraphSnapshot;
@@ -244,8 +246,12 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
 
     // `↑` from an empty composer on the Session tab opens the queue editor on
     // the newest prompt — the "press up to edit what I queued" affordance.
+    // Gated on *full* composer emptiness (chips included, not just the live
+    // buffer): editing a queued item loads it via `Composer::load`, which
+    // clears any pasted chip still waiting to be sent, so this must not
+    // trigger while a chip is attached even if nothing further was typed.
     if ui.tab == DeckTab::Session
-        && composer_empty
+        && ui.composer.is_empty()
         && model.queue.pending() > 0
         && matches!(key.code, KeyCode::Up)
     {
@@ -277,44 +283,18 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
 /// The names of the slash commands matching the composer, or empty when the
 /// popup is inactive.
 fn slash_matches(ui: &DeckUi) -> Vec<String> {
-    ui.composer
-        .slash_menu(&ui.slash_commands)
-        .map(|m| m.matches.iter().map(|c| c.name.clone()).collect())
-        .unwrap_or_default()
+    slash_popup_matches(&ui.composer, &ui.slash_commands)
 }
 
 /// Slash-popup navigation: ↑/↓ choose, Tab completes into the buffer, Enter
 /// dispatches the selection (as an enqueue, like any prompt), Esc dismisses.
-/// Returns `None` for keys the popup doesn't claim.
+/// Returns `None` for keys the popup doesn't claim. Shared with the
+/// single-session REPL (`crate::ui`) via `crate::composer` so both surfaces
+/// stay consistent by construction.
 fn handle_slash_key(key: KeyEvent, matches: &[String], ui: &mut DeckUi) -> Option<DeckAction> {
-    let selected = ui.slash_selected.min(matches.len() - 1);
-    match key.code {
-        KeyCode::Up => {
-            ui.slash_selected = selected.saturating_sub(1);
-            Some(DeckAction::Handled)
-        }
-        KeyCode::Down => {
-            ui.slash_selected = (selected + 1).min(matches.len() - 1);
-            Some(DeckAction::Handled)
-        }
-        KeyCode::Tab => {
-            ui.composer.load(matches[selected].clone());
-            ui.slash_selected = 0;
-            Some(DeckAction::Handled)
-        }
-        KeyCode::Enter => {
-            ui.composer.clear();
-            ui.slash_selected = 0;
-            Some(DeckAction::Send(WorkspaceInput::Enqueue {
-                text: matches[selected].clone(),
-            }))
-        }
-        KeyCode::Esc => {
-            ui.composer.clear();
-            ui.slash_selected = 0;
-            Some(DeckAction::Handled)
-        }
-        _ => None,
+    match handle_slash_popup_key(key, matches, &mut ui.composer, &mut ui.slash_selected)? {
+        SlashPopupOutcome::Handled => Some(DeckAction::Handled),
+        SlashPopupOutcome::Submit(text) => Some(DeckAction::Send(WorkspaceInput::Enqueue { text })),
     }
 }
 
@@ -604,7 +584,16 @@ fn handle_composer_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
             // A `!`-prefixed line is a shell command: it executes IMMEDIATELY,
             // bypassing the prompt queue and any busy agent entirely.
             Some(text) if text.trim_start().starts_with('!') => {
-                let cmd = text.trim_start().trim_start_matches('!').trim().to_string();
+                // Strip only the single leading `!` dispatch marker — not
+                // every leading `!` — so a command whose own text starts
+                // with `!` (e.g. `!!foo`, meant as the shell command `!foo`)
+                // is not rewritten into something else.
+                let leading = text.trim_start();
+                let cmd = leading
+                    .strip_prefix('!')
+                    .unwrap_or(leading)
+                    .trim()
+                    .to_string();
                 if cmd.is_empty() {
                     DeckAction::Ignored
                 } else {
@@ -842,6 +831,20 @@ mod tests {
     }
 
     #[test]
+    fn bang_prefix_only_strips_the_single_dispatch_marker() {
+        // The command text itself starts with `!` (e.g. `!important`), so
+        // the typed line is `!!important` — only the first `!` is the
+        // dispatch marker; the second belongs to the command.
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        for c in "!!important".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(action, DeckAction::Shell("!important".into()));
+    }
+
+    #[test]
     fn bang_prefix_beats_a_pending_ask_user_gate() {
         let mut model = model_with(&["lead"]);
         model.apply_inbound(&Inbound::Event {
@@ -888,6 +891,27 @@ mod tests {
         let mut ui2 = ready_ui();
         handle_deck_key(key(KeyCode::Up), &empty, &mut ui2);
         assert!(!ui2.queue_open);
+    }
+
+    #[test]
+    fn up_arrow_does_not_open_the_queue_editor_over_a_pasted_chip() {
+        // The live buffer is empty, but a pasted chip is still attached —
+        // editing a queued item would `Composer::load` and silently drop it,
+        // so the composer must not read as "empty" here.
+        let model = model_with_queue(&["first"]);
+        let mut ui = ready_ui();
+        ui.composer
+            .paste("line1\nline2\nline3\nline4\nline5\nline6");
+        assert!(ui.composer.buffer().is_empty());
+        assert!(
+            !ui.composer.is_empty(),
+            "the chip keeps the composer non-empty"
+        );
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        assert!(
+            !ui.queue_open,
+            "opening the queue editor here would drop the pasted chip on next edit"
+        );
     }
 
     #[test]

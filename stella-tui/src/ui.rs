@@ -15,7 +15,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use stella_protocol::AgentEvent;
 
-use crate::composer::{Composer, SlashCommand};
+use crate::composer::{
+    Composer, SlashCommand, SlashPopupOutcome, handle_slash_popup_key, slash_popup_matches,
+};
 use crate::input::{ScopeDecision, UserInput};
 use crate::model::{AskUserPrompt, SessionModel};
 use crate::scroll::ScrollState;
@@ -241,50 +243,20 @@ fn scope_decision_for(code: KeyCode) -> Option<ScopeDecision> {
     }
 }
 
-/// The names of the slash commands currently matching the composer, or empty
-/// when the popup is not active. Owned strings so the caller can keep
-/// mutating `ui` while acting on them.
-fn slash_matches(ui: &UiState) -> Vec<String> {
-    ui.composer
-        .slash_menu(&ui.slash_commands)
-        .map(|m| m.matches.iter().map(|c| c.name.clone()).collect())
-        .unwrap_or_default()
-}
-
 fn handle_composer_key(key: KeyEvent, ui: &mut UiState) -> ShellAction {
     // While the slash popup is open, navigation keys drive it: ↑/↓ choose,
     // Tab completes into the buffer, Enter runs the selection, Esc dismisses.
-    let slash = slash_matches(ui);
-    if !slash.is_empty() {
-        let selected = ui.slash_selected.min(slash.len() - 1);
-        match key.code {
-            KeyCode::Up => {
-                ui.slash_selected = selected.saturating_sub(1);
-                return ShellAction::Handled;
-            }
-            KeyCode::Down => {
-                ui.slash_selected = (selected + 1).min(slash.len() - 1);
-                return ShellAction::Handled;
-            }
-            KeyCode::Tab => {
-                ui.composer.load(slash[selected].clone());
-                ui.slash_selected = 0;
-                return ShellAction::Handled;
-            }
-            KeyCode::Enter => {
-                ui.composer.clear();
-                ui.slash_selected = 0;
-                return ShellAction::Submit(UserInput::Prompt {
-                    text: slash[selected].clone(),
-                });
-            }
-            KeyCode::Esc => {
-                ui.composer.clear();
-                ui.slash_selected = 0;
-                return ShellAction::Handled;
-            }
-            _ => {}
-        }
+    // Shared with the deck (`crate::deck_ui`) via `crate::composer` so both
+    // surfaces stay consistent by construction.
+    let slash = slash_popup_matches(&ui.composer, &ui.slash_commands);
+    if !slash.is_empty()
+        && let Some(outcome) =
+            handle_slash_popup_key(key, &slash, &mut ui.composer, &mut ui.slash_selected)
+    {
+        return match outcome {
+            SlashPopupOutcome::Handled => ShellAction::Handled,
+            SlashPopupOutcome::Submit(text) => ShellAction::Submit(UserInput::Prompt { text }),
+        };
     }
     match key.code {
         KeyCode::Enter => match ui.composer.take_submission() {

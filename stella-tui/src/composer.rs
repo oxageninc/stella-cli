@@ -11,6 +11,14 @@
 //! command list by the typed prefix, so `/help /clear /models /diff /files`
 //! are an *input*, not a hard-coded set — the CLI owns the real command
 //! vocabulary.
+//!
+//! [`handle_slash_popup_key`] is the one implementation of slash-popup key
+//! handling, shared by every composer-driven surface (the single-session
+//! REPL's [`crate::ui`] and the deck's [`crate::deck_ui`]) so a future fix to
+//! selection clamping, Esc semantics, or completion behavior can't land on
+//! one surface and drift from the other.
+
+use crossterm::event::{KeyCode, KeyEvent};
 
 /// Below this many lines a paste is inserted inline; at or above it, the
 /// paste collapses to a chip. Small on purpose (L-T3).
@@ -223,6 +231,66 @@ impl<'a> SlashMenu<'a> {
 
     pub fn is_empty(&self) -> bool {
         self.matches.is_empty()
+    }
+}
+
+/// The names of the slash commands currently matching the composer, or empty
+/// when the popup should be inactive. Owned strings so a caller can keep
+/// mutating its own UI state while acting on them.
+pub fn slash_popup_matches(composer: &Composer, slash_commands: &[SlashCommand]) -> Vec<String> {
+    composer
+        .slash_menu(slash_commands)
+        .map(|m| m.matches.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// What a slash-popup key press should do, abstracted over the caller's own
+/// action type — a REPL `Prompt` and a deck `Enqueue` both start from the
+/// same submitted text.
+pub enum SlashPopupOutcome {
+    /// Navigation, completion, or dismiss — fully handled here.
+    Handled,
+    /// Enter: dispatch this text as a prompt.
+    Submit(String),
+}
+
+/// Slash-popup navigation shared by every composer-driven surface: ↑/↓
+/// choose, Tab completes into the buffer, Enter dispatches the selection,
+/// Esc dismisses. Returns `None` for a key the popup doesn't claim, so the
+/// caller can fall through to normal composer editing. `matches` must be
+/// non-empty — callers only reach this once the popup is confirmed active.
+pub fn handle_slash_popup_key(
+    key: KeyEvent,
+    matches: &[String],
+    composer: &mut Composer,
+    slash_selected: &mut usize,
+) -> Option<SlashPopupOutcome> {
+    let selected = (*slash_selected).min(matches.len() - 1);
+    match key.code {
+        KeyCode::Up => {
+            *slash_selected = selected.saturating_sub(1);
+            Some(SlashPopupOutcome::Handled)
+        }
+        KeyCode::Down => {
+            *slash_selected = (selected + 1).min(matches.len() - 1);
+            Some(SlashPopupOutcome::Handled)
+        }
+        KeyCode::Tab => {
+            composer.load(matches[selected].clone());
+            *slash_selected = 0;
+            Some(SlashPopupOutcome::Handled)
+        }
+        KeyCode::Enter => {
+            composer.clear();
+            *slash_selected = 0;
+            Some(SlashPopupOutcome::Submit(matches[selected].clone()))
+        }
+        KeyCode::Esc => {
+            composer.clear();
+            *slash_selected = 0;
+            Some(SlashPopupOutcome::Handled)
+        }
+        _ => None,
     }
 }
 

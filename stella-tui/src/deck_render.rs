@@ -184,7 +184,7 @@ fn render_activity_strip(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &
 fn render_queue_popup(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut Buffer) {
     let pending = model.queue.pending();
     let w = area.width.min(64);
-    let h = ((pending as u16) + 4).min(14).min(area.height);
+    let h = ((pending + 4).min(14) as u16).min(area.height);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -217,7 +217,11 @@ fn render_queue_popup(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut
         if is_sel {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        let text: String = item.text.chars().take(w as usize - 6).collect();
+        let text: String = item
+            .text
+            .chars()
+            .take((w as usize).saturating_sub(6))
+            .collect();
         lines.push(Line::from(vec![
             Span::styled(format!("{marker}{}. ", i + 1), style.fg(theme::AMBER)),
             Span::styled(text, style),

@@ -12,10 +12,12 @@
 //! where the clock advances and the resource monitor samples, so all
 //! time-based UI shares one heartbeat.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
@@ -25,6 +27,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::composer::{Composer, SlashCommand};
@@ -127,10 +130,23 @@ fn now_ms() -> u64 {
 /// `ToolResult` + terminal `Status` when it finishes. stdout and stderr are
 /// both captured; a non-zero exit reports as a tool error. The TUI never
 /// blocks on the child — it runs on a spawned task and reports back over `tx`.
-fn spawn_shell_command(cmd: String, tx: UnboundedSender<Inbound>, started_ms: u64) {
+///
+/// `active` counts shell commands currently in flight on the shared
+/// [`SHELL_AGENT`] lane. Because immediate `!` commands can overlap (a second
+/// one dispatched before the first finishes), only the invocation that drains
+/// the count to zero is allowed to park the lane with a terminal `Status` —
+/// otherwise an earlier command finishing first would mark the lane
+/// Done/Failed while a sibling command is still genuinely running.
+fn spawn_shell_command(
+    cmd: String,
+    tx: UnboundedSender<Inbound>,
+    started_ms: u64,
+    active: Arc<AtomicUsize>,
+) {
     use stella_protocol::{AgentEvent, ToolCall, ToolOutput};
 
     let call_id = format!("shell-{started_ms}");
+    active.fetch_add(1, Ordering::SeqCst);
     let _ = tx.send(Inbound::Register(
         AgentMeta::new(SHELL_AGENT, format!("! {cmd}"), started_ms).with_role("shell"),
     ));
@@ -147,24 +163,42 @@ fn spawn_shell_command(cmd: String, tx: UnboundedSender<Inbound>, started_ms: u6
 
     tokio::spawn(async move {
         let started = std::time::Instant::now();
-        let result = tokio::process::Command::new("sh")
+        let spawned = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)
-            .output()
-            .await;
-        let (ok, content) = match result {
-            Ok(out) => {
-                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-                if !out.stderr.is_empty() {
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        let (ok, content) = match spawned {
+            Ok(mut child) => {
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+                let mut out_buf = CappedOutput::new();
+                let mut err_buf = CappedOutput::new();
+                // Read both pipes and wait for exit concurrently — draining
+                // stdout/stderr as they arrive (bounded, never fully
+                // buffered) so neither pipe can back up and stall the child.
+                let (_, _, status) = tokio::join!(
+                    read_capped(stdout, &mut out_buf),
+                    read_capped(stderr, &mut err_buf),
+                    child.wait(),
+                );
+                let mut text = out_buf.finish();
+                if !err_buf.is_empty() {
                     if !text.is_empty() {
                         text.push('\n');
                     }
-                    text.push_str(&String::from_utf8_lossy(&out.stderr));
+                    text.push_str(&err_buf.finish());
                 }
+                let success = status.as_ref().map(|s| s.success()).unwrap_or(false);
                 if text.trim().is_empty() {
-                    text = format!("(no output — exit {})", out.status);
+                    let label = status
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|e| format!("error: {e}"));
+                    text = format!("(no output — exit {label})");
                 }
-                (out.status.success(), cap_output(&text))
+                (success, text)
             }
             Err(e) => (false, format!("failed to spawn `sh -c`: {e}")),
         };
@@ -182,29 +216,87 @@ fn spawn_shell_command(cmd: String, tx: UnboundedSender<Inbound>, started_ms: u6
             },
         });
         // Park the lane so it never reads as still-working (a lingering
-        // Running shell agent would keep the spinner alive forever).
-        let _ = tx.send(Inbound::Status {
-            agent: SHELL_AGENT.to_string(),
-            status: if ok {
-                AgentStatus::Done
-            } else {
-                AgentStatus::Failed
-            },
-        });
+        // Running shell agent would keep the spinner alive forever) — but
+        // only once this was the last command in flight; `fetch_sub` returns
+        // the pre-decrement count, so `1` means we just brought it to zero.
+        if active.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let _ = tx.send(Inbound::Status {
+                agent: SHELL_AGENT.to_string(),
+                status: if ok {
+                    AgentStatus::Done
+                } else {
+                    AgentStatus::Failed
+                },
+            });
+        }
     });
 }
 
-/// Middle-out cap on shell output: keep the head and the tail (errors live at
-/// the tail), elide the middle past [`SHELL_OUTPUT_CAP`] chars.
-fn cap_output(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= SHELL_OUTPUT_CAP {
-        return text.to_string();
+/// Streams a piped child stream into `buf`, chunk by chunk, so output is
+/// capped as it arrives rather than fully buffered first.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(stream: Option<R>, buf: &mut CappedOutput) {
+    let Some(mut stream) = stream else { return };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.push(&chunk[..n]),
+        }
     }
-    let half = SHELL_OUTPUT_CAP / 2;
-    let head: String = chars[..half].iter().collect();
-    let tail: String = chars[chars.len() - half..].iter().collect();
-    format!("{head}\n…[output truncated]…\n{tail}")
+}
+
+/// Bounded middle-out accumulator for shell output: keeps a head window (up
+/// to [`SHELL_OUTPUT_CAP`] bytes) and a sliding tail window (the last
+/// `SHELL_OUTPUT_CAP / 2` bytes seen), so memory use stays capped regardless
+/// of how much a verbose command actually writes — unlike buffering the full
+/// stream and truncating only afterward. Errors live at the tail, matching
+/// [`spawn_shell_command`]'s stdout-then-stderr ordering.
+struct CappedOutput {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total: usize,
+}
+
+impl CappedOutput {
+    fn new() -> Self {
+        Self {
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.total += chunk.len();
+        if self.head.len() < SHELL_OUTPUT_CAP {
+            let take = (SHELL_OUTPUT_CAP - self.head.len()).min(chunk.len());
+            self.head.extend_from_slice(&chunk[..take]);
+        }
+        let half = SHELL_OUTPUT_CAP / 2;
+        for &b in chunk {
+            if self.tail.len() >= half {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(b);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// Renders as a full-buffer-then-truncate implementation would have:
+    /// unchanged if it fit, otherwise head + elision marker + tail.
+    fn finish(self) -> String {
+        if self.total <= SHELL_OUTPUT_CAP {
+            return String::from_utf8_lossy(&self.head).into_owned();
+        }
+        let half = SHELL_OUTPUT_CAP / 2;
+        let head = String::from_utf8_lossy(&self.head[..half.min(self.head.len())]).into_owned();
+        let tail_bytes: Vec<u8> = self.tail.into_iter().collect();
+        let tail = String::from_utf8_lossy(&tail_bytes).into_owned();
+        format!("{head}\n…[output truncated]…\n{tail}")
+    }
 }
 
 
@@ -234,6 +326,9 @@ pub async fn run_deck(
     // back here and are folded exactly like engine events. The sender lives
     // for the whole loop, so this arm never closes it.
     let (local_tx, mut local_rx) = tokio::sync::mpsc::unbounded_channel::<Inbound>();
+    // Shared in-flight count for overlapping `!` commands (see
+    // `spawn_shell_command`) — persists across every dispatch this loop makes.
+    let shell_active = Arc::new(AtomicUsize::new(0));
 
     // Blocking crossterm reader → async loop, with a shutdown flag.
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
@@ -302,7 +397,12 @@ pub async fn run_deck(
                                 // waiting on the engine. Output returns on the
                                 // local lane as ordinary events.
                                 debug.note(&format!("shell: {cmd}"));
-                                spawn_shell_command(cmd, local_tx.clone(), model.now_ms);
+                                spawn_shell_command(
+                                    cmd,
+                                    local_tx.clone(),
+                                    model.now_ms,
+                                    shell_active.clone(),
+                                );
                             }
                             DeckAction::Handled | DeckAction::Ignored => {}
                         }
@@ -340,15 +440,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cap_output_keeps_head_and_tail() {
-        let short = "fits";
-        assert_eq!(cap_output(short), short);
-        let long = format!("HEAD{}TAIL", "x".repeat(SHELL_OUTPUT_CAP * 2));
-        let capped = cap_output(&long);
-        assert!(capped.starts_with("HEAD"));
-        assert!(capped.ends_with("TAIL"));
-        assert!(capped.contains("[output truncated]"));
-        assert!(capped.chars().count() < long.chars().count());
+    fn capped_output_passes_short_text_through_unchanged() {
+        let mut buf = CappedOutput::new();
+        buf.push(b"fits");
+        assert_eq!(buf.finish(), "fits");
+    }
+
+    #[test]
+    fn capped_output_keeps_head_and_tail_when_truncated() {
+        let mut buf = CappedOutput::new();
+        buf.push(b"HEAD");
+        buf.push(&vec![b'x'; SHELL_OUTPUT_CAP * 2]);
+        buf.push(b"TAIL");
+        let out = buf.finish();
+        assert!(out.starts_with("HEAD"), "{out}");
+        assert!(out.ends_with("TAIL"), "{out}");
+        assert!(out.contains("[output truncated]"), "{out}");
+    }
+
+    #[test]
+    fn capped_output_bounds_memory_regardless_of_input_size() {
+        // The whole point of streaming with a bounded accumulator: pushing
+        // far more than the cap must not grow internal storage past it,
+        // unlike collecting the full output before truncating.
+        let mut buf = CappedOutput::new();
+        let chunk = vec![b'x'; 8192];
+        for _ in 0..64 {
+            buf.push(&chunk);
+        }
+        assert!(buf.head.len() <= SHELL_OUTPUT_CAP);
+        assert!(buf.tail.len() <= SHELL_OUTPUT_CAP / 2);
+        assert!(buf.finish().contains("[output truncated]"));
     }
 
     #[test]
@@ -358,7 +480,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_shell_command("echo hi".into(), tx, 42);
+        let active = Arc::new(AtomicUsize::new(0));
+        spawn_shell_command("echo hi".into(), tx, 42, active);
         match rx.try_recv() {
             Ok(Inbound::Register(meta)) => {
                 assert_eq!(meta.id, SHELL_AGENT);
@@ -375,6 +498,39 @@ mod tests {
         // this test pins, so completion just needs to arrive eventually.
         rt.block_on(async {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+        });
+    }
+
+    #[test]
+    fn overlapping_shell_commands_only_park_the_lane_once_the_last_finishes() {
+        // Two `!` commands dispatched before either finishes share the same
+        // SHELL_AGENT lane. The fast one (`echo`) must not send a terminal
+        // Status while the slow one (`sleep`) is still running — only the
+        // last to finish may park the lane.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let active = Arc::new(AtomicUsize::new(0));
+        spawn_shell_command("echo fast".into(), tx.clone(), 1, active.clone());
+        spawn_shell_command("sleep 0.2 && echo slow".into(), tx, 2, active);
+
+        rt.block_on(async {
+            let mut statuses = Vec::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+                {
+                    Ok(Some(Inbound::Status { status, .. })) => statuses.push(status),
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            }
+            assert_eq!(
+                statuses.len(),
+                1,
+                "exactly one terminal Status should be sent for two overlapping commands: {statuses:?}"
+            );
         });
     }
 }
