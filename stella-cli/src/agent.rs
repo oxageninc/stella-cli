@@ -41,7 +41,7 @@ use tokio::sync::mpsc;
 
 use crate::OutputFormat;
 use crate::config::Config;
-use crate::domains::{heuristic_domains, infer_domains};
+use crate::domains::{Domains, heuristic_domains, infer_domains};
 use crate::interactive::{InteractiveToolSet, SkillRegistry, default_ask_io};
 use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
 use crate::tui;
@@ -55,6 +55,7 @@ You have these tools available:
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
 - bash: Run a shell command in the workspace root (with timeout)
+- code_graph: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. Appears only when `.stella/codegraph.db` exists (run `stella init` to build it).
 - grep: Search file contents with regex (shells to ripgrep)
 - glob: Find files matching a glob pattern
 - build_project: Build with the workspace's own toolchain (cargo/npm/go/make)
@@ -67,6 +68,7 @@ You have these tools available:
 Some tools have prerequisites: issue tracking (create_issue/update_issue/close_issue/search_issues/start_work_on_issue) appears only when configured; ci_status requires the gh CLI. Use them when present.
 
 Rules:
+- For "where is X defined", "who calls/references X", or "what depends on this file" questions, reach for code_graph FIRST when it is available — it is precise and cheap. Fall back to grep/glob only when the graph can't answer (free-text search, a symbol the index doesn't carry, or no index yet).
 - Always read a file before editing it — never edit blind.
 - Make minimal, surgical edits. Use edit_file, not write_file, for changes to existing files.
 - After changing behavior, use run_tests to check the suite, and verify_done to prove the change with a witness test rather than trusting a green suite.
@@ -85,6 +87,7 @@ You have these tools available:
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
 - bash: Run a shell command in the workspace root (with timeout)
+- code_graph: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. Appears only when `.stella/codegraph.db` exists (run `stella init` to build it). For symbol and dependency questions it is precise and cheaper than grep.
 - grep: Search file contents with regex (shells to ripgrep)
 - glob: Find files matching a glob pattern
 - build_project: Build with the workspace's own toolchain (cargo/npm/go/make)
@@ -98,7 +101,7 @@ Some tools have prerequisites: issue tracking (create_issue/update_issue/close_i
 
 Methodology (always follow in order):
 1. REPRODUCE: Run the failing test or reproduce the bug before touching any file. Never edit blind, you must see the actual error first.
-2. LOCALIZE: Trace the error to its root cause. Read the failing code path. Use grep and glob to navigate precisely.
+2. LOCALIZE: Trace the error to its root cause. Read the failing code path. When code_graph is available, use it FIRST to find definitions, references, and import edges — it is precise and cheap; fall back to grep and glob for free-text search or when the graph has no answer.
 3. MINIMAL FIX: Make the smallest change that resolves the issue. No refactoring. No style changes. No "while I'm here" edits. One logical change.
 4. VERIFY: Run the target test. If it passes, use verify_done to witness the change. If it fails, read the error and adjust.
 
@@ -231,16 +234,20 @@ fn build_pipeline_system_prompt(workspace_root: &std::path::Path) -> String {
 }
 
 /// Run a one-shot prompt. `use_pipeline` selects the staged pipeline (the
-/// default) vs the raw step-loop (`--no-pipeline`).
+/// default) vs the raw step-loop (`--no-pipeline`). `test_command`, when
+/// given, arms the pipeline's deterministic verification ladder (the
+/// fail→pass flip oracle); without it, verification falls back to the model
+/// judge on every iteration.
 pub async fn run_one_shot(
     cfg: &Config,
     prompt: &str,
     budget_limit: Option<f64>,
     format: OutputFormat,
     use_pipeline: bool,
+    test_command: Option<&str>,
 ) -> Result<(), String> {
     if use_pipeline {
-        run_pipeline_one_shot(cfg, prompt, budget_limit, format).await
+        run_pipeline_one_shot(cfg, prompt, budget_limit, format, test_command).await
     } else {
         run_raw_one_shot(cfg, prompt, budget_limit, format).await
     }
@@ -254,6 +261,7 @@ async fn run_pipeline_one_shot(
     prompt: &str,
     budget_limit: Option<f64>,
     format: OutputFormat,
+    test_command: Option<&str>,
 ) -> Result<(), String> {
     let provider = build_provider(cfg)?;
     let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
@@ -330,6 +338,11 @@ async fn run_pipeline_one_shot(
             engine: engine_config_for(cfg),
             headless: !is_text,
             headless_bypass_scope_review: !is_text,
+            // `--test-command` arms the deterministic verify ladder: the
+            // fail→pass flip oracle and SubmitFast/Revise decisions all key
+            // off it. Left unset, every verification escalates to the model
+            // judge.
+            test_command: test_command.map(str::to_string),
             ..Default::default()
         };
 
@@ -877,6 +890,24 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             println!();
             continue;
         }
+        if input == "/init" {
+            println!();
+            let mut emit = |line: String| println!("  {line}");
+            match init_workspace(Some(&*provider), &cfg.workspace_root, &mut emit).await {
+                Ok(_) => {
+                    // A fresh index may name tables/types the schema gate
+                    // should know about this session, not just the next one.
+                    populate_schema_index(&registry, &cfg.workspace_root);
+                    // Re-open memory so recall/reflection use the taxonomy
+                    // `/init` just wrote — otherwise the cached domains stay
+                    // stale until the next launch.
+                    memory = SessionMemory::open(&cfg.workspace_root, true);
+                }
+                Err(e) => println!("  {} init failed: {e}", "✗".red()),
+            }
+            println!();
+            continue;
+        }
         if let Some(title) = input.strip_prefix("/rename ") {
             tui::rename_tab(title.trim());
             println!(
@@ -1051,25 +1082,24 @@ pub(crate) async fn record_turn_episode(
 ///
 /// Idempotent and best-effort: a failure degrades to a warning (init still
 /// succeeds, offline included) — the graph can always be rebuilt on a later
-/// `init` once a toolchain/parser is available.
-fn build_code_graph(workspace_root: &std::path::Path) {
+/// `init` once a toolchain/parser is available. Progress goes to `emit`
+/// (plain text, no ANSI) so both the CLI and the deck transcript can show it.
+fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut(String)) {
     let dot_stella = workspace_root.join(".stella");
     if let Err(e) = std::fs::create_dir_all(&dot_stella) {
-        eprintln!(
-            "  {} could not create .stella for the code graph: {e} — skipped",
-            "!".yellow()
-        );
+        emit(format!(
+            "! could not create .stella for the code graph: {e} — skipped"
+        ));
         return;
     }
     let db_path = dot_stella.join("codegraph.db");
-    println!("  {} indexing code graph…", "◈".cyan());
+    emit("◈ indexing code graph…".to_string());
     match stella_graph::CodeGraph::open(workspace_root, &db_path) {
         Ok(graph) => match graph.index_all() {
             Ok(stats) => {
-                println!(
-                    "  {} code graph: {} symbols, {} imports across {} file{} \
+                emit(format!(
+                    "✓ code graph: {} symbols, {} imports across {} file{} \
                      ({} parsed, {} unchanged)",
-                    "✓".green(),
                     stats.symbols,
                     stats.imports,
                     stats.files_parsed + stats.files_skipped_unchanged,
@@ -1080,23 +1110,127 @@ fn build_code_graph(workspace_root: &std::path::Path) {
                     },
                     stats.files_parsed,
                     stats.files_skipped_unchanged,
-                );
+                ));
                 graph.shutdown();
             }
             Err(e) => {
-                eprintln!(
-                    "  {} code-graph indexing failed: {e} — run `stella init` again to retry",
-                    "!".yellow()
-                );
+                emit(format!(
+                    "! code-graph indexing failed: {e} — run `stella init` again to retry"
+                ));
             }
         },
         Err(e) => {
-            eprintln!(
-                "  {} code-graph store unavailable: {e} — skipped",
-                "!".yellow()
-            );
+            emit(format!("! code-graph store unavailable: {e} — skipped"));
         }
     }
+}
+
+/// The shared init flow behind `stella init` and the `/init` chat command:
+/// infer the domain taxonomy (model-assisted when a provider is available,
+/// directory heuristic otherwise), build the code-graph index, persist
+/// `.stella/domains.toml`, and record the taxonomy into the context plane.
+/// Progress lines stream to `emit` — the CLI prints them, the deck forwards
+/// them into the transcript — so both surfaces share one implementation.
+pub(crate) async fn init_workspace(
+    provider: Option<&dyn Provider>,
+    workspace_root: &std::path::Path,
+    emit: &mut dyn FnMut(String),
+) -> Result<Domains, String> {
+    let domains = match provider {
+        Some(p) => infer_domains(p, workspace_root).await,
+        None => heuristic_domains(workspace_root),
+    };
+
+    // The code graph needs no provider — build it regardless of how the
+    // domains were inferred, so the index exists even fully offline.
+    build_code_graph(workspace_root, emit);
+
+    let path = domains.save(workspace_root)?;
+
+    // Persist the taxonomy into the context plane too: domain descriptions
+    // plus bi-temporal `covers_path` facts, so recall can fuse on them and a
+    // re-run after the taxonomy shifts supersedes (never deletes) the old
+    // beliefs. Best-effort — a store that won't open already warned.
+    if let Some(m) = SessionMemory::open(workspace_root, false) {
+        m.record_taxonomy(&domains).await;
+    }
+
+    emit(format!(
+        "✓ {} domains ({}) → {}",
+        domains.domains.len(),
+        domains.inferred_by,
+        path.display()
+    ));
+    Ok(domains)
+}
+
+/// Query the code graph (if `stella init` has built it) for the
+/// best-connected file's neighborhood, converted to the deck's Graph-tab
+/// snapshot. `None` when there is no index, it is empty, or any read fails —
+/// the tab then shows its "run stella init" hint instead of an empty graph.
+pub(crate) fn graph_snapshot(
+    workspace_root: &std::path::Path,
+) -> Option<stella_tui::GraphSnapshot> {
+    use stella_tui::{GraphEdge, GraphNode, GraphSnapshot};
+
+    let db_path = workspace_root.join(".stella").join("codegraph.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let graph = stella_graph::CodeGraph::open(workspace_root, &db_path).ok()?;
+    let focus = graph.busiest_file().ok()??;
+    let hood = graph
+        .file_neighborhood(std::path::Path::new(&focus))
+        .ok()?;
+    graph.shutdown();
+
+    let mut nodes = vec![GraphNode {
+        label: hood.file.clone(),
+        kind: "file".to_string(),
+        location: Some(hood.file.clone()),
+    }];
+    let mut edges = Vec::new();
+    for symbol in &hood.symbols {
+        edges.push(GraphEdge {
+            from: 0,
+            to: nodes.len(),
+            kind: "defines".to_string(),
+        });
+        nodes.push(GraphNode {
+            label: symbol.name.clone(),
+            kind: symbol.kind.clone(),
+            location: Some(format!("{}:{}", hood.file, symbol.start_line)),
+        });
+    }
+    for import in &hood.imports {
+        edges.push(GraphEdge {
+            from: 0,
+            to: nodes.len(),
+            kind: "imports".to_string(),
+        });
+        nodes.push(GraphNode {
+            label: import.clone(),
+            kind: "module".to_string(),
+            location: None,
+        });
+    }
+    for importer in &hood.importers {
+        edges.push(GraphEdge {
+            from: nodes.len(),
+            to: 0,
+            kind: "imports".to_string(),
+        });
+        nodes.push(GraphNode {
+            label: importer.clone(),
+            kind: "file".to_string(),
+            location: Some(importer.clone()),
+        });
+    }
+    Some(GraphSnapshot {
+        focus: hood.file,
+        nodes,
+        edges,
+    })
 }
 
 /// Open the code graph (read-only) and populate the tool registry's schema
@@ -1121,8 +1255,8 @@ pub(crate) fn populate_schema_index(registry: &ToolRegistry, workspace_root: &st
 /// index, and write `.stella/domains.toml` (see `crate::domains`). Domain
 /// inference is model-assisted when a provider resolves, with a deterministic
 /// directory heuristic fallback, so init always succeeds — offline included.
-/// The code graph (`.stella/context.db`) is built unconditionally: it needs no
-/// provider, only the on-disk source tree.
+/// The code graph (`.stella/codegraph.db`) is built unconditionally: it needs
+/// no provider, only the on-disk source tree.
 pub async fn run_init(
     model_override: Option<&str>,
     api_key_override: Option<&str>,
@@ -1133,7 +1267,7 @@ pub async fn run_init(
 
     tui::section_header("Stella init");
 
-    let domains = match Config::load(model_override, api_key_override, base_url_override) {
+    let provider = match Config::load(model_override, api_key_override, base_url_override) {
         Ok(cfg) => {
             let provider = build_provider(&cfg)?;
             println!(
@@ -1142,7 +1276,7 @@ pub async fn run_init(
                 cfg.provider.id,
                 cfg.model_id
             );
-            infer_domains(&*provider, &workspace_root).await
+            Some(provider)
         }
         Err(_) => {
             println!(
@@ -1150,31 +1284,13 @@ pub async fn run_init(
                  (re-run `stella init` with a key for a better taxonomy)",
                 "!".yellow()
             );
-            heuristic_domains(&workspace_root)
+            None
         }
     };
 
-    // The code graph needs no provider — build it regardless of how the
-    // domains were inferred, so the index exists even fully offline.
-    build_code_graph(&workspace_root);
+    let mut emit = |line: String| println!("  {line}");
+    let domains = init_workspace(provider.as_deref(), &workspace_root, &mut emit).await?;
 
-    let path = domains.save(&workspace_root)?;
-
-    // Persist the taxonomy into the context plane too: domain descriptions
-    // plus bi-temporal `covers_path` facts, so recall can fuse on them and a
-    // re-run after the taxonomy shifts supersedes (never deletes) the old
-    // beliefs. Best-effort — a store that won't open already warned.
-    if let Some(m) = SessionMemory::open(&workspace_root, false) {
-        m.record_taxonomy(&domains).await;
-    }
-
-    println!(
-        "  {} {} domains ({}) → {}",
-        "✓".green(),
-        domains.domains.len(),
-        domains.inferred_by,
-        path.display()
-    );
     for domain in &domains.domains {
         println!(
             "    {} {} — {} [{}]",
@@ -2163,6 +2279,10 @@ fn print_help() {
     println!(
         "  {}  Change the accent color (multi-window)",
         "/color <name>".bright_blue()
+    );
+    println!(
+        "  {}          Index the workspace: domain taxonomy + code graph",
+        "/init".bright_blue()
     );
     println!("  {}          Show this help", "/help".bright_blue());
     println!("  {}          Exit Stella", "/exit".bright_blue());

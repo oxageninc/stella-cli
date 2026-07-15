@@ -146,6 +146,13 @@ pub enum DeckAction {
 
 /// Fold one inbound envelope and keep the ephemeral UI in range.
 pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut DeckUi) {
+    // A refreshed graph snapshot is out-of-band view state (the Graph tab),
+    // not a model fold — apply it straight to the UI. Everything else folds
+    // into the model, then selections are re-clamped.
+    if let Inbound::GraphSnapshot(snapshot) = inbound {
+        ui.graph = Some(snapshot.clone());
+        return;
+    }
     model.apply_inbound(inbound);
     clamp(model, ui);
 }
@@ -291,10 +298,32 @@ fn slash_matches(ui: &DeckUi) -> Vec<String> {
 /// Returns `None` for keys the popup doesn't claim. Shared with the
 /// single-session REPL (`crate::ui`) via `crate::composer` so both surfaces
 /// stay consistent by construction.
+///
+/// Deck-local commands (tab switches, the help overlay) are intercepted here
+/// and act on the UI directly; everything else is enqueued for the driver,
+/// which owns the session-level vocabulary (`/clear`, `/models`, `/init`, …).
 fn handle_slash_key(key: KeyEvent, matches: &[String], ui: &mut DeckUi) -> Option<DeckAction> {
     match handle_slash_popup_key(key, matches, &mut ui.composer, &mut ui.slash_selected)? {
         SlashPopupOutcome::Handled => Some(DeckAction::Handled),
-        SlashPopupOutcome::Submit(text) => Some(DeckAction::Send(WorkspaceInput::Enqueue { text })),
+        SlashPopupOutcome::Submit(text) => Some(match text.as_str() {
+            // Views the deck itself owns: act locally, never round-trip.
+            // `/diff` opens the diff viewer; `/files` shows the file tree, so
+            // it must also *close* a diff left open from a prior view.
+            "/files" | "/diff" => {
+                ui.set_tab(DeckTab::Files);
+                ui.files_diff_open = text == "/diff";
+                DeckAction::Handled
+            }
+            "/graph" => {
+                ui.set_tab(DeckTab::Graph);
+                DeckAction::Handled
+            }
+            "/help" => {
+                ui.help_open = true;
+                DeckAction::Handled
+            }
+            _ => DeckAction::Send(WorkspaceInput::Enqueue { text }),
+        }),
     }
 }
 
@@ -991,5 +1020,52 @@ mod tests {
                 text: "/models".into()
             })
         );
+    }
+
+    #[test]
+    fn slash_files_switches_to_files_and_closes_an_open_diff() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.slash_commands = vec![SlashCommand::new("/files", "files")];
+        ui.files_diff_open = true; // a diff was left open from a prior view
+        for c in "/files".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(action, DeckAction::Handled, "/files is consumed locally");
+        assert_eq!(ui.tab, DeckTab::Files);
+        assert!(!ui.files_diff_open, "/files shows the tree, not a diff");
+    }
+
+    #[test]
+    fn slash_diff_switches_to_files_and_opens_the_diff() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.slash_commands = vec![SlashCommand::new("/diff", "diff")];
+        for c in "/diff".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(ui.tab, DeckTab::Files);
+        assert!(ui.files_diff_open, "/diff opens the viewer");
+    }
+
+    #[test]
+    fn a_refreshed_graph_snapshot_updates_the_view_out_of_band() {
+        use crate::graph::{GraphNode, GraphSnapshot};
+        let mut model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        assert!(ui.graph.is_none());
+        let snapshot = GraphSnapshot {
+            focus: "src/lib.rs".into(),
+            nodes: vec![GraphNode {
+                label: "src/lib.rs".into(),
+                kind: "file".into(),
+                location: Some("src/lib.rs".into()),
+            }],
+            edges: vec![],
+        };
+        ingest_inbound(&Inbound::GraphSnapshot(snapshot.clone()), &mut model, &mut ui);
+        assert_eq!(ui.graph.as_ref(), Some(&snapshot));
     }
 }

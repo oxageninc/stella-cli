@@ -96,6 +96,31 @@ pub struct CodeGraph {
     inner: std::sync::Arc<Inner>,
 }
 
+/// One symbol in a [`FileNeighborhood`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NeighborhoodSymbol {
+    pub name: String,
+    /// The stored kind tag as persisted by the index (`"function"`,
+    /// `"struct"`, `"class"`, `"table"`, …) — see [`SymbolKind::tag`]. An
+    /// owned `String` so this public type round-trips through serde without a
+    /// borrow lifetime.
+    pub kind: String,
+    pub start_line: u32,
+}
+
+/// The structured neighborhood of one file: its symbols and its import
+/// edges in both directions. Root-relative forward-slash paths throughout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileNeighborhood {
+    pub file: String,
+    pub symbols: Vec<NeighborhoodSymbol>,
+    /// What this file imports: resolved paths where resolution succeeded,
+    /// raw specifiers (e.g. Rust `use` paths) otherwise.
+    pub imports: Vec<String>,
+    /// Files whose imports resolve to this file.
+    pub importers: Vec<String>,
+}
+
 impl CodeGraph {
     /// Open (or create) the store at `db_path` for the workspace at `root`,
     /// **without** starting background work. Use this for one-shot indexing,
@@ -216,12 +241,45 @@ impl CodeGraph {
     }
 
     /// The OCP-provider query entrypoint: budgeted, provenance-carrying frames
-    /// (`06-context-protocol.md` §3.3), in-process shape. Built and tested as
-    /// the retrieval surface a context plane would call; not yet consumed at
-    /// runtime — the index is written on `stella init` but the CLI does not yet
-    /// query it.
+    /// (`06-context-protocol.md` §3.3), in-process shape. Consumed at runtime
+    /// by the CLI's OCP host (`stella-cli/src/ocp.rs`, `GraphProvider`), which
+    /// fans recall out to this alongside the memory store on every turn.
     pub fn query(&self, q: &ContextQuery) -> Result<Vec<ContextFrame>, GraphError> {
         frames::query(&self.inner.read_guard(), &self.inner.root, q)
+    }
+
+    /// The best-connected file in the index (most symbols + import edges) —
+    /// a UI's default focus when the caller hasn't picked a file. `None` on
+    /// an empty index.
+    pub fn busiest_file(&self) -> Result<Option<String>, GraphError> {
+        store::busiest_file(&self.inner.read_guard())
+    }
+
+    /// The structured neighborhood of `file` — its symbols and import edges
+    /// in both directions — for UI consumers (the deck's Graph tab). The
+    /// frame methods above render prose for the model; this keeps the shape.
+    pub fn file_neighborhood(&self, file: &Path) -> Result<FileNeighborhood, GraphError> {
+        let rel = self.resolve_rel(file);
+        let conn = self.inner.read_guard();
+        let symbols = store::symbols_in_file(&conn, &rel)?
+            .into_iter()
+            .map(|row| NeighborhoodSymbol {
+                name: row.name,
+                kind: row.kind.tag().to_string(),
+                start_line: row.start_line,
+            })
+            .collect();
+        let imports = store::imports_from(&conn, &rel)?
+            .into_iter()
+            .map(|row| row.to_path.unwrap_or(row.specifier))
+            .collect();
+        let importers = store::importers_of(&conn, &rel)?;
+        Ok(FileNeighborhood {
+            file: rel,
+            symbols,
+            imports,
+            importers,
+        })
     }
 
     /// All known table, type, and view names (lowercased) from the index.
@@ -275,11 +333,13 @@ impl CodeGraph {
 
 impl Drop for CodeGraph {
     fn drop(&mut self) {
-        // Best-effort teardown if the caller never called `shutdown`. Only the
-        // last handle (Arc strong-count 1) tears down, so cloned background
-        // holders don't stop the watcher early.
-        if std::sync::Arc::strong_count(&self.inner) == 1 {
-            self.shutdown();
-        }
+        // Best-effort teardown if the caller never called `shutdown`.
+        // Unconditional: `CodeGraph` is not `Clone`, so this drop IS the last
+        // public handle going away — the remaining `Arc` holders are the
+        // background catch-up task and debounce loop, which hold clones for
+        // their whole lives. Gating on strong-count == 1 (the previous
+        // behavior) could therefore never fire after a successful `mount`,
+        // leaking the OS watcher and both loops until process exit.
+        self.shutdown();
     }
 }

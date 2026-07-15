@@ -1082,29 +1082,46 @@ pub(crate) fn domains_for_node(
     Ok(out)
 }
 
-/// Live node ids tagged with ANY of the given domains — the domain-filter
-/// candidate set for `recall_scoped`. An empty `domains` slice returns `None`
-/// (meaning "no filter"), distinct from an empty set ("filter matched nothing").
-pub(crate) fn node_ids_in_domains(
+/// Live node ids that carry a domain tag but NONE in `scope` — exactly the
+/// set a scoped recall must exclude. Untagged nodes are never returned (they
+/// stay candidates): most memories — reflections whose lessons name no domain,
+/// episodes from turns that touched no taxonomy-covered file — are untagged,
+/// and a scope filter that dropped them would silence recall entirely the
+/// moment `stella init` writes a taxonomy. An empty `scope` returns an empty
+/// set (nothing is out of scope).
+///
+/// The out-of-scope test runs in one SQL statement (an anti-join against the
+/// in-scope tag set) rather than materializing every tagged id in memory and
+/// differencing in Rust — a large initialized workspace can carry many tags
+/// unrelated to the active scope.
+pub(crate) fn node_ids_excluded_by_scope(
     conn: &Connection,
-    domains: &[String],
-) -> Result<Option<std::collections::HashSet<i64>>, ContextError> {
-    if domains.is_empty() {
-        return Ok(None);
+    scope: &[String],
+) -> Result<std::collections::HashSet<i64>, ContextError> {
+    if scope.is_empty() {
+        return Ok(std::collections::HashSet::new());
     }
-    let mut set = std::collections::HashSet::new();
-    let mut stmt = conn.prepare(
-        "SELECT nd.node_id FROM node_domains nd
-         JOIN domain d ON d.id = nd.domain_id
+    let placeholders = std::iter::repeat_n("?", scope.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT DISTINCT nd.node_id FROM node_domains nd
          JOIN node n ON n.id = nd.node_id
-         WHERE d.name = ?1 AND n.superseded_at IS NULL",
-    )?;
-    for name in domains {
-        for r in stmt.query_map(params![name], |r| r.get::<_, i64>(0))? {
-            set.insert(r?);
-        }
+         WHERE n.superseded_at IS NULL
+           AND nd.node_id NOT IN (
+             SELECT nd2.node_id FROM node_domains nd2
+             JOIN domain d ON d.id = nd2.domain_id
+             WHERE d.name IN ({placeholders})
+           )"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut set = std::collections::HashSet::new();
+    for r in stmt.query_map(rusqlite::params_from_iter(scope.iter()), |r| {
+        r.get::<_, i64>(0)
+    })? {
+        set.insert(r?);
     }
-    Ok(Some(set))
+    Ok(set)
 }
 
 /// All defined domains as `(name, description)`, for status/inspection.
@@ -1429,6 +1446,68 @@ mod tests {
             "after warm, retrieval is vector-grounded"
         );
         assert!(!result.frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scoped_recall_keeps_untagged_nodes_and_drops_out_of_scope_ones() {
+        // Regression: the post-`stella init` failure mode. A workspace
+        // taxonomy makes every recall domain-scoped; most memories are
+        // written untagged (reflections with no domain, episodes touching no
+        // covered file). The scope must keep those and exclude only nodes
+        // tagged exclusively out of scope — the old hard filter returned
+        // zero frames forever once a taxonomy existed.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("context.db");
+        let store = ContextStore::open_with(
+            &path,
+            Arc::new(crate::embed::HashEmbedder::default()),
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        store
+            .upsert(
+                crate::writeback::ContextDelta::new()
+                    .with_node(
+                        NodeInput::new(NodeKind::Concept, "untagged-lesson")
+                            .with_content("prefer rg over grep in shell commands"),
+                    )
+                    .with_node(
+                        NodeInput::new(NodeKind::Concept, "in-scope")
+                            .with_content("billing retries use exponential backoff")
+                            .with_domains(["billing".to_string()]),
+                    )
+                    .with_node(
+                        NodeInput::new(NodeKind::Concept, "out-of-scope")
+                            .with_content("frontend uses tailwind for styling")
+                            .with_domains(["frontend".to_string()]),
+                    ),
+            )
+            .await
+            .unwrap();
+
+        let q = ocp_types::ContextQuery {
+            goal: "recall everything".into(),
+            query_text: Some("prefer rg over grep billing retries".into()),
+            embedding: None,
+            kinds: vec![],
+            anchors: vec![],
+            max_frames: 10,
+            max_tokens: 4000,
+            as_of: None,
+        };
+        let result = store
+            .recall_scoped(&q, &["billing".to_string()])
+            .await
+            .unwrap();
+        let titles: Vec<&str> = result.frames.iter().map(|f| f.title.as_str()).collect();
+        assert!(
+            titles.contains(&"untagged-lesson"),
+            "untagged nodes must survive a domain scope: {titles:?}"
+        );
+        assert!(
+            !titles.contains(&"out-of-scope"),
+            "nodes tagged exclusively out of scope must be excluded: {titles:?}"
+        );
     }
 
     #[tokio::test]

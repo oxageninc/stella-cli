@@ -105,8 +105,16 @@ pub struct TaskHandle {
 pub struct FleetRunReport {
     /// Every dispatched task's handle, in a deterministic (task-id) order.
     pub handles: Vec<TaskHandle>,
-    /// Task ids that completed.
+    /// Task ids whose worker reported success — the set that unblocked
+    /// dependents.
     pub completed: HashSet<TaskId>,
+    /// Tasks whose dispatch itself errored (worktree creation, ledger I/O)
+    /// before a worker could produce a handle, with the reason. Counted as
+    /// failures.
+    pub dispatch_failures: Vec<(TaskId, String)>,
+    /// Tasks never attempted because a dependency failed (or the run stopped
+    /// on budget before their wave).
+    pub skipped: Vec<TaskId>,
     /// `true` if the run stopped early because the parent budget was enforced
     /// and a child pushed it over — the remaining waves were not launched.
     pub budget_aborted: bool,
@@ -118,9 +126,12 @@ impl FleetRunReport {
         self.handles.iter().map(|h| h.outcome.cost_usd).sum()
     }
 
-    /// Whether every dispatched task's worker reported success.
+    /// Whether every task ran and reported success — dispatch failures and
+    /// dependency-skipped tasks count against this.
     pub fn all_succeeded(&self) -> bool {
-        self.handles.iter().all(|h| h.outcome.success)
+        self.dispatch_failures.is_empty()
+            && self.skipped.is_empty()
+            && self.handles.iter().all(|h| h.outcome.success)
     }
 }
 
@@ -268,12 +279,14 @@ where
     }
 
     /// Dispatch a wave of dependency-ready tasks concurrently, bounded by
-    /// `max_concurrency`. Results come back in completion order; the caller
-    /// (`run_plan`) reorders deterministically.
-    pub async fn run_wave(&self, tasks: &[&Task]) -> Vec<Result<TaskHandle, FleetError>> {
+    /// `max_concurrency`. Results come back in completion order, each tagged
+    /// with its task id (a dispatch `Err` — e.g. a failed `worktree add` —
+    /// doesn't carry a handle, and the caller must still know WHICH task it
+    /// lost); the caller (`run_plan`) reorders deterministically.
+    pub async fn run_wave(&self, tasks: &[&Task]) -> Vec<(TaskId, Result<TaskHandle, FleetError>)> {
         let concurrency = self.config.max_concurrency.max(1);
         stream::iter(tasks.iter().copied())
-            .map(|task| self.dispatch(task))
+            .map(|task| async move { (task.id.clone(), self.dispatch(task).await) })
             .buffer_unordered(concurrency)
             .collect()
             .await
@@ -304,24 +317,44 @@ where
         }
 
         let mut report = FleetRunReport::default();
-        let mut completed: HashSet<TaskId> = HashSet::new();
+        // `succeeded` gates dependents: a failed (or dispatch-errored) task
+        // must NOT unblock the tasks that depend on it — running them against
+        // work that never landed just burns budget on doomed turns. They are
+        // reported as `skipped` instead. `attempted` keeps a failed task from
+        // being re-offered by `ready_tasks` (it is never in `succeeded`).
+        let mut succeeded: HashSet<TaskId> = HashSet::new();
+        let mut attempted: HashSet<TaskId> = HashSet::new();
 
         loop {
-            let ready = plan.ready_tasks(&completed);
+            let ready: Vec<&Task> = plan
+                .ready_tasks(&succeeded)
+                .into_iter()
+                .filter(|t| !attempted.contains(&t.id))
+                .collect();
             if ready.is_empty() {
                 break;
             }
 
+            // A dispatch error (worktree creation, ledger I/O) is recorded as
+            // that task's failure — never an early return that would throw
+            // away the settled siblings' handles (their spend, commits, and
+            // worktrees would otherwise vanish from the report).
             let mut handles: Vec<TaskHandle> = Vec::with_capacity(ready.len());
-            for result in self.run_wave(&ready).await {
-                handles.push(result?);
+            for (task_id, result) in self.run_wave(&ready).await {
+                attempted.insert(task_id.clone());
+                match result {
+                    Ok(handle) => handles.push(handle),
+                    Err(e) => report.dispatch_failures.push((task_id, e.to_string())),
+                }
             }
             // Deterministic order regardless of completion timing.
             handles.sort_by(|a, b| a.task_id.cmp(&b.task_id));
 
             let mut wave_tripped_budget = false;
             for handle in handles {
-                completed.insert(handle.task_id.clone());
+                if handle.outcome.success {
+                    succeeded.insert(handle.task_id.clone());
+                }
                 if matches!(handle.budget, BudgetOutcome::AbortTurn { .. }) {
                     wave_tripped_budget = true;
                 }
@@ -334,7 +367,17 @@ where
             }
         }
 
-        report.completed = completed;
+        report.skipped = plan
+            .tasks
+            .iter()
+            .filter(|t| !attempted.contains(&t.id))
+            .map(|t| t.id.clone())
+            .collect();
+        // Dispatch failures accrue in wave-completion order, which varies run
+        // to run; sort by task id so the report reads identically for the same
+        // plan (matching the deterministic `handles` ordering).
+        report.dispatch_failures.sort_by(|a, b| a.0.cmp(&b.0));
+        report.completed = succeeded;
         Ok(report)
     }
 
@@ -428,6 +471,28 @@ mod tests {
                 success: true,
                 seen_roots: Arc::new(StdMutex::new(Vec::new())),
             }
+        }
+        /// A worker whose every task reports failure — for wave-scheduling
+        /// tests that a failed prerequisite must not unblock dependents.
+        fn failing(cost_usd: f64) -> Self {
+            Self {
+                success: false,
+                ..Self::new(cost_usd)
+            }
+        }
+    }
+
+    /// A `GitCli` that fails every `git worktree` invocation (add/remove) with
+    /// a non-zero exit — the shape of a real "worktree already exists" or
+    /// permission failure, so `WorktreeManager::create` returns an error.
+    struct FailGit;
+    #[async_trait]
+    impl GitCli for FailGit {
+        async fn run(&self, _repo: &Path, args: &[&str]) -> Result<GitOutput, GitError> {
+            if args.first() == Some(&"worktree") {
+                return Ok(GitOutput::failed(128, "fatal: worktree add failed"));
+            }
+            Ok(GitOutput::ok(""))
         }
     }
     #[async_trait]
@@ -614,5 +679,64 @@ mod tests {
         let report = f.run_plan(&plan).await.unwrap();
         assert!(!report.budget_aborted);
         assert_eq!(report.completed.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_prerequisite_skips_its_dependents() {
+        // a (fails) -> b -> c. a's failure must NOT unblock b, and c (behind
+        // b) is skipped in turn — dependents of a failure never run, so no
+        // budget is spent on doomed turns.
+        let plan = Plan::new(vec![
+            Task::new("a", "a", "p"),
+            Task::new("b", "b", "p").depends_on(["a"]),
+            Task::new("c", "c", "p").depends_on(["b"]),
+        ]);
+        let f = fleet(
+            FakeWorker::failing(0.10),
+            OkGit::new(),
+            BudgetGuard::new(BudgetMode::Observed, None, None),
+            FleetConfig::new("run1", "HEAD"),
+        );
+
+        let report = f.run_plan(&plan).await.unwrap();
+        assert!(!report.all_succeeded(), "a failed → the run did not succeed");
+        assert!(
+            !report.completed.contains("a"),
+            "a failed, so it is not in the succeeded set"
+        );
+        // Only a was ever dispatched; b and c were skipped, not attempted.
+        assert_eq!(report.handles.len(), 1);
+        assert_eq!(report.handles[0].task_id, "a");
+        let mut skipped = report.skipped.clone();
+        skipped.sort();
+        assert_eq!(skipped, vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_git_worktree_failure_is_a_recorded_dispatch_failure() {
+        // Two independent isolated tasks in one wave; git worktree add fails
+        // for both. Each is a recorded dispatch failure (not an early return
+        // that discards the wave), the run did not succeed, and the failures
+        // are reported in deterministic task-id order.
+        let plan = Plan::new(vec![Task::new("t1", "t1", "p"), Task::new("t2", "t2", "p")]);
+        let f = Fleet::new(
+            FakeWorker::new(0.10),
+            WorktreeManager::new(FailGit, "/repo"),
+            Ledger::open_in_memory().unwrap(),
+            BudgetGuard::new(BudgetMode::Observed, None, None),
+            SeqClock::new(),
+            FleetConfig::new("run1", "HEAD").with_max_concurrency(2),
+        )
+        .unwrap();
+
+        let report = f.run_plan(&plan).await.unwrap();
+        assert!(!report.all_succeeded(), "dispatch failures fail the run");
+        assert!(report.handles.is_empty(), "no task produced a handle");
+        let failed: Vec<&str> = report
+            .dispatch_failures
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(failed, vec!["t1", "t2"], "both failures recorded, sorted");
     }
 }

@@ -21,7 +21,7 @@ use ocp_types::{ContextFrame, ContextQuery, Provenance};
 use crate::error::ContextError;
 use crate::store::{
     ContextStore, NodeRow, domains_for_node, live_nodes, neighbors, node_ids_for_uris,
-    node_ids_in_domains, vectors_for_fingerprint,
+    node_ids_excluded_by_scope, vectors_for_fingerprint,
 };
 
 /// Provenance `kind` marking a frame's domain tag, so a citation view can show
@@ -102,11 +102,14 @@ impl ContextStore {
 
     /// Hybrid retrieval scoped to `domains` (scope update): fuse → dedup →
     /// diversify → budget-pack → coverage gate. When `domains` is non-empty it
-    /// **filters** candidates to nodes tagged with at least one of them AND
+    /// **filters out** nodes tagged exclusively with out-of-scope domains AND
     /// **boosts** relevance by domain overlap (a frame sharing more of the
-    /// query's domains ranks higher). An empty `domains` slice behaves exactly
-    /// like [`Self::recall`]. Every returned frame carries its domains in
-    /// provenance so a citation view can show them.
+    /// query's domains ranks higher). Untagged nodes always stay candidates:
+    /// most memories carry no domain tag, and a scope that dropped them would
+    /// return nothing the moment a workspace taxonomy exists. An empty
+    /// `domains` slice behaves exactly like [`Self::recall`]. Every returned
+    /// frame carries its domains in provenance so a citation view can show
+    /// them.
     pub async fn recall_scoped(
         &self,
         q: &ContextQuery,
@@ -140,9 +143,16 @@ impl ContextStore {
             let mut nodes = live_nodes(&conn)?;
             let mut vectors = vectors_for_fingerprint(&conn, &fp_id)?;
             let anchor_ids = node_ids_for_uris(&conn, &q.anchors)?;
-            if let Some(allowed) = node_ids_in_domains(&conn, domains)? {
-                nodes.retain(|n| allowed.contains(&n.id));
-                vectors.retain(|(id, _)| allowed.contains(id));
+            // Scope excludes only nodes whose tags are all out of scope;
+            // untagged nodes pass (the overlap boost in 3b still ranks
+            // in-scope tags above them). Dropping untagged nodes here silenced
+            // recall completely after `stella init`: reflections and episodes
+            // are commonly written with no domain tag. The exclusion set is an
+            // empty no-op when `domains` is empty.
+            let excluded = node_ids_excluded_by_scope(&conn, domains)?;
+            if !excluded.is_empty() {
+                nodes.retain(|n| !excluded.contains(&n.id));
+                vectors.retain(|(id, _)| !excluded.contains(id));
             }
             let mut domains_by_id: HashMap<i64, Vec<String>> = HashMap::new();
             for n in &nodes {

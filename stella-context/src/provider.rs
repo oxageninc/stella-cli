@@ -46,6 +46,9 @@ fn store_kinds() -> Vec<String> {
         NodeKind::Person,
         NodeKind::Artifact,
         NodeKind::Task,
+        // The kind the store exists for — omitting it routed kind-filtered
+        // memory queries away from the one provider that stores memories.
+        NodeKind::Memory,
     ]
     .iter()
     .map(|k| k.to_frame_kind())

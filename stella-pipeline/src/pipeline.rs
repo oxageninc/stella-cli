@@ -34,6 +34,7 @@
 //! need `&mut Router`). That feedback is the responsibility of the glue that
 //! owns the `Router` — documented here so the boundary is explicit.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use stella_core::hooks::{HookRunner, Hooks};
@@ -643,6 +644,12 @@ impl<'a> Pipeline<'a> {
             oracle.observe(cmd, pre.passed());
         }
 
+        // Snapshot untracked files BEFORE executing so `gather_diff` can tell
+        // files this turn created from pre-existing dirty state — otherwise a
+        // stale untracked file would be attributed to (and verified against)
+        // this turn.
+        let untracked_before = self.list_untracked().await;
+
         // Execute: one turn for simple/single-task; one turn per plan step for
         // multi-step (each step guides a fresh engine turn).
         self.emit(AgentEvent::Stage {
@@ -690,7 +697,7 @@ impl<'a> Pipeline<'a> {
         // simple lookup, only if the turn unexpectedly touched files (the
         // zero-diff guard, L-E2). "Touched files" = FileChange events observed
         // OR a non-empty diff.
-        let (mut diff_lines, mut diff_text) = self.gather_diff().await;
+        let (mut diff_lines, mut diff_text) = self.gather_diff(&untracked_before).await;
         let files_touched = file_changes > 0 || !diff_text.trim().is_empty();
         let should_verify = task_class.verifies_unconditionally()
             || (task_class == TaskClass::SimpleLookup && files_touched);
@@ -777,6 +784,7 @@ impl<'a> Pipeline<'a> {
                             &mut file_changes,
                             &mut final_text,
                             total,
+                            &untracked_before,
                         )
                         .await
                     {
@@ -838,6 +846,7 @@ impl<'a> Pipeline<'a> {
                             &mut file_changes,
                             &mut final_text,
                             total,
+                            &untracked_before,
                         )
                         .await
                     {
@@ -868,6 +877,7 @@ impl<'a> Pipeline<'a> {
         file_changes: &mut u32,
         final_text: &mut String,
         total: &mut f64,
+        untracked_before: &HashSet<String>,
     ) -> Result<(u32, String), String> {
         messages.push(CompletionMessage::user(revision_prompt(reason)));
         self.emit(AgentEvent::Stage {
@@ -883,7 +893,7 @@ impl<'a> Pipeline<'a> {
             }
             TurnOutcome::Aborted { reason } => return Err(reason),
         }
-        let (dl, dt) = self.gather_diff().await;
+        let (dl, dt) = self.gather_diff(untracked_before).await;
         self.emit(AgentEvent::Stage {
             name: StageKind::Verify,
         });
@@ -985,8 +995,10 @@ impl<'a> Pipeline<'a> {
         Ok(outcome.value)
     }
 
-    /// Run one engine turn on a private channel, then forward every event to
-    /// the consumer **except** the engine's `Stage`/`Complete` (the pipeline
+    /// Run one engine turn, forwarding every event to the consumer **live**
+    /// (a concurrent drain task, not a post-hoc flush — an execute turn can
+    /// run tool loops for minutes, and buffering froze the renderer for the
+    /// whole turn) **except** the engine's `Stage`/`Complete` (the pipeline
     /// owns those), tallying `FileChange`s into `file_changes` for the
     /// zero-diff guard.
     async fn run_engine_turn(
@@ -997,35 +1009,111 @@ impl<'a> Pipeline<'a> {
         file_changes: &mut u32,
     ) -> TurnOutcome {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let outcome = engine.run_turn(messages, budget, &tx).await;
-        drop(tx); // close the channel so the drain below terminates
-        while let Ok(event) = rx.try_recv() {
-            let forward = match &event {
-                // The pipeline is the sole authority for stage boundaries and
-                // the terminal Complete — drop the engine's per-turn copies.
-                AgentEvent::Stage { .. } | AgentEvent::Complete { .. } => false,
-                AgentEvent::FileChange { .. } => {
-                    *file_changes += 1;
-                    true
+        let consumer = self.events.clone();
+        let forwarder = tokio::spawn(async move {
+            let mut seen_file_changes: u32 = 0;
+            while let Some(event) = rx.recv().await {
+                let forward = match &event {
+                    // The pipeline is the sole authority for stage boundaries
+                    // and the terminal Complete — drop the engine's per-turn
+                    // copies.
+                    AgentEvent::Stage { .. } | AgentEvent::Complete { .. } => false,
+                    AgentEvent::FileChange { .. } => {
+                        seen_file_changes += 1;
+                        true
+                    }
+                    _ => true,
+                };
+                if forward {
+                    let _ = consumer.send(event);
                 }
-                _ => true,
-            };
-            if forward {
-                let _ = self.events.send(event);
             }
-        }
+            seen_file_changes
+        });
+        let outcome = engine.run_turn(messages, budget, &tx).await;
+        drop(tx); // close the channel so the forwarder terminates
+        *file_changes += forwarder.await.unwrap_or(0);
         outcome
     }
 
-    /// Run the diff command and return `(changed_line_count, raw_diff)`.
-    async fn gather_diff(&self) -> (u32, String) {
-        match &self.config.diff_command {
-            Some(cmd) => {
-                let out = self.commands.run(cmd).await;
-                (count_diff_lines(&out.stdout_tail), out.stdout_tail)
-            }
-            None => (0, String::new()),
+    /// The git-ignored-aware set of untracked files, root-relative. Empty
+    /// unless the configured diff command is git's (untracked accounting only
+    /// makes sense there). `-c core.quotePath=false` keeps non-ASCII paths
+    /// literal so the set matches what a later `gather_diff` sees.
+    async fn list_untracked(&self) -> HashSet<String> {
+        let is_git = self
+            .config
+            .diff_command
+            .as_deref()
+            .is_some_and(|c| c.trim_start().starts_with("git diff"));
+        if !is_git {
+            return HashSet::new();
         }
+        let out = self
+            .commands
+            .run("git -c core.quotePath=false ls-files --others --exclude-standard")
+            .await;
+        out.stdout_tail
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    /// The real added-line count of a new untracked file, via a no-index diff
+    /// numstat (`<added>\t<deleted>\t<path>`). A binary file numstats as `-`
+    /// and counts as one changed line (a change the ladder must see, but
+    /// unmeasurable in lines). Counting real lines — not a flat 1 per file —
+    /// is what keeps a large new file from slipping under the diff budget and
+    /// taking `SubmitFast`.
+    async fn untracked_added_lines(&self, path: &str) -> u32 {
+        let out = self
+            .commands
+            .run(&format!(
+                "git diff --no-index --numstat -- /dev/null {}",
+                shell_single_quote(path)
+            ))
+            .await;
+        out.stdout_tail
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .and_then(|l| l.split('\t').next())
+            .and_then(|added| added.trim().parse::<u32>().ok())
+            .unwrap_or(1)
+    }
+
+    /// Run the diff command and return `(changed_line_count, raw_diff)`.
+    ///
+    /// `git diff` cannot see untracked files, so a turn whose entire change is
+    /// a NEW file would read as "no diff" — skipping verification via the
+    /// zero-diff guard and showing the judge an empty diff. When the configured
+    /// command is git's, files that became untracked *this turn* (i.e. not in
+    /// `untracked_before`) are appended with their real added-line counts, so
+    /// pre-existing dirty state is never attributed to the turn and a large new
+    /// file cannot slip under the diff-size budget.
+    async fn gather_diff(&self, untracked_before: &HashSet<String>) -> (u32, String) {
+        let Some(cmd) = &self.config.diff_command else {
+            return (0, String::new());
+        };
+        let out = self.commands.run(cmd).await;
+        let mut lines = count_diff_lines(&out.stdout_tail);
+        let mut text = out.stdout_tail;
+        if cmd.trim_start().starts_with("git diff") {
+            let mut fresh: Vec<String> = self
+                .list_untracked()
+                .await
+                .into_iter()
+                .filter(|p| !untracked_before.contains(p))
+                .collect();
+            fresh.sort(); // deterministic order for the appended evidence
+            for path in fresh {
+                let added = self.untracked_added_lines(&path).await;
+                lines += added;
+                text.push_str(&format!("\n+ new file (untracked): {path} (+{added} lines)"));
+            }
+        }
+        (lines, text)
     }
 
     fn record_and_tick(&self, budget: &mut BudgetGuard, cost_usd: f64) -> BudgetOutcome {
@@ -1154,6 +1242,13 @@ fn count_diff_lines(diff: &str) -> u32 {
         .count() as u32
 }
 
+/// POSIX single-quote a shell argument so an untracked file path (which the
+/// user, not the pipeline, named) can never break out of the `git diff`
+/// command string. Embedded single quotes become the standard `'\''`.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1209,23 +1304,64 @@ mod tests {
         }
     }
 
-    /// A command runner: `diff` returns a fixed diff; anything else pops the
-    /// next queued test result (`true` = pass) or defaults to pass.
+    /// A command runner: the git diff command returns a fixed diff; `ls-files`
+    /// reports the scripted untracked set; a `--no-index --numstat` reports
+    /// that file's scripted added-line count; anything else pops the next
+    /// queued test result (`true` = pass) or defaults to pass.
     struct ScriptedRunner {
         test_results: std::sync::Mutex<VecDeque<bool>>,
         diff: String,
+        /// Untracked files this workspace reports, as `(path, added_lines)`.
+        untracked: Vec<(String, u32)>,
     }
     impl ScriptedRunner {
         fn new(test_results: Vec<bool>, diff: &str) -> Self {
             Self {
                 test_results: std::sync::Mutex::new(test_results.into_iter().collect()),
                 diff: diff.to_string(),
+                untracked: Vec::new(),
             }
+        }
+        fn with_untracked(mut self, untracked: Vec<(&str, u32)>) -> Self {
+            self.untracked = untracked
+                .into_iter()
+                .map(|(p, n)| (p.to_string(), n))
+                .collect();
+            self
         }
     }
     #[async_trait]
     impl CommandRunner for ScriptedRunner {
         async fn run(&self, cmd: &str) -> CmdOutcome {
+            // Order matters: the no-index numstat and ls-files probes both
+            // contain "diff"/"git", so match them before the generic diff.
+            if cmd.contains("ls-files") {
+                let listing = self
+                    .untracked
+                    .iter()
+                    .map(|(p, _)| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return CmdOutcome {
+                    exit_code: 0,
+                    stdout_tail: listing,
+                    stderr_tail: String::new(),
+                };
+            }
+            if cmd.contains("--no-index") && cmd.contains("--numstat") {
+                // Report `<added>\t0\t<path>` for the file named in the cmd.
+                let numstat = self
+                    .untracked
+                    .iter()
+                    .find(|(p, _)| cmd.contains(p.as_str()))
+                    .map(|(p, n)| format!("{n}\t0\t{p}"))
+                    .unwrap_or_default();
+                return CmdOutcome {
+                    exit_code: if numstat.is_empty() { 0 } else { 1 },
+                    stdout_tail: numstat,
+                    stderr_tail: String::new(),
+                };
+            }
             if cmd.contains("diff") {
                 return CmdOutcome {
                     exit_code: 0,
@@ -1622,6 +1758,59 @@ mod tests {
     fn count_diff_lines_ignores_headers() {
         let diff = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n context";
         assert_eq!(count_diff_lines(diff), 2);
+    }
+
+    #[test]
+    fn shell_single_quote_neutralizes_metacharacters() {
+        assert_eq!(shell_single_quote("a b"), "'a b'");
+        // An embedded quote can't break out — the classic '\'' escape.
+        assert_eq!(shell_single_quote("a'b"), r"'a'\''b'");
+        assert_eq!(shell_single_quote("x; rm -rf ~"), "'x; rm -rf ~'");
+    }
+
+    /// P1/P2 regression: a large NEW file must contribute its real added-line
+    /// count (not a flat 1, which slipped a 10k-line file under the diff
+    /// budget), and a file already untracked before the turn must not be
+    /// attributed to it.
+    #[tokio::test]
+    async fn gather_diff_counts_real_new_file_lines_and_excludes_pre_existing() {
+        let provider = ScriptedProvider::new(vec![]);
+        let resolver = OneProvider(&provider);
+        // Empty tracked diff; one big new file the ScriptedRunner reports as
+        // untracked with 5000 added lines.
+        let runner = ScriptedRunner::new(vec![], "").with_untracked(vec![("src/huge.rs", 5000)]);
+        let tools = EmptyTools;
+        let recall = NoContextRecall;
+        let repo = NoRepoStructure;
+        let approvals = AutoApproveGate;
+        let sleeper = NoopSleeper;
+        let router = router();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pipeline = Pipeline::new(
+            PipelinePorts {
+                router: &router,
+                providers: &resolver,
+                tools: &tools,
+                recall: &recall,
+                repo: &repo,
+                commands: &runner,
+                approvals: &approvals,
+                sleeper: &sleeper,
+                hooks: None,
+            },
+            tx,
+            PipelineConfig::default(),
+        );
+
+        // No baseline → the file is this turn's; its real 5000 lines count.
+        let (lines, text) = pipeline.gather_diff(&HashSet::new()).await;
+        assert_eq!(lines, 5000, "a new file counts its real added lines, not 1");
+        assert!(text.contains("src/huge.rs"), "diff text names the new file");
+
+        // Already untracked before the turn → not attributed to it.
+        let before: HashSet<String> = std::iter::once("src/huge.rs".to_string()).collect();
+        let (lines2, _) = pipeline.gather_diff(&before).await;
+        assert_eq!(lines2, 0, "a pre-existing untracked file is not this turn's change");
     }
 
     #[test]

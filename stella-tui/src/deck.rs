@@ -233,6 +233,10 @@ impl WorkspaceModel {
                     summary: format!("▶ {}", snip(text)),
                 });
             }
+            // The graph snapshot is an out-of-band read-model, not part of the
+            // event-log fold — the view state owns it, applied in
+            // `ingest_inbound`, so the model deliberately ignores it here.
+            Inbound::GraphSnapshot(_) => {}
         }
     }
 

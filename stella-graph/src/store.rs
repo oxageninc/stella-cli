@@ -377,6 +377,25 @@ pub(crate) fn file_count(conn: &Connection) -> Result<usize, GraphError> {
     Ok(count as usize)
 }
 
+/// The best-connected file in the index: most symbols plus import edges in
+/// both directions. UI consumers use it as a default focus when the caller
+/// hasn't picked a file yet. `None` on an empty index.
+pub(crate) fn busiest_file(conn: &Connection) -> Result<Option<String>, GraphError> {
+    let path = conn
+        .query_row(
+            "SELECT f.path,
+                    (SELECT COUNT(*) FROM code_graph_symbols s WHERE s.file_id = f.id)
+                  + (SELECT COUNT(*) FROM code_graph_imports i WHERE i.from_file_id = f.id)
+                  + (SELECT COUNT(*) FROM code_graph_imports i2 WHERE i2.to_path = f.path)
+                    AS degree
+             FROM code_graph_files f ORDER BY degree DESC, f.path LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(path)
+}
+
 /// All distinct symbol names of the given kind tag (e.g. `"table"`,
 /// `"schema_enum"`, `"view"`). Used by the schema gate to populate the
 /// known-schema index at session start.
@@ -480,6 +499,34 @@ mod tests {
         fs::write(root.join("x.py"), "def foo():\n    return 1\n").unwrap();
         let third = index_tree(&mut conn, &root, &grammars).unwrap();
         assert_eq!(third.files_parsed, 1);
+    }
+
+    #[test]
+    fn busiest_file_picks_the_most_connected_file() {
+        let ws = tempdir().unwrap();
+        let dbdir = tempdir().unwrap();
+        let root = canon(&ws);
+        let db = dbdir.path().join("context.db");
+        // `hub.rs` carries three symbols; `leaf.rs` carries one. The busiest
+        // file is the one with the highest symbol+import degree.
+        fs::write(
+            root.join("hub.rs"),
+            "pub fn a() {}\npub fn b() {}\npub struct C;\n",
+        )
+        .unwrap();
+        fs::write(root.join("leaf.rs"), "pub fn d() {}\n").unwrap();
+        let grammars = Grammars::load().unwrap();
+        let mut conn = open(&db).unwrap();
+        index_tree(&mut conn, &root, &grammars).unwrap();
+
+        assert_eq!(busiest_file(&conn).unwrap().as_deref(), Some("hub.rs"));
+    }
+
+    #[test]
+    fn busiest_file_is_none_on_an_empty_index() {
+        let dbdir = tempdir().unwrap();
+        let conn = open(&dbdir.path().join("context.db")).unwrap();
+        assert_eq!(busiest_file(&conn).unwrap(), None);
     }
 
     #[test]

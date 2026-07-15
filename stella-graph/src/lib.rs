@@ -30,7 +30,7 @@
 //! use stella_graph::CodeGraph;
 //!
 //! # fn main() -> Result<(), stella_graph::GraphError> {
-//! let graph = CodeGraph::open(Path::new("."), Path::new("./.stella/context.db"))?;
+//! let graph = CodeGraph::open(Path::new("."), Path::new("./.stella/codegraph.db"))?;
 //! graph.index_all()?;
 //! for frame in graph.definitions("run_turn")? {
 //!     // Cite by the human label, never the raw id (L-C4).
@@ -54,7 +54,7 @@ mod watch;
 
 pub use error::GraphError;
 pub use frames::PROVIDER_ID;
-pub use graph::CodeGraph;
+pub use graph::{CodeGraph, FileNeighborhood, NeighborhoodSymbol};
 pub use import::{ImportEdge, ImportKind};
 pub use lang::Language;
 pub use store::IndexStats;

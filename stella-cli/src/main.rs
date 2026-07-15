@@ -110,6 +110,14 @@ enum Command {
         /// falls back to the direct Engine::run_turn path.
         #[arg(long)]
         no_pipeline: bool,
+
+        /// Test command the pipeline's verify stage runs deterministically
+        /// (e.g. "cargo test -p my-crate"). Arms the fail→pass flip oracle:
+        /// a change that flips a failing test to passing can submit without
+        /// a model-judge call. Omitted, verification always escalates to the
+        /// judge.
+        #[arg(long, value_name = "CMD")]
+        test_command: Option<String>,
     },
 
     /// Work in judged rounds until a judge model confirms the goal is met
@@ -408,6 +416,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Run {
             prompt,
             no_pipeline,
+            test_command,
         } => {
             rt()?.block_on(agent::run_one_shot(
                 &cfg,
@@ -415,6 +424,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 cli.budget,
                 cli.output_format,
                 !no_pipeline,
+                test_command.as_deref(),
             ))?;
         }
         Command::Goal { goal } => {

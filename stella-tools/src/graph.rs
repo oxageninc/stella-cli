@@ -119,6 +119,21 @@ pub fn run_query(root: &Path, op: &str, target: &str) -> ToolOutput {
     graph.shutdown();
 
     match result {
+        // Importer edges only exist where import resolution succeeds
+        // (relative TS/JS and Python paths). Rust `use` paths and bare
+        // package specifiers are indexed unresolved, so an empty importers
+        // answer for such a file is a capability gap, not a stale index —
+        // saying "re-index" would send the agent down a useless `stella
+        // init` retry.
+        Ok(frames) if frames.is_empty() && op == "importers" && !target.ends_with(".py") => {
+            ToolOutput::Ok {
+                content: format!(
+                    "no importers found for `{target}` — importer edges exist only where \
+                     import resolution succeeds (relative TS/JS/Python imports); Rust `use` \
+                     paths are indexed unresolved. Try `references` on the module name instead."
+                ),
+            }
+        }
         Ok(frames) if frames.is_empty() => ToolOutput::Ok {
             content: format!(
                 "no {op} found for `{target}` (index may be stale — `stella init` re-indexes)"

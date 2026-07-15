@@ -85,14 +85,26 @@ pub async fn run_fleet(
     let ledger = Ledger::open(&dot_stella.join("fleet.db"))
         .map_err(|e| format!("could not open the fleet ledger: {e}"))?;
 
-    let run_id = format!("fleet-{}", crate::memory::unix_now_secs());
+    // Millisecond + pid: two runs in the same second (scripted/CI) must not
+    // share a ledger run id — `record_run` is INSERT OR REPLACE, so a
+    // collision would merge both runs' accounting under one row. A pre-epoch
+    // clock is a hard error rather than a silent fallback to a constant (which
+    // would reintroduce the very collision this guards against).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch — cannot mint a unique fleet run id")?
+        .as_millis();
+    let run_id = format!("fleet-{now_ms}-{}", std::process::id());
     let worker = EngineWorker {
         cfg: cfg.clone(),
         budget_limit,
     };
     let fleet = Fleet::new(
         worker,
-        WorktreeManager::new(SystemGitCli, root.clone()),
+        // The run id scopes every worktree/branch slug: task ids repeat
+        // across runs (`t1`, `t2`, …) and worktrees are kept for review, so
+        // an unscoped second run would collide on `git worktree add`.
+        WorktreeManager::new(SystemGitCli, root.clone()).with_run_scope(&run_id),
         ledger,
         agent::build_budget_guard(budget_limit),
         SystemClock::new(),
@@ -347,18 +359,19 @@ fn render_report(plan: &Plan, report: &FleetRunReport, dot_stella: &Path) {
             println!("      {}", handle.outcome.summary.dimmed());
         }
     }
-    let not_run: Vec<&str> = plan
-        .tasks
-        .iter()
-        .filter(|t| !report.completed.contains(&t.id))
-        .filter(|t| !report.handles.iter().any(|h| h.task_id == t.id))
-        .map(|t| t.id.as_str())
-        .collect();
-    if !not_run.is_empty() {
+    for (task_id, reason) in &report.dispatch_failures {
         println!(
-            "  {} not launched: {}",
+            "  {} {} — dispatch failed: {}",
+            "✗".red(),
+            task_id.bold(),
+            reason.dimmed()
+        );
+    }
+    if !report.skipped.is_empty() {
+        println!(
+            "  {} skipped (dependency failed or budget stop): {}",
             "○".yellow(),
-            not_run.join(", ").dimmed()
+            report.skipped.join(", ").dimmed()
         );
     }
     println!(

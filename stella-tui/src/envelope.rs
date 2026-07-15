@@ -12,6 +12,7 @@
 
 use stella_protocol::AgentEvent;
 
+use crate::graph::GraphSnapshot;
 use crate::input::UserInput;
 
 /// Stable identifier for one agent/run within the workspace. Human-meaningful
@@ -121,6 +122,15 @@ pub enum Inbound {
     /// bar's "queued" count goes down the moment work actually starts, and a
     /// trace row records which agent picked the prompt up.
     PromptStarted { agent: AgentId, text: String },
+    /// A refreshed code-graph snapshot for the Graph tab. Unlike the other
+    /// variants this is **not** a folded event — the graph is an out-of-band
+    /// read-model (see `COMMAND_DECK_DESIGN.md` → "The purity boundary"). It
+    /// rides the inbound channel only because that is the driver→deck path;
+    /// [`crate::deck_ui::ingest_inbound`] applies it straight to the view
+    /// state (`DeckUi::graph`) and the model fold ignores it. The driver
+    /// sends one after `/init` rebuilds the index so the tab reflects it
+    /// without a restart.
+    GraphSnapshot(GraphSnapshot),
 }
 
 /// What the deck sends back to the caller / engine. The single-session

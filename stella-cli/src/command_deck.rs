@@ -53,7 +53,7 @@ use stella_tools::ToolRegistry;
 use stella_tools::custom::{CustomTool, CustomToolSet};
 use stella_tools::hook_runner::ShellHookRunner;
 use stella_tui::{
-    AgentMeta, AgentStatus, DeckOptions, Inbound, UserInput, WorkspaceInput, run_deck,
+    AgentMeta, AgentStatus, DeckOptions, Inbound, SlashCommand, UserInput, WorkspaceInput, run_deck,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -130,7 +130,7 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
     let system_prompt =
         agent::with_session_hook_context(agent::build_system_prompt(&cfg.workspace_root), cfg)
             .await;
-    let mut messages = vec![CompletionMessage::system(system_prompt)];
+    let mut messages = vec![CompletionMessage::system(system_prompt.clone())];
     // `warn: false`: past this point diagnostics would land on the alternate
     // screen; a memory-less session degrades silently here.
     let mut memory = SessionMemory::open(&cfg.workspace_root, false);
@@ -165,6 +165,16 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
 
     let opts = DeckOptions {
         debug_log_path: debug_log_path(),
+        slash_commands: vec![
+            SlashCommand::new("/help", "show commands"),
+            SlashCommand::new("/clear", "reset the conversation"),
+            SlashCommand::new("/models", "list providers & models"),
+            SlashCommand::new("/init", "index the workspace: domains + code graph"),
+            SlashCommand::new("/files", "open the Files tab"),
+            SlashCommand::new("/diff", "open the diff viewer"),
+            SlashCommand::new("/graph", "open the code-graph tab"),
+        ],
+        initial_graph: agent::graph_snapshot(&cfg.workspace_root),
         ..Default::default()
     };
     // The deck owns its channel ends and runs on its own task so rendering
@@ -195,6 +205,34 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
             agent: LEAD.to_string(),
             text: prompt.clone(),
         });
+
+        // Session-level slash commands are the driver's, never the model's —
+        // the deck's popup enqueues them like any prompt (tab switches and
+        // the help overlay were already handled TUI-side and never reach us).
+        match run_deck_command(
+            &prompt,
+            &in_tx,
+            &mut messages,
+            &system_prompt,
+            &*provider,
+            &registry,
+            cfg,
+        )
+        .await
+        {
+            DeckCommand::Prompt => {}
+            DeckCommand::Handled => continue 'session,
+            DeckCommand::InitCompleted => {
+                // `/init` changed the taxonomy and rebuilt the index. Re-open
+                // memory so recall/reflection use the new domains this session
+                // (not just the next), and push a fresh Graph-tab snapshot.
+                memory = SessionMemory::open(&cfg.workspace_root, false);
+                if let Some(snapshot) = agent::graph_snapshot(&cfg.workspace_root) {
+                    let _ = in_tx.send(Inbound::GraphSnapshot(snapshot));
+                }
+                continue 'session;
+            }
+        }
 
         // Per-turn conversation bookkeeping, mirroring `run_interactive`:
         // refresh the volatile recall block, then append the user prompt.
@@ -331,6 +369,90 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
         Ok(Err(e)) => Err(format!("deck terminal error: {e}")),
         Err(e) => Err(format!("deck task failed: {e}")),
     }
+}
+
+/// The disposition of a would-be slash command.
+enum DeckCommand {
+    /// Not a command — run the model turn as usual.
+    Prompt,
+    /// Handled as a command; skip the model turn.
+    Handled,
+    /// `/init` finished successfully; skip the turn AND refresh the session's
+    /// derived state (memory domains, Graph tab) which the new taxonomy/index
+    /// changed.
+    InitCompleted,
+}
+
+/// Handle a session-level slash command. Output goes into the lead agent's
+/// transcript as `Text` events — the deck renders exclusively from events, so
+/// printing to stdout (which the alternate screen owns) is never an option.
+///
+/// Vocabulary: `/help`, `/clear`, `/models`, `/init`. `/files`, `/diff`,
+/// `/graph` are deck-local (tab switches) and consumed TUI-side; an unknown
+/// bare `/command` gets a hint rather than a wasted model call. Every command
+/// is no-argument, so the *whole* trimmed input is matched — `/init do the
+/// thing` is a model prompt, not a silent reindex that discards the rest.
+async fn run_deck_command(
+    prompt: &str,
+    in_tx: &UnboundedSender<Inbound>,
+    messages: &mut Vec<CompletionMessage>,
+    system_prompt: &str,
+    provider: &dyn Provider,
+    registry: &ToolRegistry,
+    cfg: &Config,
+) -> DeckCommand {
+    let trimmed = prompt.trim();
+    if !trimmed.starts_with('/') {
+        return DeckCommand::Prompt;
+    }
+    let say = |text: String| {
+        let _ = in_tx.send(Inbound::Event {
+            agent: LEAD.to_string(),
+            event: AgentEvent::Text { delta: text },
+        });
+    };
+    match trimmed {
+        "/help" => {
+            say("commands: /help · /clear (reset conversation) · /models (list providers) · \
+                 /init (index the workspace: domains + code graph) · /files · /diff · /graph \
+                 (switch tabs) — anything else is a prompt. ctrl+t queue · ? overlay help"
+                .to_string());
+        }
+        "/clear" => {
+            messages.clear();
+            messages.push(CompletionMessage::system(system_prompt.to_string()));
+            say("conversation cleared".to_string());
+        }
+        "/models" => {
+            say(Config::available_models_plain());
+        }
+        "/init" => {
+            let mut emit = |line: String| say(line);
+            match agent::init_workspace(Some(provider), &cfg.workspace_root, &mut emit).await {
+                Ok(_) => {
+                    // A fresh index may name tables/types the schema gate
+                    // should know about this session, not just the next one.
+                    agent::populate_schema_index(registry, &cfg.workspace_root);
+                    return DeckCommand::InitCompleted;
+                }
+                Err(e) => say(format!("init failed: {e}")),
+            }
+        }
+        // Deck-local tab commands are normally consumed TUI-side, but a queued
+        // one reaches here — accept it as handled (a no-op) rather than
+        // calling it "unknown".
+        "/files" | "/diff" | "/graph" => {}
+        // A bare unknown /word is a typo'd command, not a prompt — say so
+        // instead of spending a model call. Anything with arguments (e.g.
+        // `/src/main.rs explain`) falls through and stays a prompt.
+        _ if !trimmed.contains(char::is_whitespace) => {
+            say(format!(
+                "unknown command `{trimmed}` — try /help, /clear, /models, /init, /files, /diff, /graph"
+            ));
+        }
+        _ => return DeckCommand::Prompt,
+    }
+    DeckCommand::Handled
 }
 
 /// One engine turn for the lead agent: the deck-mode analogue of

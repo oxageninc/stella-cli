@@ -281,6 +281,18 @@ impl SessionMemory {
     /// bi-temporal `covers_path` fact. Re-running `init` after the taxonomy
     /// shifts supersedes stale beliefs instead of deleting them, so
     /// "what did we believe at T1" still answers (L-C3).
+    ///
+    /// Known limitation: `covers_path` *facts* are versioned (a moved path's
+    /// old fact is superseded), but the File node's `node_domains` tags are
+    /// insert-only — re-running `init` after a path moves from domain A to B
+    /// adds the B tag without removing A. This does NOT break recall
+    /// correctness: the session scopes recall to the *full current taxonomy*,
+    /// so the node still passes the scope filter via B; the only residual is a
+    /// mild domain-overlap ranking boost for A. A correct fix is versioned
+    /// node-domain associations (matching the fact model) — deliberately not a
+    /// wholesale `node_domains` rewrite, which would depend on the unenforced
+    /// invariant that only the taxonomy ever tags File nodes and would silently
+    /// wipe tags from any future source.
     pub async fn record_taxonomy(&self, taxonomy: &crate::domains::Domains) {
         let domains = taxonomy
             .domains
@@ -295,10 +307,16 @@ impl SessionMemory {
             .iter()
             .flat_map(|d| {
                 d.paths.iter().map(|path| {
+                    // Tag the nodes themselves, not just the edge — node-level
+                    // tags are what `recall_scoped`'s domain filter and
+                    // overlap boost read (`node_domains` rows come from the
+                    // subject/object inputs, never from the fact's own tags).
                     let subject = NodeInput::new(NodeKind::Concept, &d.name)
-                        .with_uri(format!("domain://{}", d.name));
-                    let object =
-                        NodeInput::new(NodeKind::File, path).with_uri(format!("file://{path}"));
+                        .with_uri(format!("domain://{}", d.name))
+                        .with_domains([d.name.clone()]);
+                    let object = NodeInput::new(NodeKind::File, path)
+                        .with_uri(format!("file://{path}"))
+                        .with_domains([d.name.clone()]);
                     let mut fact = FactAssertion::new(subject, "covers_path", object)
                         .with_domains([d.name.clone()]);
                     // A domain legitimately covers several paths at once.
@@ -332,7 +350,10 @@ impl SessionMemory {
             return 0;
         }
 
-        // 1. Store as recallable, domain-tagged reflection memories.
+        // 1. Store as recallable, domain-tagged reflection memories. Still
+        // best-effort (a failed reflection never fails the turn), but the
+        // outcome is kept so the "remembered" line below can't claim success
+        // for lessons that never landed in the store.
         let delta = ContextDelta {
             memories: lessons
                 .iter()
@@ -340,28 +361,48 @@ impl SessionMemory {
                 .collect(),
             ..Default::default()
         };
-        let _ = self.store.upsert(delta).await;
+        let stored = self.store.upsert(delta).await.is_ok();
 
         // 2. Append to the mining log and mine for auto-creatable skills.
+        // Track whether the log write actually succeeded so the message below
+        // never claims a fallback that didn't happen.
         let log_path = self
             .workspace_root
             .join(".stella")
             .join("reflections.jsonl");
+        let mut logged = true;
         for lesson in &lessons {
-            if let Ok(line) = serde_json::to_string(lesson) {
-                let _ = append_line(&log_path, &line);
+            match serde_json::to_string(lesson) {
+                Ok(line) if append_line(&log_path, &line).is_ok() => {}
+                _ => logged = false,
             }
         }
         self.auto_create_skills(&log_path, quiet);
 
         if !quiet {
-            println!(
-                "  {} remembered {} lesson(s) from this turn",
-                "✦".magenta(),
-                lessons.len()
-            );
+            if stored {
+                println!(
+                    "  {} remembered {} lesson(s) from this turn",
+                    "✦".magenta(),
+                    lessons.len()
+                );
+            } else if logged {
+                println!(
+                    "  {} could not persist {} lesson(s) to the context store \
+                     (logged to reflections.jsonl only)",
+                    "!".yellow(),
+                    lessons.len()
+                );
+            } else {
+                println!(
+                    "  {} could not persist {} lesson(s) — both the context store \
+                     and reflections.jsonl writes failed",
+                    "!".yellow(),
+                    lessons.len()
+                );
+            }
         }
-        lessons.len()
+        if stored { lessons.len() } else { 0 }
     }
 
     /// Mine the whole reflection log for recurring lessons and auto-create
