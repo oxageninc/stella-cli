@@ -26,7 +26,8 @@ use std::path::{Path, PathBuf};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use stella_context::{
-    ContextDelta, ContextQuery, ContextStore, HashEmbedder, MemoryInput, SystemClock,
+    ContextDelta, ContextQuery, ContextStore, DomainInput, EpisodeInput, EpisodeOutcome,
+    FactAssertion, HashEmbedder, MemoryInput, NodeInput, NodeKind, SystemClock, format_rfc3339,
 };
 use stella_core::skills::{
     self, AutoCreateConfig, AutoCreateDecision, LoadSkillsOptions, SelectionConfig, Skill,
@@ -221,6 +222,93 @@ impl SessionMemory {
         }
     }
 
+    /// Record the turn that just finished as an episodic memory: a summary,
+    /// the files it touched, and how it ended. Episodes become retrievable
+    /// `Episode` nodes, so future recall can surface "we did something like
+    /// this before" alongside reflections — the episodic half of the context
+    /// plane (`stella-context` L-C3 neighborhood). Domain tags come from the
+    /// touched files' taxonomy prefixes. Best-effort like everything here: a
+    /// failed write must never fail the turn it describes.
+    pub async fn record_episode(
+        &self,
+        prompt: &str,
+        outcome: EpisodeOutcome,
+        files_touched: &[(String, String)],
+        started_unix_secs: i64,
+    ) {
+        let mut summary: String = prompt.chars().take(240).collect();
+        if prompt.chars().count() > 240 {
+            summary.push('…');
+        }
+
+        let mut domains: Vec<String> = Vec::new();
+        for (path, _ops) in files_touched {
+            for name in self.domains.domains_for_path(path) {
+                if !domains.contains(&name) {
+                    domains.push(name);
+                }
+            }
+        }
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(started_unix_secs);
+        let mut episode = EpisodeInput::new(
+            summary,
+            format_rfc3339(started_unix_secs),
+            format_rfc3339(now_secs),
+        )
+        .with_domains(domains);
+        episode.outcome = outcome;
+        episode.files_touched = files_touched.iter().map(|(path, _)| path.clone()).collect();
+
+        let delta = ContextDelta {
+            episodes: vec![episode],
+            ..Default::default()
+        };
+        let _ = self.store.upsert(delta).await;
+    }
+
+    /// Persist the `stella init` taxonomy into the context plane: each domain
+    /// as a described domain record, and each of its path prefixes as a
+    /// bi-temporal `covers_path` fact. Re-running `init` after the taxonomy
+    /// shifts supersedes stale beliefs instead of deleting them, so
+    /// "what did we believe at T1" still answers (L-C3).
+    pub async fn record_taxonomy(&self, taxonomy: &crate::domains::Domains) {
+        let domains = taxonomy
+            .domains
+            .iter()
+            .map(|d| DomainInput {
+                name: d.name.clone(),
+                description: (!d.description.is_empty()).then(|| d.description.clone()),
+            })
+            .collect();
+        let facts = taxonomy
+            .domains
+            .iter()
+            .flat_map(|d| {
+                d.paths.iter().map(|path| {
+                    let subject = NodeInput::new(NodeKind::Concept, &d.name)
+                        .with_uri(format!("domain://{}", d.name));
+                    let object =
+                        NodeInput::new(NodeKind::File, path).with_uri(format!("file://{path}"));
+                    let mut fact = FactAssertion::new(subject, "covers_path", object)
+                        .with_domains([d.name.clone()]);
+                    // A domain legitimately covers several paths at once.
+                    fact.multivalued = true;
+                    fact
+                })
+            })
+            .collect();
+        let delta = ContextDelta {
+            domains,
+            facts,
+            ..Default::default()
+        };
+        let _ = self.store.upsert(delta).await;
+    }
+
     /// Post-turn self-reflection: one cheap model call producing 0-3
     /// durable lessons, stored as domain-tagged reflection memories AND
     /// appended to the skill-mining log; recurring lessons auto-promote to
@@ -400,6 +488,14 @@ pub fn inject_recall_block(messages: &mut Vec<CompletionMessage>, block: Option<
             }
         }
     }
+}
+
+/// Seconds since the Unix epoch — the episode timestamps' primitive.
+pub(crate) fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Whether a completed turn is even worth a post-turn reflection model call.

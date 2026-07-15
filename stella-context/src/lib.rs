@@ -57,8 +57,8 @@ pub use provider::{ContextProvider, ProviderRegistry};
 pub use retrieval::{DropReason, DroppedFrame, RecallResult, is_lexical_fallback};
 pub use store::{ContextStore, NodeInput, NodeKind, NodeRow};
 pub use writeback::{
-    ContextDelta, EpisodeInput, EpisodeOutcome, FactAssertion, FactView, MemoryInput, MemoryKind,
-    UpsertReceipt,
+    ContextDelta, DomainInput, EpisodeInput, EpisodeOutcome, FactAssertion, FactView, MemoryInput,
+    MemoryKind, UpsertReceipt,
 };
 
 // Re-export the OCP wire types callers pass in/out, so a consumer needs only

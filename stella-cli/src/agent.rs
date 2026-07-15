@@ -44,6 +44,7 @@ use crate::domains::{heuristic_domains, infer_domains};
 use crate::interactive::{InteractiveToolSet, SkillRegistry, default_ask_io};
 use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
 use crate::tui;
+use stella_context::EpisodeOutcome;
 
 const SYSTEM_PROMPT: &str = r#"You are Stella, a fast terminal coding agent. You help the user with software engineering tasks by reading files, writing code, running commands, and searching the codebase.
 
@@ -241,6 +242,7 @@ async fn run_pipeline_one_shot(
     }
 
     let turn_start = Instant::now();
+    let started_unix = crate::memory::unix_now_secs();
     let execution = begin_execution(&store, "pipeline", prompt, cfg);
 
     let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -339,6 +341,22 @@ async fn run_pipeline_one_shot(
             Err(_) => ("error", 0.0),
         };
         let _ = store.finish_execution(*id, outcome_label, cost);
+    }
+
+    // Episodic memory: a run that did work (tools or file changes) becomes a
+    // retrievable Episode node — outcome, files touched, time window.
+    if let Some(m) = &memory
+        && (turn_warrants_reflection(&messages) || !files.is_empty())
+    {
+        let episode_outcome = match &result {
+            Ok(outcome) => match outcome.status {
+                PipelineStatus::Completed => EpisodeOutcome::Success,
+                PipelineStatus::Aborted { .. } => EpisodeOutcome::Aborted,
+            },
+            Err(_) => EpisodeOutcome::Failure,
+        };
+        m.record_episode(prompt, episode_outcome, &files, started_unix)
+            .await;
     }
 
     if result.is_ok()
@@ -604,6 +622,7 @@ async fn run_raw_one_shot(
         inject_recall_block(&mut messages, m.recall_block(prompt).await);
     }
 
+    let started_unix = crate::memory::unix_now_secs();
     let outcome = run_turn(
         &*provider,
         base_tools,
@@ -619,6 +638,20 @@ async fn run_raw_one_shot(
         prompt,
     )
     .await;
+    // Episodic memory first (works even for a failed turn — failures are
+    // exactly the episodes worth recalling)…
+    if let Some(m) = &memory {
+        let files = registry.files_touched();
+        if turn_warrants_reflection(&messages) || !files.is_empty() {
+            let episode_outcome = if outcome.is_ok() {
+                EpisodeOutcome::Success
+            } else {
+                EpisodeOutcome::Failure
+            };
+            m.record_episode(prompt, episode_outcome, &files, started_unix)
+                .await;
+        }
+    }
     // …and reflect on the completed turn, recording domain-tagged lessons
     // (recurring ones auto-promote to SKILL.md files). Best-effort: never
     // fails or slows the turn that just ran. Gated on `turn_warrants_reflection`
@@ -676,6 +709,7 @@ pub async fn run_goal_cmd(
         inject_recall_block(&mut messages, m.recall_block(goal).await);
     }
 
+    let started_unix = crate::memory::unix_now_secs();
     let outcome = run_goal_turn(
         &*provider,
         base_tools,
@@ -689,6 +723,18 @@ pub async fn run_goal_cmd(
         goal,
     )
     .await;
+    if let Some(m) = &memory {
+        let files = registry.files_touched();
+        if turn_warrants_reflection(&messages) || !files.is_empty() {
+            let episode_outcome = if outcome.is_ok() {
+                EpisodeOutcome::Success
+            } else {
+                EpisodeOutcome::Failure
+            };
+            m.record_episode(goal, episode_outcome, &files, started_unix)
+                .await;
+        }
+    }
     if outcome.is_ok()
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
@@ -832,7 +878,9 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             // Everything the goal loop appends past here is this turn's work,
             // gating reflection on it (see `turn_warrants_reflection`).
             let turn_start = messages.len();
-            if let Err(e) = run_goal_turn(
+            let files_before = registry.files_touched().len();
+            let started_unix = crate::memory::unix_now_secs();
+            let result = run_goal_turn(
                 &*provider,
                 base_tools,
                 &custom_tools,
@@ -844,8 +892,18 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                 &store,
                 goal,
             )
-            .await
-            {
+            .await;
+            record_turn_episode(
+                &memory,
+                goal,
+                &result,
+                &registry,
+                files_before,
+                started_unix,
+                &messages[turn_start..],
+            )
+            .await;
+            if let Err(e) = result {
                 eprintln!("  {} {}\n", "Error:".red().bold(), e);
             } else if turn_warrants_reflection(&messages[turn_start..])
                 && let Some(m) = &mut memory
@@ -866,7 +924,9 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         // Everything `run_turn` appends past here is this turn's work; the
         // reflection gate reads only that slice (see `turn_warrants_reflection`).
         let turn_start = messages.len();
-        if let Err(e) = run_turn(
+        let files_before = registry.files_touched().len();
+        let started_unix = crate::memory::unix_now_secs();
+        let result = run_turn(
             &*provider,
             base_tools,
             &custom_tools,
@@ -880,8 +940,18 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             "chat",
             input,
         )
-        .await
-        {
+        .await;
+        record_turn_episode(
+            &memory,
+            input,
+            &result,
+            &registry,
+            files_before,
+            started_unix,
+            &messages[turn_start..],
+        )
+        .await;
+        if let Err(e) = result {
             eprintln!("  {} {}\n", "Error:".red().bold(), e);
         } else if turn_warrants_reflection(&messages[turn_start..])
             && let Some(m) = &mut memory
@@ -895,6 +965,38 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     }
     println!("\n  {}", "Goodbye! ✦".magenta());
     Ok(())
+}
+
+/// Record one interactive turn as an episode: only new paths this turn (the
+/// slice past `files_before` in the session-cumulative ledger — a re-touch of
+/// an earlier path is not re-listed, an accepted approximation), gated the
+/// same way as reflection so trivial conversational turns write nothing.
+/// `pub(crate)`: the Command Deck's turn driver records through the same
+/// helper.
+pub(crate) async fn record_turn_episode(
+    memory: &Option<SessionMemory>,
+    prompt: &str,
+    result: &Result<(), String>,
+    registry: &ToolRegistry,
+    files_before: usize,
+    started_unix: i64,
+    turn_messages: &[CompletionMessage],
+) {
+    let Some(m) = memory else {
+        return;
+    };
+    let mut all_files = registry.files_touched();
+    let turn_files = all_files.split_off(files_before.min(all_files.len()));
+    if !turn_warrants_reflection(turn_messages) && turn_files.is_empty() {
+        return;
+    }
+    let episode_outcome = if result.is_ok() {
+        EpisodeOutcome::Success
+    } else {
+        EpisodeOutcome::Failure
+    };
+    m.record_episode(prompt, episode_outcome, &turn_files, started_unix)
+        .await;
 }
 
 /// Build the workspace code-graph index into `.stella/codegraph.db` (the
@@ -1012,6 +1114,15 @@ pub async fn run_init(
     build_code_graph(&workspace_root);
 
     let path = domains.save(&workspace_root)?;
+
+    // Persist the taxonomy into the context plane too: domain descriptions
+    // plus bi-temporal `covers_path` facts, so recall can fuse on them and a
+    // re-run after the taxonomy shifts supersedes (never deletes) the old
+    // beliefs. Best-effort — a store that won't open already warned.
+    if let Some(m) = SessionMemory::open(&workspace_root, false) {
+        m.record_taxonomy(&domains).await;
+    }
+
     println!(
         "  {} {} domains ({}) → {}",
         "✓".green(),

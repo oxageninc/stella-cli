@@ -208,6 +208,8 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
         // The execution record outlives the turn future so a cancelled turn
         // can still be closed out in the store.
         let execution = agent::begin_execution(&store, "deck", &prompt, cfg);
+        let files_before = registry.files_touched().len();
+        let started_unix = crate::memory::unix_now_secs();
 
         let end = {
             let turn = run_lead_turn(
@@ -277,6 +279,16 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
                         },
                     });
                 }
+                agent::record_turn_episode(
+                    &memory,
+                    &prompt,
+                    &outcome,
+                    &registry,
+                    files_before,
+                    started_unix,
+                    &messages[reflect_start..],
+                )
+                .await;
                 if outcome.is_ok()
                     && turn_warrants_reflection(&messages[reflect_start..])
                     && let Some(m) = &mut memory
