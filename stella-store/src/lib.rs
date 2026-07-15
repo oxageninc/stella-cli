@@ -65,6 +65,18 @@ impl From<rusqlite::Error> for StoreError {
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+/// Reject graph `properties` that are not a valid JSON document before they
+/// reach a plain SQLite `TEXT` column. Under the previous DuckDB backend the
+/// column was JSON-typed and refused malformed input at the DB boundary;
+/// SQLite silently persists arbitrary bytes, so unparseable data would only
+/// surface later, when a JSON-expecting reader chokes on it. The empty
+/// default `"{}"` is valid JSON and passes.
+fn validate_json_properties(properties: &str) -> Result<()> {
+    serde_json::from_str::<serde_json::Value>(properties)
+        .map(|_| ())
+        .map_err(|e| StoreError(format!("graph properties are not valid JSON: {e}")))
+}
+
 /// One StepUsage-shaped telemetry record (mirrors the event, plus the
 /// derived cache-miss column so analytics never re-derive it).
 #[derive(Debug, Clone, PartialEq)]
@@ -421,7 +433,14 @@ impl Store {
     }
 
     /// Upsert a graph node — the context plane's write seam.
+    ///
+    /// `properties` must be a valid JSON document. The old DuckDB backend
+    /// stored it in a JSON-typed column that rejected malformed input at the
+    /// DB boundary; SQLite's `TEXT` column would silently accept arbitrary
+    /// bytes, so the JSON-validity invariant is re-asserted here before the
+    /// INSERT rather than let unparseable data reach JSON-expecting readers.
     pub fn upsert_graph_node(&self, id: &str, label: &str, properties: &str) -> Result<()> {
+        validate_json_properties(properties)?;
         self.lock().execute(
             "INSERT INTO graph_nodes (id, label, properties) VALUES (?, ?, ?) \
              ON CONFLICT (id) DO UPDATE SET label = excluded.label, \
@@ -432,6 +451,9 @@ impl Store {
     }
 
     /// Insert a graph edge.
+    ///
+    /// `properties` must be a valid JSON document — see [`Store::upsert_graph_node`]
+    /// for why the invariant is enforced here rather than by the column type.
     pub fn insert_graph_edge(
         &self,
         src: &str,
@@ -439,6 +461,7 @@ impl Store {
         edge_type: &str,
         properties: &str,
     ) -> Result<()> {
+        validate_json_properties(properties)?;
         self.lock().execute(
             "INSERT INTO graph_edges (src, dst, edge_type, properties) VALUES (?, ?, ?, ?)",
             params![src, dst, edge_type, properties],
@@ -804,6 +827,66 @@ mod tests {
             "upsert, not duplicate"
         );
         assert_eq!(store.count("graph_edges").unwrap(), 1);
+    }
+
+    #[test]
+    fn graph_seam_rejects_non_json_properties_and_persists_valid_ones() {
+        let store = Store::in_memory().unwrap();
+
+        // Malformed JSON is refused at the seam by BOTH write methods — the
+        // invariant the JSON-typed DuckDB column used to enforce — so nothing
+        // unparseable lands in the plain SQLite TEXT column.
+        assert!(
+            store
+                .upsert_graph_node("doc:readme", "Document", "not json")
+                .is_err(),
+            "node upsert must reject non-JSON properties"
+        );
+        assert!(
+            store
+                .insert_graph_edge("doc:readme", "sym:main", "mentions", "{oops")
+                .is_err(),
+            "edge insert must reject non-JSON properties"
+        );
+        assert_eq!(
+            store.count("graph_nodes").unwrap(),
+            0,
+            "a rejected node must not be written"
+        );
+        assert_eq!(
+            store.count("graph_edges").unwrap(),
+            0,
+            "a rejected edge must not be written"
+        );
+
+        // Valid JSON — including the empty default and a caller-supplied
+        // object — is accepted and round-trips out of the column intact.
+        store
+            .upsert_graph_node("doc:readme", "Document", r#"{"path":"README.md"}"#)
+            .unwrap();
+        store
+            .insert_graph_edge("doc:readme", "sym:main", "mentions", "{}")
+            .unwrap();
+        assert_eq!(store.count("graph_nodes").unwrap(), 1);
+        assert_eq!(store.count("graph_edges").unwrap(), 1);
+
+        let conn = store.lock();
+        let node_props: String = conn
+            .query_row(
+                "SELECT properties FROM graph_nodes WHERE id = ?",
+                params!["doc:readme"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(node_props, r#"{"path":"README.md"}"#);
+        let edge_props: String = conn
+            .query_row(
+                "SELECT properties FROM graph_edges WHERE src = ? AND dst = ?",
+                params!["doc:readme", "sym:main"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_props, "{}");
     }
 
     /// Test-only shorthand: a telemetry row with just the analytics-relevant

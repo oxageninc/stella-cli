@@ -81,18 +81,18 @@ impl ContextProvider for MemoryProvider {
         // The store's recall does not honor `query.kinds`, so a kind-filtered
         // query (now routed here because we advertise those kinds) must be
         // filtered before returning — otherwise a `kinds: [Symbol]` request
-        // could surface memory/fact frames. Frames removed here count toward
-        // the truncation metadata alongside the store's own drops.
+        // could surface memory/fact frames. This filtering is NOT truncation:
+        // `ContextQueryResult.truncated`/`dropped_estimate` describe candidates
+        // that matched the request but were cut for budget, so they reflect
+        // only the store's own drops — a non-matching kind was never a
+        // candidate for this query in the first place.
         let mut frames = result.frames;
-        let mut dropped = result.dropped.len();
         if !query.kinds.is_empty() {
-            let before = frames.len();
             frames.retain(|f| query.kinds.contains(&f.kind));
-            dropped += before - frames.len();
         }
         Ok(ContextQueryResult {
-            truncated: dropped > 0,
-            dropped_estimate: u32::try_from(dropped).ok(),
+            truncated: !result.dropped.is_empty(),
+            dropped_estimate: u32::try_from(result.dropped.len()).ok(),
             frames,
         })
     }

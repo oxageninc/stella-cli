@@ -306,9 +306,10 @@ fn handle_slash_key(key: KeyEvent, matches: &[String], ui: &mut DeckUi) -> Optio
     match handle_slash_popup_key(key, matches, &mut ui.composer, &mut ui.slash_selected)? {
         SlashPopupOutcome::Handled => Some(DeckAction::Handled),
         SlashPopupOutcome::Submit(text) => Some(match text.as_str() {
-            // Views the deck itself owns: act locally, never round-trip.
-            // `/diff` opens the diff viewer; `/files` shows the file tree, so
-            // it must also *close* a diff left open from a prior view.
+            // Only the tab-switch commands are deck-local (they change view
+            // state the driver has no say over). `/diff` opens the diff
+            // viewer; `/files` shows the file tree, so it must also *close* a
+            // diff left open from a prior view.
             "/files" | "/diff" => {
                 ui.set_tab(DeckTab::Files);
                 ui.files_diff_open = text == "/diff";
@@ -318,10 +319,9 @@ fn handle_slash_key(key: KeyEvent, matches: &[String], ui: &mut DeckUi) -> Optio
                 ui.set_tab(DeckTab::Graph);
                 DeckAction::Handled
             }
-            "/help" => {
-                ui.help_open = true;
-                DeckAction::Handled
-            }
+            // Everything else — including `/help` — is enqueued for the
+            // driver, which owns the session vocabulary and answers into the
+            // transcript (a transient overlay would leave no record).
             _ => DeckAction::Send(WorkspaceInput::Enqueue { text }),
         }),
     }

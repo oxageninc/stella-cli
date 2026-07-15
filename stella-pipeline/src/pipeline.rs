@@ -34,7 +34,7 @@
 //! need `&mut Router`). That feedback is the responsibility of the glue that
 //! owns the `Router` — documented here so the boundary is explicit.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use stella_core::hooks::{HookRunner, Hooks};
@@ -54,7 +54,7 @@ use crate::candidate::{
 use crate::plan::{PlanStep, build_planner_prompt, parse_plan, plan_repair_prompt};
 use crate::ports::{
     ApprovalGate, CommandRunner, ContextRecallPort, ProviderResolver, RecalledFrame,
-    RepoStructurePort, ScopeDecision,
+    RepoStatusPort, RepoStructurePort, ScopeDecision,
 };
 use crate::scope::{ScopeEstimate, apply_trim, build_proposal, needs_scope_review};
 use crate::triage::{TaskClass, classify_triage_response, resolve_task_class, triage_prompt};
@@ -86,6 +86,9 @@ pub struct PipelinePorts<'a> {
     pub recall: &'a dyn ContextRecallPort,
     /// Repo-structure summary for the planner's split context (L-E6).
     pub repo: &'a dyn RepoStructurePort,
+    /// Untracked-file snapshots for the zero-diff guard (`git diff` can't see
+    /// untracked files; this makes new/modified untracked files visible).
+    pub repo_status: &'a dyn RepoStatusPort,
     /// Runs the verification ladder's test and diff commands (L-E11).
     pub commands: &'a dyn CommandRunner,
     /// The interactive scope-review gate (L-E5).
@@ -289,6 +292,7 @@ pub struct Pipeline<'a> {
     tools: &'a dyn stella_core::ToolExecutor,
     recall: &'a dyn ContextRecallPort,
     repo: &'a dyn RepoStructurePort,
+    repo_status: &'a dyn RepoStatusPort,
     commands: &'a dyn CommandRunner,
     approvals: &'a dyn ApprovalGate,
     sleeper: &'a dyn Sleeper,
@@ -310,6 +314,7 @@ impl<'a> Pipeline<'a> {
             tools: ports.tools,
             recall: ports.recall,
             repo: ports.repo,
+            repo_status: ports.repo_status,
             commands: ports.commands,
             approvals: ports.approvals,
             sleeper: ports.sleeper,
@@ -644,11 +649,12 @@ impl<'a> Pipeline<'a> {
             oracle.observe(cmd, pre.passed());
         }
 
-        // Snapshot untracked files BEFORE executing so `gather_diff` can tell
-        // files this turn created from pre-existing dirty state — otherwise a
-        // stale untracked file would be attributed to (and verified against)
-        // this turn.
-        let untracked_before = self.list_untracked().await;
+        // Snapshot untracked files (with content fingerprints) BEFORE
+        // executing so `gather_diff` can tell files this turn created OR
+        // modified from pre-existing dirty state — a stale untracked file with
+        // an unchanged fingerprint is not this turn's work, but one the turn
+        // edited (fingerprint changed) is.
+        let untracked_before = self.repo_status.untracked_fingerprints().await;
 
         // Execute: one turn for simple/single-task; one turn per plan step for
         // multi-step (each step guides a fresh engine turn).
@@ -877,7 +883,7 @@ impl<'a> Pipeline<'a> {
         file_changes: &mut u32,
         final_text: &mut String,
         total: &mut f64,
-        untracked_before: &HashSet<String>,
+        untracked_before: &HashMap<String, String>,
     ) -> Result<(u32, String), String> {
         messages.push(CompletionMessage::user(revision_prompt(reason)));
         self.emit(AgentEvent::Stage {
@@ -1036,37 +1042,13 @@ impl<'a> Pipeline<'a> {
         outcome
     }
 
-    /// The git-ignored-aware set of untracked files, root-relative. Empty
-    /// unless the configured diff command is git's (untracked accounting only
-    /// makes sense there). `-c core.quotePath=false` keeps non-ASCII paths
-    /// literal so the set matches what a later `gather_diff` sees.
-    async fn list_untracked(&self) -> HashSet<String> {
-        let is_git = self
-            .config
-            .diff_command
-            .as_deref()
-            .is_some_and(|c| c.trim_start().starts_with("git diff"));
-        if !is_git {
-            return HashSet::new();
-        }
-        let out = self
-            .commands
-            .run("git -c core.quotePath=false ls-files --others --exclude-standard")
-            .await;
-        out.stdout_tail
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect()
-    }
-
-    /// The real added-line count of a new untracked file, via a no-index diff
+    /// The real added-line count of an untracked file, via a no-index diff
     /// numstat (`<added>\t<deleted>\t<path>`). A binary file numstats as `-`
     /// and counts as one changed line (a change the ladder must see, but
     /// unmeasurable in lines). Counting real lines — not a flat 1 per file —
-    /// is what keeps a large new file from slipping under the diff budget and
-    /// taking `SubmitFast`.
+    /// is what keeps a large untracked file from slipping under the diff budget
+    /// and taking `SubmitFast`. A single file's numstat is one line, so this is
+    /// safe against the CommandRunner's output truncation.
     async fn untracked_added_lines(&self, path: &str) -> u32 {
         let out = self
             .commands
@@ -1086,13 +1068,15 @@ impl<'a> Pipeline<'a> {
     /// Run the diff command and return `(changed_line_count, raw_diff)`.
     ///
     /// `git diff` cannot see untracked files, so a turn whose entire change is
-    /// a NEW file would read as "no diff" — skipping verification via the
-    /// zero-diff guard and showing the judge an empty diff. When the configured
-    /// command is git's, files that became untracked *this turn* (i.e. not in
-    /// `untracked_before`) are appended with their real added-line counts, so
-    /// pre-existing dirty state is never attributed to the turn and a large new
-    /// file cannot slip under the diff-size budget.
-    async fn gather_diff(&self, untracked_before: &HashSet<String>) -> (u32, String) {
+    /// a NEW (or edited-untracked) file would read as "no diff" — skipping
+    /// verification via the zero-diff guard and showing the judge an empty
+    /// diff. When the configured command is git's, untracked files that were
+    /// **created or modified this turn** — present now with either no
+    /// `untracked_before` entry or a changed fingerprint — are appended with
+    /// their real added-line counts. Untouched dirty files (same fingerprint)
+    /// are excluded, so pre-existing state is never attributed to the turn, and
+    /// a large untracked file cannot slip under the diff-size budget.
+    async fn gather_diff(&self, untracked_before: &HashMap<String, String>) -> (u32, String) {
         let Some(cmd) = &self.config.diff_command else {
             return (0, String::new());
         };
@@ -1100,17 +1084,19 @@ impl<'a> Pipeline<'a> {
         let mut lines = count_diff_lines(&out.stdout_tail);
         let mut text = out.stdout_tail;
         if cmd.trim_start().starts_with("git diff") {
-            let mut fresh: Vec<String> = self
-                .list_untracked()
-                .await
-                .into_iter()
-                .filter(|p| !untracked_before.contains(p))
+            let after = self.repo_status.untracked_fingerprints().await;
+            // Created (absent before) OR modified (fingerprint changed) this
+            // turn — never an untouched dirty file.
+            let mut fresh: Vec<&str> = after
+                .iter()
+                .filter(|(path, fp)| untracked_before.get(*path) != Some(*fp))
+                .map(|(path, _)| path.as_str())
                 .collect();
             fresh.sort(); // deterministic order for the appended evidence
             for path in fresh {
-                let added = self.untracked_added_lines(&path).await;
+                let added = self.untracked_added_lines(path).await;
                 lines += added;
-                text.push_str(&format!("\n+ new file (untracked): {path} (+{added} lines)"));
+                text.push_str(&format!("\n+ untracked change: {path} (+{added} lines)"));
             }
         }
         (lines, text)
@@ -1265,9 +1251,34 @@ mod tests {
     use tokio::sync::Mutex as TokioMutex;
     use tokio::sync::mpsc;
 
-    use crate::ports::{AutoApproveGate, CmdOutcome, NoContextRecall, NoRepoStructure};
+    use crate::ports::{
+        AutoApproveGate, CmdOutcome, NoContextRecall, NoRepoStatus, NoRepoStructure,
+    };
 
     // ---- test doubles ---------------------------------------------------
+
+    /// A [`RepoStatusPort`] returning a fixed untracked `path -> fingerprint`
+    /// map — the "after execute" snapshot `gather_diff` diffs against a
+    /// caller-supplied before-snapshot.
+    struct FakeRepoStatus {
+        files: HashMap<String, String>,
+    }
+    impl FakeRepoStatus {
+        fn new(files: Vec<(&str, &str)>) -> Self {
+            Self {
+                files: files
+                    .into_iter()
+                    .map(|(p, fp)| (p.to_string(), fp.to_string()))
+                    .collect(),
+            }
+        }
+    }
+    #[async_trait]
+    impl RepoStatusPort for FakeRepoStatus {
+        async fn untracked_fingerprints(&self) -> HashMap<String, String> {
+            self.files.clone()
+        }
+    }
 
     /// A scripted provider serving triage, plan, worker, and judge calls from
     /// one ordered queue (the resolver hands the same provider to every role).
@@ -1477,6 +1488,7 @@ mod tests {
         let tools = EmptyTools;
         let recall = NoContextRecall;
         let repo = NoRepoStructure;
+        let repo_status = NoRepoStatus;
         let approvals = AutoApproveGate;
         let sleeper = NoopSleeper;
         let router = router();
@@ -1494,6 +1506,7 @@ mod tests {
                 tools: &tools,
                 recall: &recall,
                 repo: &repo,
+                repo_status: &repo_status,
                 commands: &runner,
                 approvals: &approvals,
                 sleeper: &sleeper,
@@ -1549,6 +1562,7 @@ mod tests {
         let tools = EmptyTools;
         let recall = NoContextRecall;
         let repo = NoRepoStructure;
+        let repo_status = NoRepoStatus;
         let approvals = AutoApproveGate;
         let sleeper = NoopSleeper;
         let router = router();
@@ -1566,6 +1580,7 @@ mod tests {
                 tools: &tools,
                 recall: &recall,
                 repo: &repo,
+                repo_status: &repo_status,
                 commands: &runner,
                 approvals: &approvals,
                 sleeper: &sleeper,
@@ -1609,6 +1624,7 @@ mod tests {
         let tools = EmptyTools;
         let recall = NoContextRecall;
         let repo = NoRepoStructure;
+        let repo_status = NoRepoStatus;
         let approvals = AutoApproveGate;
         let sleeper = NoopSleeper;
         let router = router();
@@ -1621,6 +1637,7 @@ mod tests {
                 tools: &tools,
                 recall: &recall,
                 repo: &repo,
+                repo_status: &repo_status,
                 commands: &runner,
                 approvals: &approvals,
                 sleeper: &sleeper,
@@ -1665,6 +1682,7 @@ mod tests {
         let tools = EmptyTools;
         let recall = NoContextRecall;
         let repo = NoRepoStructure;
+        let repo_status = NoRepoStatus;
         let approvals = FixedGate(ScopeDecision::Approve);
         let sleeper = NoopSleeper;
         let router = router();
@@ -1682,6 +1700,7 @@ mod tests {
                 tools: &tools,
                 recall: &recall,
                 repo: &repo,
+                repo_status: &repo_status,
                 commands: &runner,
                 approvals: &approvals,
                 sleeper: &sleeper,
@@ -1717,6 +1736,7 @@ mod tests {
         let tools = EmptyTools;
         let recall = NoContextRecall;
         let repo = NoRepoStructure;
+        let repo_status = NoRepoStatus;
         let approvals = FixedGate(ScopeDecision::Abort);
         let sleeper = NoopSleeper;
         let router = router();
@@ -1729,6 +1749,7 @@ mod tests {
                 tools: &tools,
                 recall: &recall,
                 repo: &repo,
+                repo_status: &repo_status,
                 commands: &runner,
                 approvals: &approvals,
                 sleeper: &sleeper,
@@ -1776,9 +1797,11 @@ mod tests {
     async fn gather_diff_counts_real_new_file_lines_and_excludes_pre_existing() {
         let provider = ScriptedProvider::new(vec![]);
         let resolver = OneProvider(&provider);
-        // Empty tracked diff; one big new file the ScriptedRunner reports as
-        // untracked with 5000 added lines.
+        // Empty tracked diff; the ScriptedRunner reports src/huge.rs's no-index
+        // numstat as 5000 added lines. The repo status reports it as untracked
+        // with fingerprint "v2".
         let runner = ScriptedRunner::new(vec![], "").with_untracked(vec![("src/huge.rs", 5000)]);
+        let repo_status = FakeRepoStatus::new(vec![("src/huge.rs", "v2")]);
         let tools = EmptyTools;
         let recall = NoContextRecall;
         let repo = NoRepoStructure;
@@ -1793,6 +1816,7 @@ mod tests {
                 tools: &tools,
                 recall: &recall,
                 repo: &repo,
+                repo_status: &repo_status,
                 commands: &runner,
                 approvals: &approvals,
                 sleeper: &sleeper,
@@ -1803,14 +1827,24 @@ mod tests {
         );
 
         // No baseline → the file is this turn's; its real 5000 lines count.
-        let (lines, text) = pipeline.gather_diff(&HashSet::new()).await;
+        let (lines, text) = pipeline.gather_diff(&HashMap::new()).await;
         assert_eq!(lines, 5000, "a new file counts its real added lines, not 1");
         assert!(text.contains("src/huge.rs"), "diff text names the new file");
 
-        // Already untracked before the turn → not attributed to it.
-        let before: HashSet<String> = std::iter::once("src/huge.rs".to_string()).collect();
-        let (lines2, _) = pipeline.gather_diff(&before).await;
+        // Present before at the SAME fingerprint → untouched dirty state, not
+        // attributed to the turn.
+        let unchanged: HashMap<String, String> =
+            std::iter::once(("src/huge.rs".to_string(), "v2".to_string())).collect();
+        let (lines2, _) = pipeline.gather_diff(&unchanged).await;
         assert_eq!(lines2, 0, "a pre-existing untracked file is not this turn's change");
+
+        // Present before but at a DIFFERENT fingerprint → the turn edited an
+        // already-untracked file; it must be visible (the P1 regression).
+        let modified: HashMap<String, String> =
+            std::iter::once(("src/huge.rs".to_string(), "v1".to_string())).collect();
+        let (lines3, text3) = pipeline.gather_diff(&modified).await;
+        assert_eq!(lines3, 5000, "an edit to an already-untracked file is counted");
+        assert!(text3.contains("src/huge.rs"));
     }
 
     #[test]

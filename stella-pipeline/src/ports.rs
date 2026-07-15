@@ -88,6 +88,26 @@ pub trait RepoStructurePort: Send + Sync {
     async fn structure_summary(&self) -> String;
 }
 
+/// A snapshot of the working tree's untracked (git-ignored-aware) files, each
+/// with a content fingerprint. The verification ladder diffs a before-turn and
+/// after-turn snapshot to find files the turn **created or modified**, since
+/// `git diff` alone is blind to untracked files.
+///
+/// Distinct from [`CommandRunner`] on purpose: the listing must be COMPLETE —
+/// `CommandRunner` output is middle-out truncated (L-S3), so a large untracked
+/// set would lose files and corrupt the diff-size accounting — and it must
+/// carry per-file fingerprints so a modification (not just a creation) to an
+/// already-untracked file is visible. A caller without a git working tree
+/// supplies [`NoRepoStatus`].
+#[async_trait]
+pub trait RepoStatusPort: Send + Sync {
+    /// Untracked files as `path -> fingerprint`, where the fingerprint changes
+    /// whenever the file's content does (e.g. `len:mtime_nanos`). Complete and
+    /// never truncated. Empty when the workspace is not a git repo or on any
+    /// failure — the guard then rests on the tracked `git diff` alone.
+    async fn untracked_fingerprints(&self) -> std::collections::HashMap<String, String>;
+}
+
 /// The outcome of running one shell command through [`CommandRunner`]. Output
 /// is pre-truncated by the runner (middle-out, L-S3) into head+tail tails —
 /// the pipeline never needs the full stream, only exit status and enough
@@ -183,6 +203,18 @@ pub struct NoRepoStructure;
 impl RepoStructurePort for NoRepoStructure {
     async fn structure_summary(&self) -> String {
         String::new()
+    }
+}
+
+/// A [`RepoStatusPort`] that reports no untracked files — for callers with no
+/// git working tree (the zero-diff guard then uses the tracked diff alone).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoRepoStatus;
+
+#[async_trait]
+impl RepoStatusPort for NoRepoStatus {
+    async fn untracked_fingerprints(&self) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
     }
 }
 

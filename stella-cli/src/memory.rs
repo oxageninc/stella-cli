@@ -282,17 +282,25 @@ impl SessionMemory {
     /// shifts supersedes stale beliefs instead of deleting them, so
     /// "what did we believe at T1" still answers (L-C3).
     ///
-    /// Known limitation: `covers_path` *facts* are versioned (a moved path's
-    /// old fact is superseded), but the File node's `node_domains` tags are
-    /// insert-only — re-running `init` after a path moves from domain A to B
-    /// adds the B tag without removing A. This does NOT break recall
-    /// correctness: the session scopes recall to the *full current taxonomy*,
-    /// so the node still passes the scope filter via B; the only residual is a
-    /// mild domain-overlap ranking boost for A. A correct fix is versioned
-    /// node-domain associations (matching the fact model) — deliberately not a
-    /// wholesale `node_domains` rewrite, which would depend on the unenforced
-    /// invariant that only the taxonomy ever tags File nodes and would silently
-    /// wipe tags from any future source.
+    /// Known limitation (deliberately deferred): `covers_path` *facts* are
+    /// versioned (a moved path's old fact is superseded), but the File node's
+    /// `node_domains` tags are insert-only — re-running `init` after a path
+    /// moves from domain A to B adds the B tag without removing A. This does
+    /// NOT break recall correctness: the session scopes recall to the *full
+    /// current taxonomy*, so the node still passes the scope filter via B; the
+    /// residual is only a domain-overlap ranking boost for A, and only while A
+    /// itself remains a taxonomy domain.
+    ///
+    /// Two fixes were considered and both deferred:
+    /// - Versioned node-domain associations (mirroring the fact model) — the
+    ///   correct design, but a `stella-context` schema change (`node_domains`
+    ///   gains validity columns, and every scope query must filter live rows).
+    ///   Disproportionate to a ranking-edge, and higher-risk right after the
+    ///   store's DuckDB→SQLite migration.
+    /// - Retiring taxonomy-owned tags before re-adding (a `node_domains`
+    ///   rewrite) — rejected as brittle: it relies on the unenforced invariant
+    ///   that only the taxonomy ever tags File nodes, so it would silently wipe
+    ///   a tag written by any future source.
     pub async fn record_taxonomy(&self, taxonomy: &crate::domains::Domains) {
         let domains = taxonomy
             .domains
@@ -364,41 +372,47 @@ impl SessionMemory {
         let stored = self.store.upsert(delta).await.is_ok();
 
         // 2. Append to the mining log and mine for auto-creatable skills.
-        // Track whether the log write actually succeeded so the message below
-        // never claims a fallback that didn't happen.
+        // Count how many lessons actually reached the log so the message below
+        // reports partial persistence accurately (some serialize/append writes
+        // may fail while others succeed).
         let log_path = self
             .workspace_root
             .join(".stella")
             .join("reflections.jsonl");
-        let mut logged = true;
+        let mut logged_count = 0usize;
         for lesson in &lessons {
-            match serde_json::to_string(lesson) {
-                Ok(line) if append_line(&log_path, &line).is_ok() => {}
-                _ => logged = false,
+            if let Ok(line) = serde_json::to_string(lesson)
+                && append_line(&log_path, &line).is_ok()
+            {
+                logged_count += 1;
             }
         }
         self.auto_create_skills(&log_path, quiet);
 
         if !quiet {
+            let n = lessons.len();
             if stored {
                 println!(
-                    "  {} remembered {} lesson(s) from this turn",
-                    "✦".magenta(),
-                    lessons.len()
+                    "  {} remembered {n} lesson(s) from this turn",
+                    "✦".magenta()
                 );
-            } else if logged {
+            } else if logged_count == n {
                 println!(
-                    "  {} could not persist {} lesson(s) to the context store \
+                    "  {} could not persist {n} lesson(s) to the context store \
                      (logged to reflections.jsonl only)",
-                    "!".yellow(),
-                    lessons.len()
+                    "!".yellow()
+                );
+            } else if logged_count > 0 {
+                println!(
+                    "  {} could not persist {n} lesson(s) to the context store; \
+                     {logged_count} of {n} reached reflections.jsonl",
+                    "!".yellow()
                 );
             } else {
                 println!(
-                    "  {} could not persist {} lesson(s) — both the context store \
+                    "  {} could not persist {n} lesson(s) — both the context store \
                      and reflections.jsonl writes failed",
-                    "!".yellow(),
-                    lessons.len()
+                    "!".yellow()
                 );
             }
         }

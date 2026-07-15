@@ -27,8 +27,8 @@ use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
 use stella_pipeline::{
     AutoApproveGate, CmdOutcome, CommandRunner, ContextRecallPort, NoContextRecall, Pipeline,
-    PipelineConfig, PipelinePorts, PipelineStatus, ProviderResolver, RepoStructurePort,
-    StdioApprovalGate,
+    PipelineConfig, PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort,
+    RepoStructurePort, StdioApprovalGate,
 };
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{AgentEvent, CompletionMessage, ModelRef, Role, ToolOutput};
@@ -320,6 +320,9 @@ async fn run_pipeline_one_shot(
         let repo_structure = GitRepoStructure {
             root: cfg.workspace_root.clone(),
         };
+        let repo_status = GitRepoStatus {
+            root: cfg.workspace_root.clone(),
+        };
         let command_runner = ShellCommandRunner {
             root: cfg.workspace_root.clone(),
         };
@@ -362,6 +365,7 @@ async fn run_pipeline_one_shot(
             tools: &tools,
             recall,
             repo: &repo_structure,
+            repo_status: &repo_status,
             commands: &command_runner,
             approvals: if is_text {
                 &stdio_gate
@@ -526,6 +530,66 @@ impl RepoStructurePort for GitRepoStructure {
             }
             _ => String::new(),
         }
+    }
+}
+
+/// Untracked-file fingerprints for the pipeline's zero-diff guard. Unlike the
+/// pipeline's `CommandRunner` (whose output is truncated), this captures the
+/// COMPLETE `git ls-files --others` listing and fingerprints each file itself
+/// (in-process, with real filesystem access), so a large untracked set is not
+/// silently clipped and a modification to an already-untracked file is
+/// detectable (its `len:mtime` fingerprint changes).
+struct GitRepoStatus {
+    root: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl RepoStatusPort for GitRepoStatus {
+    async fn untracked_fingerprints(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        // `-z` NUL-delimits paths (robust to spaces/newlines); quotePath off
+        // keeps non-ASCII literal. Full stdout is read — never truncated.
+        let output = tokio::process::Command::new("git")
+            .args([
+                "-c",
+                "core.quotePath=false",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ])
+            .current_dir(&self.root)
+            .output()
+            .await;
+        let Ok(listing) = output else {
+            return out;
+        };
+        if !listing.status.success() {
+            return out; // not a git repo, or git unavailable
+        }
+        for rel in String::from_utf8_lossy(&listing.stdout)
+            .split('\0')
+            .filter(|p| !p.is_empty())
+        {
+            // Fingerprint = size:mtime_nanos — changes whenever the file is
+            // written, without reading (and hashing) potentially large
+            // untracked files on every snapshot. Unreadable metadata → a
+            // sentinel so the file still registers as present.
+            let fingerprint = match std::fs::metadata(self.root.join(rel)) {
+                Ok(meta) => {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    format!("{}:{mtime}", meta.len())
+                }
+                Err(_) => "unreadable".to_string(),
+            };
+            out.insert(rel.to_string(), fingerprint);
+        }
+        out
     }
 }
 
@@ -898,6 +962,11 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                     // A fresh index may name tables/types the schema gate
                     // should know about this session, not just the next one.
                     populate_schema_index(&registry, &cfg.workspace_root);
+                    // The code graph now exists — expose the `code_graph` tool
+                    // to the rest of this session (it is registered only when
+                    // an index is present, so a session that started without
+                    // one otherwise wouldn't see it until relaunch).
+                    registry.enable_code_graph_if_available(&cfg.workspace_root);
                     // Re-open memory so recall/reflection use the taxonomy
                     // `/init` just wrote — otherwise the cached domains stay
                     // stale until the next launch.

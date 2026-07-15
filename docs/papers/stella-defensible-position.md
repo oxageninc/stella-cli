@@ -278,8 +278,10 @@ Two architectural constraints, enforced together:
    lock-in. Nine providers plus any local server.
 2. **No phone-home:** The only outbound network traffic Stella produces is to
    the model provider the user chose. No telemetry, no update checks, no
-   "anonymous" analytics. Every event is recorded in a local SQLite file
-   (`.stella/store.db`).
+   "anonymous" analytics. Events are recorded, best-effort, to a local SQLite
+   file (`.stella/store.db`) — the store is never a dependency of a turn: a
+   session runs even when it can't be opened, and an individual event write
+   that fails degrades the local record rather than the run.
 
 ### Why it is hard to copy
 

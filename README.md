@@ -619,9 +619,10 @@ remember" at prompt time.
 
 ## Local telemetry — SQLite, on your disk
 
-Every execution is recorded in `.stella/store.db`: the full event stream
-(chain-of-thought deltas included), per-model-call telemetry (tokens in/out, cache
-read hit/miss, cost from the model card's pricing), and the Files-Touched ledger
+Executions are recorded, best-effort, in `.stella/store.db` (the store is never a
+dependency of a turn — a session runs even if it can't be opened): the full event
+stream (chain-of-thought deltas included), per-model-call telemetry (tokens in/out,
+cache read hit/miss, cost from the model card's pricing), and the Files-Touched ledger
 (`file_locks` and `graph_nodes` / `graph_edges` tables exist in the schema as
 reserved seams for the context plane; no shipping command writes them yet). Query it
 with any SQLite client. **Nothing leaves your machine** — the only network traffic

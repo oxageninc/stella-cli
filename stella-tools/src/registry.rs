@@ -48,6 +48,12 @@ impl FileOp {
 /// "Files Touched" panel and persisted as telemetry.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    /// Tools enabled AFTER construction — currently just `code_graph`, once a
+    /// mid-session `stella init` / `/init` builds the index. Kept in a
+    /// separate interior-mutable overlay so the primary `tools` map stays
+    /// immutable and lock-free; the overlay is consulted as a fallback in the
+    /// three read paths (`schemas`, dispatch, name listing).
+    late_tools: std::sync::RwLock<HashMap<String, Arc<dyn Tool>>>,
     root: PathBuf,
     touched: std::sync::Mutex<Vec<(String, Vec<FileOp>)>>,
     schema_index: std::sync::Mutex<SchemaIndex>,
@@ -147,15 +153,39 @@ impl ToolRegistry {
         }
         Self {
             tools,
+            late_tools: std::sync::RwLock::new(HashMap::new()),
             root,
             touched: std::sync::Mutex::new(Vec::new()),
             schema_index: std::sync::Mutex::new(SchemaIndex::default()),
         }
     }
 
-    /// All tool schemas, for advertising to the model.
+    /// Enable the `code_graph` query tool if `stella init` has since built the
+    /// index and it isn't already registered. Idempotent, cheap, and safe to
+    /// call every turn. Lets a mid-session `/init` expose `code_graph` to
+    /// subsequent turns without rebuilding the whole registry (and its MCP
+    /// wrapper) — the overlay is shared through every `&ToolRegistry` /
+    /// `Arc<ToolRegistry>` reference the session already holds.
+    pub fn enable_code_graph_if_available(&self, root: &std::path::Path) {
+        if !crate::graph::graph_available(root) {
+            return;
+        }
+        let tool: Arc<dyn Tool> = Arc::new(crate::graph::CodeGraphQuery);
+        let name = tool.schema().name;
+        if self.tools.contains_key(&name) {
+            return; // already registered at construction
+        }
+        let mut late = self.late_tools.write().unwrap_or_else(|p| p.into_inner());
+        late.entry(name).or_insert(tool);
+    }
+
+    /// All tool schemas, for advertising to the model — primary tools plus any
+    /// late-enabled overlay tools.
     pub fn schemas(&self) -> Vec<ToolSchema> {
-        self.tools.values().map(|t| t.schema()).collect()
+        let mut schemas: Vec<ToolSchema> = self.tools.values().map(|t| t.schema()).collect();
+        let late = self.late_tools.read().unwrap_or_else(|p| p.into_inner());
+        schemas.extend(late.values().map(|t| t.schema()));
+        schemas
     }
 
     /// Execute a tool by name. Returns an error `ToolOutput` if the name is
@@ -216,7 +246,17 @@ impl ToolRegistry {
             }
         }
 
-        let output = match self.tools.get(name) {
+        // Resolve from the primary map, falling back to the late-enabled
+        // overlay. Clone the `Arc` out so the overlay's read lock is released
+        // before the `.await` (a lock guard must not cross an await point).
+        let tool = self.tools.get(name).cloned().or_else(|| {
+            self.late_tools
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(name)
+                .cloned()
+        });
+        let output = match tool {
             Some(tool) => tool.execute(input, &self.root).await,
             None => ToolOutput::Error {
                 message: format!(
@@ -312,7 +352,13 @@ impl ToolRegistry {
     /// Comma-separated sorted list of registered tool names, for error
     /// messages.
     pub fn available_names(&self) -> String {
-        let mut names: Vec<&str> = self.tools.keys().map(|s| s.as_str()).collect();
+        let late = self.late_tools.read().unwrap_or_else(|p| p.into_inner());
+        let mut names: Vec<String> = self
+            .tools
+            .keys()
+            .cloned()
+            .chain(late.keys().cloned())
+            .collect();
         names.sort();
         names.join(", ")
     }
@@ -414,6 +460,41 @@ mod tests {
                 "{absent} must be absent"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn code_graph_tool_is_enabled_after_a_mid_session_index_build() {
+        // A session that starts without a code-graph index doesn't advertise
+        // `code_graph`; once `stella init` / `/init` builds the index,
+        // `enable_code_graph_if_available` must expose it for the rest of the
+        // session (schema advertised AND dispatchable) without a rebuild.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let reg = ToolRegistry::with_issue_backend(root.clone(), None);
+        let has_code_graph = |r: &ToolRegistry| r.schemas().iter().any(|s| s.name == "code_graph");
+
+        assert!(!has_code_graph(&reg), "no index → not advertised");
+        reg.enable_code_graph_if_available(&root); // no index yet: a no-op
+        assert!(!has_code_graph(&reg));
+
+        // Build a minimal index, exactly what `stella init` does.
+        std::fs::write(root.join("lib.rs"), "pub fn f() {}\n").unwrap();
+        let db = root.join(".stella").join("codegraph.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let graph = stella_graph::CodeGraph::open(&root, &db).unwrap();
+        graph.index_all().unwrap();
+        graph.shutdown();
+
+        reg.enable_code_graph_if_available(&root);
+        assert!(has_code_graph(&reg), "index built → now advertised");
+        // And it actually dispatches through the overlay.
+        let out = reg
+            .execute(
+                "code_graph",
+                &serde_json::json!({"op": "definitions", "target": "f"}),
+            )
+            .await;
+        assert!(!out.is_error(), "code_graph must dispatch: {out:?}");
     }
 
     #[test]

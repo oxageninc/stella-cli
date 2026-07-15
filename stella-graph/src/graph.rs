@@ -83,11 +83,23 @@ impl Inner {
             .push(handle);
     }
 
+    /// Install the live watcher — but only if `shutdown()` has not already
+    /// run. The flag check and the store happen under the **same** watcher
+    /// lock that `shutdown()` takes to set the flag and clear the slot, so the
+    /// install serializes against shutdown and the mount-vs-shutdown TOCTOU
+    /// window is closed: a watcher created by the background task after a
+    /// concurrent `shutdown()` is dropped here (at end of scope) instead of
+    /// being stored, so it can never leak past shutdown.
     fn set_watcher(&self, watcher: RecommendedWatcher) {
-        *self
+        let mut slot = self
             .watcher
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(watcher);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.shutdown.load(Ordering::Relaxed) {
+            // `watcher` is dropped at end of scope → stops watching at once.
+            return;
+        }
+        *slot = Some(watcher);
     }
 }
 
@@ -101,9 +113,9 @@ pub struct CodeGraph {
 pub struct NeighborhoodSymbol {
     pub name: String,
     /// The stored kind tag as persisted by the index (`"function"`,
-    /// `"struct"`, `"class"`, `"table"`, …) — see [`SymbolKind::tag`]. An
-    /// owned `String` so this public type round-trips through serde without a
-    /// borrow lifetime.
+    /// `"struct"`, `"class"`, `"table"`, …) — see [`crate::SymbolKind::tag`].
+    /// An owned `String` so this public type round-trips through serde without
+    /// a borrow lifetime.
     pub kind: String,
     pub start_line: u32,
 }
@@ -297,12 +309,21 @@ impl CodeGraph {
     /// closes the event channel, so the debounce loop exits on its own; task
     /// handles are aborted as a backstop.
     pub fn shutdown(&self) {
-        self.inner.shutdown.store(true, Ordering::Relaxed);
-        *self
-            .inner
-            .watcher
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        // Set the shutdown flag *and* clear the watcher slot under one hold of
+        // the watcher lock. `set_watcher` re-checks the flag under this same
+        // lock, so install and shutdown serialize: a watcher installed
+        // concurrently by the mount background task is either cleared here (if
+        // it stored first) or dropped by `set_watcher` (if it runs after us).
+        // Invariant: after this returns, no watcher can be (re)installed.
+        {
+            let mut watcher = self
+                .inner
+                .watcher
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.inner.shutdown.store(true, Ordering::Relaxed);
+            *watcher = None;
+        }
         let handles: Vec<JoinHandle<()>> = self
             .inner
             .tasks
@@ -341,5 +362,70 @@ impl Drop for CodeGraph {
         // behavior) could therefore never fire after a successful `mount`,
         // leaking the OS watcher and both loops until process exit.
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A parked `notify` watcher, not armed on any path — enough to exercise
+    /// the install path without depending on OS event delivery.
+    fn make_watcher() -> RecommendedWatcher {
+        notify::recommended_watcher(|_res: notify::Result<notify::Event>| {}).unwrap()
+    }
+
+    fn open_graph() -> (CodeGraph, TempDir, TempDir) {
+        let ws = TempDir::new().unwrap();
+        let dbdir = TempDir::new().unwrap();
+        let graph = CodeGraph::open(ws.path(), &dbdir.path().join("context.db")).unwrap();
+        (graph, ws, dbdir)
+    }
+
+    fn watcher_is_installed(graph: &CodeGraph) -> bool {
+        graph
+            .inner
+            .watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    /// Reproduces the mount-vs-shutdown race deterministically: `shutdown()`
+    /// runs first (flag set, slot cleared), then the racing mount task — having
+    /// already passed its pre-install shutdown check — tries to install its
+    /// watcher. The guarded `set_watcher` must drop it, not store it, so the
+    /// OS watcher cannot leak past shutdown.
+    #[test]
+    fn set_watcher_after_shutdown_drops_the_watcher() {
+        let (graph, _ws, _dbdir) = open_graph();
+
+        graph.shutdown();
+        graph.inner.set_watcher(make_watcher());
+
+        assert!(
+            !watcher_is_installed(&graph),
+            "a watcher installed after shutdown must be dropped, not retained"
+        );
+    }
+
+    /// Control: with no shutdown, the normal install path stores the watcher.
+    #[test]
+    fn set_watcher_before_shutdown_stores_the_watcher() {
+        let (graph, _ws, _dbdir) = open_graph();
+
+        graph.inner.set_watcher(make_watcher());
+        assert!(
+            watcher_is_installed(&graph),
+            "a watcher installed before shutdown must be retained"
+        );
+
+        // And a subsequent shutdown clears it back out.
+        graph.shutdown();
+        assert!(
+            !watcher_is_installed(&graph),
+            "shutdown must clear an already-installed watcher"
+        );
     }
 }
