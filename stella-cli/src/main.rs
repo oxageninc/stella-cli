@@ -49,7 +49,7 @@ pub enum OutputFormat {
 #[derive(Parser)]
 #[command(
     name = "stella",
-    version = version_string(),
+    version = version_static(),
     about = "A fast, BYOK, model-agnostic terminal coding agent"
 )]
 struct Cli {
@@ -177,15 +177,19 @@ fn version_string() -> String {
     }
 }
 
+/// clap's `version` attribute needs a `'static` string, but the dev stamp is
+/// assembled at runtime — leak it once at parse time (a few bytes, once per
+/// process).
+fn version_static() -> &'static str {
+    version_string().leak()
+}
+
 /// Whether `chat` should launch the Command Deck: an explicit `--plain` or
 /// STELLA_PLAIN=1 opts out, and both stdin and stdout must be real terminals
 /// (raw mode + the alternate screen are meaningless on a pipe).
 fn use_deck(plain_flag: bool) -> bool {
     let plain_env = std::env::var_os("STELLA_PLAIN").is_some_and(|v| !v.is_empty() && v != "0");
-    !plain_flag
-        && !plain_env
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
+    !plain_flag && !plain_env && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 /// `--budget` must be a positive, finite dollar amount — a NaN or negative

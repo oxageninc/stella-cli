@@ -954,7 +954,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn prompt_started_pops_the_front_of_the_queue_and_leaves_a_trace() {
         let mut w = WorkspaceModel::new();
         w.apply_inbound(&reg("lead"));
@@ -967,7 +966,10 @@ mod tests {
             text: "first".into(),
         });
         assert_eq!(w.queue.pending(), 1);
-        assert_eq!(w.queue.items.front().map(|q| q.text.as_str()), Some("second"));
+        assert_eq!(
+            w.queue.items.front().map(|q| q.text.as_str()),
+            Some("second")
+        );
         let row = w.trace.rows.back().expect("a trace row was recorded");
         assert_eq!(row.agent, "lead");
         assert!(row.summary.contains("first"), "{}", row.summary);
@@ -984,7 +986,9 @@ mod tests {
             text: "driver-side prompt".into(),
         });
         assert_eq!(w.queue.pending(), 1);
-=======
+    }
+
+    #[test]
     fn prompt_queue_edits_like_a_list() {
         let mut q = PromptQueue::default();
         q.enqueue("a".into(), 1);
@@ -996,7 +1000,6 @@ mod tests {
         assert_eq!(q.remove(9), None, "out of range is a no-op");
         q.clear();
         assert_eq!(q.pending(), 0);
->>>>>>> 41325e9a4a9d778b2906cd2be26473dc260bd7b7
     }
 
     #[test]

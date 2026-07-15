@@ -358,10 +358,7 @@ fn render_diff(
     .split(area);
     let w = area.width as usize;
     Paragraph::new(diff::header_line(path, w)).render(bands[0], buf);
-    let visible: Vec<Line<'static>> = lines
-        .get(window)
-        .map(<[Line]>::to_vec)
-        .unwrap_or_default();
+    let visible: Vec<Line<'static>> = lines.get(window).map(<[Line]>::to_vec).unwrap_or_default();
     Paragraph::new(Text::from(visible)).render(bands[1], buf);
     Paragraph::new(diff::footer_line(added, removed, w)).render(bands[2], buf);
 }
@@ -759,7 +756,9 @@ fn collapsed_thinking_line(text: &str) -> Line<'static> {
         ),
         Span::styled(
             tail,
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         ),
     ])
 }
@@ -979,11 +978,7 @@ mod tests {
         model.apply(&AgentEvent::Reasoning { delta: long });
         let lines = transcript_lines(&model, false);
         assert_eq!(lines.len(), 1);
-        let text: String = lines[0]
-            .spans
-            .iter()
-            .map(|s| s.content.clone())
-            .collect();
+        let text: String = lines[0].spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.ends_with("THE-TAIL"), "keeps the tail: {text}");
         assert!(text.contains('…'), "marks the elision: {text}");
     }

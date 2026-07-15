@@ -142,8 +142,7 @@ fn render_activity_strip(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &
         String::new()
     };
     let right_w = right_text.chars().count() as u16;
-    let cols =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(right_w)]).split(area);
+    let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(right_w)]).split(area);
 
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
     let running = model
@@ -456,7 +455,10 @@ mod tests {
         let mut idle = WorkspaceModel::new();
         assert!(!activity_strip_active(&idle));
         idle.queue.enqueue("later".into(), 1);
-        assert!(activity_strip_active(&idle), "queued prompts keep it visible");
+        assert!(
+            activity_strip_active(&idle),
+            "queued prompts keep it visible"
+        );
         assert!(activity_strip_active(&running_model_with_queue()));
     }
 

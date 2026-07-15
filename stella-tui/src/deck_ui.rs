@@ -332,11 +332,9 @@ fn handle_queue_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -> D
             ui.queue_sel = (ui.queue_sel + 1).min(count - 1);
             DeckAction::Handled
         }
-        KeyCode::Char('x') if ctrl => {
-            DeckAction::Send(WorkspaceInput::QueueRemove {
-                index: ui.queue_sel,
-            })
-        }
+        KeyCode::Char('x') if ctrl => DeckAction::Send(WorkspaceInput::QueueRemove {
+            index: ui.queue_sel,
+        }),
         KeyCode::Enter => {
             // Pull the prompt out of the queue and into the composer to edit —
             // it is *removed*, not duplicated; re-submitting re-enqueues it.
@@ -943,7 +941,10 @@ mod tests {
         let mut ui = ready_ui();
         handle_deck_key(ctrl('t'), &model, &mut ui);
         // First press only arms the confirm.
-        assert_eq!(handle_deck_key(ctrl('d'), &model, &mut ui), DeckAction::Handled);
+        assert_eq!(
+            handle_deck_key(ctrl('d'), &model, &mut ui),
+            DeckAction::Handled
+        );
         assert!(ui.queue_confirm_clear);
         // Any other key disarms it.
         handle_deck_key(key(KeyCode::Down), &model, &mut ui);
