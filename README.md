@@ -6,17 +6,6 @@
   </picture>
 </p>
 
-```text
-        ·  .  ✦   ·        ·   ✦        .   ·      ✦   .        ·
-   ███████╗████████╗███████╗██╗     ██╗      █████╗    ·   .   ✦
-   ██╔════╝╚══██╔══╝██╔════╝██║     ██║     ██╔══██╗       ·
-   ███████╗   ██║   █████╗  ██║     ██║     ███████║   ✦        ·
-   ╚════██║   ██║   ██╔══╝  ██║     ██║     ██╔══██║      ·   .
-   ███████║   ██║   ███████╗███████╗███████╗██║  ██║  ·      ✦
-   ╚══════╝   ╚═╝   ╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝    .   ·
-   a deterministic coding agent · verified done, not claimed done
-```
-
 <p align="center"><strong>A fast, BYOK, model-agnostic terminal coding agent, built in Rust — that refuses to call a task done until a test proves it.</strong></p>
 
 <p align="center"><em>For everyone who is sick of token waste and average agent runners.</em></p>
