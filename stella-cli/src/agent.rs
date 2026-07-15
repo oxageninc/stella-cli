@@ -116,8 +116,19 @@ const MEMORY_PROMPT_BUDGET_CHARS: usize = 16_000;
 /// Assemble the session's system prompt from a `base` instruction set plus
 /// the workspace's saved memories. Memories are loaded ONCE per session and
 /// concatenated in filename order so the resulting prefix is byte-stable
+<<<<<<< HEAD
+/// across every model call — that stability is what lets the whole prompt
+/// (instructions + memories) ride the provider's prompt cache instead of
+/// being re-billed. Memories saved mid-session deliberately do NOT appear
+/// until the next session: hot-injecting them would invalidate the cached
+/// prefix on every save. This coexists with `SessionMemory`'s per-turn
+/// recall block (memory.rs) — the baked prefix carries durable lessons, the
+/// recall block carries turn-relevant memories and skills.
+pub(crate) fn build_system_prompt(workspace_root: &std::path::Path) -> String {
+=======
 /// across every model call — that stability preserves prompt-cache hits.
 fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> String {
+>>>>>>> 41325e9a4a9d778b2906cd2be26473dc260bd7b7
     let dir = workspace_root.join(".stella/memories");
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .map(|entries| {
@@ -1035,7 +1046,7 @@ pub async fn run_init(
 /// mcp__<server>__<tool> names. Absent config -> None (zero overhead).
 /// Connection is best-effort per server (stella-mcp isolates failures);
 /// failed servers are reported once in text mode, never fatal.
-async fn connect_mcp(
+pub(crate) async fn connect_mcp(
     cfg: &Config,
     native: std::sync::Arc<dyn ToolExecutor>,
     print_diagnostics: bool,
@@ -1084,7 +1095,7 @@ async fn connect_mcp(
 /// then ~/.config/stella/tools/*.toml — workspace wins on collision; see
 /// stella_tools::custom). Broken manifests never abort a session: their
 /// diagnostics print once (text mode) and show up in `stella tools`.
-fn discover_custom_tools(cfg: &Config, print_diagnostics: bool) -> Vec<CustomTool> {
+pub(crate) fn discover_custom_tools(cfg: &Config, print_diagnostics: bool) -> Vec<CustomTool> {
     let report = custom::discover(&cfg.workspace_root);
     if print_diagnostics {
         for diagnostic in &report.diagnostics {
@@ -1273,7 +1284,7 @@ pub fn run_tools_validation(dir: Option<&std::path::Path>) -> Result<(), String>
 /// Construct the turn/session budget guard from `--budget`. No limit at
 /// all still meters spend (`BudgetMode::Observed`) so the cost summary and
 /// `BudgetTick` events stay meaningful even when nothing is enforced.
-fn build_budget_guard(budget_limit: Option<f64>) -> BudgetGuard {
+pub(crate) fn build_budget_guard(budget_limit: Option<f64>) -> BudgetGuard {
     match budget_limit {
         Some(limit) => BudgetGuard::new(BudgetMode::Enforced, Some(limit), None),
         None => BudgetGuard::new(BudgetMode::Observed, None, None),
@@ -1283,7 +1294,7 @@ fn build_budget_guard(budget_limit: Option<f64>) -> BudgetGuard {
 /// Open the workspace DuckDB store (`.stella/stella.duckdb`). Persistence is
 /// observability, not a work dependency: a store that won't open warns once
 /// and the session runs on without it — never a startup failure.
-fn open_store(workspace_root: &std::path::Path) -> Option<Arc<Store>> {
+pub(crate) fn open_store(workspace_root: &std::path::Path) -> Option<Arc<Store>> {
     match Store::open(workspace_root) {
         Ok(store) => Some(Arc::new(store)),
         Err(e) => {
@@ -1307,7 +1318,7 @@ const DRIFT_SEED_SAMPLES: usize = 20;
 /// estimator starts already corrected instead of re-learning each session.
 /// Best-effort like all persistence: no store (or a failed query) just means
 /// starting uncalibrated — factor 1.0, the pre-drift behavior.
-fn seed_calibration(store: &Option<Arc<Store>>, cfg: &Config) -> CalibrationMap {
+pub(crate) fn seed_calibration(store: &Option<Arc<Store>>, cfg: &Config) -> CalibrationMap {
     let calibration = CalibrationMap::new();
     if let Some(store) = store
         && let Ok(samples) = store.drift_samples(cfg.provider.id, &cfg.model_id, DRIFT_SEED_SAMPLES)
@@ -1320,7 +1331,7 @@ fn seed_calibration(store: &Option<Arc<Store>>, cfg: &Config) -> CalibrationMap 
 
 /// Begin an execution record; a failure degrades to "no persistence for this
 /// execution" rather than blocking the work.
-fn begin_execution(
+pub(crate) fn begin_execution(
     store: &Option<Arc<Store>>,
     kind: &str,
     prompt: &str,
@@ -1478,7 +1489,7 @@ fn spawn_renderer(
         let mut store_warned = false;
         while let Some(event) = rx.recv().await {
             if let Some((store, id)) = &execution {
-                if store.record_event(*id, seq, &event).is_err() && !store_warned {
+                if !persist_event(store, *id, seq, &event, &provider_id) && !store_warned {
                     eprintln!(
                         "  {} store write failed — telemetry for this execution is incomplete",
                         "⚠".yellow()
@@ -1486,40 +1497,6 @@ fn spawn_renderer(
                     store_warned = true;
                 }
                 seq += 1;
-                if let AgentEvent::StepUsage {
-                    step,
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    cached_input_tokens,
-                    estimated_input_tokens,
-                    cost_usd,
-                    duration_ms,
-                    retries,
-                    tool_calls,
-                } = &event
-                {
-                    let _ = store.record_telemetry(
-                        *id,
-                        &TelemetryRow {
-                            step: *step as u64,
-                            provider: provider_id.clone(),
-                            model: model.clone(),
-                            input_tokens: *input_tokens,
-                            estimated_input_tokens: *estimated_input_tokens,
-                            output_tokens: *output_tokens,
-                            cache_read_tokens: *cached_input_tokens,
-                            cache_miss_tokens: input_tokens.saturating_sub(*cached_input_tokens),
-                            // Populated once the usage envelope carries
-                            // cache-write counts (staged follow-up).
-                            cache_write_tokens: 0,
-                            cost_usd: *cost_usd,
-                            duration_ms: *duration_ms,
-                            retries: *retries,
-                            tool_calls: *tool_calls as u64,
-                        },
-                    );
-                }
             }
             match format {
                 OutputFormat::StreamJson => {
@@ -1566,6 +1543,58 @@ fn spawn_renderer(
         }
         collected
     })
+}
+
+/// Persist one drained event to an open execution record: append it to the
+/// event stream and, for `StepUsage`, add a telemetry row. Shared by
+/// [`spawn_renderer`] (one-shot/REPL rendering) and the command deck's event
+/// forwarder (`crate::command_deck`), so the store's write path lives in
+/// exactly one place. Returns `false` when the event-stream append failed so
+/// the caller can surface its once-only warning; the telemetry row stays
+/// silently best-effort, exactly as before this was extracted.
+pub(crate) fn persist_event(
+    store: &Store,
+    execution_id: i64,
+    seq: u64,
+    event: &AgentEvent,
+    provider_id: &str,
+) -> bool {
+    let recorded = store.record_event(execution_id, seq, event).is_ok();
+    if let AgentEvent::StepUsage {
+        step,
+        model,
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        estimated_input_tokens,
+        cost_usd,
+        duration_ms,
+        retries,
+        tool_calls,
+    } = event
+    {
+        let _ = store.record_telemetry(
+            execution_id,
+            &TelemetryRow {
+                step: *step as u64,
+                provider: provider_id.to_string(),
+                model: model.clone(),
+                input_tokens: *input_tokens,
+                estimated_input_tokens: *estimated_input_tokens,
+                output_tokens: *output_tokens,
+                cache_read_tokens: *cached_input_tokens,
+                cache_miss_tokens: input_tokens.saturating_sub(*cached_input_tokens),
+                // Populated once the usage envelope carries cache-write
+                // counts (staged follow-up).
+                cache_write_tokens: 0,
+                cost_usd: *cost_usd,
+                duration_ms: *duration_ms,
+                retries: *retries,
+                tool_calls: *tool_calls as u64,
+            },
+        );
+    }
+    recorded
 }
 
 /// Run one goal loop through `stella_core::Engine::run_goal`: working turns
@@ -1707,7 +1736,7 @@ async fn run_goal_turn(
 /// served by the shared adapter re-identified per provider so its
 /// `Provider::id()` and error messages name the surface actually being
 /// called (an xAI 401 must never read "Z.ai rejected the API key").
-fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
+pub(crate) fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
     build_provider_parts(
         &cfg.provider,
         &cfg.model_id,

@@ -30,7 +30,11 @@ stella-store = { path = "../stella-store" }
 stella-mcp = { path = "../stella-mcp" }
 stella-context = { path = "../stella-context" }
 stella-graph = { path = "../stella-graph" }
+<<<<<<< HEAD
+stella-tui = { path = "../stella-tui" }
+=======
 stella-pipeline = { path = "../stella-pipeline" }
+>>>>>>> 41325e9a4a9d778b2906cd2be26473dc260bd7b7
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }

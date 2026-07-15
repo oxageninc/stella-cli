@@ -115,6 +115,12 @@ pub enum Inbound {
     Event { agent: AgentId, event: AgentEvent },
     /// A supervisor lifecycle transition not carried by the event stream.
     Status { agent: AgentId, status: AgentStatus },
+    /// The dispatcher took the oldest queued prompt and handed it to an
+    /// agent. The deck's [`PromptQueue`](crate::deck::PromptQueue) is FIFO on
+    /// both sides of the channel, so this pops the front entry — the status
+    /// bar's "queued" count goes down the moment work actually starts, and a
+    /// trace row records which agent picked the prompt up.
+    PromptStarted { agent: AgentId, text: String },
 }
 
 /// What the deck sends back to the caller / engine. The single-session

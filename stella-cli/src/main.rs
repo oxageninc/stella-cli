@@ -18,6 +18,7 @@
 //!   human-readable output).
 
 mod agent;
+mod command_deck;
 mod config;
 mod domains;
 mod interactive;
@@ -26,6 +27,7 @@ mod settings;
 mod stats;
 mod tui;
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -47,7 +49,7 @@ pub enum OutputFormat {
 #[derive(Parser)]
 #[command(
     name = "stella",
-    version,
+    version = version_string(),
     about = "A fast, BYOK, model-agnostic terminal coding agent"
 )]
 struct Cli {
@@ -82,6 +84,12 @@ struct Cli {
     /// without ever blocking (observed mode).
     #[arg(long, env = "STELLA_BUDGET", value_parser = parse_budget)]
     budget: Option<f64>,
+
+    /// Use the plain line-based REPL for chat instead of the Command Deck
+    /// (the tabbed TUI). The deck also steps aside automatically when stdin
+    /// or stdout is not a terminal. Env: STELLA_PLAIN=1.
+    #[arg(long)]
+    plain: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -157,6 +165,29 @@ enum Command {
     Version,
 }
 
+/// The version string shown by `--version` and `stella version`: the crate
+/// version, plus the git sha stamped by dev-mode builds (`scripts/dev.sh`
+/// sets `STELLA_BUILD_GIT_SHA` at compile time) so a `stella-dev` binary
+/// always names the exact checkout it was built from. Release builds carry
+/// no stamp and print the bare semver, unchanged.
+fn version_string() -> String {
+    match option_env!("STELLA_BUILD_GIT_SHA") {
+        Some(sha) if !sha.is_empty() => format!("{}-dev.{sha}", env!("CARGO_PKG_VERSION")),
+        _ => env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+/// Whether `chat` should launch the Command Deck: an explicit `--plain` or
+/// STELLA_PLAIN=1 opts out, and both stdin and stdout must be real terminals
+/// (raw mode + the alternate screen are meaningless on a pipe).
+fn use_deck(plain_flag: bool) -> bool {
+    let plain_env = std::env::var_os("STELLA_PLAIN").is_some_and(|v| !v.is_empty() && v != "0");
+    !plain_flag
+        && !plain_env
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+}
+
 /// `--budget` must be a positive, finite dollar amount — a NaN or negative
 /// limit would make every comparison silently false and turn the "hard
 /// cap" into a no-op, the worst failure mode for a money control.
@@ -207,7 +238,7 @@ fn run(cli: Cli) -> Result<(), String> {
             return stats::run_stats(*format, provider.as_deref());
         }
         Some(Command::Version) => {
-            println!("stella v{}", env!("CARGO_PKG_VERSION"));
+            println!("stella v{}", version_string());
             return Ok(());
         }
         _ => {}
@@ -266,7 +297,14 @@ fn run(cli: Cli) -> Result<(), String> {
             rt()?.block_on(agent::run_goal_cmd(&cfg, &goal, cli.budget))?;
         }
         Command::Chat => {
-            rt()?.block_on(agent::run_interactive(&cfg, cli.budget))?;
+            // The Command Deck (tabbed TUI) is the default chat surface on a
+            // real terminal; `--plain` / STELLA_PLAIN=1 / a non-TTY stream
+            // falls back to the line-based REPL.
+            if use_deck(cli.plain) {
+                rt()?.block_on(command_deck::run_deck_session(&cfg, cli.budget))?;
+            } else {
+                rt()?.block_on(agent::run_interactive(&cfg, cli.budget))?;
+            }
         }
         // Models/Version (and Tools) short-circuit in the first match at the
         // top of `run` before a provider is resolved; Init is handled by the

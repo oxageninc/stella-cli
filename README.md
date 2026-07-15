@@ -615,6 +615,26 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p stella-cli -- models
 ```
 
+### Dev mode — test a checkout from any workspace
+
+To try your working copy against real projects *before* baking a release,
+install it as `stella-dev` — it lives side by side with the released
+`stella` and never shadows it:
+
+```bash
+scripts/dev.sh install        # build (release) + link ~/.local/bin/stella-dev
+cd ~/any/other/repo
+stella-dev                    # the tabbed Command Deck, running your checkout
+stella-dev version            # e.g. 0.1.16-dev.3f2c9aa+dirty — sha of the build
+```
+
+The link points into this checkout's `target/`, so iterating is just a
+rebuild — `scripts/dev.sh build` (or plain `cargo build --release -p
+stella-cli`) and every open workspace immediately runs the fresh binary.
+`--debug` builds the debug profile for faster compiles;
+`scripts/dev.sh status` shows what both binaries resolve to, and
+`scripts/dev.sh uninstall` removes the link.
+
 <div align="center">
 
 `·  ·  ✦  ·  ·  ───────────────────────────────────────────────  ·  ·  ✦  ·  ·`
