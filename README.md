@@ -6,10 +6,7 @@
   </picture>
 </p>
 
-<p align="center"><strong>A fast, BYOK, model-agnostic terminal coding agent, built in Rust — that refuses to call a task done until a test proves it.</strong></p>
-
-<p align="center"><em>For everyone who is sick of token waste and average agent runners.</em></p>
-
+<p align="center"><strong>A fast, Gragh RAG with embeddings, BYOK, model-agnostic terminal coding agent, built in Rust.</strong></p>
 <p align="center">
   <a href="https://github.com/oxageninc/stella/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/oxageninc/stella/ci.yml?branch=main&style=flat-square&logo=github&label=ci" alt="CI status"></a>
   <a href="https://github.com/oxageninc/stella/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/oxageninc/stella/release.yml?style=flat-square&logo=github&label=release" alt="Release status"></a>
