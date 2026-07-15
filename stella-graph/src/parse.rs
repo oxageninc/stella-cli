@@ -795,9 +795,10 @@ pub struct User {
 ";
         let parsed = parse(Language::Rust, src);
         assert!(
-            parsed.symbols.iter().any(|s| {
-                s.name == "users" && s.kind == SymbolKind::Table
-            }),
+            parsed
+                .symbols
+                .iter()
+                .any(|s| { s.name == "users" && s.kind == SymbolKind::Table }),
             "Diesel table! not detected: {:?}",
             parsed.symbols
         );
@@ -818,7 +819,8 @@ class Helper:
 ";
         let parsed = parse(Language::Python, src);
         assert!(
-            parsed.symbols
+            parsed
+                .symbols
                 .iter()
                 .any(|s| s.name == "payments" && s.kind == SymbolKind::Table),
             "Django model not detected: {:?}",
@@ -839,9 +841,7 @@ class Order(Base):
 ";
         let parsed = parse(Language::Python, src);
         assert!(
-            parsed.symbols
-                .iter()
-                .any(|s| s.kind == SymbolKind::Table),
+            parsed.symbols.iter().any(|s| s.kind == SymbolKind::Table),
             "SQLAlchemy model not detected: {:?}",
             parsed.symbols
         );

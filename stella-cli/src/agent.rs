@@ -116,7 +116,6 @@ const MEMORY_PROMPT_BUDGET_CHARS: usize = 16_000;
 /// Assemble the session's system prompt from a `base` instruction set plus
 /// the workspace's saved memories. Memories are loaded ONCE per session and
 /// concatenated in filename order so the resulting prefix is byte-stable
-<<<<<<< HEAD
 /// across every model call — that stability is what lets the whole prompt
 /// (instructions + memories) ride the provider's prompt cache instead of
 /// being re-billed. Memories saved mid-session deliberately do NOT appear
@@ -124,11 +123,7 @@ const MEMORY_PROMPT_BUDGET_CHARS: usize = 16_000;
 /// prefix on every save. This coexists with `SessionMemory`'s per-turn
 /// recall block (memory.rs) — the baked prefix carries durable lessons, the
 /// recall block carries turn-relevant memories and skills.
-pub(crate) fn build_system_prompt(workspace_root: &std::path::Path) -> String {
-=======
-/// across every model call — that stability preserves prompt-cache hits.
 fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> String {
->>>>>>> 41325e9a4a9d778b2906cd2be26473dc260bd7b7
     let dir = workspace_root.join(".stella/memories");
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .map(|entries| {
@@ -187,8 +182,9 @@ Workspace memories (lessons from previous sessions — apply them):
     prompt
 }
 
-/// Shortcut: the raw step-loop system prompt plus workspace memories.
-fn build_system_prompt(workspace_root: &std::path::Path) -> String {
+/// Shortcut: the raw step-loop system prompt plus workspace memories
+/// (`pub(crate)`: the Command Deck session assembles the same prompt).
+pub(crate) fn build_system_prompt(workspace_root: &std::path::Path) -> String {
     assemble_system_prompt(SYSTEM_PROMPT, workspace_root)
 }
 
@@ -960,7 +956,7 @@ fn build_code_graph(workspace_root: &std::path::Path) {
 /// index with all known table/type/view names. Best-effort: if the graph
 /// can't open (no `.stella/codegraph.db`), the schema gate runs with an
 /// empty index — it just won't catch conflicts until `stella init` runs.
-fn populate_schema_index(registry: &ToolRegistry, workspace_root: &std::path::Path) {
+pub(crate) fn populate_schema_index(registry: &ToolRegistry, workspace_root: &std::path::Path) {
     let db_path = workspace_root.join(".stella").join("codegraph.db");
     if !db_path.exists() {
         return;

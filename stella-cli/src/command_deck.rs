@@ -233,6 +233,15 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
                         | Some(WorkspaceInput::ToAgent {
                             input: UserInput::Prompt { text }, ..
                         }) => queue.push_back(text),
+                        // The deck's queue editor mutates its own view of the
+                        // backlog and mirrors each edit here so the dispatch
+                        // queue never drifts from what the user is looking at.
+                        Some(WorkspaceInput::QueueRemove { index }) => {
+                            if index < queue.len() {
+                                queue.remove(index);
+                            }
+                        }
+                        Some(WorkspaceInput::QueueClear) => queue.clear(),
                         Some(WorkspaceInput::ToAgent {
                             input: UserInput::AskUserAnswer { answer, .. }, ..
                         }) => {
@@ -499,7 +508,10 @@ impl ToolExecutor for FileChangeTap<'_> {
     }
 
     async fn execute(&self, name: &str, input: &Value) -> ToolOutput {
-        let path = input.get("path").and_then(Value::as_str).map(str::to_string);
+        let path = input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         // Pre-state, captured before the mutation: existence decides
         // Created-vs-Modified for write_file; content is delete_file's diff.
         let pre = match (name, &path) {
@@ -518,11 +530,9 @@ impl ToolExecutor for FileChangeTap<'_> {
         if let Some(path) = path
             && let Some((kind, diff)) = file_change_of(name, input, pre)
         {
-            let _ = self.events.send(AgentEvent::FileChange {
-                path,
-                kind,
-                diff,
-            });
+            let _ = self
+                .events
+                .send(AgentEvent::FileChange { path, kind, diff });
         }
         output
     }
@@ -556,10 +566,7 @@ fn file_change_of(
         }
         "delete_file" => {
             let old = pre.and_then(|(_, content)| content);
-            Some((
-                FileChangeKind::Deleted,
-                old.map(|c| pseudo_diff(&c, "")),
-            ))
+            Some((FileChangeKind::Deleted, old.map(|c| pseudo_diff(&c, ""))))
         }
         _ => None,
     }
@@ -571,8 +578,7 @@ fn file_change_of(
 fn pseudo_diff(old: &str, new: &str) -> String {
     let mut out = String::new();
     let mut side = |content: &str, prefix: char| {
-        let mut lines = 0usize;
-        for line in content.lines() {
+        for (lines, line) in content.lines().enumerate() {
             if lines == PSEUDO_DIFF_MAX_LINES {
                 out.push_str(&format!(
                     " … ({} more lines)\n",
@@ -583,7 +589,6 @@ fn pseudo_diff(old: &str, new: &str) -> String {
             out.push(prefix);
             out.push_str(line);
             out.push('\n');
-            lines += 1;
         }
     };
     side(old, '-');
@@ -757,11 +762,11 @@ mod tests {
     }
 
     /// Drive [`DeckAskUserIo::prompt`] with a scripted answer and inspect the
-    /// Inbound stream it produces.
-    async fn run_prompt(
-        options: &[&str],
-        answer: &str,
-    ) -> (Result<String, String>, Vec<Inbound>) {
+    /// Inbound stream it produces. The answer is sent only AFTER the AskUser
+    /// card appears: `prompt` drains stale answers before presenting (the
+    /// cancelled-turn contract), so a pre-sent answer would be swallowed and
+    /// the await would hang.
+    async fn run_prompt(options: &[&str], answer: &str) -> (Result<String, String>, Vec<Inbound>) {
         let (in_tx, mut in_rx) = mpsc::unbounded_channel();
         let (ans_tx, ans_rx) = mpsc::unbounded_channel();
         let io = DeckAskUserIo {
@@ -769,10 +774,12 @@ mod tests {
             inbound: in_tx,
             answers: Arc::new(tokio::sync::Mutex::new(ans_rx)),
         };
-        ans_tx.send(answer.to_string()).unwrap();
         let opts: Vec<String> = options.iter().map(|s| s.to_string()).collect();
-        let result = io.prompt("which one?", &opts).await;
+        let asking = tokio::spawn(async move { io.prompt("which one?", &opts).await });
         let mut seen = Vec::new();
+        seen.push(in_rx.recv().await.expect("the AskUser card is presented"));
+        ans_tx.send(answer.to_string()).unwrap();
+        let result = asking.await.expect("the prompt task settles");
         while let Ok(inbound) = in_rx.try_recv() {
             seen.push(inbound);
         }

@@ -299,7 +299,6 @@ impl CappedOutput {
     }
 }
 
-
 /// Run the command deck to completion. [`Inbound`] envelopes stream in over
 /// `inbound`; the user's [`WorkspaceInput`]s stream out over `submissions`.
 /// Returns when the inbound stream closes or the user quits, having always

@@ -103,8 +103,15 @@ pub fn garble_line(phase: u64, width: usize) -> Line<'static> {
             // A gradient that ping-pongs dark→bright→dark across the width.
             let steps = ramp.len() * 2 - 2;
             let slot = (col * steps) / width.max(1);
-            let idx = if slot < ramp.len() { slot } else { steps - slot };
-            Span::styled(ch.to_string(), Style::default().fg(ramp[idx.min(ramp.len() - 1)]))
+            let idx = if slot < ramp.len() {
+                slot
+            } else {
+                steps - slot
+            };
+            Span::styled(
+                ch.to_string(),
+                Style::default().fg(ramp[idx.min(ramp.len() - 1)]),
+            )
         })
         .collect::<Vec<_>>();
     Line::from(spans)
