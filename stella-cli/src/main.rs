@@ -192,7 +192,7 @@ enum Command {
     Models,
 
     /// Summarize cost, tokens, and resolve rate per provider/model from
-    /// local telemetry (.stella/stella.duckdb) — $/resolved-task receipts
+    /// local telemetry (.stella/store.db) — $/resolved-task receipts
     Stats {
         /// Output format: table (aligned, with TOTAL row), json, or csv
         #[arg(long, value_enum, default_value = "table")]

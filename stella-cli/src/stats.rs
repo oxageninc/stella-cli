@@ -1,5 +1,5 @@
 //! `stella stats` — cost/$-per-resolved-task analytics straight from the
-//! workspace's local DuckDB telemetry (`.stella/stella.duckdb`).
+//! workspace's local SQLite telemetry (`.stella/store.db`).
 //!
 //! Reads what `stella-store` recorded — nothing else. Works with zero API
 //! keys configured (no provider is ever resolved), never writes: if the
@@ -32,7 +32,7 @@ pub fn run_stats(format: StatsFormat, provider: Option<&str>) -> Result<(), Stri
 
     // Stats is read-only: opening the store would create `.stella/` as a
     // side effect, so bail out politely when there's nothing to read.
-    let db_path = workspace_root.join(".stella").join("stella.duckdb");
+    let db_path = workspace_root.join(".stella").join("store.db");
     let rows = if db_path.exists() {
         let store =
             Store::open(&workspace_root).map_err(|e| format!("cannot open local store: {e}"))?;
@@ -82,7 +82,7 @@ fn empty_message(provider: Option<&str>) -> String {
              chat/goal) to generate local telemetry."
         ),
         None => "No executions recorded yet — run `stella run \"...\"` (or chat/goal) to \
-                 generate local telemetry in .stella/stella.duckdb."
+                 generate local telemetry in .stella/store.db."
             .to_string(),
     }
 }

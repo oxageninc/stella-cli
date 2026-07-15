@@ -1,6 +1,6 @@
 [package]
 name = "stella-store"
-description = "Local DuckDB persistence: executions, full event streams (chain of thought), telemetry, file locks, and graph nodes/edges. One writer per session; readers are free."
+description = "Local SQLite persistence: executions, full event streams (chain of thought), telemetry, file locks, and graph nodes/edges. One writer per session; readers are free."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,7 @@ publish.workspace = true
 
 [dependencies]
 stella-protocol = { path = "../stella-protocol" }
-duckdb.workspace = true
+rusqlite.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 

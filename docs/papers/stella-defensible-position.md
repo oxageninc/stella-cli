@@ -92,7 +92,7 @@ We identify seven such properties in Stella's design.
 | I | Ports, not concretions | The engine (`stella-core`) never imports a provider SDK, filesystem API, or terminal library | Crate-level dependency boundary; `Provider` trait (`stella-protocol`) and `ToolExecutor` trait (`stella-core::ports`) |
 | II | No I/O in the engine | All decision logic is synchronous functions over owned data | Architectural discipline; property-tested in `stella-core` |
 | III | Witness-test contract | A task is done only when a test fails on old code and passes on new | `verify_done` tool (`stella-tools::verify`) |
-| IV | BYOK + no phone-home | The only outbound network traffic is to the user's chosen provider; all telemetry is local | Architectural invariant; local DuckDB (`stella-store`) |
+| IV | BYOK + no phone-home | The only outbound network traffic is to the user's chosen provider; all telemetry is local | Architectural invariant; local SQLite (`stella-store`) |
 | V | Prompt-cache-native memory | Lessons load into a byte-stable system prompt prefix at ~0.1x input price | `build_system_prompt` (`stella-cli::agent`); L-E8 cache discipline |
 | VI | Budget at safe boundaries | The budget guard consults only between model calls, never interrupts a tool | `run_turn` budget check (`stella-core::driver`); property-tested |
 | VII | Open Context Protocol | Retrieval is a typed, budgeted, provenance-carrying, consent-gated, conformance-verified protocol | `ocp-types`, `ocp-host`, `ocp-conformance` |
@@ -278,8 +278,8 @@ Two architectural constraints, enforced together:
    lock-in. Nine providers plus any local server.
 2. **No phone-home:** The only outbound network traffic Stella produces is to
    the model provider the user chose. No telemetry, no update checks, no
-   "anonymous" analytics. Every event is recorded in a local DuckDB file
-   (`.stella/stella.duckdb`).
+   "anonymous" analytics. Every event is recorded in a local SQLite file
+   (`.stella/store.db`).
 
 ### Why it is hard to copy
 
@@ -311,7 +311,7 @@ rejection is often not negotiable. Stella passes the gate by design. Agents
 that require cloud connectivity, even optionally, do not.
 
 For individual developers, the trust perimeter means **your code stays on your
-machine.** The telemetry file is local DuckDB — query it, delete it, back it
+machine.** The telemetry file is local SQLite — query it, delete it, back it
 up, share it. Nobody sees it unless you choose to share it.
 
 ---
@@ -522,7 +522,7 @@ Stella on:
 - **BYOK**: Claude Code is locked to Anthropic models. Stella supports nine
   providers plus local.
 - **No phone-home**: Claude Code is a client of Anthropic's platform; usage is
-  metered server-side. Stella's telemetry is local DuckDB.
+  metered server-side. Stella's telemetry is local SQLite.
 - **Ports**: Claude Code's engine is not separable from its provider
   integration. Stella's engine is SDK-free.
 - **Witness-test**: Claude Code does not have a verify_done-equivalent. It

@@ -1,5 +1,5 @@
-//! `stella-store` — the session's local DuckDB database at
-//! `.stella/stella.duckdb`: durable state, full execution records, and
+//! `stella-store` — the session's local SQLite database at
+//! `.stella/store.db`: durable state, full execution records, and
 //! analytics-grade telemetry, all on the user's disk (no server, no
 //! account — the local-first non-negotiable).
 //!
@@ -24,11 +24,14 @@
 //!
 //! # Concurrency
 //!
-//! DuckDB is single-writer per database file. One `Store` per session
-//! process is the contract; internally a `Mutex<Connection>` serializes
-//! writers across in-process parallel agents. Multi-PROCESS fleets need a
-//! lock-holder (or one store per worker + merge) — documented limitation,
-//! not a silent one.
+//! One embedded SQLite file (`rusqlite`, bundled — the workspace's "one
+//! storage engine" invariant; every other embedded store in this workspace
+//! is SQLite too). WAL journaling is enabled at open, so a read-only caller
+//! (`stella stats`) is never blocked by a live session's writes. SQLite
+//! still serializes writers per file; one `Store` per session process is the
+//! contract, and internally a `Mutex<Connection>` serializes writers across
+//! in-process parallel agents. Multi-PROCESS fleets need a lock-holder (or
+//! one store per worker + merge) — documented limitation, not a silent one.
 //!
 //! # Graceful degradation
 //!
@@ -39,7 +42,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use duckdb::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use stella_protocol::AgentEvent;
 
@@ -54,8 +57,8 @@ impl std::fmt::Display for StoreError {
 }
 impl std::error::Error for StoreError {}
 
-impl From<duckdb::Error> for StoreError {
-    fn from(e: duckdb::Error) -> Self {
+impl From<rusqlite::Error> for StoreError {
+    fn from(e: rusqlite::Error) -> Self {
         StoreError(e.to_string())
     }
 }
@@ -134,23 +137,26 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (creating if needed) the workspace database at
-    /// `.stella/stella.duckdb` and apply the schema.
+    /// Open (creating if needed) the workspace database at `.stella/store.db`
+    /// and apply the schema.
     pub fn open(workspace_root: &Path) -> Result<Self> {
         let dir = workspace_root.join(".stella");
         std::fs::create_dir_all(&dir).map_err(|e| StoreError(e.to_string()))?;
-        let conn = Connection::open(dir.join("stella.duckdb"))?;
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
-        store.migrate()?;
-        Ok(store)
+        Self::init(Connection::open(dir.join("store.db"))?)
     }
 
     /// In-memory store — tests and ephemeral runs.
     pub fn in_memory() -> Result<Self> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> Result<Self> {
+        // execute_batch tolerates the row PRAGMA journal_mode returns (a
+        // plain pragma_update errors on it). WAL means a read-only caller
+        // (`stella stats`) is never blocked by a live session's writes.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let store = Self {
-            conn: Mutex::new(Connection::open_in_memory()?),
+            conn: Mutex::new(conn),
         };
         store.migrate()?;
         Ok(store)
@@ -159,74 +165,82 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         let conn = self.lock();
         conn.execute_batch(
-            "CREATE SEQUENCE IF NOT EXISTS execution_seq;
-             CREATE TABLE IF NOT EXISTS executions (
-               id BIGINT PRIMARY KEY DEFAULT nextval('execution_seq'),
+            "CREATE TABLE IF NOT EXISTS executions (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
                kind TEXT NOT NULL,
                prompt TEXT NOT NULL,
                provider TEXT NOT NULL,
                model TEXT NOT NULL,
-               started_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
-               finished_at TIMESTAMP,
+               started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               finished_at TEXT,
                outcome TEXT,
-               cost_usd DOUBLE NOT NULL DEFAULT 0
+               cost_usd REAL NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS events (
-               execution_id BIGINT NOT NULL,
-               seq BIGINT NOT NULL,
-               ts TIMESTAMP NOT NULL DEFAULT current_timestamp,
+               execution_id INTEGER NOT NULL,
+               seq INTEGER NOT NULL,
+               ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                event_type TEXT NOT NULL,
-               payload JSON NOT NULL
+               payload TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS telemetry (
-               execution_id BIGINT NOT NULL,
-               step BIGINT NOT NULL,
-               ts TIMESTAMP NOT NULL DEFAULT current_timestamp,
+               execution_id INTEGER NOT NULL,
+               step INTEGER NOT NULL,
+               ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                provider TEXT NOT NULL,
                model TEXT NOT NULL,
-               input_tokens BIGINT NOT NULL,
-               estimated_input_tokens BIGINT NOT NULL DEFAULT 0,
-               output_tokens BIGINT NOT NULL,
-               cache_read_tokens BIGINT NOT NULL,
-               cache_miss_tokens BIGINT NOT NULL,
-               cache_write_tokens BIGINT NOT NULL DEFAULT 0,
-               cost_usd DOUBLE NOT NULL,
-               duration_ms BIGINT NOT NULL,
+               input_tokens INTEGER NOT NULL,
+               estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
+               output_tokens INTEGER NOT NULL,
+               cache_read_tokens INTEGER NOT NULL,
+               cache_miss_tokens INTEGER NOT NULL,
+               cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+               cost_usd REAL NOT NULL,
+               duration_ms INTEGER NOT NULL,
                retries INTEGER NOT NULL,
-               tool_calls BIGINT NOT NULL
+               tool_calls INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS files_touched (
-               execution_id BIGINT NOT NULL,
+               execution_id INTEGER NOT NULL,
                path TEXT NOT NULL,
                ops TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS file_locks (
                path TEXT PRIMARY KEY,
                holder TEXT NOT NULL,
-               acquired_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+               acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
              );
              CREATE TABLE IF NOT EXISTS graph_nodes (
                id TEXT PRIMARY KEY,
                label TEXT NOT NULL,
-               properties JSON NOT NULL DEFAULT '{}'
+               properties TEXT NOT NULL DEFAULT '{}'
              );
              CREATE TABLE IF NOT EXISTS graph_edges (
                src TEXT NOT NULL,
                dst TEXT NOT NULL,
                edge_type TEXT NOT NULL,
-               properties JSON NOT NULL DEFAULT '{}'
+               properties TEXT NOT NULL DEFAULT '{}'
              );",
         )?;
         // Additive migration for databases created before drift correction
         // landed: `CREATE TABLE IF NOT EXISTS` above is a no-op on them, so
-        // the column arrives via ALTER. Old rows default to 0 = "no estimate
-        // was taken", which `drift_samples` excludes as signal-free. (No NOT
-        // NULL here — DuckDB can't retrofit the constraint onto a non-empty
-        // table; the DEFAULT keeps new writes non-null in practice.)
-        conn.execute_batch(
-            "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS \
-             estimated_input_tokens BIGINT DEFAULT 0;",
+        // the column arrives via ALTER when it's missing. Old rows default to
+        // 0 = "no estimate was taken", which `drift_samples` excludes as
+        // signal-free. Unlike DuckDB, SQLite allows a NOT NULL column with a
+        // DEFAULT to be added to a non-empty table — the default backfills
+        // existing rows, so the constraint holds from the moment it lands.
+        let has_estimated_column: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('telemetry') \
+             WHERE name = 'estimated_input_tokens'",
+            [],
+            |row| row.get(0),
         )?;
+        if has_estimated_column == 0 {
+            conn.execute_batch(
+                "ALTER TABLE telemetry ADD COLUMN estimated_input_tokens \
+                 INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         Ok(())
     }
 
@@ -248,13 +262,11 @@ impl Store {
         model: &str,
     ) -> Result<i64> {
         let conn = self.lock();
-        let id: i64 = conn.query_row(
-            "INSERT INTO executions (kind, prompt, provider, model) VALUES (?, ?, ?, ?) \
-             RETURNING id",
+        conn.execute(
+            "INSERT INTO executions (kind, prompt, provider, model) VALUES (?, ?, ?, ?)",
             params![kind, prompt, provider, model],
-            |row| row.get(0),
         )?;
-        Ok(id)
+        Ok(conn.last_insert_rowid())
     }
 
     /// Append one event to the execution's stream. `seq` is the caller's
@@ -319,7 +331,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<(u64, u64)>> {
         let conn = self.lock();
-        // execution ids come from a monotonic sequence and steps count up
+        // execution ids come from an AUTOINCREMENT counter and steps count up
         // within one execution, so (execution_id, step) is insertion order —
         // unlike ts, whose second-level granularity ties within a turn.
         let mut stmt = conn.prepare(
@@ -363,7 +375,7 @@ impl Store {
     /// Close an execution record.
     pub fn finish_execution(&self, execution_id: i64, outcome: &str, cost_usd: f64) -> Result<()> {
         self.lock().execute(
-            "UPDATE executions SET finished_at = current_timestamp, outcome = ?, cost_usd = ? \
+            "UPDATE executions SET finished_at = CURRENT_TIMESTAMP, outcome = ?, cost_usd = ? \
              WHERE id = ?",
             params![outcome, cost_usd, execution_id],
         )?;
@@ -376,17 +388,17 @@ impl Store {
     pub fn acquire_file_lock(&self, path: &str, holder: &str) -> Result<bool> {
         let conn = self.lock();
         // Only "no such lock row" means unclaimed. A genuine query error must
-        // propagate — `.ok()` would misread it as unclaimed and drive a
-        // spurious INSERT (then a PK conflict), corrupting lock state.
-        let existing: Option<String> = match conn.query_row(
-            "SELECT holder FROM file_locks WHERE path = ?",
-            params![path],
-            |row| row.get(0),
-        ) {
-            Ok(holder) => Some(holder),
-            Err(duckdb::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(e.into()),
-        };
+        // propagate — `.optional()` maps just the no-rows case to `None`;
+        // every other error still propagates via `?`. Swallowing a real error
+        // as "unclaimed" would drive a spurious INSERT (then a PK conflict),
+        // corrupting lock state.
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT holder FROM file_locks WHERE path = ?",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()?;
         match existing {
             Some(current) => Ok(current == holder),
             None => {
@@ -484,11 +496,11 @@ impl Store {
                     count(*) AS runs,
                     count(*) FILTER (WHERE e.outcome = 'completed') AS resolved,
                     coalesce(sum(e.cost_usd), 0) AS total_cost_usd,
-                    CAST(coalesce(sum(t.input_tokens), 0) AS BIGINT) AS input_tokens,
-                    CAST(coalesce(sum(t.output_tokens), 0) AS BIGINT) AS output_tokens,
-                    CAST(coalesce(sum(t.cache_read_tokens), 0) AS BIGINT) AS cache_read_tokens,
-                    CAST(coalesce(sum(t.cache_write_tokens), 0) AS BIGINT) AS cache_write_tokens,
-                    CAST(coalesce(sum(t.duration_ms), 0) AS BIGINT) AS total_duration_ms
+                    CAST(coalesce(sum(t.input_tokens), 0) AS INTEGER) AS input_tokens,
+                    CAST(coalesce(sum(t.output_tokens), 0) AS INTEGER) AS output_tokens,
+                    CAST(coalesce(sum(t.cache_read_tokens), 0) AS INTEGER) AS cache_read_tokens,
+                    CAST(coalesce(sum(t.cache_write_tokens), 0) AS INTEGER) AS cache_write_tokens,
+                    CAST(coalesce(sum(t.duration_ms), 0) AS INTEGER) AS total_duration_ms
              FROM executions e
              LEFT JOIN (
                SELECT execution_id,
@@ -712,23 +724,23 @@ mod tests {
         // Simulate a database created before drift correction: the telemetry
         // table exists WITHOUT estimated_input_tokens and already has a row.
         {
-            let conn = Connection::open(root.join(".stella/stella.duckdb")).unwrap();
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
             conn.execute_batch(
                 "CREATE TABLE telemetry (
-                   execution_id BIGINT NOT NULL,
-                   step BIGINT NOT NULL,
-                   ts TIMESTAMP NOT NULL DEFAULT current_timestamp,
+                   execution_id INTEGER NOT NULL,
+                   step INTEGER NOT NULL,
+                   ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                    provider TEXT NOT NULL,
                    model TEXT NOT NULL,
-                   input_tokens BIGINT NOT NULL,
-                   output_tokens BIGINT NOT NULL,
-                   cache_read_tokens BIGINT NOT NULL,
-                   cache_miss_tokens BIGINT NOT NULL,
-                   cache_write_tokens BIGINT NOT NULL DEFAULT 0,
-                   cost_usd DOUBLE NOT NULL,
-                   duration_ms BIGINT NOT NULL,
+                   input_tokens INTEGER NOT NULL,
+                   output_tokens INTEGER NOT NULL,
+                   cache_read_tokens INTEGER NOT NULL,
+                   cache_miss_tokens INTEGER NOT NULL,
+                   cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                   cost_usd REAL NOT NULL,
+                   duration_ms INTEGER NOT NULL,
                    retries INTEGER NOT NULL,
-                   tool_calls BIGINT NOT NULL
+                   tool_calls INTEGER NOT NULL
                  );
                  INSERT INTO telemetry (execution_id, step, provider, model, input_tokens,
                    output_tokens, cache_read_tokens, cache_miss_tokens, cost_usd, duration_ms,

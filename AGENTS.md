@@ -138,7 +138,7 @@ Sixteen crates. The one-sentence rule of thumb:
 | Change CLI commands, flags, or agent wiring | `stella-cli` | This is the shipping binary. |
 | Change REPL rendering / panels / keybindings | `stella-tui` | Pure-fold ratatui REPL. Not yet the default shell. |
 | Touch shared types crossing a crate boundary | `stella-protocol` | **Zero logic, zero I/O — types only.** |
-| Persistence: executions, events, telemetry (DuckDB) | `stella-store` | |
+| Persistence: executions, events, telemetry (SQLite) | `stella-store` | |
 | Retrieval: graph, embeddings, episodic memory | `stella-context` | |
 | Tree-sitter code indexing | `stella-graph` | |
 | Triage → … → judge orchestration plane | `stella-pipeline` | |
@@ -172,7 +172,7 @@ editing Stella's own code should know what lives where:
 | `.stella/mcp.toml` | MCP server config — extra tools merged into the registry at session start. |
 | `.stella/domains.toml` | Domain taxonomy for memory/reflection tagging, inferred by `stella init`. |
 | `.stella/reflections.jsonl` | Per-turn reflection mining log (one JSON object per line). |
-| `.stella/stella.duckdb` | Local DuckDB telemetry (executions, events, cost/tokens). No phone-home. |
+| `.stella/store.db` | Local SQLite telemetry (executions, events, cost/tokens). No phone-home. |
 | `.stella/codegraph.db` | Tree-sitter code-graph index, built on `stella init`. |
 
 ---
@@ -232,9 +232,6 @@ seconds; `cargo test --workspace` rebuilds everything.
 
 ## Gotchas
 
-- **Bundled DuckDB** (`stella-store`) is a heavy C++ compile on a cold cache.
-  First `cargo build --workspace` takes minutes; use `cargo build -p <crate>`
-  to avoid it when you're not touching store.
 - **`Cargo.lock` is tracked.** Stella ships a binary and `install.sh` builds
   with `--locked`, so the lockfile must be committed and reproducible.
 - **The `dcp-types/` crate** is a prototype. If you see it in the workspace

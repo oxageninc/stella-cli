@@ -73,8 +73,9 @@ scripts/release.sh patch             # 0.1.15 -> 0.1.16  (also: minor, major)
 It refuses to run unless your checkout is clean and matches `origin/main`, and
 it never leaves your tree modified. macOS targets build natively; the Linux
 targets cross-compile via [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)
-(Zig as the C/C++ cross-linker — no Docker, and it compiles DuckDB's bundled
-C++ cleanly, unlike the old `cross` image). `zig` and `cargo-zigbuild` are
+(Zig as the C/C++ cross-linker — no Docker, and it compiles the workspace's
+bundled C deps (SQLite, tree-sitter grammars) cleanly, unlike the old `cross`
+image). `zig` and `cargo-zigbuild` are
 auto-installed if missing. All release assets are uploaded in one call, which
 matters because this repo has **immutable releases** enabled — a published
 release's assets can't be added or changed afterward, so an incomplete release

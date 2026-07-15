@@ -44,8 +44,6 @@ Thumbs.db
 .env.local
 .env.*.local
 !.env.example
-*.duckdb
-*.duckdb.*
 
 # Stella-specific
 .stella/

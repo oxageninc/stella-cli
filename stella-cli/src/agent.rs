@@ -1451,7 +1451,7 @@ pub(crate) fn build_budget_guard(budget_limit: Option<f64>) -> BudgetGuard {
     }
 }
 
-/// Open the workspace DuckDB store (`.stella/stella.duckdb`). Persistence is
+/// Open the workspace SQLite store (`.stella/store.db`). Persistence is
 /// observability, not a work dependency: a store that won't open warns once
 /// and the session runs on without it — never a startup failure.
 pub(crate) fn open_store(workspace_root: &std::path::Path) -> Option<Arc<Store>> {

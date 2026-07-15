@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/rust-1.90%2B-FFAC26?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.90+">
   <img src="https://img.shields.io/badge/providers-9%20%2B%20local-FFAC26?style=flat-square" alt="9 providers + local">
   <img src="https://img.shields.io/badge/phone--home-none-1f7a3d?style=flat-square" alt="No phone-home">
-  <img src="https://img.shields.io/badge/telemetry-local%20DuckDB-1f7a3d?style=flat-square" alt="Local DuckDB telemetry">
+  <img src="https://img.shields.io/badge/telemetry-local%20SQLite-1f7a3d?style=flat-square" alt="Local SQLite telemetry">
   <a href="#the-arena"><img src="https://img.shields.io/badge/%E2%9A%94_arena-open_challenge-E5484D?style=flat-square" alt="Arena — open challenge"></a>
   <a href="https://github.com/sponsors/macanderson"><img src="https://img.shields.io/badge/%E2%99%A5_sponsor-stella-EA4AAA?style=flat-square" alt="Sponsor Stella"></a>
 </p>
@@ -54,7 +54,7 @@ of the shipping `stella` CLI today, not a roadmap item:
 | 🔑 **Models** | Locked to one vendor / one account | **BYOK, 9 providers + any local server** — auto-detected, pinnable per run | Part 14 |
 | 🧵 **Orchestration** | Sprawling multi-agent swarms that lose the plot | One **deterministic single-thread engine** — no coordinator tax | Part 9 |
 | 💾 **Memory** | Re-read the world every session | **Prompt-cache-native** lessons in a byte-stable prompt (~0.1× input price) | Parts 6 & 11 |
-| 📡 **Telemetry** | Phone home to a SaaS backend | **Zero phone-home.** Every event in a local `DuckDB` file — your data, your disk | Part 13 |
+| 📡 **Telemetry** | Phone home to a SaaS backend | **Zero phone-home.** Every event in a local `SQLite` file — your data, your disk | Part 13 |
 | 💰 **Cost** | Runs until you notice the bill | A **hard `--budget`** that aborts cleanly, never mid-tool | Part 1 |
 
 <div align="center">
@@ -88,7 +88,7 @@ and the harness to prove it ships in this repo.
 ```text
    STELLA ────────────────────⚔────────────────────  THE BIG BOYS
    your keys · 9 providers + local  │  one vendor, their account
-   telemetry on your disk (DuckDB)  │  telemetry in their cloud
+   telemetry on your disk (SQLite)  │  telemetry in their cloud
    WITNESS CONFIRMED                │  "looks done to me"
    hard --budget, aborts cleanly    │  runs until you notice the bill
    $ per resolved task              │  $ per vibe
@@ -104,7 +104,7 @@ and the harness to prove it ships in this repo.
 3. **Official scoring only.** SWE-bench Verified's Docker evaluator, unmodified.
    No self-graded homework.
 4. **Publish everything.** `predictions.jsonl`, `summary.json`, per-instance
-   logs, and the token/cost numbers straight out of your local DuckDB telemetry.
+   logs, and the token/cost numbers straight out of your local SQLite telemetry.
    If it can't be reproduced, it didn't happen.
 
 ### Pick your division
@@ -264,7 +264,7 @@ flowchart TD
     CORE -->|Provider port| MODEL["stella-model — adapters<br/>anthropic · openai · gemini · vertex · bedrock · zai<br/>(+ any OpenAI-compatible: xai · deepseek · openrouter · local)"]
     CORE -->|ToolExecutor port| TOOLS["stella-tools<br/>CRUD · bash · grep · glob · build · test · verify_done · issues · CI"]
     MCP["stella-mcp<br/>external MCP servers"] -.->|merges tools into registry| TOOLS
-    CORE -->|emits AgentEvent stream| STORE["stella-store<br/>DuckDB: executions · events · telemetry"]
+    CORE -->|emits AgentEvent stream| STORE["stella-store<br/>SQLite: executions · events · telemetry"]
     U -->|"recall · episodes · bi-temporal facts"| CTX["stella-context — context plane<br/>recall · embeddings · memory"]
     GRAPH["stella-graph — tree-sitter code index"] -->|"indexed on `stella init` · queried via `code_graph` + `stella graph`"| DB[("SQLite code graph<br/>.stella/codegraph.db")]
     MODEL -.->|versioned serde| PROTO["stella-protocol — shared types + Provider/tool ports"]
@@ -617,14 +617,14 @@ fans out through the **OCP host** to the memory store *and* the code graph, fuse
 by score under one frame/token budget — the graph's symbols join "what do we
 remember" at prompt time.
 
-## Local telemetry — DuckDB, on your disk
+## Local telemetry — SQLite, on your disk
 
-Every execution is recorded in `.stella/stella.duckdb`: the full event stream
+Every execution is recorded in `.stella/store.db`: the full event stream
 (chain-of-thought deltas included), per-model-call telemetry (tokens in/out, cache
 read hit/miss, cost from the model card's pricing), and the Files-Touched ledger
 (`file_locks` and `graph_nodes` / `graph_edges` tables exist in the schema as
 reserved seams for the context plane; no shipping command writes them yet). Query it
-with any DuckDB client. **Nothing leaves your machine** — the only network traffic
+with any SQLite client. **Nothing leaves your machine** — the only network traffic
 Stella produces is to the model provider you chose.
 
 <div align="center">
@@ -657,7 +657,7 @@ targets — see the architecture status note above).
 | `stella-core` | ✅ | The step-driver engine (no I/O): parallel tools, goal loop, budget, retry, compaction, loop detection, router |
 | `stella-tools` | ✅ | The built-in tools (CRUD, `bash`, `grep`/`glob`, build/test, `verify_done`, issues, CI) — workspace-root-pinned |
 | `stella-model` | ✅ | The `Provider` port's adapters: anthropic, openai, gemini, vertex, bedrock, zai (SSE, tool-call dialects, SigV4, pricing) |
-| `stella-store` | ✅ | DuckDB persistence — executions, events (full CoT), telemetry, files-touched |
+| `stella-store` | ✅ | SQLite persistence — executions, events (full CoT), telemetry, files-touched |
 | `stella-mcp` | ✅ | MCP client (stdio + HTTP, protocol `2025-06-18`) merging external tools into the registry; per-call timeouts isolate dead servers |
 | `stella-protocol` | ✅ | Zero-logic, zero-I/O stability contract: shared serde types + the `Provider`/tool ports |
 | `stella-context` | ✅ | The context plane: reflection-memory recall + embedding index, an episode recorded for every working turn, and bi-temporal `covers_path` facts written at `stella init` — all recalled through one fused, budgeted pipeline |

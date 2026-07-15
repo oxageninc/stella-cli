@@ -68,7 +68,7 @@ Notes that matter for benchmarking:
   data, is the authority on which models exist.
 - Cost is metered at $0 (no pricing card), so `--budget` is not a useful cap
   off-grid; use the harness `--timeout` instead.
-- Local runs land in the same DuckDB telemetry as hosted runs; `stella stats`
+- Local runs land in the same SQLite telemetry as hosted runs; `stella stats`
   reports them under the `off-grid` division.
 
 ## 2 · Run the benchmark
@@ -127,7 +127,7 @@ division **Off-grid** and the standard receipts:
   per-instance logs from the run directory;
 - the official evaluator's output;
 - `stella stats --format csv` for the token/latency numbers straight out of
-  local DuckDB — the "resolve rate at $0 marginal cost" claim is the number
+  local SQLite — the "resolve rate at $0 marginal cost" claim is the number
   that decides this division.
 
 Reproducibility bar: name the exact server (Ollama/vLLM/LM Studio/llama.cpp +

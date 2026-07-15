@@ -51,7 +51,7 @@ out to them at runtime).
 git clone https://github.com/oxageninc/stella.git
 cd stella
 
-cargo build --workspace          # first build compiles bundled DuckDB — go get coffee
+cargo build --workspace          # first build compiles bundled SQLite — quick
 cargo test  --workspace          # the full suite
 cargo run -p stella-cli -- models   # smoke-check your build
 ```
@@ -85,7 +85,7 @@ Sixteen crates sounds like a lot; the rule of thumb is one sentence each:
 | Change a CLI command, flag, or the agent wiring | `stella-cli` |
 | Change the REPL rendering / panels / keybindings | `stella-tui` |
 | Touch shared types crossing a crate boundary | `stella-protocol` (zero logic, zero I/O — types only) |
-| Persistence: executions, events, telemetry (DuckDB) | `stella-store` |
+| Persistence: executions, events, telemetry (SQLite) | `stella-store` |
 | Retrieval: graph, embeddings, episodic memory | `stella-context` |
 | Tree-sitter code indexing | `stella-graph` |
 | The triage → … → judge orchestration plane | `stella-pipeline` |

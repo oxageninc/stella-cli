@@ -234,7 +234,7 @@ makes it **verifiable.**
 
 A single-thread engine produces a **reproducible execution trace.** Every
 event (model call, tool execution, compaction, budget check) is recorded in
-the DuckDB event stream. A failed run can be replayed: the same inputs produce
+the SQLite event stream. A failed run can be replayed: the same inputs produce
 the same trace (modulo model nondeterminism, which is the model's
 nondeterminism, not the engine's). This makes debugging tractable and makes
 the Arena benchmarking meaningful — the harness is the variable, not the
