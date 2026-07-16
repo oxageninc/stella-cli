@@ -45,13 +45,15 @@ impl DeckTab {
         DeckTab::Files,
     ];
 
+    /// The tab-bar label. Deck tab labels are UPPERCASE by convention —
+    /// every tab added later must follow (e.g. `SKILLS`, `MCP`).
     pub fn title(self) -> &'static str {
         match self {
-            DeckTab::Session => "Session",
-            DeckTab::Agents => "Agents",
-            DeckTab::Traces => "Traces",
-            DeckTab::Graph => "Graph",
-            DeckTab::Files => "Files",
+            DeckTab::Session => "SESSION",
+            DeckTab::Agents => "AGENTS",
+            DeckTab::Traces => "TRACES",
+            DeckTab::Graph => "GRAPH",
+            DeckTab::Files => "FILES",
         }
     }
 
@@ -328,11 +330,11 @@ impl WorkspaceModel {
             // The driver flipped staged-pipeline routing (`/pipeline`) — the
             // PIPELINE stat box tracks it live.
             Inbound::Pipeline(on) => self.pipeline = *on,
-            // The graph snapshot and the slash vocabulary are out-of-band
-            // read-models, not part of the event-log fold — the view state
-            // owns them, applied in `ingest_inbound`, so the model
-            // deliberately ignores them here.
-            Inbound::GraphSnapshot(_) | Inbound::SlashCommands(_) => {}
+            // The graph snapshot, the slash vocabulary, and the installed-
+            // agents list are out-of-band read-models, not part of the
+            // event-log fold — the view state owns them, applied in
+            // `ingest_inbound`, so the model deliberately ignores them here.
+            Inbound::GraphSnapshot(_) | Inbound::SlashCommands(_) | Inbound::AgentsList { .. } => {}
         }
     }
 
@@ -939,8 +941,7 @@ mod tests {
             status: AgentStatus::WaitingInput,
         });
         assert_eq!(
-            w.agents[0].turn_started_ms,
-            None,
+            w.agents[0].turn_started_ms, None,
             "WaitingInput status must stop the turn clock"
         );
         assert_eq!(

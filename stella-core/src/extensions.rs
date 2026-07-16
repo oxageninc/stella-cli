@@ -112,6 +112,13 @@ pub struct AgentDef {
     pub name: String,
     /// One-line description for the `/agents` listing.
     pub description: String,
+    /// The agent's toolbelt — frontmatter `tools:`, a comma-separated list
+    /// of tool names granted to the agent. `None` means the definition does
+    /// not restrict tools: the agent gets **all** tools (also the meaning of
+    /// an explicit `tools: *` / `tools: all`). `Some(vec![])` cannot occur —
+    /// an empty list parses to `None` as well, matching the ecosystem
+    /// convention where omission grants everything.
+    pub tools: Option<Vec<String>>,
     /// The markdown body — the agent's instructions/system prompt.
     pub body: String,
     /// The file this was loaded from.
@@ -223,12 +230,31 @@ pub fn command_from_file(path: &str, raw: &str) -> Result<CommandDef, ExtensionD
     })
 }
 
+/// Parse a frontmatter `tools:` value into the toolbelt grant. `None` means
+/// "all tools": no key, an empty value, or the explicit wildcard forms
+/// (`*` / `all`). Anything else is the comma-separated grant list.
+pub fn parse_toolbelt(value: Option<&str>) -> Option<Vec<String>> {
+    let value = value?.trim();
+    if value.is_empty() || value == "*" || value.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    let tools: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!tools.is_empty()).then_some(tools)
+}
+
 /// Parse one agent file.
 pub fn agent_from_file(path: &str, raw: &str) -> Result<AgentDef, ExtensionDiagnostic> {
     let (name, description, body) = definition_from_file(path, raw, "AGENT.md")?;
+    let tools = parse_toolbelt(parse_frontmatter(raw).data.get("tools").map(String::as_str));
     Ok(AgentDef {
         name,
         description,
+        tools,
         body,
         source_path: path.to_string(),
     })
@@ -510,6 +536,36 @@ mod tests {
         assert_eq!(agent.name, "code-reviewer");
         assert_eq!(agent.description, "Reviews diffs for correctness");
         assert!(agent.body.contains("meticulous"));
+        assert_eq!(
+            agent.tools,
+            Some(vec!["Read".to_string(), "Grep".to_string()]),
+            "the frontmatter toolbelt is parsed as the grant list"
+        );
+    }
+
+    #[test]
+    fn agent_without_a_tools_key_grants_all_tools() {
+        let raw = "---\nname: helper\ndescription: d\n---\nBody.";
+        let agent = agent_from_file("/x/helper.md", raw).unwrap();
+        assert_eq!(agent.tools, None, "no `tools:` key = unrestricted");
+    }
+
+    #[test]
+    fn toolbelt_wildcards_and_empties_mean_all_tools() {
+        assert_eq!(parse_toolbelt(None), None);
+        assert_eq!(parse_toolbelt(Some("")), None);
+        assert_eq!(parse_toolbelt(Some("  ")), None);
+        assert_eq!(parse_toolbelt(Some("*")), None);
+        assert_eq!(parse_toolbelt(Some("ALL")), None);
+        assert_eq!(
+            parse_toolbelt(Some(", ,")),
+            None,
+            "only separators = none named"
+        );
+        assert_eq!(
+            parse_toolbelt(Some("Read,  Grep , Bash")),
+            Some(vec!["Read".into(), "Grep".into(), "Bash".into()])
+        );
     }
 
     // ---- expansion ----

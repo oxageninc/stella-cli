@@ -58,6 +58,10 @@ pub struct ToolRegistry {
     /// `cite_memory` tool instance and drained per execution by
     /// [`ToolRegistry::take_memory_citations`].
     citations: crate::memory::CitationLedger,
+    /// Per-session agent-invocation ledger (see [`crate::agent_use`]) —
+    /// drained once per execution by the persistence layer, exactly like
+    /// the file-touch ledger above but as an event log, never aggregated.
+    agent_uses: std::sync::Mutex<crate::agent_use::AgentUseLedger>,
     schema_index: std::sync::Mutex<SchemaIndex>,
     /// The session's extension hook bus, once a host attaches one
     /// ([`ToolRegistry::attach_bus`]). Every emission is `None`-guarded, so
@@ -174,6 +178,7 @@ impl ToolRegistry {
             root,
             touched: std::sync::Mutex::new(FileTouchLedger::default()),
             citations,
+            agent_uses: std::sync::Mutex::new(crate::agent_use::AgentUseLedger::default()),
             schema_index: std::sync::Mutex::new(SchemaIndex::default()),
             bus: std::sync::RwLock::new(None),
         }
@@ -716,6 +721,31 @@ impl ToolRegistry {
     /// eligibility count.
     pub fn take_memory_citations(&self) -> Vec<crate::memory::MemoryCitation> {
         std::mem::take(&mut *self.citations.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Record one invocation of an installed agent definition (see
+    /// [`crate::agent_use`]). `version` is the definition's pinned version at
+    /// invocation time; `reason` is a short free-text why/how (may be empty).
+    pub fn record_agent_use(&self, agent: &str, version: u32, reason: &str) {
+        self.agent_uses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record(crate::agent_use::AgentUseEvent {
+                agent: agent.to_string(),
+                version,
+                reason: reason.to_string(),
+            });
+    }
+
+    /// Take every agent invocation recorded since the last drain — the
+    /// per-execution persistence step calls this exactly once per execution
+    /// so each invocation lands in the store attributed to the execution it
+    /// happened under.
+    pub fn drain_agent_uses(&self) -> Vec<crate::agent_use::AgentUseEvent> {
+        self.agent_uses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain()
     }
 
     /// Comma-separated sorted list of registered tool names, for error

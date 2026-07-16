@@ -147,6 +147,17 @@ async fn main() -> std::io::Result<()> {
                         edges: vec![],
                         files: demo_graph().files,
                     }));
+                // The installed-agents manager needs the real driver (disk +
+                // provider); the demo answers with an empty list so the pane
+                // renders its empty state instead of loading forever.
+                WorkspaceInput::AgentsRefresh
+                | WorkspaceInput::AgentSave { .. }
+                | WorkspaceInput::AgentPin { .. }
+                | WorkspaceInput::AgentCreate { .. } => {
+                    let _ = react_tx.send(Inbound::AgentsList {
+                        entries: vec![],
+                        status: Some("the demo has no agents on disk".to_string()),
+                    });
                 }
                 WorkspaceInput::Quit => break,
             }
