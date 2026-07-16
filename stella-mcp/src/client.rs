@@ -112,6 +112,13 @@ pub struct McpToolInfo {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// The server advertised this tool as read-only or idempotent, so a
+    /// duplicate delivery is harmless and the client may transparently
+    /// re-send it after an ambiguous connection drop. `false` (the default
+    /// for un-annotated tools) means a drop mid-call is surfaced as an
+    /// error instead — the server may have already executed the call, and
+    /// re-sending a mutating tool risks double execution.
+    pub safe_to_retry: bool,
 }
 
 /// A connected MCP client for a single server.
@@ -328,11 +335,26 @@ impl McpClient {
                 conn.tear_down(&err);
                 Err(err)
             }
-            // The connection died fast. Attempt exactly one transparent
-            // reconnect + retry so a single blip self-heals inside this turn.
+            // The connection died fast. Reconnect (healing the transport for
+            // the next call) and — only when the tool is advertised
+            // read-only/idempotent — transparently re-send so a single blip
+            // self-heals inside this turn. The drop is *ambiguous*: the
+            // server may have executed the call before the connection died,
+            // so re-sending a mutating tool risks double execution
+            // (duplicate ticket, double insert). Those surface the drop as
+            // model-visible data instead.
             RequestOutcome::Dropped(err) => {
                 conn.tear_down(&err);
-                if self.reconnect_locked(&mut conn).await.is_err() {
+                let reconnected = self.reconnect_locked(&mut conn).await.is_ok();
+                if !self.tool_is_retry_safe(tool) {
+                    return Err(McpError::Transport(format!(
+                        "connection to `{}` dropped mid-call; `{tool}` may or may not have \
+                         executed and is not marked read-only/idempotent, so it was not \
+                         re-sent automatically ({err})",
+                        self.name
+                    )));
+                }
+                if !reconnected {
                     return Err(err);
                 }
                 match self.request_once(&conn, "tools/call", raw_params).await {
@@ -351,6 +373,16 @@ impl McpClient {
             // Reconnecting would not help, so pass it straight through.
             RequestOutcome::Protocol(err) => Err(err),
         }
+    }
+
+    /// Whether `tool` is advertised by the server as read-only or idempotent
+    /// — the only cases where re-sending after an ambiguous connection drop
+    /// cannot double a side effect. Unknown tools answer `false`.
+    fn tool_is_retry_safe(&self, tool: &str) -> bool {
+        self.tools
+            .iter()
+            .find(|t| t.name == tool)
+            .is_some_and(|t| t.safe_to_retry)
     }
 
     /// One bounded request on the *current* transport, classified into a
@@ -571,6 +603,8 @@ async fn fetch_all_tools(
                 description: tool.description.unwrap_or_default(),
                 name: tool.name,
                 input_schema: normalize_schema(tool.input_schema),
+                safe_to_retry: tool.annotations.read_only_hint
+                    || tool.annotations.idempotent_hint,
             });
         }
         match page.next_cursor {
@@ -837,7 +871,9 @@ mod tests {
     }
 
     /// Build a fresh, fully-healthy scripted transport (handshake + one queued
-    /// `tools/call` success) — the shape a reconnect factory yields.
+    /// `tools/call` success) — the shape a reconnect factory yields. The
+    /// `echo` tool is advertised read-only so the transparent post-drop
+    /// retry is permitted.
     fn healthy_transport() -> Box<dyn Transport> {
         let t = ScriptedTransport::new();
         t.push_ok(
@@ -846,7 +882,8 @@ mod tests {
         );
         t.push_ok(
             "tools/list",
-            serde_json::json!({ "tools": [{ "name": "echo", "inputSchema": { "type": "object" } }] }),
+            serde_json::json!({ "tools": [{ "name": "echo", "inputSchema": { "type": "object" },
+                "annotations": { "readOnlyHint": true } }] }),
         );
         t.push_ok(
             "tools/call",
@@ -856,9 +893,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dropped_connection_transparently_reconnects_and_retries() {
+    async fn a_dropped_connection_transparently_reconnects_and_retries_read_only_tools() {
         // Initial transport: handshake succeeds, then the very first tools/call
-        // drops the connection (child exited).
+        // drops the connection (child exited). `echo` is advertised read-only,
+        // so re-sending after the ambiguous drop is safe.
         let initial = ScriptedTransport::new();
         initial.push_ok(
             "initialize",
@@ -866,7 +904,8 @@ mod tests {
         );
         initial.push_ok(
             "tools/list",
-            serde_json::json!({ "tools": [{ "name": "echo", "inputSchema": { "type": "object" } }] }),
+            serde_json::json!({ "tools": [{ "name": "echo", "inputSchema": { "type": "object" },
+                "annotations": { "readOnlyHint": true } }] }),
         );
         initial.push_err("tools/call", McpError::Closed("child exited".into()));
 
@@ -891,6 +930,72 @@ mod tests {
         assert_eq!(health.state, HealthState::Live);
         assert_eq!(health.consecutive_failures, 0);
         assert!(health.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_call_on_a_mutating_tool_is_not_resent() {
+        // `send` carries no readOnlyHint/idempotentHint: the drop is
+        // ambiguous (the server may have executed the call before the
+        // connection died), so the client must NOT re-send it — at-most-once
+        // for side-effecting tools. The reconnect still heals the transport
+        // for the *next* call.
+        let initial = ScriptedTransport::new();
+        initial.push_ok(
+            "initialize",
+            serde_json::json!({ "protocolVersion": PREFERRED_PROTOCOL_VERSION }),
+        );
+        initial.push_ok(
+            "tools/list",
+            serde_json::json!({ "tools": [{ "name": "send", "inputSchema": { "type": "object" } }] }),
+        );
+        initial.push_err("tools/call", McpError::Closed("child exited".into()));
+
+        let healed = ScriptedTransport::new();
+        healed.push_ok(
+            "initialize",
+            serde_json::json!({ "protocolVersion": PREFERRED_PROTOCOL_VERSION }),
+        );
+        healed.push_ok(
+            "tools/list",
+            serde_json::json!({ "tools": [{ "name": "send", "inputSchema": { "type": "object" } }] }),
+        );
+        healed.push_ok(
+            "tools/call",
+            serde_json::json!({ "content": [{ "type": "text", "text": "second call" }] }),
+        );
+        let healed: std::sync::Mutex<Option<Box<dyn Transport>>> =
+            std::sync::Mutex::new(Some(Box::new(healed)));
+
+        let mut client = McpClient::new("srv", Box::new(initial)).with_test_reconnector(move || {
+            let t = healed.lock().unwrap().take().expect("one reconnect");
+            async move { Ok(t) }
+        });
+        client.initialize().await.unwrap();
+
+        // The dropped mutating call surfaces as an error naming the ambiguity…
+        let err = client
+            .call_tool("send", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("may or may not have executed"),
+            "error must explain the ambiguity: {msg}"
+        );
+
+        // …while the healed transport still has its queued response, proving
+        // the client did not consume it with an automatic re-send; the next
+        // call succeeds on the reconnected transport.
+        let out = client
+            .call_tool("send", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            ToolOutput::Ok {
+                content: "second call".into()
+            }
+        );
     }
 
     #[tokio::test]
