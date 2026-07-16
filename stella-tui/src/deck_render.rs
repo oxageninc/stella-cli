@@ -325,7 +325,7 @@ fn cpu_bar(pct: f64) -> String {
 /// A centered help overlay listing the deck's keys.
 fn render_help(area: Rect, buf: &mut Buffer) {
     let w = area.width.min(62);
-    let h = area.height.min(20);
+    let h = area.height.min(21);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -351,7 +351,19 @@ fn render_help(area: Rect, buf: &mut Buffer) {
             theme::body(),
         )),
         Line::from(Span::styled(
-            "  Ctrl-T / ↑   queue editor · ctrl+x delete · ctrl+d ×2 clear",
+            "  Ctrl-T / ↑   queue editor (↑ when prompts are queued)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  ↑ ↓          select a message (Session) · Esc clears",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Ctrl-O       expand/collapse the selected message",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "               (at the prompt: newest · ×2 = all thinking)",
             theme::body(),
         )),
         Line::from(Span::styled(

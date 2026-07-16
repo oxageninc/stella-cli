@@ -7,7 +7,7 @@
 //! each line. The output is a vector of styled [`Line`]s that the transcript
 //! renderer and word-wrapper consume unchanged.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::theme;
@@ -200,7 +200,7 @@ fn parse_inline_spans(text: &str) -> Vec<Span<'static>> {
                     format!("{link_text} ({url})")
                 },
                 Style::new()
-                    .fg(Color::Blue)
+                    .fg(theme::RUN)
                     .add_modifier(Modifier::UNDERLINED),
             ));
             i = paren + 1;
@@ -259,9 +259,9 @@ fn strip_numbered(lead: &str) -> Option<&str> {
 /// Build a heading line with level-appropriate styling.
 fn heading_line(content: &str, level: usize) -> Line<'static> {
     let prefix = match level {
-        1 => "",
-        2 => "",
-        _ => "",
+        1 => "◆ ",
+        2 => "◈ ",
+        _ => "· ",
     };
     let style = match level {
         1 | 2 => theme::heading(),
@@ -275,7 +275,7 @@ fn heading_line(content: &str, level: usize) -> Line<'static> {
 
 /// Style for inline code spans and fenced code blocks.
 fn code_style() -> Style {
-    Style::new().fg(Color::Yellow)
+    Style::new().fg(theme::WARN)
 }
 
 // ── Search helpers ─────────────────────────────────────────────────────────
@@ -366,7 +366,7 @@ mod tests {
         // Three spans: "inline ", code, " here"
         let code_span = &lines[0].spans[1];
         assert_eq!(code_span.content, "code");
-        assert_eq!(code_span.style.fg, Some(Color::Yellow));
+        assert_eq!(code_span.style.fg, Some(theme::WARN));
     }
 
     #[test]
@@ -380,9 +380,9 @@ mod tests {
                 "heading is bold"
             );
         }
-        assert_eq!(collect_spans_text(&lines[0]), "Title");
-        assert_eq!(collect_spans_text(&lines[1]), "Subtitle");
-        assert_eq!(collect_spans_text(&lines[2]), "Section");
+        assert_eq!(collect_spans_text(&lines[0]), "\u{25c6} Title");
+        assert_eq!(collect_spans_text(&lines[1]), "\u{25c8} Subtitle");
+        assert_eq!(collect_spans_text(&lines[2]), "\u{b7} Section");
     }
 
     #[test]

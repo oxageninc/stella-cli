@@ -189,72 +189,6 @@ pub(crate) fn inner_width(area: Rect) -> usize {
 // Word-aware line wrapping (pre-wrap so scroll math stays line-exact, L-T4)
 // ---------------------------------------------------------------------------
 
-/// Pre-wrap styled lines to fit `max_width` display columns. Lines that
-/// already fit pass through unchanged; lines that overflow are split at word
-/// boundaries (preferring spaces, hard-breaking long words) into multiple
-/// `Line`s, each preserving the original span styles.
-///
-/// This runs *before* the scroll window calculation so the line-exact scroll
-/// math operates on visual (wrapped) rows — the rendered text never overflows
-/// horizontally and the scroll offset stays accurate.
-pub(crate) fn wrap_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
-    if max_width == 0 {
-        return lines;
-    }
-    let mut out = Vec::with_capacity(lines.len());
-    for line in lines {
-        if line.width() <= max_width {
-            out.push(line);
-        } else {
-            wrap_one(line, max_width, &mut out);
-        }
-    }
-    out
-}
-
-/// Wrap a single overflowing line into multiple lines of at most `max_width`.
-fn wrap_one(line: Line<'static>, max_width: usize, out: &mut Vec<Line<'static>>) {
-    // Flatten the line's spans into (char, style) pairs so we can measure and
-    // split at arbitrary positions while preserving styling.
-    let styled: Vec<(char, Style)> = line
-        .spans
-        .iter()
-        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
-        .collect();
-
-    let mut current: Vec<(char, Style)> = Vec::new();
-    let mut current_w = 0usize;
-
-    let flush = |cur: &mut Vec<(char, Style)>, out: &mut Vec<Line<'static>>| {
-        if !cur.is_empty() {
-            out.push(Line::from(styled_chars_to_spans(std::mem::take(cur))));
-        }
-    };
-
-    for (ch, style) in styled {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_w + cw > max_width && !current.is_empty() {
-            // Prefer breaking at the last space so words stay intact.
-            if let Some(space_idx) = current.iter().rposition(|(c, _)| *c == ' ') {
-                let remainder: Vec<(char, Style)> = current.split_off(space_idx);
-                // `current` now holds everything before the space.
-                flush(&mut current, out);
-                current = remainder;
-                current_w = current
-                    .iter()
-                    .map(|(c, _)| UnicodeWidthChar::width(*c).unwrap_or(0))
-                    .sum();
-            } else {
-                flush(&mut current, out);
-                current_w = 0;
-            }
-        }
-        current.push((ch, style));
-        current_w += cw;
-    }
-    flush(&mut current, out);
-}
-
 /// Coalesce adjacent same-styled characters into spans for compact output.
 fn styled_chars_to_spans(chars: Vec<(char, Style)>) -> Vec<Span<'static>> {
     if chars.is_empty() {
@@ -397,11 +331,24 @@ pub(crate) fn render_transcript(
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let total = lines.len();
     let visible: Vec<Line<'static>> = lines
         .get(window.clone())
         .map(<[Line]>::to_vec)
         .unwrap_or_default();
+    render_transcript_window(visible, window, lines.len(), following, area, buf);
+}
+
+/// [`render_transcript`] for a caller that already materialized just the
+/// visible window (the deck's fold cache clones ≤ one viewport of lines per
+/// frame instead of the whole history); `total` sizes the title.
+pub(crate) fn render_transcript_window(
+    visible: Vec<Line<'static>>,
+    window: Range<usize>,
+    total: usize,
+    following: bool,
+    area: Rect,
+    buf: &mut Buffer,
+) {
     let title = if following {
         format!(" transcript · {total} lines · following ")
     } else {
@@ -757,7 +704,7 @@ pub(crate) fn transcript_lines(
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for entry in &model.transcript {
-        entry_lines(entry, expand_thinking, width, &mut out);
+        entry_lines(entry, expand_thinking, expand_thinking, width, &mut out);
     }
     out
 }
@@ -765,6 +712,7 @@ pub(crate) fn transcript_lines(
 pub(crate) fn entry_lines(
     entry: &TranscriptEntry,
     expand_thinking: bool,
+    expanded: bool,
     width: usize,
     out: &mut Vec<Line<'static>>,
 ) {
@@ -807,7 +755,8 @@ pub(crate) fn entry_lines(
         }
         TranscriptEntry::Reasoning(text) => {
             let total_lines = text.lines().count().max(1);
-            let chevron = if expand_thinking { "⏶" } else { "⏵" };
+            let show_all = expand_thinking || expanded;
+            let chevron = if show_all { "⏶" } else { "⏵" };
             out.push(Line::from(vec![
                 Span::styled(format!("{chevron} "), Style::new().fg(theme::AMBER)),
                 Span::styled(
@@ -818,7 +767,7 @@ pub(crate) fn entry_lines(
             let reasoning_style = Style::new()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC);
-            if expand_thinking {
+            if show_all {
                 for l in text.split('\n') {
                     out.push(Line::from(Span::styled(
                         format!("  {l}"),
@@ -842,13 +791,15 @@ pub(crate) fn entry_lines(
                 }
                 if total_lines > preview_count {
                     out.push(Line::from(Span::styled(
-                        "  ⋯ ctrl+r to expand",
+                        "  ⋯ ctrl+o expands this thought · ctrl+r all",
                         Style::new().fg(Color::DarkGray),
                     )));
                 }
             }
         }
-        TranscriptEntry::ToolStart { name, input, .. } => {
+        TranscriptEntry::ToolStart {
+            name, input, raw, ..
+        } => {
             let line = Line::from(vec![
                 Span::styled(
                     label_tag(name),
@@ -857,10 +808,31 @@ pub(crate) fn entry_lines(
                 Span::styled(input.clone(), Style::new().fg(Color::DarkGray)),
             ]);
             wrap_one_indent(line, width, LABEL_COL, out);
+            if expanded {
+                // ctrl+o: the full argument object, pretty-printed and dim.
+                // An over-budget argument may not parse (char-capped raw) —
+                // show it wrapped rather than clipped at the pane edge.
+                let pretty = serde_json::from_str::<serde_json::Value>(raw)
+                    .and_then(|v| serde_json::to_string_pretty(&v))
+                    .unwrap_or_else(|_| raw.clone());
+                for l in pretty.lines() {
+                    wrap_one_indent(
+                        Line::from(Span::styled(
+                            format!("    {l}"),
+                            Style::new().fg(theme::MUTED),
+                        )),
+                        width,
+                        4,
+                        out,
+                    );
+                }
+            }
         }
         TranscriptEntry::ToolResult {
+            name,
             ok,
             summary,
+            full,
             duration_ms,
             ..
         } => {
@@ -869,18 +841,51 @@ pub(crate) fn entry_lines(
             } else {
                 ("✗", Color::Red)
             };
-            let line = Line::from(vec![
-                Span::styled(
-                    label_tag(glyph),
-                    Style::new().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(summary.clone()),
-                Span::styled(
-                    format!("  ({duration_ms}ms)"),
-                    Style::new().fg(Color::DarkGray),
-                ),
-            ]);
-            wrap_one_indent(line, width, LABEL_COL, out);
+            // The result labels itself with the tool it answers (resolved
+            // from the start entry) so call/result rows read as a pair.
+            let label = label_tag(&format!("{glyph} {name}"));
+            let extra = full.lines().count().saturating_sub(1);
+            if expanded {
+                let line = Line::from(vec![
+                    Span::styled(label, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("({} lines · {duration_ms}ms)", extra + 1),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                ]);
+                wrap_one_indent(line, width, LABEL_COL, out);
+                for l in full.lines() {
+                    wrap_one_indent(
+                        Line::from(Span::styled(
+                            format!("    {l}"),
+                            Style::new().fg(theme::MUTED),
+                        )),
+                        width,
+                        4,
+                        out,
+                    );
+                }
+            } else {
+                // Collapsed: exactly one output line; the hint names how many
+                // more ctrl+o would reveal. Multi-line output NEVER floods the
+                // transcript uninvited.
+                let first = full
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or(summary.as_str());
+                let shown: String = first.chars().take(160).collect();
+                let hint = if extra > 0 {
+                    format!("  (+{extra} lines · {duration_ms}ms)")
+                } else {
+                    format!("  ({duration_ms}ms)")
+                };
+                let line = Line::from(vec![
+                    Span::styled(label, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::raw(shown),
+                    Span::styled(hint, Style::new().fg(Color::DarkGray)),
+                ]);
+                wrap_one_indent(line, width, LABEL_COL, out);
+            }
         }
         TranscriptEntry::Retry { attempt, reason } => out.push(Line::from(Span::styled(
             format!("↻ retry #{attempt}: {reason}"),
@@ -1435,6 +1440,12 @@ mod tests {
         assert!(joined.contains("read_file"));
         assert!(joined.contains("not found"));
         assert!(joined.contains("12ms"));
+        // The result row resolves its tool name from the call so the two
+        // rows read as an aligned pair.
+        assert!(
+            joined.contains("[✗ read_file]"),
+            "result labels itself with its tool: {joined}"
+        );
     }
 
     // ---- Replay determinism (L-T1) ------------------------------------

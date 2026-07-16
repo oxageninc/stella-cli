@@ -82,6 +82,22 @@ pub struct DeckUi {
     /// Armed by the first `ctrl+d` in the queue editor; the second one clears
     /// the whole queue. Any other key disarms.
     pub queue_confirm_clear: bool,
+    /// The transcript entry highlighted with ↑/↓ on the Session tab —
+    /// `ctrl+o` toggles its expanded view. `None` = nothing selected.
+    pub session_selected: Option<usize>,
+    /// Set by a selection move; the session view consumes it (where visual
+    /// row ranges are known) to scroll the selected entry into view.
+    pub session_pending_scroll: Option<usize>,
+    /// Per-agent set of entry indices expanded with `ctrl+o`.
+    pub expanded: std::collections::HashMap<String, std::collections::HashSet<usize>>,
+    /// Bumped on every expansion toggle so the fold cache invalidates.
+    pub expanded_rev: u64,
+    /// Armed by a `ctrl+o` pressed from the prompt (no selection); a second
+    /// consecutive `ctrl+o` escalates to the all-thinking toggle. Any other
+    /// key disarms.
+    pub ctrl_o_primed: bool,
+    /// The Session tab's incremental transcript fold cache.
+    pub session_fold: crate::views::session::SessionFold,
 }
 
 impl Default for DeckUi {
@@ -108,6 +124,12 @@ impl Default for DeckUi {
             queue_open: false,
             queue_sel: 0,
             queue_confirm_clear: false,
+            session_selected: None,
+            session_pending_scroll: None,
+            expanded: std::collections::HashMap::new(),
+            expanded_rev: 0,
+            ctrl_o_primed: false,
+            session_fold: crate::views::session::SessionFold::default(),
         }
     }
 }
@@ -127,6 +149,21 @@ impl DeckUi {
         if tab != self.tab {
             self.tab = tab;
             self.tab_switched_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Point the deck at agent `idx`. A session-message selection indexes the
+    /// *previously* focused agent's transcript, so it must not carry across;
+    /// dropping it also re-arms tail-follow (the selection is what pinned the
+    /// scroll window). Same-agent is a no-op.
+    pub fn focus_agent(&mut self, idx: usize) {
+        if idx == self.focused {
+            return;
+        }
+        self.focused = idx;
+        if self.session_selected.take().is_some() {
+            self.session_pending_scroll = None;
+            self.session_scroll.follow = true;
         }
     }
 }
@@ -160,9 +197,9 @@ pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut De
 /// Clamp selections to the current agent/file/queue counts.
 fn clamp(model: &WorkspaceModel, ui: &mut DeckUi) {
     if model.agents.is_empty() {
-        ui.focused = 0;
+        ui.focus_agent(0);
     } else {
-        ui.focused = ui.focused.min(model.agents.len() - 1);
+        ui.focus_agent(ui.focused.min(model.agents.len() - 1));
     }
     let files = model.ledger.records.len();
     ui.files_sel = if files == 0 {
@@ -182,6 +219,12 @@ fn clamp(model: &WorkspaceModel, ui: &mut DeckUi) {
 pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -> DeckAction {
     if key.kind == KeyEventKind::Release {
         return DeckAction::Ignored;
+    }
+
+    let is_ctrl_o =
+        key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('o'));
+    if !is_ctrl_o {
+        ui.ctrl_o_primed = false;
     }
 
     // Ctrl-C: clean cancel + quit, from anywhere.
@@ -204,6 +247,35 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
     // Ctrl-R toggles the collapsed-thinking view from anywhere.
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('r')) {
         ui.thinking_expanded = !ui.thinking_expanded;
+        return DeckAction::Handled;
+    }
+
+    // Ctrl-O: the expand/collapse verb. On a ↑/↓-highlighted message it
+    // toggles that message; from the prompt it toggles the most recent
+    // expandable message, and a second consecutive press escalates to the
+    // all-thinking toggle (chain-of-thought everywhere).
+    if is_ctrl_o {
+        if let Some(sel) = ui.session_selected {
+            // Only a genuinely expandable entry toggles — a no-op press must
+            // not bump `expanded_rev` and invalidate the settled fold cache.
+            if let Some(agent) = model.agents.get(ui.focused)
+                && agent.model.transcript.get(sel).is_some_and(is_expandable)
+            {
+                let id = agent.meta.id.clone();
+                toggle_expanded(ui, &id, sel);
+            }
+        } else if ui.ctrl_o_primed {
+            ui.ctrl_o_primed = false;
+            ui.thinking_expanded = !ui.thinking_expanded;
+        } else {
+            if let Some(agent) = model.agents.get(ui.focused)
+                && let Some(idx) = last_expandable(&agent.model.transcript)
+            {
+                let id = agent.meta.id.clone();
+                toggle_expanded(ui, &id, idx);
+            }
+            ui.ctrl_o_primed = true;
+        }
         return DeckAction::Handled;
     }
 
@@ -282,7 +354,7 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         DeckTab::Traces => handle_traces_key(key, model, ui, composer_empty),
         DeckTab::Graph => handle_graph_key(key, ui, composer_empty),
         DeckTab::Files => handle_files_key(key, model, ui),
-        DeckTab::Session => handle_session_key(key, ui),
+        DeckTab::Session => handle_session_key(key, model, ui),
     }
     .unwrap_or_else(|| handle_composer_key(key, ui))
 }
@@ -458,12 +530,12 @@ fn handle_agents_key(
     let count = model.agents.len();
     match key.code {
         KeyCode::Up => {
-            ui.focused = ui.focused.saturating_sub(1);
+            ui.focus_agent(ui.focused.saturating_sub(1));
             Some(DeckAction::Handled)
         }
         KeyCode::Down => {
             if count > 0 {
-                ui.focused = (ui.focused + 1).min(count - 1);
+                ui.focus_agent((ui.focused + 1).min(count - 1));
             }
             Some(DeckAction::Handled)
         }
@@ -578,9 +650,74 @@ fn handle_files_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -> O
     }
 }
 
-fn handle_session_key(key: KeyEvent, ui: &mut DeckUi) -> Option<DeckAction> {
+/// Flip entry `idx`'s expanded state for `agent`, invalidating the fold cache.
+fn toggle_expanded(ui: &mut DeckUi, agent: &str, idx: usize) {
+    let set = ui.expanded.entry(agent.to_string()).or_default();
+    if !set.remove(&idx) {
+        set.insert(idx);
+    }
+    ui.expanded_rev += 1;
+}
+
+/// Whether `ctrl+o` can meaningfully expand this entry — exactly the variants
+/// whose [`crate::render::entry_lines`] rendering honors the expanded flag: a
+/// tool call (full args), a tool result (full output), or a collapsed thought.
+fn is_expandable(entry: &crate::model::TranscriptEntry) -> bool {
+    use crate::model::TranscriptEntry as E;
+    matches!(
+        entry,
+        E::ToolStart { .. } | E::ToolResult { .. } | E::Reasoning(_)
+    )
+}
+
+/// The most recent transcript entry `ctrl+o` can meaningfully expand.
+fn last_expandable(transcript: &[crate::model::TranscriptEntry]) -> Option<usize> {
+    transcript.iter().rposition(is_expandable)
+}
+
+fn handle_session_key(
+    key: KeyEvent,
+    model: &WorkspaceModel,
+    ui: &mut DeckUi,
+) -> Option<DeckAction> {
     let (total, height) = (ui.metrics.session_total, ui.metrics.session_height);
+    let entries = model
+        .agents
+        .get(ui.focused)
+        .map(|a| a.model.transcript.len())
+        .unwrap_or(0);
     match key.code {
+        // ↑/↓ walk a message highlight through the transcript (the scroll
+        // window follows the highlight); ↓ past the last message drops the
+        // highlight and re-arms tail-follow. PgUp/PgDn stay pure scroll.
+        KeyCode::Up if entries > 0 => {
+            let sel = match ui.session_selected {
+                None => entries - 1,
+                Some(0) => 0,
+                Some(i) => i - 1,
+            };
+            ui.session_selected = Some(sel);
+            ui.session_pending_scroll = Some(sel);
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Down if entries > 0 => {
+            match ui.session_selected {
+                Some(i) if i + 1 < entries => {
+                    ui.session_selected = Some(i + 1);
+                    ui.session_pending_scroll = Some(i + 1);
+                }
+                Some(_) => {
+                    ui.session_selected = None;
+                    ui.session_scroll.follow = true;
+                }
+                None => ui.session_scroll.scroll_down(1, total, height),
+            }
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Esc if ui.session_selected.is_some() => {
+            ui.session_selected = None;
+            Some(DeckAction::Handled)
+        }
         KeyCode::Up => {
             ui.session_scroll.scroll_up(1, total, height);
             Some(DeckAction::Handled)
@@ -680,6 +817,148 @@ mod tests {
         }
         m
     }
+
+    /// Push one tool call + multi-line result onto `agent`'s transcript.
+    fn with_tool_exchange(m: &mut WorkspaceModel, agent: &str) {
+        use stella_protocol::{AgentEvent, ToolCall, ToolOutput};
+        m.apply_inbound(&Inbound::Event {
+            agent: agent.into(),
+            event: AgentEvent::ToolStart {
+                call: ToolCall {
+                    call_id: "c1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({ "path": "src/main.rs" }),
+                },
+            },
+        });
+        m.apply_inbound(&Inbound::Event {
+            agent: agent.into(),
+            event: AgentEvent::ToolResult {
+                call_id: "c1".into(),
+                output: ToolOutput::Ok {
+                    content: "line one\nline two\nline three".into(),
+                },
+                duration_ms: 7,
+            },
+        });
+    }
+
+    #[test]
+    fn up_selects_the_last_message_and_ctrl_o_toggles_it() {
+        let mut model = model_with(&["lead"]);
+        with_tool_exchange(&mut model, "lead");
+        let mut ui = ready_ui();
+
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        assert_eq!(
+            ui.session_selected,
+            Some(1),
+            "up highlights the newest message"
+        );
+
+        handle_deck_key(ctrl('o'), &model, &mut ui);
+        assert!(
+            ui.expanded.get("lead").is_some_and(|set| set.contains(&1)),
+            "ctrl+o expands the highlighted message"
+        );
+        let rev = ui.expanded_rev;
+        handle_deck_key(ctrl('o'), &model, &mut ui);
+        assert!(
+            ui.expanded.get("lead").is_none_or(|set| !set.contains(&1)),
+            "a second ctrl+o collapses it again"
+        );
+        assert!(
+            ui.expanded_rev > rev,
+            "each toggle invalidates the fold cache"
+        );
+    }
+
+    #[test]
+    fn double_ctrl_o_from_the_prompt_toggles_all_thinking() {
+        let mut model = model_with(&["lead"]);
+        with_tool_exchange(&mut model, "lead");
+        let mut ui = ready_ui();
+        assert!(!ui.thinking_expanded);
+
+        // First press (no selection): toggles the most recent expandable
+        // message and arms the escalation…
+        handle_deck_key(ctrl('o'), &model, &mut ui);
+        assert!(ui.ctrl_o_primed);
+        assert!(!ui.thinking_expanded);
+        // …second consecutive press: the all-thinking toggle.
+        handle_deck_key(ctrl('o'), &model, &mut ui);
+        assert!(
+            ui.thinking_expanded,
+            "ctrl+o twice = chain-of-thought everywhere"
+        );
+
+        // Any other key disarms the escalation.
+        handle_deck_key(ctrl('o'), &model, &mut ui);
+        handle_deck_key(key(KeyCode::Down), &model, &mut ui);
+        assert!(
+            !ui.ctrl_o_primed,
+            "a non-ctrl+o key disarms the double-press"
+        );
+    }
+
+    #[test]
+    fn down_past_the_last_message_clears_selection_and_rearms_follow() {
+        let mut model = model_with(&["lead"]);
+        with_tool_exchange(&mut model, "lead");
+        let mut ui = ready_ui();
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        handle_deck_key(key(KeyCode::Down), &model, &mut ui);
+        assert_eq!(ui.session_selected, None, "down past the tail deselects");
+        assert!(ui.session_scroll.follow, "…and re-arms tail-follow");
+    }
+
+    #[test]
+    fn ctrl_o_on_a_non_expandable_selection_is_a_no_op() {
+        let mut model = model_with(&["lead"]);
+        // A plain text message — `entry_lines` ignores the expanded flag for
+        // it, so ctrl+o has nothing to toggle.
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Text {
+                delta: "hello".into(),
+            },
+        });
+        let mut ui = ready_ui();
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        assert_eq!(ui.session_selected, Some(0));
+
+        let rev = ui.expanded_rev;
+        handle_deck_key(ctrl('o'), &model, &mut ui);
+        assert!(
+            ui.expanded.get("lead").is_none_or(|set| set.is_empty()),
+            "nothing marked expanded"
+        );
+        assert_eq!(
+            ui.expanded_rev, rev,
+            "a no-op press must not invalidate the settled fold cache"
+        );
+    }
+
+    #[test]
+    fn switching_focus_drops_the_session_selection() {
+        let mut model = model_with(&["lead", "sub"]);
+        with_tool_exchange(&mut model, "lead");
+        let mut ui = ready_ui();
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        assert!(ui.session_selected.is_some());
+
+        // Focus another agent from the Agents tab: the selection indexes the
+        // *previous* agent's transcript and must not carry across.
+        ui.tab = DeckTab::Agents;
+        handle_deck_key(key(KeyCode::Down), &model, &mut ui);
+        assert_eq!(ui.focused, 1);
+        assert_eq!(
+            ui.session_selected, None,
+            "selection cleared on focus change"
+        );
+        assert!(ui.session_scroll.follow, "…and tail-follow re-arms");
+    }
+
     fn ready_ui() -> DeckUi {
         let mut ui = DeckUi::default();
         ui.splash.skip(); // past the splash for interaction tests
