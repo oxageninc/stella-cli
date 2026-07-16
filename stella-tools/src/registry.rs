@@ -859,14 +859,14 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(names.len(), 21, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 22, "unexpected tool count: {names:?}");
     }
 
     #[test]
     fn issue_tools_absent_without_a_configured_backend() {
         let reg = ToolRegistry::with_issue_backend(PathBuf::from("/tmp"), None);
         let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
-        assert_eq!(names.len(), 16, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 17, "unexpected tool count: {names:?}");
         for absent in [
             "create_issue",
             "update_issue",
