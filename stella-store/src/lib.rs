@@ -340,6 +340,10 @@ const MIGRATIONS: [Migration; 4] = [
     // NOTE: several in-flight branches each add a store.db migration — the
     // slot number is taken naively here and reconciled at merge time.
     migrate_v3_to_v4,
+    // v4 → v5: the skill_usage invocation log (purely additive — SKILLS tab).
+    // NOTE: same naive-slot caveat — may need a one-line renumber at
+    // cascade-merge since sibling branches also append migrations.
+    migrate_v4_to_v5,
 ];
 
 /// The schema version this build writes — the `PRAGMA user_version` of
@@ -350,7 +354,7 @@ const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// Every table the store owns — the allowlist for [`Store::count`] and the
 /// fresh-file probe in [`Store::migrate`].
-const TABLES: [&str; 10] = [
+const TABLES: [&str; 11] = [
     "executions",
     "events",
     "telemetry",
@@ -361,6 +365,7 @@ const TABLES: [&str; 10] = [
     "graph_nodes",
     "graph_edges",
     "agent_uses",
+    "skill_usage",
 ];
 
 /// Tables whose shape has not changed since v0. `IF NOT EXISTS` keeps one
@@ -532,6 +537,20 @@ const AGENT_USES_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_uses (
      CREATE INDEX IF NOT EXISTS agent_uses_by_agent
        ON agent_uses(agent, version, execution_id);";
 
+/// `skill_usage` DDL at [`SCHEMA_VERSION`] — per-execution skill-version
+/// invocation telemetry (SKILLS tab), the exact analogue of [`AGENT_USES_DDL`].
+/// Append-only: one row per skill applied in a turn, no UNIQUE key. The
+/// by-skill index serves per-skill/version aggregate queries.
+const SKILL_USAGE_DDL: &str = "CREATE TABLE IF NOT EXISTS skill_usage (
+       execution_id INTEGER NOT NULL,
+       skill TEXT NOT NULL,
+       version INTEGER NOT NULL,
+       reason TEXT NOT NULL DEFAULT '',
+       ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+     );
+     CREATE INDEX IF NOT EXISTS skill_usage_by_skill
+       ON skill_usage(skill, version, execution_id);";
+
 /// The full latest schema, applied in one shot to fresh databases only.
 /// Existing files never see this — [`MIGRATIONS`] upgrades them shape by
 /// shape, so this can always describe the CURRENT shape.
@@ -544,6 +563,7 @@ fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(TELEMETRY_INDEX)?;
     tx.execute_batch(MEMORY_CITATIONS_DDL)?;
     tx.execute_batch(AGENT_USES_DDL)?;
+    tx.execute_batch(SKILL_USAGE_DDL)?;
     Ok(())
 }
 
@@ -744,6 +764,13 @@ fn migrate_v2_to_v3(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// EXISTS` also covers a partial file that somehow already grew the table.
 fn migrate_v3_to_v4(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(AGENT_USES_DDL)?;
+    Ok(())
+}
+
+/// v4 → v5: the additive `skill_usage` table (skill-version usage telemetry,
+/// SKILLS tab). Purely additive, mirroring [`migrate_v3_to_v4`].
+fn migrate_v4_to_v5(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(SKILL_USAGE_DDL)?;
     Ok(())
 }
 
@@ -1036,6 +1063,21 @@ impl Store {
                 "INSERT INTO agent_uses (execution_id, agent, version, reason) \
                  VALUES (?, ?, ?, ?)",
                 params![execution_id, row.agent, row.version as i64, row.reason],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record the skills applied in one execution — one row per skill at its
+    /// pinned version, never aggregated (see [`SkillUsageRow`]). The analogue
+    /// of [`Self::record_agent_uses`] for the SKILLS tab.
+    pub fn record_skill_usage(&self, execution_id: i64, skills: &[SkillUsageRow]) -> Result<()> {
+        let conn = self.lock();
+        for row in skills {
+            conn.execute(
+                "INSERT INTO skill_usage (execution_id, skill, version, reason) \
+                 VALUES (?, ?, ?, ?)",
+                params![execution_id, row.skill, row.version as i64, row.reason],
             )?;
         }
         Ok(())

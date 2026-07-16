@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use stella_tui::scenario::{demo_graph, demo_inbound};
 use stella_tui::{
     AgentControl, AgentMeta, AgentStatus, DeckOptions, GraphNode, GraphSnapshot, Inbound,
-    ScopeDecision, SlashCommand, UserInput, WorkspaceInput, run_deck,
+    ScopeDecision, SkillsView, SlashCommand, UserInput, WorkspaceInput, run_deck,
 };
 
 fn now_ms() -> u64 {
@@ -158,6 +158,15 @@ async fn main() -> std::io::Result<()> {
                         entries: vec![],
                         status: Some("the demo has no agents on disk".to_string()),
                     });
+                }
+                // The demo has no skills engine — answer with an empty list so
+                // the SKILLS tab renders its empty state instead of hanging.
+                WorkspaceInput::Skill(_) => {
+                    let _ = react_tx.send(Inbound::Skills(SkillsView {
+                        rows: vec![],
+                        status: Some("the demo has no skills on disk".to_string()),
+                        busy: false,
+                    }));
                 }
                 WorkspaceInput::Quit => break,
             }

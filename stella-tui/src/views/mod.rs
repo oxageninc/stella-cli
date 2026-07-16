@@ -8,4 +8,5 @@ pub mod files;
 pub mod graph;
 pub mod installed;
 pub mod session;
+pub mod skills;
 pub mod traces;

@@ -160,6 +160,20 @@ pub enum Inbound {
         entries: Vec<InstalledAgentEntry>,
         status: Option<String>,
     },
+    /// A refreshed snapshot of the installed skills for the SKILLS tab. The
+    /// driver owns the skills on disk (both scopes), their enabled/version/pin
+    /// state, and the npx registry; the deck renders this read-model. Applied
+    /// straight to `DeckUi::skills` by [`crate::deck_ui::ingest_inbound`],
+    /// ignored by the model fold — same out-of-band contract as
+    /// [`Inbound::GraphSnapshot`].
+    Skills(SkillsView),
+    /// The result of a registry search (`npx skills find <query>`). Folded
+    /// into the SKILLS tab's search pane; out-of-band like [`Inbound::Skills`].
+    SkillSearch {
+        query: String,
+        hits: Vec<SkillSearchHit>,
+        status: Option<String>,
+    },
 }
 
 /// Which config level an installed agent definition lives at.
@@ -286,8 +300,113 @@ pub enum WorkspaceInput {
         description: String,
         scope: AgentScope,
     },
+    /// A SKILLS-tab operation (list / enable / uninstall / search / install /
+    /// create / edit / pin). The driver owns the skills on disk + npx + model
+    /// and answers with a refreshed [`Inbound::Skills`] / [`Inbound::SkillSearch`].
+    Skill(SkillOp),
     /// Tear down the deck.
     Quit,
+}
+
+/// Which scope a skill lives in / is installed to. The loader reads both
+/// (`<workspace>/.stella/skills` and `~/.config/stella/skills`); the SKILLS
+/// tab asks this on install/create.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillScope {
+    /// `<workspace>/.stella/skills` — travels with the repo.
+    Project,
+    /// `~/.config/stella/skills` — the user-global directory.
+    User,
+}
+
+impl SkillScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            SkillScope::Project => "project",
+            SkillScope::User => "user",
+        }
+    }
+}
+
+/// One installed-skill row in the SKILLS tab — a driver snapshot, deliberately
+/// decoupled from `stella_core::skills::Skill` so the TUI crate stays
+/// independent of the skills engine (the driver maps one to the other).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillRow {
+    pub scope: SkillScope,
+    pub name: String,
+    pub description: String,
+    /// The pinned version's markdown body — carried so the tab can open the
+    /// edit overlay with no extra round-trip.
+    pub body: String,
+    /// Provenance label — `"workspace"`, `"user"`, `"installed"`, `"auto"`.
+    pub origin: String,
+    /// Session/persistent enabled state (a disabled skill is excluded from
+    /// recall injection; the file stays on disk).
+    pub enabled: bool,
+    /// The pinned/current version the recall path uses.
+    pub version: u32,
+    /// The highest version on disk (`version < latest` ⇒ pinned to an older one).
+    pub latest: u32,
+    /// Whether the deck may uninstall (delete) it.
+    pub removable: bool,
+}
+
+/// One registry search hit. Minimal by design: `id` (the leading token,
+/// passed verbatim to `npx skills add`) + the full `label` line as printed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillSearchHit {
+    pub id: String,
+    pub label: String,
+}
+
+/// The full installed-skills read-model rendered by the SKILLS tab.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkillsView {
+    pub rows: Vec<SkillRow>,
+    /// A one-line status/outcome hint (last op result), or `None`.
+    pub status: Option<String>,
+    /// True while a driver op (npx search/install, LLM create) is in flight,
+    /// so the tab can show a working state.
+    pub busy: bool,
+}
+
+/// A SKILLS-tab operation routed to the driver, which owns the disk + npx +
+/// model. The deck emits one and folds back the refreshed [`Inbound::Skills`]
+/// / [`Inbound::SkillSearch`] snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkillOp {
+    /// Re-enumerate installed skills → [`Inbound::Skills`].
+    List,
+    /// Persistently enable/disable a skill → re-send the list.
+    SetEnabled {
+        scope: SkillScope,
+        name: String,
+        enabled: bool,
+    },
+    /// Delete a skill entirely from disk (deck double-confirms first).
+    Uninstall { scope: SkillScope, name: String },
+    /// `npx skills find <query>` → [`Inbound::SkillSearch`].
+    Search { query: String },
+    /// Install a registry skill into `scope` → refresh the list.
+    Install { scope: SkillScope, id: String },
+    /// LLM-assisted creation from a short description → refresh the list.
+    Create {
+        scope: SkillScope,
+        description: String,
+    },
+    /// Save an edited body as a NEW version (increments + pins it).
+    Edit {
+        scope: SkillScope,
+        name: String,
+        body: String,
+    },
+    /// Pin `version` as the active one WITHOUT editing (no version bump).
+    Pin {
+        scope: SkillScope,
+        name: String,
+        version: u32,
+    },
 }
 
 /// The agent-control verbs surfaced by the dashboard. `Stop` maps to a clean

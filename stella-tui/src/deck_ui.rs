@@ -29,7 +29,8 @@ use crate::composer::{
 };
 use crate::deck::{DeckTab, WorkspaceModel};
 use crate::envelope::{
-    AgentControl, AgentId, AgentScope, AgentStatus, Inbound, InstalledAgentEntry, WorkspaceInput,
+    AgentControl, AgentId, AgentScope, AgentStatus, Inbound, InstalledAgentEntry, SkillOp,
+    SkillScope, SkillSearchHit, SkillsView, WorkspaceInput,
 };
 use crate::graph::GraphSnapshot;
 use crate::input::{ScopeDecision, UserInput};
@@ -156,6 +157,79 @@ impl InstalledPanel {
     }
 }
 
+/// Which pane of the SKILLS tab has the keyboard: the installed list or the
+/// registry search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkillsFocus {
+    #[default]
+    Installed,
+    Search,
+}
+
+/// An active SKILLS-tab overlay that captures keys ahead of the list/search
+/// panes — the scope picker, the create-description input, the edit buffer, or
+/// the version pin picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillPrompt {
+    /// Choose install/create scope (project or user) before dispatching.
+    Scope {
+        action: ScopeAction,
+        /// Highlighted choice: `false` = project, `true` = user.
+        user: bool,
+    },
+    /// Type a short description for LLM-assisted creation (then the scope
+    /// picker follows).
+    CreateDescription { buffer: String },
+    /// Edit a skill's body; saving increments its version and pins the new one.
+    Edit {
+        scope: SkillScope,
+        name: String,
+        buffer: String,
+    },
+    /// Pick a version to pin (no edit, no version bump).
+    Pin {
+        scope: SkillScope,
+        name: String,
+        latest: u32,
+        sel: u32,
+    },
+}
+
+/// The deferred action a [`SkillPrompt::Scope`] picker resolves into once the
+/// user chooses a scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeAction {
+    Install { id: String },
+    Create { description: String },
+}
+
+/// All SKILLS-tab view state. The installed list + `busy`/`status` come from
+/// [`Inbound::Skills`] snapshots the driver owns; the rest (selection, the
+/// live search query, transient arming, the active overlay) is local.
+#[derive(Debug, Clone, Default)]
+pub struct SkillsPanel {
+    /// The installed-skills read-model, from [`Inbound::Skills`].
+    pub view: SkillsView,
+    pub focus: SkillsFocus,
+    /// Selected row in the installed list.
+    pub sel: usize,
+    /// The live search-query buffer.
+    pub query: String,
+    /// Last search results, from [`Inbound::SkillSearch`].
+    pub hits: Vec<SkillSearchHit>,
+    pub search_sel: usize,
+    /// Query changed since the last search → Enter re-searches, not installs.
+    pub query_dirty: bool,
+    /// An npx search/install is in flight (client-side optimism).
+    pub searching: bool,
+    /// One-line hint (last op outcome / affordance).
+    pub status: Option<String>,
+    /// First `ctrl+x` arms; the second uninstalls.
+    pub uninstall_armed: bool,
+    /// An active overlay capturing keys ahead of the panes.
+    pub prompt: Option<SkillPrompt>,
+}
+
 /// All ephemeral view state for the deck.
 #[derive(Debug, Clone)]
 pub struct DeckUi {
@@ -164,6 +238,8 @@ pub struct DeckUi {
     pub agents_pane: AgentsPane,
     /// The INSTALLED AGENTS pane's state.
     pub installed: InstalledPanel,
+    /// The SKILLS tab's view state (installed list, search, overlays).
+    pub skills: SkillsPanel,
     /// The one global composer — typing works from any tab.
     pub composer: Composer,
     pub splash: SplashState,
@@ -265,6 +341,7 @@ impl Default for DeckUi {
             tab: DeckTab::Session,
             agents_pane: AgentsPane::default(),
             installed: InstalledPanel::default(),
+            skills: SkillsPanel::default(),
             composer: Composer::with_paste_threshold(crate::composer::DECK_PASTE_LINE_THRESHOLD),
             splash: SplashState::new(),
             help_open: false,
@@ -396,6 +473,42 @@ pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut De
         if let Some(status) = status {
             ui.installed.status = Some(status.clone());
         }
+        return;
+    }
+    // Skills snapshots are out-of-band view state (like the graph, the slash
+    // vocabulary, and the agents list): applied straight to `DeckUi::skills`.
+    if let Inbound::Skills(view) = inbound {
+        ui.skills.view = view.clone();
+        // A fresh list is the completion signal for a disk/npx op: stop the
+        // spinner and disarm any half-armed uninstall.
+        ui.skills.searching = false;
+        ui.skills.uninstall_armed = false;
+        if view.status.is_some() {
+            ui.skills.status = view.status.clone();
+        }
+        let n = ui.skills.view.rows.len();
+        ui.skills.sel = if n == 0 { 0 } else { ui.skills.sel.min(n - 1) };
+        return;
+    }
+    if let Inbound::SkillSearch {
+        query,
+        hits,
+        status,
+    } = inbound
+    {
+        if ui.skills.query.trim() == query.trim() {
+            ui.skills.query_dirty = false;
+        }
+        ui.skills.hits = hits.clone();
+        ui.skills.search_sel = 0;
+        ui.skills.searching = false;
+        ui.skills.status = status.clone().or_else(|| {
+            Some(if hits.is_empty() {
+                format!("no skills found for “{query}”")
+            } else {
+                format!("{} result(s) — ⏎ installs the selected one", hits.len())
+            })
+        });
         return;
     }
     model.apply_inbound(inbound);
@@ -577,6 +690,17 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
 
     let composer_empty = ui.composer.buffer().is_empty();
 
+    // The SKILLS tab is a keyboard-owning manager: it claims the keys for its
+    // list, search query, and overlays *ahead* of tab-nav and the global
+    // composer, so a search term (or a manage hotkey like space) is never
+    // swallowed as prompt text. Keys it declines (`None`) fall through — Tab
+    // still leaves the tab, `?` still opens help from the installed pane.
+    if ui.tab == DeckTab::Skills
+        && let Some(action) = handle_skills_key(key, ui)
+    {
+        return action;
+    }
+
     // Deck-global tab navigation (Tab / Shift-Tab only — digits never switch
     // tabs: they quick-pick ask-user answers and must be typeable as the
     // first character of a prompt). The slash popup claims Tab first —
@@ -653,6 +777,10 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         DeckTab::Graph => handle_graph_key(key, ui, composer_empty),
         DeckTab::Files => handle_files_key(key, model, ui, composer_empty),
         DeckTab::Session => handle_session_key(key, model, ui),
+        // The SKILLS tab claims its keys earlier (before the composer), so a
+        // key that reaches here fell through on purpose — leave it to the
+        // deck-global handlers below.
+        DeckTab::Skills => None,
     } {
         return action;
     }
@@ -747,6 +875,13 @@ fn handle_slash_key(key: KeyEvent, matches: &[String], ui: &mut DeckUi) -> Optio
                 ui.agents_pane = AgentsPane::Installed;
                 ui.installed.busy = true;
                 DeckAction::Send(WorkspaceInput::AgentsRefresh)
+            }
+            // `/skills` opens the SKILLS tab directly and asks the driver —
+            // which owns the skills on disk — for a fresh installed list.
+            "/skills" => {
+                ui.set_tab(DeckTab::Skills);
+                ui.skills.status = Some("loading skills…".to_string());
+                DeckAction::Send(WorkspaceInput::Skill(SkillOp::List))
             }
             // Everything else — including `/help` — is enqueued for the
             // driver, which owns the session vocabulary and answers into the
@@ -992,6 +1127,385 @@ fn handle_pick_version_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
             })
         }
         _ => DeckAction::Handled,
+    }
+}
+
+/// SKILLS-tab keys. Returns `Some` for keys the tab claims ahead of the
+/// composer (nav, manage hotkeys, the search query, overlays), `None` for keys
+/// that should fall through to the deck-global handlers — Tab still leaves the
+/// tab and `?` still opens help from the installed pane.
+fn handle_skills_key(key: KeyEvent, ui: &mut DeckUi) -> Option<DeckAction> {
+    // An overlay (scope picker / create / edit / pin) is fully modal.
+    if ui.skills.prompt.is_some() {
+        return Some(handle_skills_prompt_key(key, ui));
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match ui.skills.focus {
+        SkillsFocus::Installed => handle_skills_installed_key(key, ui, ctrl),
+        SkillsFocus::Search => handle_skills_search_key(key, ui),
+    }
+}
+
+/// The installed-skills (manage) pane: navigate, toggle enabled (space),
+/// uninstall (ctrl+x twice), edit (e), pin (p), create (n), cross to search (→).
+fn handle_skills_installed_key(key: KeyEvent, ui: &mut DeckUi, ctrl: bool) -> Option<DeckAction> {
+    let count = ui.skills.view.rows.len();
+    // Any key other than a fresh ctrl+x disarms the two-press uninstall.
+    let was_armed = ui.skills.uninstall_armed;
+    let is_ctrl_x = ctrl && matches!(key.code, KeyCode::Char('x'));
+    if !is_ctrl_x {
+        ui.skills.uninstall_armed = false;
+    }
+    match key.code {
+        KeyCode::Right => {
+            ui.skills.focus = SkillsFocus::Search;
+            ui.skills.status = None;
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Up => {
+            ui.skills.sel = ui.skills.sel.saturating_sub(1);
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Down => {
+            if count > 0 {
+                ui.skills.sel = (ui.skills.sel + 1).min(count - 1);
+            }
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Char(' ') => {
+            let Some(row) = ui.skills.view.rows.get(ui.skills.sel) else {
+                return Some(DeckAction::Handled);
+            };
+            let enabled = !row.enabled;
+            let name = row.name.clone();
+            let scope = row.scope;
+            ui.skills.status = Some(format!(
+                "{name} {}",
+                if enabled { "enabled" } else { "disabled" }
+            ));
+            // Optimistic flip; the driver's refreshed snapshot is authoritative.
+            if let Some(r) = ui.skills.view.rows.get_mut(ui.skills.sel) {
+                r.enabled = enabled;
+            }
+            Some(DeckAction::Send(WorkspaceInput::Skill(SkillOp::SetEnabled {
+                scope,
+                name,
+                enabled,
+            })))
+        }
+        KeyCode::Char('x') if ctrl => {
+            let Some(row) = ui.skills.view.rows.get(ui.skills.sel) else {
+                return Some(DeckAction::Handled);
+            };
+            if !row.removable {
+                ui.skills.status = Some(format!(
+                    "{} can't be deleted here — press space to disable it",
+                    row.name
+                ));
+                return Some(DeckAction::Handled);
+            }
+            if was_armed {
+                let name = row.name.clone();
+                let scope = row.scope;
+                ui.skills.searching = true;
+                ui.skills.status = Some(format!("deleting {name}…"));
+                Some(DeckAction::Send(WorkspaceInput::Skill(SkillOp::Uninstall {
+                    scope,
+                    name,
+                })))
+            } else {
+                ui.skills.uninstall_armed = true;
+                ui.skills.status = Some(format!(
+                    "press ctrl+x again to DELETE {} ({}) from disk",
+                    row.name,
+                    row.scope.label()
+                ));
+                Some(DeckAction::Handled)
+            }
+        }
+        // Edit the selected skill's body (saving makes a new pinned version).
+        KeyCode::Char('e') if !ctrl => {
+            if let Some(row) = ui.skills.view.rows.get(ui.skills.sel) {
+                ui.skills.prompt = Some(SkillPrompt::Edit {
+                    scope: row.scope,
+                    name: row.name.clone(),
+                    buffer: row.body.clone(),
+                });
+            }
+            Some(DeckAction::Handled)
+        }
+        // Pin a specific version (no edit, no version bump).
+        KeyCode::Char('p') if !ctrl => {
+            if let Some(row) = ui.skills.view.rows.get(ui.skills.sel) {
+                if row.latest <= 1 {
+                    ui.skills.status = Some(format!("{} has only one version", row.name));
+                } else {
+                    ui.skills.prompt = Some(SkillPrompt::Pin {
+                        scope: row.scope,
+                        name: row.name.clone(),
+                        latest: row.latest,
+                        sel: row.version,
+                    });
+                }
+            }
+            Some(DeckAction::Handled)
+        }
+        // Create a new skill with LLM assistance from a short description.
+        KeyCode::Char('n') if !ctrl => {
+            ui.skills.prompt = Some(SkillPrompt::CreateDescription {
+                buffer: String::new(),
+            });
+            Some(DeckAction::Handled)
+        }
+        _ => None,
+    }
+}
+
+/// The registry-search pane: type a query, run it (⏎), pick a hit, and install
+/// the highlighted one (⏎ again → scope picker). ← returns to the manage pane.
+fn handle_skills_search_key(key: KeyEvent, ui: &mut DeckUi) -> Option<DeckAction> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Left => {
+            ui.skills.focus = SkillsFocus::Installed;
+            ui.skills.status = None;
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Up => {
+            ui.skills.search_sel = ui.skills.search_sel.saturating_sub(1);
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Down => {
+            let n = ui.skills.hits.len();
+            if n > 0 {
+                ui.skills.search_sel = (ui.skills.search_sel + 1).min(n - 1);
+            }
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Backspace => {
+            ui.skills.query.pop();
+            ui.skills.query_dirty = true;
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Enter => {
+            if !ui.skills.query_dirty && !ui.skills.hits.is_empty() {
+                // Install the highlighted hit — ask the scope first.
+                let idx = ui.skills.search_sel.min(ui.skills.hits.len() - 1);
+                let id = ui.skills.hits[idx].id.clone();
+                ui.skills.prompt = Some(SkillPrompt::Scope {
+                    action: ScopeAction::Install { id },
+                    user: false,
+                });
+                Some(DeckAction::Handled)
+            } else {
+                let query = ui.skills.query.trim().to_string();
+                if query.is_empty() {
+                    ui.skills.status = Some("type a search term first".into());
+                    return Some(DeckAction::Handled);
+                }
+                ui.skills.searching = true;
+                ui.skills.query_dirty = false;
+                ui.skills.status = Some(format!("searching “{query}”…"));
+                Some(DeckAction::Send(WorkspaceInput::Skill(SkillOp::Search {
+                    query,
+                })))
+            }
+        }
+        // Printable chars (space included — queries have spaces) type into the
+        // query; modified chords are left for the global handlers.
+        KeyCode::Char(c) if !ctrl && !alt => {
+            ui.skills.query.push(c);
+            ui.skills.query_dirty = true;
+            Some(DeckAction::Handled)
+        }
+        _ => None,
+    }
+}
+
+/// The active SKILLS overlay's keys (fully modal): the scope picker (resolves
+/// an install/create into a scoped op), the create-description input, the edit
+/// buffer (ctrl+s saves a new version), and the version pin picker.
+fn handle_skills_prompt_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    match ui.skills.prompt.clone() {
+        Some(SkillPrompt::Scope { action, user }) => {
+            match key.code {
+                KeyCode::Esc => {
+                    ui.skills.prompt = None;
+                    ui.skills.status = Some("cancelled".into());
+                    DeckAction::Handled
+                }
+                KeyCode::Left | KeyCode::Up | KeyCode::Char('p') | KeyCode::Char('P') => {
+                    ui.skills.prompt = Some(SkillPrompt::Scope {
+                        action,
+                        user: false,
+                    });
+                    DeckAction::Handled
+                }
+                KeyCode::Right | KeyCode::Down | KeyCode::Char('u') | KeyCode::Char('U') => {
+                    ui.skills.prompt = Some(SkillPrompt::Scope { action, user: true });
+                    DeckAction::Handled
+                }
+                KeyCode::Enter => {
+                    let scope = if user {
+                        SkillScope::User
+                    } else {
+                        SkillScope::Project
+                    };
+                    ui.skills.prompt = None;
+                    ui.skills.searching = true;
+                    match action {
+                        ScopeAction::Install { id } => {
+                            ui.skills.status =
+                                Some(format!("installing {id} for {}…", scope.label()));
+                            DeckAction::Send(WorkspaceInput::Skill(SkillOp::Install { scope, id }))
+                        }
+                        ScopeAction::Create { description } => {
+                            ui.skills.status =
+                                Some(format!("assembling a skill for {}…", scope.label()));
+                            DeckAction::Send(WorkspaceInput::Skill(SkillOp::Create {
+                                scope,
+                                description,
+                            }))
+                        }
+                    }
+                }
+                // Modal: swallow everything else.
+                _ => DeckAction::Handled,
+            }
+        }
+        // The create-description input: type a short description, ⏎ moves on to
+        // the scope picker (which dispatches the LLM-assisted create).
+        Some(SkillPrompt::CreateDescription { mut buffer }) => match key.code {
+            KeyCode::Esc => {
+                ui.skills.prompt = None;
+                DeckAction::Handled
+            }
+            KeyCode::Enter => {
+                let description = buffer.trim().to_string();
+                if description.is_empty() {
+                    ui.skills.status = Some("describe the skill first".into());
+                    DeckAction::Handled
+                } else {
+                    ui.skills.prompt = Some(SkillPrompt::Scope {
+                        action: ScopeAction::Create { description },
+                        user: false,
+                    });
+                    DeckAction::Handled
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                ui.skills.prompt = Some(SkillPrompt::CreateDescription { buffer });
+                DeckAction::Handled
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                buffer.push(c);
+                ui.skills.prompt = Some(SkillPrompt::CreateDescription { buffer });
+                DeckAction::Handled
+            }
+            _ => DeckAction::Handled,
+        },
+        // The edit buffer: a minimal textarea. ⏎ inserts a newline; ctrl+s saves
+        // (a new pinned version); esc cancels.
+        Some(SkillPrompt::Edit {
+            scope,
+            name,
+            mut buffer,
+        }) => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            match key.code {
+                KeyCode::Esc => {
+                    ui.skills.prompt = None;
+                    ui.skills.status = Some("edit cancelled".into());
+                    DeckAction::Handled
+                }
+                KeyCode::Char('s') if ctrl => {
+                    ui.skills.prompt = None;
+                    ui.skills.searching = true;
+                    ui.skills.status = Some(format!("saving {name}…"));
+                    DeckAction::Send(WorkspaceInput::Skill(SkillOp::Edit {
+                        scope,
+                        name,
+                        body: buffer,
+                    }))
+                }
+                KeyCode::Enter => {
+                    buffer.push('\n');
+                    ui.skills.prompt = Some(SkillPrompt::Edit {
+                        scope,
+                        name,
+                        buffer,
+                    });
+                    DeckAction::Handled
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                    ui.skills.prompt = Some(SkillPrompt::Edit {
+                        scope,
+                        name,
+                        buffer,
+                    });
+                    DeckAction::Handled
+                }
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    buffer.push(c);
+                    ui.skills.prompt = Some(SkillPrompt::Edit {
+                        scope,
+                        name,
+                        buffer,
+                    });
+                    DeckAction::Handled
+                }
+                _ => DeckAction::Handled,
+            }
+        }
+        // The pin picker: ↑/↓ choose a version, ⏎ pins it (no version bump).
+        Some(SkillPrompt::Pin {
+            scope,
+            name,
+            latest,
+            sel,
+        }) => match key.code {
+            KeyCode::Esc => {
+                ui.skills.prompt = None;
+                DeckAction::Handled
+            }
+            KeyCode::Up => {
+                ui.skills.prompt = Some(SkillPrompt::Pin {
+                    scope,
+                    name,
+                    latest,
+                    sel: sel.saturating_sub(1).max(1),
+                });
+                DeckAction::Handled
+            }
+            KeyCode::Down => {
+                ui.skills.prompt = Some(SkillPrompt::Pin {
+                    scope,
+                    name,
+                    latest,
+                    sel: (sel + 1).min(latest),
+                });
+                DeckAction::Handled
+            }
+            KeyCode::Enter => {
+                ui.skills.prompt = None;
+                ui.skills.searching = true;
+                ui.skills.status = Some(format!("pinning {name} to v{sel}…"));
+                DeckAction::Send(WorkspaceInput::Skill(SkillOp::Pin {
+                    scope,
+                    name,
+                    version: sel,
+                }))
+            }
+            _ => DeckAction::Handled,
+        },
+        None => DeckAction::Ignored,
     }
 }
 

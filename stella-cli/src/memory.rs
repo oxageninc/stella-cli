@@ -142,13 +142,17 @@ pub(crate) fn load_workspace_skills(workspace_root: &Path) -> Vec<Skill> {
 pub(crate) fn load_workspace_skills_with_diagnostics(
     workspace_root: &Path,
 ) -> skills::LoadedSkills {
-    skills::load_skills_with_diagnostics(
+    let mut loaded = skills::load_skills_with_diagnostics(
         &FsSkillSource,
         &LoadSkillsOptions {
             workspace_skills_dir: workspace_skills_dir(workspace_root),
             user_skills_dir: user_skills_dir(),
         },
-    )
+    );
+    // A skill disabled from the SKILLS tab is excluded from recall/selection
+    // and the ⚡ slash menu — its file stays on disk (see `crate::skill_manager`).
+    crate::skill_manager::retain_enabled(&mut loaded.skills, workspace_root);
+    loaded
 }
 
 impl SessionMemory {
@@ -243,6 +247,31 @@ impl SessionMemory {
         } else {
             Some(format!("{RECALL_MARKER}\n\n{}", sections.join("\n\n")))
         }
+    }
+
+    /// The skills recall would inject for `prompt`, as `(name, reason)` pairs
+    /// for skill-version usage telemetry — `reason` is the matched
+    /// domains/terms that selected it. Same enabled-filtered load + selection
+    /// as [`Self::recall_block`], so this reports exactly what was applied.
+    pub fn selected_skills(&self, prompt: &str) -> Vec<(String, String)> {
+        skills::select_skills(
+            &self.load_skills(),
+            prompt,
+            &self.domains.names(),
+            &SelectionConfig::default(),
+        )
+        .into_iter()
+        .map(|s| {
+            let mut why: Vec<String> = Vec::new();
+            if !s.matched_domains.is_empty() {
+                why.push(format!("domains: {}", s.matched_domains.join(", ")));
+            }
+            if !s.matched_terms.is_empty() {
+                why.push(format!("terms: {}", s.matched_terms.join(", ")));
+            }
+            (s.skill.name, why.join("; "))
+        })
+        .collect()
     }
 
     /// Record the turn that just finished as an episodic memory: a summary,
