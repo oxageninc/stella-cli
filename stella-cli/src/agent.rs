@@ -119,16 +119,35 @@ Rules:
 const MEMORY_PROMPT_BUDGET_CHARS: usize = 16_000;
 
 /// Assemble the session's system prompt from a `base` instruction set plus
-/// the workspace's saved memories. Memories are loaded ONCE per session and
-/// concatenated in filename order so the resulting prefix is byte-stable
-/// across every model call — that stability is what lets the whole prompt
-/// (instructions + memories) ride the provider's prompt cache instead of
-/// being re-billed. Memories saved mid-session deliberately do NOT appear
-/// until the next session: hot-injecting them would invalidate the cached
-/// prefix on every save. This coexists with `SessionMemory`'s per-turn
-/// recall block (memory.rs) — the baked prefix carries durable lessons, the
-/// recall block carries turn-relevant memories and skills.
+/// the workspace's saved memories and the workspace rules section (Tier 1
+/// soft adherence, `stella_core::rules`). Both are loaded ONCE per session
+/// and concatenated deterministically so the resulting prefix is
+/// byte-stable across every model call — that stability is what lets the
+/// whole prompt (instructions + memories + rules) ride the provider's
+/// prompt cache instead of being re-billed. Memories saved mid-session
+/// deliberately do NOT appear until the next session: hot-injecting them
+/// would invalidate the cached prefix on every save. This coexists with
+/// `SessionMemory`'s per-turn recall block (memory.rs) — the baked prefix
+/// carries durable lessons, the recall block carries turn-relevant memories
+/// and skills. The rules rendered here are the same set whose Tier-2 guards
+/// `crate::rules::enforce_workspace_rules` arms at the tool boundary.
 fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> String {
+    let mut prompt = base.to_string();
+    append_workspace_memories(&mut prompt, workspace_root);
+    let rules_section = stella_core::rules::render_rules_section(
+        &crate::rules::load_workspace_rules(workspace_root),
+    );
+    if !rules_section.is_empty() {
+        prompt.push('\n');
+        prompt.push_str(&rules_section);
+    }
+    prompt
+}
+
+/// The memories half of [`assemble_system_prompt`]: append the workspace's
+/// saved memories (filename order, budget-capped) to `prompt`, or leave it
+/// untouched when there are none.
+fn append_workspace_memories(prompt: &mut String, workspace_root: &std::path::Path) {
     let dir = workspace_root.join(".stella/memories");
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .map(|entries| {
@@ -139,7 +158,7 @@ fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> Strin
         })
         .unwrap_or_default();
     if files.is_empty() {
-        return base.to_string();
+        return;
     }
     files.sort();
 
@@ -170,21 +189,20 @@ fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> Strin
         memories.push_str(&entry);
     }
     if memories.is_empty() {
-        return base.to_string();
+        return;
     }
-    let mut prompt = format!(
-        "{base}
+    prompt.push_str(&format!(
+        "
 
 Workspace memories (lessons from previous sessions — apply them):
 {memories}"
-    );
+    ));
     if dropped > 0 {
         prompt.push_str(&format!(
             "
 ({dropped} additional memories exceeded the prompt budget and were omitted —              consolidate .stella/memories/ to bring them back)"
         ));
     }
-    prompt
 }
 
 /// EngineConfig for a session: defaults, with the workspace root as the
@@ -269,6 +287,7 @@ async fn run_pipeline_one_shot(
     let registry: Arc<ToolRegistry> =
         Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let mcp = connect_mcp(cfg, registry.clone(), format == OutputFormat::Text).await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
@@ -715,6 +734,7 @@ async fn run_raw_one_shot(
     let registry: std::sync::Arc<ToolRegistry> =
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let mcp = connect_mcp(cfg, registry.clone(), format == OutputFormat::Text).await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
@@ -810,6 +830,7 @@ pub async fn run_goal_cmd(
     let registry: std::sync::Arc<ToolRegistry> =
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let mcp = connect_mcp(cfg, registry.clone(), true).await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
@@ -888,6 +909,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     let mcp = connect_mcp(cfg, registry.clone(), true).await;
     populate_schema_index(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -2574,6 +2596,31 @@ mod tests {
         assert_eq!(
             row.cache_write_tokens, 640,
             "the event's cache-write count must reach the store, never a hard-coded 0"
+        );
+    }
+
+    /// Tier-1 rule wiring (issue #103): a workspace rule renders into the
+    /// assembled system prompt, appended after the untouched base prefix.
+    #[test]
+    fn system_prompt_carries_the_workspace_rules_section() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let rules_dir = root.path().join(".stella/rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(
+            rules_dir.join("no-force-push.md"),
+            "---\nguard-tool: Bash\nguard-deny-command: git push --force*\n---\nNever force-push.",
+        )
+        .unwrap();
+
+        let prompt = build_system_prompt(root.path());
+        assert!(
+            prompt.starts_with(SYSTEM_PROMPT),
+            "rules append to the prompt; the base prefix must stay intact"
+        );
+        assert!(prompt.contains("## Workspace rules"));
+        assert!(
+            prompt.contains("Never force-push.  [enforced]"),
+            "a guarded rule must render with the enforced marker: {prompt}"
         );
     }
 

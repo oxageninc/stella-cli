@@ -19,6 +19,12 @@
 //!   normalized workspace-relative path, carrying its deduplicated CRUD
 //!   letters, session line-delta totals, and the ordered JSON audit log of
 //!   every individual touch (event, reason, per-touch line delta).
+//! - **rules** — extension-authored workspace rules: one row per rule id,
+//!   holding the full rule markdown in the `.stella/rules/*.md` authoring
+//!   format (the store never parses it — `stella_core::rules` does).
+//!   Written by extension providers via [`Store::upsert_rule`]; read at
+//!   session start by `stella-cli`, which merges these (lowest precedence)
+//!   with the on-disk rule files.
 //! - **file_locks** — schema + API for cooperative file claims in multi-agent
 //!   work. Reserved: no shipping command acquires locks yet.
 //! - **graph_nodes / graph_edges** — schema reserved as a future seam for a
@@ -125,6 +131,19 @@ pub struct FileTouchRow {
     pub events_json: String,
 }
 
+/// One extension-authored workspace rule, as stored: the full rule markdown
+/// in the `.stella/rules/*.md` authoring format plus the writer's label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleRow {
+    /// The rule id — the analog of a rule file's filename stem.
+    pub rule_id: String,
+    /// Full rule markdown (optional frontmatter + body). Opaque to the
+    /// store; `stella_core::rules::rule_from_file` parses it.
+    pub contents: String,
+    /// Opaque label naming the writer (extension/provider id).
+    pub source: String,
+}
+
 /// One aggregated analytics row per (provider, model): the numbers behind
 /// "$-per-resolved-task" receipts, straight from local telemetry.
 ///
@@ -228,13 +247,16 @@ type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// a file at `user_version` i to i + 1. Fresh files never run these — they
 /// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
 /// directly.
-const MIGRATIONS: [Migration; 2] = [
+const MIGRATIONS: [Migration; 3] = [
     // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
     // their write paths have always assumed.
     migrate_v0_to_v1,
     // v1 → v2: files_touched grows line-delta totals + the JSON audit log,
     // and the UNIQUE (execution_id, path) key.
     migrate_v1_to_v2,
+    // v2 → v3: the additive `rules` table (extension-authored workspace
+    // rules for the stella-core rules engine).
+    migrate_v2_to_v3,
 ];
 
 /// The schema version this build writes — the `PRAGMA user_version` of
@@ -245,11 +267,12 @@ const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// Every table the store owns — the allowlist for [`Store::count`] and the
 /// fresh-file probe in [`Store::migrate`].
-const TABLES: [&str; 7] = [
+const TABLES: [&str; 8] = [
     "executions",
     "events",
     "telemetry",
     "files_touched",
+    "rules",
     "file_locks",
     "graph_nodes",
     "graph_edges",
@@ -362,6 +385,22 @@ fn telemetry_ddl(table: &str) -> String {
     )
 }
 
+/// `rules` DDL — one row per extension-authored workspace rule, keyed by
+/// rule id (the analog of a rule file's filename stem). `contents` is the
+/// FULL rule markdown in the `.stella/rules/*.md` authoring format
+/// (optional `---` frontmatter — `description:`/`guard-*:` keys — plus the
+/// rule statement body); the store never parses it, `stella_core::rules`
+/// does. `source` is an opaque label naming the writer (extension/provider
+/// id). `IF NOT EXISTS` so one batch serves both the fresh-file schema and
+/// the v2 → v3 migration.
+const RULES_TABLE: &str = "CREATE TABLE IF NOT EXISTS rules (
+       rule_id TEXT PRIMARY KEY,
+       contents TEXT NOT NULL,
+       source TEXT NOT NULL,
+       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+     );";
+
 /// `drift_samples` filters (provider, model) and sorts (execution_id DESC,
 /// step DESC) at EVERY session start, over a table that grows one row per
 /// model call forever — without this index it full-scans. Non-unique on
@@ -378,6 +417,7 @@ fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(&events_ddl("events"))?;
     tx.execute_batch(&telemetry_ddl("telemetry"))?;
     tx.execute_batch(&files_touched_ddl("files_touched"))?;
+    tx.execute_batch(RULES_TABLE)?;
     tx.execute_batch(TELEMETRY_INDEX)?;
     Ok(())
 }
@@ -562,6 +602,14 @@ fn migrate_v1_to_v2(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         // rebuild, create the v2 shape fresh.
         tx.execute_batch(&files_touched_ddl("files_touched"))?;
     }
+    Ok(())
+}
+
+/// v2 → v3: create the `rules` table ([`RULES_TABLE`]). Purely additive —
+/// no existing table changes shape, so there is nothing to rebuild or
+/// dedupe.
+fn migrate_v2_to_v3(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(RULES_TABLE)?;
     Ok(())
 }
 
@@ -865,6 +913,49 @@ impl Store {
         Ok(())
     }
 
+    /// Upsert one extension-authored workspace rule — the write seam an
+    /// extension provider uses to publish a rule without touching
+    /// `.stella/rules/`. `contents` is the full rule markdown in the
+    /// authoring format `stella_core::rules::rule_from_file` parses; the
+    /// store treats it as opaque text. Re-publishing an existing `rule_id`
+    /// replaces its contents and source and bumps `updated_at`.
+    pub fn upsert_rule(&self, rule_id: &str, contents: &str, source: &str) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO rules (rule_id, contents, source) VALUES (?, ?, ?) \
+             ON CONFLICT (rule_id) DO UPDATE SET contents = excluded.contents, \
+             source = excluded.source, updated_at = CURRENT_TIMESTAMP",
+            params![rule_id, contents, source],
+        )?;
+        Ok(())
+    }
+
+    /// Delete one extension-authored rule; returns whether a row existed.
+    pub fn delete_rule(&self, rule_id: &str) -> Result<bool> {
+        let deleted = self
+            .lock()
+            .execute("DELETE FROM rules WHERE rule_id = ?", params![rule_id])?;
+        Ok(deleted > 0)
+    }
+
+    /// Every stored rule, ordered by rule id — deterministic, so the rules
+    /// section assembled from these into a session's system prompt stays
+    /// byte-stable (the prompt-cache contract).
+    pub fn list_rules(&self) -> Result<Vec<RuleRow>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT rule_id, contents, source FROM rules ORDER BY rule_id")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RuleRow {
+                    rule_id: row.get(0)?,
+                    contents: row.get(1)?,
+                    source: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Upsert a graph node — the context plane's write seam.
     ///
     /// `properties` must be a valid JSON document. The old DuckDB backend
@@ -1163,6 +1254,55 @@ mod tests {
         store
             .record_files_touched(1, &[touch_row("src/new.rs", "C", 7, 0)])
             .unwrap();
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rules_upsert_list_delete_roundtrip() {
+        let store = Store::in_memory().unwrap();
+        store
+            .upsert_rule("no-force-push", "Never force-push.", "ext:policy")
+            .unwrap();
+        store
+            .upsert_rule("a-first", "Sort me first.", "ext:policy")
+            .unwrap();
+        // Re-publishing an id replaces contents and source, never duplicates.
+        store
+            .upsert_rule(
+                "no-force-push",
+                "---\nguard-tool: Bash\nguard-deny-command: git push --force*\n---\nNever force-push.",
+                "ext:policy-v2",
+            )
+            .unwrap();
+
+        let rules = store.list_rules().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].rule_id, "a-first", "ordered by rule id");
+        assert_eq!(rules[1].source, "ext:policy-v2");
+        assert!(rules[1].contents.contains("guard-tool: Bash"));
+
+        assert!(store.delete_rule("a-first").unwrap());
+        assert!(
+            !store.delete_rule("a-first").unwrap(),
+            "a second delete reports no row"
+        );
+        assert_eq!(store.count("rules").unwrap(), 1);
+    }
+
+    #[test]
+    fn v3_migration_adds_the_rules_table_to_a_legacy_file() {
+        // A legacy file upgraded through the whole migration chain must end
+        // at SCHEMA_VERSION with the rules table present and writable.
+        let root = temp_root("v3_rules");
+        {
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
+            conn.execute_batch(LEGACY_V0_SCHEMA).unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+        store.upsert_rule("r", "rule text", "ext").unwrap();
+        assert_eq!(store.count("rules").unwrap(), 1);
         drop(store);
         std::fs::remove_dir_all(&root).ok();
     }

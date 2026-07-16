@@ -224,6 +224,7 @@ async fn run_task(
     cfg.workspace_root = root.to_path_buf();
     let provider = agent::build_provider(&cfg)?;
     let registry = ToolRegistry::new_detected(root.to_path_buf()).await;
+    crate::rules::enforce_workspace_rules(&registry, root);
 
     let mut messages = vec![
         CompletionMessage::system(

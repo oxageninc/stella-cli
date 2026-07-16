@@ -223,6 +223,7 @@ pub async fn run_deck_session(
     let registry: Arc<ToolRegistry> =
         Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     agent::populate_schema_index(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let custom_tools = agent::discover_custom_tools(cfg, true).await;
     let mut budget = agent::build_budget_guard(budget_limit);
     let store = agent::open_store(&cfg.workspace_root);

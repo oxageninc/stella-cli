@@ -26,6 +26,7 @@ mod fleet_cmd;
 mod interactive;
 mod memory;
 mod ocp;
+mod rules;
 mod runtime;
 mod settings;
 mod stats;
