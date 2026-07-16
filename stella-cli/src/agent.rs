@@ -1154,7 +1154,7 @@ pub(crate) async fn record_turn_episode(
 /// succeeds, offline included) — the graph can always be rebuilt on a later
 /// `init` once a toolchain/parser is available. Progress goes to `emit`
 /// (plain text, no ANSI) so both the CLI and the deck transcript can show it.
-fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut(String)) {
+async fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut(String)) {
     let dot_stella = workspace_root.join(".stella");
     if let Err(e) = std::fs::create_dir_all(&dot_stella) {
         emit(format!(
@@ -1164,34 +1164,50 @@ fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut(Strin
     }
     let db_path = dot_stella.join("codegraph.db");
     emit("◈ indexing code graph…".to_string());
-    match stella_graph::CodeGraph::open(workspace_root, &db_path) {
-        Ok(graph) => match graph.index_all() {
-            Ok(stats) => {
-                emit(format!(
-                    "✓ code graph: {} symbols, {} imports across {} file{} \
-                     ({} parsed, {} unchanged)",
-                    stats.symbols,
-                    stats.imports,
-                    stats.files_parsed + stats.files_skipped_unchanged,
-                    if stats.files_parsed + stats.files_skipped_unchanged == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                    stats.files_parsed,
-                    stats.files_skipped_unchanged,
-                ));
-                graph.shutdown();
-            }
-            Err(e) => {
-                emit(format!(
+    // A full-tree tree-sitter index is seconds-to-minutes of blocking file
+    // reads + parsing + SQLite on a large repo. Run it on the blocking pool
+    // so it never pins a runtime worker — the deck driver awaits `/init`
+    // inline and must stay responsive to queue edits and cancels meanwhile
+    // (the incremental watcher path already does this, stella-graph
+    // watch.rs). `emit` stays on this side of the boundary: the only
+    // pre-completion line is the one above.
+    let root = workspace_root.to_path_buf();
+    let outcome = tokio::task::spawn_blocking(move || {
+        match stella_graph::CodeGraph::open(&root, &db_path) {
+            Ok(graph) => match graph.index_all() {
+                Ok(stats) => {
+                    graph.shutdown();
+                    Ok(stats)
+                }
+                Err(e) => Err(format!(
                     "! code-graph indexing failed: {e} — run `stella init` again to retry"
-                ));
-            }
-        },
-        Err(e) => {
-            emit(format!("! code-graph store unavailable: {e} — skipped"));
+                )),
+            },
+            Err(e) => Err(format!("! code-graph store unavailable: {e} — skipped")),
         }
+    })
+    .await;
+    match outcome {
+        Ok(Ok(stats)) => {
+            emit(format!(
+                "✓ code graph: {} symbols, {} imports across {} file{} \
+                 ({} parsed, {} unchanged)",
+                stats.symbols,
+                stats.imports,
+                stats.files_parsed + stats.files_skipped_unchanged,
+                if stats.files_parsed + stats.files_skipped_unchanged == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                stats.files_parsed,
+                stats.files_skipped_unchanged,
+            ));
+        }
+        Ok(Err(warning)) => emit(warning),
+        Err(e) => emit(format!(
+            "! code-graph indexing task failed: {e} — run `stella init` again to retry"
+        )),
     }
 }
 
@@ -1213,7 +1229,7 @@ pub(crate) async fn init_workspace(
 
     // The code graph needs no provider — build it regardless of how the
     // domains were inferred, so the index exists even fully offline.
-    build_code_graph(workspace_root, emit);
+    build_code_graph(workspace_root, emit).await;
 
     let path = domains.save(workspace_root)?;
 
