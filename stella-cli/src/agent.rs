@@ -2449,9 +2449,11 @@ mod tests {
         // shared ZaiProvider shim, id "zai", nor the anthropic branch). Both
         // arms read extra addressing/credentials from the environment; set
         // the minimum each requires. build_provider only constructs — no
-        // network call. These env vars are read by no other test, so setting
-        // them here is race-free within the test binary; the missing-project
-        // error case shares this test so the set/remove stays serialized.
+        // network call. Env mutation is UB against concurrent getenv on
+        // POSIX, so hold the binary-wide env lock for the whole
+        // mutate-read-cleanup window; the missing-project error case shares
+        // this test so the set/remove stays serialized.
+        let _env = crate::test_env::lock();
         unsafe {
             std::env::set_var("VERTEX_PROJECT_ID", "test-project");
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");

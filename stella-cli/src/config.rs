@@ -1122,7 +1122,10 @@ mod tests {
             dialect: Dialect::OpenaiCompatible,
             seeded: false,
         };
-        // SAFETY: test-only env mutation, unique var names per test.
+        // SAFETY: test-only env mutation, unique var names per test — and
+        // serialized behind the binary-wide env lock, because setenv racing
+        // any concurrent getenv is UB on POSIX regardless of var names.
+        let _env = crate::test_env::lock();
         unsafe {
             std::env::remove_var("STELLA_TEST_ALIAS_PRIMARY_KEY");
             std::env::set_var("STELLA_TEST_ALIAS_SECONDARY_KEY", "sk-from-alias");
@@ -1280,7 +1283,10 @@ mod tests {
                 "default_model": "m1"
             }}}"#,
         );
-        // SAFETY: test-only env mutation, unique var name per test.
+        // SAFETY: test-only env mutation, unique var name per test — and
+        // serialized behind the binary-wide env lock (setenv racing any
+        // concurrent getenv is UB on POSIX regardless of var names).
+        let _env = crate::test_env::lock();
         unsafe {
             std::env::set_var("STELLA_TEST_ENVRANK_KEY", "sk-from-env");
         }
