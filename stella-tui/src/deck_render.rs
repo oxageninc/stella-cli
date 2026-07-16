@@ -355,7 +355,7 @@ fn cpu_bar(pct: f64) -> String {
 /// A centered help overlay listing the deck's keys.
 fn render_help(area: Rect, buf: &mut Buffer) {
     let w = area.width.min(62);
-    let h = area.height.min(21);
+    let h = area.height.min(22);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -367,7 +367,6 @@ fn render_help(area: Rect, buf: &mut Buffer) {
         Line::from(Span::styled(" Command Deck — keys", theme::accent())),
         Line::default(),
         Line::from(Span::styled("  Tab / ⇧Tab   switch tabs", theme::body())),
-        Line::from(Span::styled("  1–5          jump to a tab", theme::body())),
         Line::from(Span::styled(
             "  ⌘⏎ / ⌃⏎      queue prompt (never blocks)",
             theme::body(),

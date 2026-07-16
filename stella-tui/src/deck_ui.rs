@@ -312,9 +312,10 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
 
     let composer_empty = ui.composer.buffer().is_empty();
 
-    // Deck-global tab navigation (Tab / Shift-Tab always; digits when empty).
-    // The slash popup claims Tab first — completion beats tab-cycling while
-    // the menu is open.
+    // Deck-global tab navigation (Tab / Shift-Tab only — digits never switch
+    // tabs: they quick-pick ask-user answers and must be typeable as the
+    // first character of a prompt). The slash popup claims Tab first —
+    // completion beats tab-cycling while the menu is open.
     let slash = slash_matches(ui);
     if slash.is_empty() {
         match key.code {
@@ -324,10 +325,6 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
             }
             KeyCode::BackTab => {
                 ui.set_tab(ui.tab.prev());
-                return DeckAction::Handled;
-            }
-            KeyCode::Char(d @ '1'..='5') if composer_empty => {
-                ui.set_tab(DeckTab::from_index((d as usize) - ('1' as usize)));
                 return DeckAction::Handled;
             }
             KeyCode::Char('?') if composer_empty => {
@@ -1059,19 +1056,21 @@ mod tests {
     }
 
     #[test]
-    fn tab_and_digits_switch_tabs_only_when_composer_empty() {
+    fn only_tab_switches_tabs_and_digits_always_type() {
         let model = model_with(&["lead"]);
         let mut ui = ready_ui();
         assert_eq!(ui.tab, DeckTab::Session);
         handle_deck_key(key(KeyCode::Tab), &model, &mut ui);
         assert_eq!(ui.tab, DeckTab::Agents);
+        handle_deck_key(key(KeyCode::BackTab), &model, &mut ui);
+        assert_eq!(ui.tab, DeckTab::Session);
+        // A digit with an empty composer starts the prompt — it never jumps
+        // to a tab, so prompts can begin with 1–5.
         handle_deck_key(ch('3'), &model, &mut ui);
-        assert_eq!(ui.tab, DeckTab::Traces);
-        // Once typing, a digit types instead of switching.
+        assert_eq!(ui.tab, DeckTab::Session, "digit typed, tab unchanged");
         handle_deck_key(ch('h'), &model, &mut ui);
         handle_deck_key(ch('2'), &model, &mut ui);
-        assert_eq!(ui.tab, DeckTab::Traces, "digit typed, tab unchanged");
-        assert_eq!(ui.composer.buffer(), "h2");
+        assert_eq!(ui.composer.buffer(), "3h2");
     }
 
     #[test]
