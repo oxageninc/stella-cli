@@ -40,7 +40,9 @@
 //! still serializes writers per file; one `Store` per session process is the
 //! contract, and internally a `Mutex<Connection>` serializes writers across
 //! in-process parallel agents. Multi-PROCESS fleets need a lock-holder (or
-//! one store per worker + merge) — documented limitation, not a silent one.
+//! one store per worker + merge) — `stella fleet` follows exactly that: its
+//! workers are threads, and the single orchestrator process holds the one
+//! `Store` that acquires and releases their file claims.
 //!
 //! # Schema versioning
 //!
@@ -878,30 +880,42 @@ impl Store {
     /// Cooperative file lock: succeeds only if `path` is unclaimed or
     /// already held by `holder` (re-entrant). Returns whether the lock is
     /// now held.
+    ///
+    /// `INSERT … DO NOTHING` + read-back rather than check-then-insert: two
+    /// PROCESSES racing for the same path (two fleet runs in one workspace)
+    /// resolve to one winner — the losing INSERT is a no-op, never a
+    /// primary-key error — and the read-back reports honestly for both.
     pub fn acquire_file_lock(&self, path: &str, holder: &str) -> Result<bool> {
         let conn = self.lock();
-        // Only "no such lock row" means unclaimed. A genuine query error must
-        // propagate — `.optional()` maps just the no-rows case to `None`;
-        // every other error still propagates via `?`. Swallowing a real error
-        // as "unclaimed" would drive a spurious INSERT (then a PK conflict),
-        // corrupting lock state.
-        let existing: Option<String> = conn
+        conn.execute(
+            "INSERT INTO file_locks (path, holder) VALUES (?, ?) \
+             ON CONFLICT (path) DO NOTHING",
+            params![path, holder],
+        )?;
+        // A row that vanished between the two statements means the competing
+        // holder released cross-process in that window; "not held" is the
+        // conservative truthful answer for THIS call.
+        let current: Option<String> = conn
             .query_row(
                 "SELECT holder FROM file_locks WHERE path = ?",
                 params![path],
                 |row| row.get(0),
             )
             .optional()?;
-        match existing {
-            Some(current) => Ok(current == holder),
-            None => {
-                conn.execute(
-                    "INSERT INTO file_locks (path, holder) VALUES (?, ?)",
-                    params![path, holder],
-                )?;
-                Ok(true)
-            }
-        }
+        Ok(current.as_deref() == Some(holder))
+    }
+
+    /// Who currently holds the claim on `path`, if anyone — the read half a
+    /// consumer uses to NAME the conflicting holder in its error.
+    pub fn file_lock_holder(&self, path: &str) -> Result<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT holder FROM file_locks WHERE path = ?",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     /// Release a lock (only the holder's release removes it).
@@ -1801,6 +1815,20 @@ mod tests {
         assert!(!store.acquire_file_lock("src/a.rs", "agent-2").unwrap());
         store.release_file_lock("src/a.rs", "agent-1").unwrap();
         assert!(store.acquire_file_lock("src/a.rs", "agent-2").unwrap());
+    }
+
+    #[test]
+    fn file_lock_holder_names_the_current_holder() {
+        let store = Store::in_memory().unwrap();
+        assert_eq!(store.file_lock_holder("src/a.rs").unwrap(), None);
+        store.acquire_file_lock("src/a.rs", "agent-1").unwrap();
+        assert_eq!(
+            store.file_lock_holder("src/a.rs").unwrap(),
+            Some("agent-1".to_string()),
+            "a loser's conflict error must be able to name the winner"
+        );
+        store.release_file_lock("src/a.rs", "agent-1").unwrap();
+        assert_eq!(store.file_lock_holder("src/a.rs").unwrap(), None);
     }
 
     #[test]

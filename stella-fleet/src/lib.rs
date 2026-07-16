@@ -16,8 +16,10 @@
 //!   reconciliation and a capped-deferred-wait CI watcher (L-E4).
 //!
 //! and [`fleet`] — **THE dispatch seam** ([`Fleet::dispatch`], L-E9): the one
-//! API subagent fan-out goes through, stamping lineage into the ledger and
-//! metering child spend into the parent [`stella_core::BudgetGuard`].
+//! API subagent fan-out goes through, claiming a task's declared paths as
+//! cooperative file locks (`stella-store`'s `file_locks`) for the attempt's
+//! duration, stamping lineage into the ledger, and metering child spend into
+//! the parent [`stella_core::BudgetGuard`].
 //!
 //! Design constraints (from the task and `02-architecture.md`): we shell out
 //! to the `git`/`gh` binaries via `tokio::process` behind port traits rather

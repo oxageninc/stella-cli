@@ -127,6 +127,10 @@ impl ToolRegistry {
             Arc::new(crate::project::RunTests),
             Arc::new(crate::ci::CiStatus),
             Arc::new(crate::screenshot::Screenshot),
+            // SVG generation is client-side (the model authors the SVG, the
+            // pipeline validates/sanitizes) — no provider key needed, so
+            // unlike image/video it is always registered.
+            Arc::new(crate::media::GenerateSvg),
         ];
         // The code-graph query tool exists only when `stella init` has built
         // an index — same conditional-registration discipline as the issue
@@ -135,9 +139,14 @@ impl ToolRegistry {
             entries.push(Arc::new(crate::graph::CodeGraphQuery));
         }
         // Media generation exists only when an image-capable provider key is
-        // configured — BYOK end to end.
+        // configured — BYOK end to end. The async video pair additionally
+        // needs the key family to have a video adapter.
         if let Some(media) = media_backend {
-            entries.push(Arc::new(crate::media::GenerateImage(media.provider)));
+            entries.push(Arc::new(crate::media::GenerateImage(media.image)));
+            if let Some(video) = media.video {
+                entries.push(Arc::new(crate::media::GenerateVideo(video.clone())));
+                entries.push(Arc::new(crate::media::PollVideo(video)));
+            }
         }
         // Issue tools exist only when a tracker is configured — no dead
         // schema entries burning tokens, no surface that errors on use.
@@ -784,11 +793,16 @@ mod tests {
         }
 
         // Conditionally-registered tools never show up in a bare registry's
-        // schemas (code_graph needs an index on disk, generate_image needs a
-        // media key), so the registry-driven loop above can't catch them
+        // schemas (code_graph needs an index on disk, the media tools need a
+        // capable key), so the registry-driven loop above can't catch them
         // drifting out of RESERVED_NAMES. Pin them explicitly — if you add a
         // new conditionally-registered tool, add its name to this array.
-        const CONDITIONALLY_REGISTERED: &[&str] = &["code_graph", "generate_image"];
+        const CONDITIONALLY_REGISTERED: &[&str] = &[
+            "code_graph",
+            "generate_image",
+            "generate_video",
+            "poll_video",
+        ];
         for name in CONDITIONALLY_REGISTERED {
             assert!(
                 crate::custom::RESERVED_NAMES.contains(name),
@@ -819,6 +833,7 @@ mod tests {
             "run_tests",
             "ci_status",
             "screenshot",
+            "generate_svg",
             "create_issue",
             "update_issue",
             "close_issue",
@@ -827,14 +842,14 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(names.len(), 20, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 21, "unexpected tool count: {names:?}");
     }
 
     #[test]
     fn issue_tools_absent_without_a_configured_backend() {
         let reg = ToolRegistry::with_issue_backend(PathBuf::from("/tmp"), None);
         let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
-        assert_eq!(names.len(), 15, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 16, "unexpected tool count: {names:?}");
         for absent in [
             "create_issue",
             "update_issue",
@@ -845,6 +860,71 @@ mod tests {
             assert!(
                 !names.contains(&absent.to_string()),
                 "{absent} must be absent"
+            );
+        }
+    }
+
+    #[test]
+    fn video_tools_register_only_with_a_video_capable_media_backend() {
+        // A provider that satisfies the port but is never called — tool
+        // registration is what's under test here, not generation.
+        struct NullMedia;
+        #[async_trait]
+        impl stella_media::MediaProvider for NullMedia {
+            fn id(&self) -> &str {
+                "null"
+            }
+            fn capabilities(&self) -> stella_media::MediaCapabilities {
+                stella_media::MediaCapabilities::default()
+            }
+            async fn generate_image(
+                &self,
+                _req: stella_media::ImageRequest,
+            ) -> Result<stella_media::MediaArtifact, stella_media::MediaError> {
+                Err(stella_media::MediaError::Terminal("not under test".into()))
+            }
+            async fn generate_video(
+                &self,
+                _req: stella_media::VideoRequest,
+            ) -> Result<stella_media::MediaJob, stella_media::MediaError> {
+                Err(stella_media::MediaError::Terminal("not under test".into()))
+            }
+            async fn poll_video(
+                &self,
+                _job: &stella_media::MediaJob,
+            ) -> Result<stella_media::MediaJobStatus, stella_media::MediaError> {
+                Err(stella_media::MediaError::Terminal("not under test".into()))
+            }
+        }
+        let provider: Arc<dyn stella_media::MediaProvider> = Arc::new(NullMedia);
+        let names = |backend| {
+            ToolRegistry::with_backends(PathBuf::from("/tmp"), None, Some(backend))
+                .schemas()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let with_video = names(crate::media::MediaBackend {
+            image: provider.clone(),
+            video: Some(provider.clone()),
+        });
+        for expected in ["generate_image", "generate_video", "poll_video"] {
+            assert!(
+                with_video.contains(&expected.to_string()),
+                "missing {expected}: {with_video:?}"
+            );
+        }
+
+        let image_only = names(crate::media::MediaBackend {
+            image: provider,
+            video: None,
+        });
+        assert!(image_only.contains(&"generate_image".to_string()));
+        for absent in ["generate_video", "poll_video"] {
+            assert!(
+                !image_only.contains(&absent.to_string()),
+                "{absent} must be absent without a video adapter"
             );
         }
     }
