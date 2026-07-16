@@ -412,6 +412,40 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
         theme::EMBER_FLAME
     };
 
+    // CACHE: the session prompt-cache hit rate — cumulative cache-read (hit)
+    // tokens over cumulative input tokens (a subset of it by the
+    // `CompletionUsage` contract, so the ratio is always in `[0, 1]`; clamped
+    // regardless), with the raw counts in parens. `—` before any usage has
+    // been metered.
+    let cache_hit = model.cache_hit_tokens();
+    let cache_total = model.total_input_tokens();
+    let cache_spans: Vec<Span<'static>> = if cache_total == 0 {
+        vec![Span::styled("—", val)]
+    } else {
+        let pct = ((cache_hit as f64 / cache_total as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0);
+        vec![
+            Span::styled(format!("{pct:.0}%"), val),
+            Span::styled(
+                format!(
+                    " ({}/{} tokens)",
+                    fmt_tokens(cache_hit),
+                    fmt_tokens(cache_total)
+                ),
+                dim,
+            ),
+        ]
+    };
+
+    // PIPELINE: ON when the session drives the staged pipeline, OFF for the
+    // raw engine loop (`model.pipeline`).
+    let (pipeline_txt, pipeline_style) = if model.pipeline {
+        ("ON", Style::default().fg(theme::SUCCESS_BRIGHT))
+    } else {
+        ("OFF", dim)
+    };
+
     // (label, value, priority) in SVG order. Higher priority survives a narrow
     // row longer; STAGE and CONTEXT are must-keep (`MUST_KEEP`) because the
     // stage and the token meter are the load-bearing cells (§5).
@@ -465,10 +499,16 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
             )],
             6,
         ),
+        ("CACHE", cache_spans, 4),
         (
             "AGENTS",
             vec![Span::styled(format!("{} active", model.active_count()), val)],
             4,
+        ),
+        (
+            "PIPELINE",
+            vec![Span::styled(pipeline_txt, pipeline_style)],
+            3,
         ),
     ];
 
@@ -585,6 +625,20 @@ fn fmt_k(n: u64) -> String {
         format!("{}k", n / 1000)
     } else if n >= 1_000 {
         format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Format a token count with uppercase scale suffixes and one decimal:
+/// `105.3M`, `211.4K`, `950` — the CACHE-cell convention. `fmt_k` (the context
+/// meter) caps at `k`; cumulative cache counts reach the millions, so this
+/// carries an `M` tier, matching the requested `67% (105.3M/211.4M tokens)`.
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
     } else {
         n.to_string()
     }
@@ -720,7 +774,9 @@ mod tests {
             ui.composer.insert_char(c);
         }
 
-        for (w, h) in [(80u16, 24u16), (120, 40)] {
+        // 160 (was 120) so the now-wider statline (with the CACHE + PIPELINE
+        // cells) still has room for the ethos chip, which is dropped first.
+        for (w, h) in [(80u16, 24u16), (160, 40)] {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|f| render_deck(&model, &mut ui, f)).unwrap();
             let text = buffer_text(term.backend().buffer());
@@ -862,10 +918,11 @@ mod tests {
 
     #[test]
     fn statline_shows_labeled_cells_and_the_ethos_chip() {
-        // A wide terminal fits every cell plus the (chrome) ethos chip.
+        // A wide terminal fits every cell plus the (chrome) ethos chip. 160
+        // (was 120) leaves room for the CACHE + PIPELINE cells added to the row.
         let model = running_model_with_queue();
         let ui = DeckUi::default();
-        let area = Rect::new(0, 0, 120, 2);
+        let area = Rect::new(0, 0, 160, 2);
         let mut buf = Buffer::empty(area);
         render_status_bar(&model, &ui, area, &mut buf);
         let text = buffer_text(&buf);
@@ -879,7 +936,9 @@ mod tests {
             "CPU",
             "CONTEXT",
             "SPEND",
+            "CACHE",
             "AGENTS",
+            "PIPELINE",
             "deterministic-first",
         ] {
             assert!(text.contains(needle), "statline missing {needle:?}:\n{text}");
@@ -900,6 +959,147 @@ mod tests {
         assert!(text.contains("stella"), "brand kept:\n{text}");
         assert!(text.contains("STAGE"), "stage kept:\n{text}");
         assert!(text.contains("CONTEXT"), "context meter kept:\n{text}");
+    }
+
+    /// One committed model call, carrying `input`/`cached` usage — the fold
+    /// that feeds the CACHE cell.
+    fn step_usage(input: u64, cached: u64) -> AgentEvent {
+        AgentEvent::StepUsage {
+            step: 1,
+            model: "glm".into(),
+            input_tokens: input,
+            output_tokens: 0,
+            cached_input_tokens: cached,
+            cache_write_tokens: 0,
+            estimated_input_tokens: 0,
+            cost_usd: 0.0,
+            duration_ms: 1,
+            retries: 0,
+            tool_calls: 0,
+        }
+    }
+
+    /// The running model plus one metered step with the given cache usage.
+    fn model_with_cache(input: u64, cached: u64) -> WorkspaceModel {
+        let mut m = running_model_with_queue();
+        m.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: step_usage(input, cached),
+        });
+        m
+    }
+
+    #[test]
+    fn statline_cache_box_shows_hit_rate_and_compact_token_counts() {
+        // 105.3M cache-read over 211.4M input → 50% (rounded), compact `M`s.
+        let model = model_with_cache(211_400_000, 105_300_000);
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("CACHE"), "cache label present:\n{text}");
+        assert!(
+            text.contains("50% (105.3M/211.4M tokens)"),
+            "cache hit rate + compact counts:\n{text}"
+        );
+    }
+
+    #[test]
+    fn statline_cache_box_sits_after_spend_and_before_agents() {
+        let model = model_with_cache(1_000, 500);
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        let pos = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?}:\n{text}"))
+        };
+        assert!(pos("SPEND") < pos("CACHE"), "CACHE after SPEND:\n{text}");
+        assert!(pos("CACHE") < pos("AGENTS"), "CACHE before AGENTS:\n{text}");
+        assert!(
+            pos("AGENTS") < pos("PIPELINE"),
+            "PIPELINE after AGENTS:\n{text}"
+        );
+    }
+
+    #[test]
+    fn statline_cache_box_renders_zero_and_full_hit_rates() {
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+
+        // 0%: input metered, nothing served from cache.
+        let cold = model_with_cache(1_000, 0);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&cold, &ui, area, &mut buf);
+        assert!(
+            buffer_text(&buf).contains("0% (0/1.0K tokens)"),
+            "cold cache reads 0%:\n{}",
+            buffer_text(&buf)
+        );
+
+        // 100%: every input token was a cache hit.
+        let warm = model_with_cache(1_000, 1_000);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&warm, &ui, area, &mut buf);
+        assert!(
+            buffer_text(&buf).contains("100% (1.0K/1.0K tokens)"),
+            "fully warm cache reads 100%:\n{}",
+            buffer_text(&buf)
+        );
+    }
+
+    #[test]
+    fn statline_cache_box_is_a_dash_before_any_usage() {
+        // No StepUsage metered yet → the CACHE cell shows the no-data dash and
+        // never divides by zero (the render below must not panic).
+        let model = running_model_with_queue();
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("CACHE"), "cache label still present:\n{text}");
+        assert!(
+            !text.contains("tokens"),
+            "no token counts before any usage:\n{text}"
+        );
+    }
+
+    #[test]
+    fn statline_pipeline_box_reads_on_or_off_with_the_mode() {
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+
+        let mut off = running_model_with_queue();
+        off.pipeline = false;
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&off, &ui, area, &mut buf);
+        let off_text = buffer_text(&buf);
+        assert!(off_text.contains("PIPELINE"), "pipeline label:\n{off_text}");
+        assert!(
+            off_text.contains("OFF"),
+            "raw engine loop reads OFF:\n{off_text}"
+        );
+
+        let mut on = running_model_with_queue();
+        on.pipeline = true;
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&on, &ui, area, &mut buf);
+        let on_text = buffer_text(&buf);
+        assert!(
+            !on_text.contains("OFF"),
+            "staged pipeline is not OFF:\n{on_text}"
+        );
+        // The CONTEXT *label* also contains "ON", so scope the positive check
+        // to the value row (the second rendered line).
+        let values = on_text.lines().nth(1).expect("value row");
+        assert!(
+            values.contains("ON"),
+            "staged pipeline reads ON:\n{on_text}"
+        );
     }
 
     #[test]

@@ -93,6 +93,11 @@ pub struct AgentEntry {
     pub status: AgentStatus,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Cumulative prompt-cache *read* (hit) tokens — the `cached_input_tokens`
+    /// sum from `StepUsage`. A subset of `tokens_in` by the `CompletionUsage`
+    /// contract (`cached_input_tokens ⊆ input_tokens`), so the session
+    /// cache-hit rate `cache_read_tokens / tokens_in` is always in `[0, 1]`.
+    pub cache_read_tokens: u64,
     /// Live spend. Authoritative once a `BudgetTick` has been seen (its
     /// `spent_usd` already covers step costs — mirrors the HUD accounting in
     /// `SessionModel`); until then, `StepUsage.cost_usd` accumulates here as
@@ -118,6 +123,7 @@ impl AgentEntry {
             status: AgentStatus::Queued,
             tokens_in: 0,
             tokens_out: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
             budget_ticked: false,
             last_activity_ms: started,
@@ -158,6 +164,12 @@ pub struct WorkspaceModel {
     /// field (sampled by [`crate::resource::ResourceMonitor`], not folded from
     /// events). Drives the status-bar gauge and dispatch backpressure.
     pub global_cpu_pct: f32,
+    /// Whether the session drives turns through the staged pipeline (triage →
+    /// plan → execute → verify → judge) rather than the raw engine loop.
+    /// Surfaced as the `PIPELINE` stat box. The deck runs the raw
+    /// `Engine::run_turn` path today, so this reads `false` there; it is the
+    /// seam to flip if the deck ever runs the staged pipeline.
+    pub pipeline: bool,
 }
 
 impl WorkspaceModel {
@@ -183,6 +195,19 @@ impl WorkspaceModel {
     /// The most-recently-routed model, if any route has been observed.
     pub fn latest_model(&self) -> Option<&str> {
         self.routes.entries.back().map(|e| e.model.as_str())
+    }
+
+    /// Cumulative prompt-cache hit tokens across all agents — the numerator of
+    /// the session cache-hit rate (a subset of [`Self::total_input_tokens`]).
+    pub fn cache_hit_tokens(&self) -> u64 {
+        self.agents.iter().map(|a| a.cache_read_tokens).sum()
+    }
+
+    /// Cumulative input tokens across all agents — the denominator of the
+    /// session cache-hit rate. `cache_hit_tokens ⊆ total_input_tokens` by the
+    /// `CompletionUsage` contract, so the ratio never exceeds 1.
+    pub fn total_input_tokens(&self) -> u64 {
+        self.agents.iter().map(|a| a.tokens_in).sum()
     }
 
     /// The **sole** mutator: fold one inbound envelope into the deck.
@@ -302,12 +327,14 @@ impl WorkspaceModel {
                 AgentEvent::StepUsage {
                     input_tokens,
                     output_tokens,
+                    cached_input_tokens,
                     model,
                     cost_usd,
                     ..
                 } => {
                     entry.tokens_in += input_tokens;
                     entry.tokens_out += output_tokens;
+                    entry.cache_read_tokens += cached_input_tokens;
                     entry.meta.model = Some(model.clone());
                     // Fallback accounting: a stream that never emits
                     // `BudgetTick` (scenario feeds, minimal drivers) still

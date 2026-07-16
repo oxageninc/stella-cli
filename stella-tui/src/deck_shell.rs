@@ -67,6 +67,10 @@ pub struct DeckOptions {
     /// `--no-anim` flag, for CI and asciinema-style recordings that want a
     /// static frame. Also forced on by `STELLA_NO_ANIM` or `NO_COLOR`.
     pub no_anim: bool,
+    /// Whether this session runs turns through the staged pipeline (triage →
+    /// plan → execute → verify → judge). Seeded into
+    /// [`WorkspaceModel::pipeline`] and surfaced as the `PIPELINE` stat box.
+    pub pipeline: bool,
 }
 
 fn now_ms() -> u64 {
@@ -284,6 +288,7 @@ pub async fn run_deck(
 
     let mut model = WorkspaceModel::new();
     model.now_ms = now_ms();
+    model.pipeline = opts.pipeline;
     let mut ui = DeckUi::new(Composer::with_paste_threshold(
         crate::composer::DECK_PASTE_LINE_THRESHOLD,
     ));

@@ -282,6 +282,9 @@ pub async fn run_deck_session(
         slash_commands: deck_slash_commands(&custom),
         initial_graph: agent::graph_snapshot(&cfg.workspace_root),
         no_anim,
+        // The deck drives turns through the raw `Engine::run_turn` path (see
+        // `run_lead_turn`), not the staged pipeline, so PIPELINE reads OFF here.
+        pipeline: false,
         ..Default::default()
     };
     // The deck owns its channel ends and runs on its own task so rendering
