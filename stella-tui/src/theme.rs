@@ -43,6 +43,28 @@ pub const DIFF_ADD_BG: Color = Color::Rgb(20, 44, 26);
 /// Subtle background tint behind removed diff lines (pair with [`BAD`]).
 pub const DIFF_DEL_BG: Color = Color::Rgb(52, 24, 26);
 
+// ── Syntax highlighting (diff bodies) ───────────────────────────────────────
+//
+// A four-color code palette layered *under* the add/remove diff semantics:
+// the `+`/`-` background always wins (add/remove is never lost — see
+// `crate::diff`), while a recognized token overrides only the foreground.
+// Every color is chosen to read on all three diff backdrops (add green, del
+// red, and the plain panel) and to stay inside the amber/ember brand family —
+// never pink/purple. Keyword rides the brand amber so code structure pops the
+// way the accent does everywhere else; strings take a softer warm sand so they
+// separate from keywords without a second saturated hue; numbers take a
+// lighter cousin of the cool [`RUN`] cyan used across the deck (brightened to
+// read on the diff backdrops); comments dim toward [`MUTED`].
+
+/// Language keyword (`fn`/`let`/`def`/`import`/`return`…).
+pub const SYNTAX_KEYWORD: Color = AMBER;
+/// String / char literal.
+pub const SYNTAX_STRING: Color = Color::Rgb(214, 184, 120);
+/// Numeric literal.
+pub const SYNTAX_NUMBER: Color = Color::Rgb(126, 197, 214);
+/// Line comment (rendered dimmed + italic).
+pub const SYNTAX_COMMENT: Color = Color::Rgb(118, 124, 134);
+
 // ── Activity spinner ────────────────────────────────────────────────────────
 
 /// Burnt-sunset ember ramp, dark → bright, for the working-spinner gradient —

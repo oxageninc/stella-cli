@@ -268,6 +268,12 @@ fn classify_zai_429(body: &str, retry_after_ms: Option<u64>) -> ProviderError {
 struct ZaiStreamChoice {
     #[serde(default)]
     delta: ZaiStreamDelta,
+    /// Why generation ended for this choice. `"length"` is the OpenAI-
+    /// compatible signal that the output was cut off at `max_tokens` — the
+    /// truncation marker a partially-streamed tool call needs so it can be
+    /// reported rather than silently nulled.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -459,6 +465,10 @@ async fn aggregate_zai_stream(
     let mut text = String::new();
     let mut usage = CompletionUsage::default();
     let mut tool_calls: BTreeMap<usize, ToolCallAccumulator> = BTreeMap::new();
+    // Set once any choice reports `finish_reason: "length"` — the output was
+    // cut off at the token limit, so a tool call whose argument JSON didn't
+    // finish streaming is truncated, not merely malformed.
+    let mut truncated_at_token_limit = false;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = http::next_with_timeout(&mut stream, http::STREAM_IDLE_TIMEOUT).await? {
@@ -484,6 +494,9 @@ async fn aggregate_zai_stream(
                 usage.output_tokens = u.completion_tokens;
             }
             for choice in parsed.choices {
+                if choice.finish_reason.as_deref() == Some("length") {
+                    truncated_at_token_limit = true;
+                }
                 if let Some(content) = choice.delta.content {
                     text.push_str(&content);
                 }
@@ -505,21 +518,63 @@ async fn aggregate_zai_stream(
         }
     }
 
+    // OpenAI-style tool calls stream sequentially by index, so when the
+    // stream reports `finish_reason: "length"` only the highest-index call
+    // can be the one the token limit cut. Pinning truncation there keeps the
+    // blame on the right call — an earlier call whose JSON is broken is the
+    // model's own malformed output and still gets the repair sentinel below.
+    let truncated_index = if truncated_at_token_limit {
+        tool_calls.keys().next_back().copied()
+    } else {
+        None
+    };
+
     let mut calls = Vec::with_capacity(tool_calls.len());
-    for acc in tool_calls.into_values() {
+    for (index, acc) in tool_calls {
+        let truncated = Some(index) == truncated_index;
         let trimmed = acc.arguments.trim();
-        // A no-argument tool call arrives as `arguments: ""`; that is an empty
-        // object, not null — a downstream tool deserializing its input as an
-        // object must not be handed `null`. A *non-empty* body that fails to
-        // parse is the model's own broken JSON (GLM emits these): fall back to
-        // the `Value::Null` sentinel `driver.rs::execute_with_repair` checks
-        // for, so the repair loop — documented as tuned to GLM's failure shapes
-        // — can ask the model to retry, rather than erroring out the whole turn
-        // before any `ToolCall` is produced. Mirrors openai.rs / anthropic.rs.
         let input = if trimmed.is_empty() {
+            if truncated {
+                // The limit landed after the call's id/name but before any
+                // argument fragment: executing it with `{}` would fail on
+                // missing parameters and re-enter the same unwinnable
+                // retry-retruncate loop as a mid-payload cut.
+                return Err(http::truncated_tool_input_error(
+                    label,
+                    &acc.name,
+                    "",
+                    "finish_reason=length",
+                ));
+            }
+            // A no-argument tool call arrives as `arguments: ""`; that is an
+            // empty object, not null — a downstream tool deserializing its
+            // input as an object must not be handed `null`.
             Value::Object(serde_json::Map::new())
         } else {
-            serde_json::from_str(trimmed).unwrap_or(Value::Null)
+            match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                // The stream stopped at the token limit MID-arguments: the
+                // JSON is truncated, not the model's own broken syntax.
+                // Terminal and turn-aborting — mirroring openai.rs's
+                // `response.incomplete` handling — because retrying the
+                // identical request re-truncates identically (the reported
+                // "stuck-loop" defect).
+                Err(_) if truncated => {
+                    return Err(http::truncated_tool_input_error(
+                        label,
+                        &acc.name,
+                        trimmed,
+                        "finish_reason=length",
+                    ));
+                }
+                // A *non-empty* body that fails to parse without being the
+                // truncated call is the model's own broken JSON (GLM emits
+                // these): fall back to the `Value::Null` sentinel
+                // `driver.rs::execute_with_repair` checks for, so the repair
+                // loop — documented as tuned to GLM's failure shapes — can
+                // ask the model to retry. Mirrors anthropic.rs.
+                Err(_) => Value::Null,
+            }
         };
         calls.push(ToolCall {
             call_id: acc.id,
@@ -728,6 +783,138 @@ mod tests {
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].name, "bash");
         assert_eq!(result.tool_calls[0].input, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn complete_surfaces_a_tool_call_truncated_at_the_token_limit_not_null() {
+        let server = MockServer::start().await;
+        // GLM streams a large tool call, but the output is cut off at the token
+        // limit MID-arguments: the final chunk carries `finish_reason: "length"`
+        // and the accumulated `arguments` is an unterminated JSON fragment.
+        // Unlike the malformed-but-complete case (which becomes the repair
+        // sentinel), a truncation is a terminal, actionable failure that must
+        // surface with a raw snippet — never a silent null the repair loop
+        // spins on forever (the reported "stuck-loop").
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"write_file\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"# Title\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider =
+            ZaiProvider::new(ApiKey::new("sk-test-zai"), "glm-5.2").with_base_url(server.uri());
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage::user("write the readme")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![ToolSchema {
+                name: "write_file".into(),
+                description: "Write a file".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+            }],
+        };
+
+        let err = provider.complete(req).await.unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Terminal(_)),
+            "a truncated tool call must be terminal, got {err:?}"
+        );
+        assert!(!err.is_retryable(), "re-issuing the request re-truncates");
+        let msg = err.to_string();
+        assert!(msg.contains("write_file"), "names the tool: {msg}");
+        assert!(
+            msg.contains("finish_reason=length"),
+            "names the cause: {msg}"
+        );
+        assert!(msg.contains("README.md"), "carries a raw snippet: {msg}");
+    }
+
+    /// With parallel tool calls and a `finish_reason: "length"` cut, the
+    /// truncation error must blame the call that was actually cut (the
+    /// highest index — the one still streaming) — an earlier call whose
+    /// complete-but-broken JSON is GLM's own output must not be misreported
+    /// as truncated.
+    #[tokio::test]
+    async fn truncation_is_blamed_on_the_last_call_not_an_earlier_broken_one() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{not valid json\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"README\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider =
+            ZaiProvider::new(ApiKey::new("sk-test-zai"), "glm-5.2").with_base_url(server.uri());
+        let err = provider
+            .complete(CompletionRequest {
+                messages: vec![CompletionMessage::user("do both")],
+                max_output_tokens: None,
+                temperature: None,
+                effort: None,
+                tools: vec![],
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("write_file"),
+            "blames the truncated call: {msg}"
+        );
+        assert!(
+            !msg.contains("bash"),
+            "must not blame the earlier repairable call: {msg}"
+        );
+    }
+
+    /// `finish_reason: "length"` landing after a call's id/name but before
+    /// any argument fragment must surface the terminal truncation error —
+    /// never a silent `{}` that executes with missing parameters.
+    #[tokio::test]
+    async fn a_tool_call_with_no_arguments_cut_at_the_token_limit_is_terminal() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"write_file\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider =
+            ZaiProvider::new(ApiKey::new("sk-test-zai"), "glm-5.2").with_base_url(server.uri());
+        let err = provider
+            .complete(CompletionRequest {
+                messages: vec![CompletionMessage::user("write the readme")],
+                max_output_tokens: None,
+                temperature: None,
+                effort: None,
+                tools: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Terminal(_)),
+            "expected Terminal, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("write_file"), "names the tool: {msg}");
     }
 
     #[tokio::test]

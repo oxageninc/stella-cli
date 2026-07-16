@@ -48,6 +48,7 @@ pub mod diff;
 pub mod envelope;
 pub mod fx;
 pub mod graph;
+pub mod markdown;
 pub mod resource;
 pub mod scenario;
 pub mod splash;

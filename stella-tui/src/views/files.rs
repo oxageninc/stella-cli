@@ -288,7 +288,7 @@ fn render_diff_pane(
         .unwrap_or((0, 0));
     match diff_text {
         Some(text) if !text.is_empty() => {
-            let lines = diff::body_lines(&text);
+            let lines = diff::body_lines(&text, record.map(|r| r.path.as_str()));
             let total = lines.len();
             ui.metrics.files_diff_total = total;
             ui.metrics.files_diff_height = inner_h;

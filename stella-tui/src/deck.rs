@@ -232,6 +232,12 @@ impl WorkspaceModel {
                     kind: TraceKind::Stage,
                     summary: format!("▶ {}", snip(text)),
                 });
+                // Show the user's prompt inline in the agent's transcript so
+                // the conversational scrollback is self-contained, matching
+                // the Crush-style layout where user messages are visible.
+                if let Some(idx) = self.index_of(agent) {
+                    self.agents[idx].model.push_user_prompt(text);
+                }
             }
             // The graph snapshot is an out-of-band read-model, not part of the
             // event-log fold — the view state owns it, applied in

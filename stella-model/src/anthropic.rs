@@ -125,7 +125,15 @@ enum AnthropicStreamEvent {
         delta: AnthropicDelta,
     },
     #[serde(rename = "message_delta")]
-    MessageDelta { usage: Option<AnthropicUsage> },
+    MessageDelta {
+        /// Carries `stop_reason` — `"max_tokens"` when the model was cut off
+        /// at the output-token limit. Tracked so a tool call whose argument
+        /// JSON was truncated mid-stream surfaces an actionable error instead
+        /// of a silent `Null` (see [`crate::http::truncated_tool_input_error`]).
+        #[serde(default)]
+        delta: AnthropicMessageDeltaBody,
+        usage: Option<AnthropicUsage>,
+    },
     /// A mid-stream error event. The Messages API can send
     /// `event: error` / `data: {"type":"error","error":{...}}` after already
     /// streaming content — modeled explicitly so it aborts the turn with a
@@ -135,6 +143,16 @@ enum AnthropicStreamEvent {
     Error { error: AnthropicStreamError },
     #[serde(other)]
     Other,
+}
+
+/// The `delta` object of a `message_delta` event. Only `stop_reason` is
+/// modeled — it is how the Messages API signals *why* generation ended, and
+/// `"max_tokens"` specifically means the output was cut off at the token
+/// limit (potentially mid-tool-call).
+#[derive(Deserialize, Debug, Default)]
+struct AnthropicMessageDeltaBody {
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -362,6 +380,15 @@ async fn aggregate_anthropic_stream(
     let mut text = String::new();
     let mut usage = CompletionUsage::default();
     let mut tool_uses: BTreeMap<usize, ToolUseAccumulator> = BTreeMap::new();
+    // Why generation ended, from the `message_delta` event. `"max_tokens"`
+    // means the stream was cut off at the output-token limit — the signal a
+    // truncated tool-call payload needs to be reported as such rather than
+    // silently nulled.
+    let mut stop_reason: Option<String> = None;
+    // The highest content-block index that started. Blocks stream
+    // sequentially, so only this block can have been cut off by the token
+    // limit — a later block starting proves every earlier one closed.
+    let mut last_block_index: Option<usize> = None;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = http::next_with_timeout(&mut stream, http::STREAM_IDLE_TIMEOUT).await? {
@@ -387,16 +414,19 @@ async fn aggregate_anthropic_stream(
                 }
                 Ok(AnthropicStreamEvent::ContentBlockStart {
                     index,
-                    content_block: AnthropicStartBlock::ToolUse { id, name },
+                    content_block,
                 }) => {
-                    tool_uses.insert(
-                        index,
-                        ToolUseAccumulator {
-                            id,
-                            name,
-                            input_json: String::new(),
-                        },
-                    );
+                    last_block_index = Some(index);
+                    if let AnthropicStartBlock::ToolUse { id, name } = content_block {
+                        tool_uses.insert(
+                            index,
+                            ToolUseAccumulator {
+                                id,
+                                name,
+                                input_json: String::new(),
+                            },
+                        );
+                    }
                 }
                 Ok(AnthropicStreamEvent::ContentBlockDelta { index, delta }) => match delta {
                     AnthropicDelta::TextDelta { text: delta } => text.push_str(&delta),
@@ -407,14 +437,19 @@ async fn aggregate_anthropic_stream(
                     }
                     AnthropicDelta::Other => {}
                 },
-                Ok(AnthropicStreamEvent::MessageDelta { usage: Some(u) }) => {
-                    if u.input_tokens > 0 {
-                        usage.input_tokens = u.input_tokens + u.cache_read_input_tokens;
+                Ok(AnthropicStreamEvent::MessageDelta { delta, usage: u }) => {
+                    if let Some(reason) = delta.stop_reason {
+                        stop_reason = Some(reason);
                     }
-                    if u.cache_read_input_tokens > 0 {
-                        usage.cached_input_tokens = u.cache_read_input_tokens;
+                    if let Some(u) = u {
+                        if u.input_tokens > 0 {
+                            usage.input_tokens = u.input_tokens + u.cache_read_input_tokens;
+                        }
+                        if u.cache_read_input_tokens > 0 {
+                            usage.cached_input_tokens = u.cache_read_input_tokens;
+                        }
+                        usage.output_tokens = u.output_tokens;
                     }
-                    usage.output_tokens = u.output_tokens;
                 }
                 Ok(_) => {}
                 Err(_) => {
@@ -425,21 +460,70 @@ async fn aggregate_anthropic_stream(
         }
     }
 
-    let tool_calls = tool_uses
-        .into_values()
-        .map(|acc| {
-            let input = if acc.input_json.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_str(&acc.input_json).unwrap_or(serde_json::Value::Null)
-            };
-            ToolCall {
-                call_id: acc.id,
-                name: acc.name,
-                input,
+    // The one content block the token limit could have cut: the last block
+    // started, and only when the stream actually stopped at `max_tokens`.
+    // Pinning truncation to that block keeps the blame on the call that was
+    // cut — an *earlier* call whose JSON is broken is the model's own
+    // malformed output and still gets the repair sentinel below.
+    let truncated_index = if stop_reason.as_deref() == Some("max_tokens") {
+        last_block_index
+    } else {
+        None
+    };
+
+    let mut tool_calls = Vec::with_capacity(tool_uses.len());
+    for (index, acc) in tool_uses {
+        let truncated = Some(index) == truncated_index;
+        let input = if acc.input_json.is_empty() {
+            if truncated {
+                // The limit landed after this call's `content_block_start`
+                // but before its first `input_json_delta`: executing it with
+                // `{}` would fail on missing parameters and re-enter the same
+                // unwinnable retry-retruncate loop as a mid-payload cut.
+                return Err(http::truncated_tool_input_error(
+                    "Anthropic",
+                    &acc.name,
+                    "",
+                    "stop_reason=max_tokens",
+                ));
             }
-        })
-        .collect();
+            // A no-argument tool call arrives with no `input_json_delta` at
+            // all: that is an empty object, never null.
+            serde_json::json!({})
+        } else {
+            match serde_json::from_str(&acc.input_json) {
+                Ok(value) => value,
+                // The fragments were concatenated byte-exactly (the SSE
+                // decoder's own tests prove arbitrary chunk boundaries
+                // reassemble losslessly), so an unparseable buffer on the
+                // block the token limit cut means the arguments never
+                // finished streaming. Terminal and turn-aborting — mirroring
+                // openai.rs's `response.incomplete` handling — because
+                // retrying the identical request re-truncates identically:
+                // the old silent `Null` here sent the driver's repair loop
+                // into exactly that "stuck-loop".
+                Err(_) if truncated => {
+                    return Err(http::truncated_tool_input_error(
+                        "Anthropic",
+                        &acc.name,
+                        &acc.input_json,
+                        "stop_reason=max_tokens",
+                    ));
+                }
+                // Broken JSON on a block that *finished* is the model's own
+                // malformed output: fall back to the `Value::Null` sentinel
+                // `driver.rs::execute_with_repair` consumes (the documented
+                // adapter contract), so the repair loop asks the model to
+                // re-emit just this call instead of aborting the turn.
+                Err(_) => serde_json::Value::Null,
+            }
+        };
+        tool_calls.push(ToolCall {
+            call_id: acc.id,
+            name: acc.name,
+            input,
+        });
+    }
 
     Ok((text, tool_calls, usage))
 }
@@ -450,6 +534,257 @@ mod tests {
     use stella_protocol::MessageRole;
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The reported failure's happy path: a multi-kilobyte `write_file` tool
+    /// call whose argument JSON is split across HUNDREDS of `input_json_delta`
+    /// fragments (and thus many SSE events / network chunks) must reassemble
+    /// to the exact JSON object — never a truncated buffer or `null`. Proves
+    /// the assembly itself is sound for large payloads; the null only ever
+    /// came from genuine truncation, handled by the test below.
+    #[tokio::test]
+    async fn complete_reassembles_a_large_multi_fragment_tool_call() {
+        let server = MockServer::start().await;
+        // A realistic large `write_file` content field: several KB, with the
+        // newlines, quotes and backslashes a real README carries.
+        let mut content = String::new();
+        for i in 0..200 {
+            content.push_str(&format!(
+                "## Section {i}\n\nSome \"quoted\" text with a backslash \\ and a tab\there.\n\n"
+            ));
+        }
+        let full_input = serde_json::json!({"path": "README.md", "content": content});
+        let full_input_json = serde_json::to_string(&full_input).unwrap();
+
+        // Fragment the JSON at arbitrary byte-ish boundaries (chars), exactly
+        // as Anthropic streams `partial_json` — including splits mid-escape.
+        let chars: Vec<char> = full_input_json.chars().collect();
+        let mut body = String::from(
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":40,\"output_tokens\":0}}}\n\n\
+             event: content_block_start\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"write_file\"}}\n\n",
+        );
+        for piece in chars.chunks(29) {
+            let frag: String = piece.iter().collect();
+            let escaped = serde_json::to_string(&frag).unwrap();
+            body.push_str("event: content_block_delta\n");
+            body.push_str(&format!(
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{escaped}}}}}\n\n"
+            ));
+        }
+        body.push_str(
+            "event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":0,\"output_tokens\":15}}\n\n",
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(ApiKey::new("sk-test"), "claude-fable-5")
+            .with_base_url(server.uri());
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage::user("write the readme")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![stella_protocol::tool::ToolSchema {
+                name: "write_file".into(),
+                description: "Write a file".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+            }],
+        };
+
+        let result = provider.complete(req).await.expect("should succeed");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(
+            result.tool_calls[0].input, full_input,
+            "large multi-fragment tool input must reassemble to the exact JSON, not null"
+        );
+    }
+
+    /// The reported bug's failure path: the model starts a large `write_file`
+    /// tool call but the stream stops at the output-token limit MID-JSON —
+    /// `partial_json` is an unterminated fragment and `message_delta` carries
+    /// `stop_reason: "max_tokens"`. The adapter must NOT silently emit a
+    /// tool call with `null` input (which the driver's repair loop can never
+    /// fix, producing the observed "stuck-loop"); it must surface a clear,
+    /// non-retryable Terminal error naming the truncation and carrying a raw
+    /// snippet of what was accumulated.
+    #[tokio::test]
+    async fn complete_surfaces_a_truncated_tool_call_instead_of_silent_null() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"write_file\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"# Title\\\\nlots of\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":8192}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(ApiKey::new("sk-test"), "claude-fable-5")
+            .with_base_url(server.uri());
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage::user("write the readme")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![stella_protocol::tool::ToolSchema {
+                name: "write_file".into(),
+                description: "Write a file".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+            }],
+        };
+
+        let err = provider.complete(req).await.unwrap_err();
+        // A truncated-at-max_tokens tool call is a terminal, non-retryable
+        // failure — retrying with the same output budget re-truncates.
+        assert!(
+            matches!(err, ProviderError::Terminal(_)),
+            "expected Terminal, got {err:?}"
+        );
+        assert!(!err.is_retryable());
+        let msg = err.to_string();
+        assert!(msg.contains("write_file"), "names the tool: {msg}");
+        assert!(msg.contains("max_tokens"), "names the cause: {msg}");
+        // The raw accumulated snippet must be surfaced, never dropped to null.
+        assert!(msg.contains("README.md"), "carries a raw snippet: {msg}");
+    }
+
+    /// Broken JSON on a call that *finished* streaming (the stream did not
+    /// stop at `max_tokens`) is the model's own malformed output — the
+    /// adapter must keep the `Value::Null` repair sentinel the driver's
+    /// documented repair loop consumes, not abort the turn.
+    #[tokio::test]
+    async fn malformed_but_complete_tool_json_falls_back_to_the_null_repair_sentinel() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"edit_file\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": not json,}\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":40}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(ApiKey::new("sk-test"), "claude-fable-5")
+            .with_base_url(server.uri());
+        let result = provider
+            .complete(CompletionRequest {
+                messages: vec![CompletionMessage::user("edit the file")],
+                max_output_tokens: None,
+                temperature: None,
+                effort: None,
+                tools: vec![],
+            })
+            .await
+            .expect("a repairable malformed call must not abort the turn");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].input, serde_json::Value::Null);
+    }
+
+    /// `max_tokens` landing between a tool call's `content_block_start` and
+    /// its first `input_json_delta` must surface the same terminal truncation
+    /// error as a mid-payload cut — never a silent `{}` that executes with
+    /// missing parameters and re-enters the retry-retruncate loop.
+    #[tokio::test]
+    async fn a_tool_call_with_no_arguments_cut_at_max_tokens_is_terminal() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"write_file\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":8192}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(ApiKey::new("sk-test"), "claude-fable-5")
+            .with_base_url(server.uri());
+        let err = provider
+            .complete(CompletionRequest {
+                messages: vec![CompletionMessage::user("write the readme")],
+                max_output_tokens: None,
+                temperature: None,
+                effort: None,
+                tools: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Terminal(_)),
+            "expected Terminal, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("write_file"), "names the tool: {msg}");
+        assert!(msg.contains("max_tokens"), "names the cause: {msg}");
+    }
+
+    /// With parallel tool calls, the truncation error must blame the call the
+    /// token limit actually cut (the last block started) — an earlier call
+    /// whose complete-but-broken JSON is the model's own output must not be
+    /// misreported as truncated.
+    #[tokio::test]
+    async fn truncation_is_blamed_on_the_call_that_was_cut_not_an_earlier_broken_one() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"edit_file\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": broken,}\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"write_file\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":8192}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(ApiKey::new("sk-test"), "claude-fable-5")
+            .with_base_url(server.uri());
+        let err = provider
+            .complete(CompletionRequest {
+                messages: vec![CompletionMessage::user("do both")],
+                max_output_tokens: None,
+                temperature: None,
+                effort: None,
+                tools: vec![],
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("write_file"),
+            "blames the truncated call: {msg}"
+        );
+        assert!(
+            !msg.contains("edit_file"),
+            "must not blame the earlier repairable call: {msg}"
+        );
+    }
 
     #[test]
     fn to_anthropic_messages_hoists_system_and_maps_roles() {

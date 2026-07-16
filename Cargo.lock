@@ -2837,6 +2837,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tui-big-text",
+ "unicode-width",
 ]
 
 [[package]]

@@ -6,347 +6,82 @@
   </picture>
 </p>
 
-<p align="center"><strong>A fast, Gragh RAG with embeddings, BYOK, model-agnostic terminal coding agent, built in Rust.</strong></p>
+<p align="center"><strong>A fast, BYOK, model-agnostic terminal coding agent, built in Rust.</strong></p>
 <p align="center">
   <a href="https://github.com/oxageninc/stella/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/oxageninc/stella/ci.yml?branch=main&style=flat-square&logo=github&label=ci" alt="CI status"></a>
   <a href="https://github.com/oxageninc/stella/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/oxageninc/stella/release.yml?style=flat-square&logo=github&label=release" alt="Release status"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-FFAC26?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/rust-1.90%2B-FFAC26?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.90+">
   <img src="https://img.shields.io/badge/providers-9%20%2B%20local-FFAC26?style=flat-square" alt="9 providers + local">
-  <img src="https://img.shields.io/badge/phone--home-none-1f7a3d?style=flat-square" alt="No phone-home">
-  <img src="https://img.shields.io/badge/telemetry-local%20SQLite-1f7a3d?style=flat-square" alt="Local SQLite telemetry">
-  <a href="#the-arena"><img src="https://img.shields.io/badge/%E2%9A%94_arena-open_challenge-E5484D?style=flat-square" alt="Arena — open challenge"></a>
-  <a href="https://github.com/sponsors/macanderson"><img src="https://img.shields.io/badge/%E2%99%A5_sponsor-stella-EA4AAA?style=flat-square" alt="Sponsor Stella"></a>
 </p>
 
 <p align="center">
   <a href="https://docs.oxagen.sh/stella"><b>Website</b></a> ·
   <a href="https://docs.oxagen.sh/docs/stella"><b>Docs</b></a> ·
-  <a href="https://docs.oxagen.sh/docs/stella/quickstart"><b>Quickstart</b></a> ·
-  <a href="#why-stella-stands-apart"><b>Why it's different</b></a> ·
-  <a href="#the-arena"><b>⚔ The Arena</b></a> ·
-  <a href="https://oxagen.sh/#field-manual"><b>The Field Manual</b></a>
+  <a href="https://docs.oxagen.sh/docs/stella/quickstart"><b>Quickstart</b></a>
 </p>
 
-<div align="center">
+Stella is an open-source, bring-your-own-key (BYOK) coding agent that runs in
+your terminal. It supports nine hosted model providers plus any local
+OpenAI-compatible server, keeps all telemetry in a local SQLite database (no
+phone-home), and enforces a hard per-run budget. It is built in Rust as a
+workspace of focused crates.
 
-`·  ·  ✦  ·  ·  ───────────────────────────────────────────────  ·  ·  ✦  ·  ·`
+## Features
 
-</div>
-
-> **The field manual is the theory. Stella is the running code.**
->
-> Stella is the open-source reference implementation of [*Engineering Deterministic
-> AI Coding Agents*](https://oxagen.sh/#field-manual) — Oxagen's 14-part field manual on why
-> "the next leap in AI coding isn't a bigger model, it's a better system around the
-> model." Every design decision below traces back to a chapter of that manual and to
-> the primary research it cites. From the makers of [Oxagen](https://docs.oxagen.sh).
-
-## Why Stella stands apart
-
-Most coding agents search, guess, and stop at *"the test suite is green."* Stella
-is engineered around a harder contract — and every row below is a working feature
-of the shipping `stella` CLI today, not a roadmap item:
-
-| | What most agents do | What Stella does | Manual |
-|---|---|---|---|
-| 🎯 **Done** | Stop when the suite is green | Stop only when a **witness test fails on the old code and passes on the new** (`WITNESS CONFIRMED`) | Part 10 |
-| 🔑 **Models** | Locked to one vendor / one account | **BYOK, 9 providers + any local server** — auto-detected, pinnable per run | Part 14 |
-| 🧵 **Orchestration** | Sprawling multi-agent swarms that lose the plot | One **deterministic single-thread engine** — no coordinator tax | Part 9 |
-| 💾 **Memory** | Re-read the world every session | **Prompt-cache-native** lessons in a byte-stable prompt (~0.1× input price) | Parts 6 & 11 |
-| 📡 **Telemetry** | Phone home to a SaaS backend | **Zero phone-home.** Every event in a local `SQLite` file — your data, your disk | Part 13 |
-| 💰 **Cost** | Runs until you notice the bill | A **hard `--budget`** that aborts cleanly, never mid-tool | Part 1 |
-
-<div align="center">
-
-`·  ·  ✦  ·  ·  ───────────────────────────────────────────────  ·  ·  ✦  ·  ·`
-
-</div>
-
-<a id="the-arena"></a>
-
-## ⚔ The Arena
-
-```text
-       ·  ✦   ·        ·   ✦        .   ·      ✦   .        ·
-    █████╗ ██████╗ ███████╗███╗   ██╗ █████╗      ·   .   ✦
-   ██╔══██╗██╔══██╗██╔════╝████╗  ██║██╔══██╗         ·
-   ███████║██████╔╝█████╗  ██╔██╗ ██║███████║     ✦        ·
-   ██╔══██║██╔══██╗██╔══╝  ██║╚██╗██║██╔══██║        ·   .
-   ██║  ██║██║  ██║███████╗██║ ╚████║██║  ██║    ·      ✦
-   ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝      .   ·
-   same model · same budget · official scoring · receipts or it didn't happen
-```
-
-**This repo is a standing challenge.** Stella exists because we are sick of token
-waste and average agent runners — agents that re-read the world every session,
-spiral through retry loops on your dime, and declare victory on a green suite
-nobody witnessed. We didn't build Stella to coexist with Claude Code, Codex CLI,
-Gemini CLI, and Aider. We built it to **beat them, in public, with receipts** —
-and the harness to prove it ships in this repo.
-
-```text
-   STELLA ────────────────────⚔────────────────────  THE BIG BOYS
-   your keys · 9 providers + local  │  one vendor, their account
-   telemetry on your disk (SQLite)  │  telemetry in their cloud
-   WITNESS CONFIRMED                │  "looks done to me"
-   hard --budget, aborts cleanly    │  runs until you notice the bill
-   $ per resolved task              │  $ per vibe
-```
-
-### The rules — receipts or it didn't happen
-
-1. **Same model on both sides.** BYOK makes this a fair fight: run the exact same
-   `claude-fable-5` under Stella and under Claude Code, and the *harness* — not
-   the model — is the variable being measured.
-2. **Same per-task budget.** Every instance is capped by `--budget`. Burning 4×
-   the tokens to tie is a loss.
-3. **Official scoring only.** SWE-bench Verified's Docker evaluator, unmodified.
-   No self-graded homework.
-4. **Publish everything.** `predictions.jsonl`, `summary.json`, per-instance
-   logs, and the token/cost numbers straight out of your local SQLite telemetry.
-   If it can't be reproduced, it didn't happen.
-
-### Pick your division
-
-| Division | The game | Wins on |
-|---|---|---|
-| 🥇 **Heavyweight** | Frontier model, $2/task cap | Highest resolve rate |
-| 🪶 **Featherweight** | Any model, any cap | Lowest **$ per resolved task** |
-| 🔌 **Off-grid** | Local models only (`--base-url`, zero API keys) — [the guide](docs/off-grid.md) | Resolve rate at $0 marginal cost |
-| ⚔️ **Cross-harness** | Same model, Stella vs. any other agent CLI | Biggest head-to-head gap |
-
-### Enter
-
-```bash
-# 1 · build the contender
-cargo build --release -p stella-cli
-
-# 2 · validate the wiring — spends nothing
-python3 bench/run_swebench.py --instances bench/instances.sample.jsonl --dry-run
-
-# 3 · fight — your keys, your budget
-export ANTHROPIC_API_KEY=...   # or any provider you prefer
-python3 bench/run_swebench.py --limit 25 --model anthropic/claude-fable-5 --budget 2.0
-
-# 4 · score with the official evaluator (Docker required)
-pip install swebench
-python -m swebench.harness.run_evaluation \
-  --predictions_path bench/results/<run-id>/predictions.jsonl \
-  --run_id <run-id> --dataset_name princeton-nlp/SWE-bench_Verified
-
-# 5 · submit — packages the receipts (sha-256 over predictions) and drafts
-#     the submission issue in the required title format
-stella arena submit bench/results/<run-id> --matchup "stella vs claude-code"
-stella arena leaderboard          # the standings, from bench/leaderboard.json
-```
-
-The full harness docs live in [`bench/`](bench/README.md), and a
-[Harbor](https://www.harborframework.com/) adapter for containerized, at-scale,
-head-to-head runs against other agents lives in
-[`bench/harbor_adapter/`](bench/harbor_adapter/README.md).
-
-For the **Cross-harness** division, [`arena`](https://github.com/oxageninc/arena)
-is a standalone, open-source runner that pits Stella against Claude Code, Gemini
-CLI, Oxagen, and any agent you bolt on — same model, same budget, held-out tests
-the agent can't see or author, and paired statistics (Wilson intervals, exact
-McNemar, bootstrap CIs), with every run's manifest, transcripts, and diffs kept
-as receipts.
-
-### The leaderboard
-
-| # | Pilot | Match-up | Model | Division | Resolved | $/resolved | Receipts |
-|---|---|---|---|---|---|---|---|
-| 1 | *your name here* | — | — | — | — | — | — |
-
-> This board starts **empty on purpose.** No marketing numbers, no cherry-picked
-> internal runs — every row that ever lands here comes from a community-submitted,
-> officially-scored, fully-receipted run, and the first entries are permanent. To
-> submit, open an issue titled
-> **`arena: <agent A> vs <agent B> — <model> @ $<budget>`** with your artifacts
-> attached. Post your losses too: a loss with receipts is a bug report, and bug
-> reports get fixed.
-
-<div align="center">
-
-`·  ·  ✦  ·  ·  ───────────────────────────────────────────────  ·  ·  ✦  ·  ·`
-
-</div>
-
-## The agent engine, in four diagrams
-
-### 1 · The step loop
-
-Stella runs a single deterministic loop: plan a step, fan tools out **in parallel**,
-observe, compact if the context is getting noisy, and repeat — all under a hard
-budget. No coordinator, no agent-of-agents, no lost middle.
-
-```mermaid
-flowchart TD
-    U(["Your prompt"]) --> P["Plan the next step<br/>(worker model)"]
-    P --> T{"Tool calls<br/>requested?"}
-    T -- "yes" --> X["Execute tools — read-only CONCURRENTLY,<br/>mutating in call-order (barrier)<br/>read · edit · bash · grep · glob · build · test"]
-    X --> O["Observe results (in original call order)<br/>+ append to Files-Touched ledger [C·R·U·D]"]
-    O --> C["Compaction · loop-detection · retry<br/>(keep signal, drop noise)"]
-    C --> B{"Budget<br/>exhausted?"}
-    B -- "no" --> P
-    B -- "yes" --> STOP(["Abort cleanly — never mid-tool"])
-    T -- "no" --> V["verify_done gate"]
-    V --> D{"WITNESS<br/>CONFIRMED?"}
-    D -- "yes" --> DONE(["Done + cost / token summary"])
-    D -- "no" --> P
-    classDef gate fill:#FFAC26,stroke:#8a5a00,color:#1a1200;
-    class V,D gate;
-```
-
-### 2 · The deterministic definition of done — `verify_done`
-
-A green suite can hide unwired features and vacuous tests. A **witness** cannot.
-Stella replays your new test files against the *previous* code in a throwaway
-**shadow worktree** at `git HEAD`; the test must **fail there** (the feature is
-genuinely absent) and **pass on your change** (the feature is genuinely present).
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant A as Agent
-    participant S as Shadow worktree @ git HEAD
-    participant N as Your change (working tree)
-    A->>N: Write the code change + a witness test
-    A->>N: Run the suite on the new code
-    N-->>A: Expect PASS — feature present
-    A->>S: git worktree add --detach at HEAD, copy ONLY the new test files in
-    S-->>A: Run the same suite, expect FAIL — feature absent
-    A->>S: git worktree remove --force — working tree never mutated
-    Note over A,N: PASS-on-new AND FAIL-on-old = WITNESS CONFIRMED. A merely green suite is NOT accepted.
-```
-
-### 3 · Goal mode — a judge that verifies from evidence
-
-`stella goal "..."` works in rounds. After each round an **LLM judge** — armed with
-its *own read-only tools* — inspects the actual repository for evidence instead of
-trusting the worker's word, and its feedback drives the next round. Bounded by a
-round cap and your `--budget`.
-
-```mermaid
-flowchart LR
-    G(["stella goal '…'"]) --> R["Round N — worker makes progress"]
-    R --> E["Collect EVIDENCE<br/>diffs · test output · CI"]
-    E --> J["LLM Judge — its OWN read-only tools<br/>read_file · grep · glob<br/>explorations · ci_status · search_issues"]
-    J --> Q{"Goal met?"}
-    Q -- "no + one concrete next action" --> R
-    Q -- "yes" --> W["verify_done"]
-    W --> DONE(["✅ Goal confirmed"])
-    R -. "round cap (8) / shared --budget reached" .-> STOP(["Bounded stop — never loops unjudged"])
-    classDef judge fill:#FFAC26,stroke:#8a5a00,color:#1a1200;
-    class J judge;
-```
-
-### 4 · The architecture — ports, not concretions
-
-`stella-core` has **no I/O of its own**: it drives every model call through the
-`Provider` port and every tool through the `ToolExecutor` port, and emits an
-`AgentEvent` stream over a channel. All decision logic — compaction, eviction, loop
-detection, budget — is plain synchronous functions over owned data, so a new vendor
-or tool is an adapter (never a rewrite), and the whole engine is trivially
-property-testable.
-
-This is the path the shipping `stella` binary actually runs today — the CLI
-drives `stella-core` directly, which fans out to the provider, tool, store, and
-context adapters through their ports:
-
-```mermaid
-flowchart TD
-    U(["stella · the CLI (stella-cli)<br/>REPL · run · goal · monitor"]) --> CORE
-    subgraph CORE["stella-core · the engine (NO I/O)"]
-      ENG["step driver · goal loop · budget<br/>retry · compaction · loop-detection · router"]
-    end
-    CORE -->|Provider port| MODEL["stella-model — adapters<br/>anthropic · openai · gemini · vertex · bedrock · zai<br/>(+ any OpenAI-compatible: xai · deepseek · openrouter · local)"]
-    CORE -->|ToolExecutor port| TOOLS["stella-tools<br/>CRUD · bash · grep · glob · build · test · verify_done · issues · CI"]
-    MCP["stella-mcp<br/>external MCP servers"] -.->|merges tools into registry| TOOLS
-    CORE -->|emits AgentEvent stream| STORE["stella-store<br/>SQLite: executions · events · telemetry"]
-    U -->|"recall · episodes · bi-temporal facts"| CTX["stella-context — context plane<br/>recall · embeddings · memory"]
-    GRAPH["stella-graph — tree-sitter code index"] -->|"indexed on `stella init` · queried via `code_graph` + `stella graph`"| DB[("SQLite code graph<br/>.stella/codegraph.db")]
-    MODEL -.->|versioned serde| PROTO["stella-protocol — shared types + Provider/tool ports"]
-    TOOLS -.-> PROTO
-    STORE -.-> PROTO
-    classDef eng fill:#FFAC26,stroke:#8a5a00,color:#1a1200;
-    class ENG eng;
-```
-
-> **Status — every layer is wired.** The diagram above is the live runtime
-> path, and the once-"next" library crates now ship in the CLI: `stella-fleet`
-> drives `stella fleet` (a DAG of tasks, a git worktree per isolated task, a
-> spend ledger), `stella-graph` answers at runtime through the agent's
-> `code_graph` tool and the `stella graph` command (on top of the
-> `stella init` index and the session-start schema gate), the context plane
-> records an **episode** for every working turn and bi-temporal `covers_path`
-> **facts** at `init` alongside reflection recall, and `stella-media` exposes
-> BYOK image generation as the `generate_image` tool. Lifecycle **hooks**
-> from `settings.json` gate every tool call (`PreToolUse` can block), recall
-> routes through the **`ocp-host` runtime** (see the OCP note below), and
-> `stella arena` turns the README's challenge into a command. The remaining
-> partial — and a great place to contribute — is:
->
-> - **`stella-media`'s SVG + video surfaces** — library-complete (the SVG
->   sanitize/repair pipeline, cost-gated async video jobs) but not yet exposed
->   as tools or commands.
->
-> It's tracked in the issues — grab it.
-
-> **The Open Context Protocol (OCP).** Retrieval in Stella is designed as an open,
-> versioned wire protocol (`ocp/1.0-draft`): the **`ocp-types` crate** (zero
-> dependencies beyond `serde`), a **host runtime** (`ocp-host`), and a **public
-> conformance suite** (`ocp-conformance`) — so anyone can ship an OCP provider
-> (in-process, stdio child, or remote HTTP) and prove it green against the suite
-> without a line of Stella code. What the host enforces today: providers are spawned
-> with a scrubbed environment (no credentials inherited via env vars), each call is
-> timeout-bounded and crash-isolated, an HTTP transport is always treated as egress
-> and consent-gated, and frame content is transported as untrusted data, never
-> executed. The host is also the CLI's own runtime path now: every recall fans
-> out through `Host::query_all` to the in-tree sources — `workspace-memory`
-> (the bi-temporal store) and `code-graph` (the tree-sitter index) — as
-> in-process OCP providers, with the same timeouts, isolation, and
-> budget-honesty audit an external provider gets. (Filesystem confinement of
-> stdio providers is future work.) It's how "code is a graph, not text" (Field
-> Manual Part 4) becomes a standard instead of a feature.
-
-<div align="center">
-
-`·  ·  ✦  ·  ·  ───────────────────────────────────────────────  ·  ·  ✦  ·  ·`
-
-</div>
+- **BYOK, auto-detected** — Set one provider's API key and Stella detects it.
+  Pin a specific model per run or shell with `--model`.
+- **Deterministic definition of done** — `verify_done` replays your new test
+  files against the previous code in a shadow worktree at `git HEAD`; the test
+  must fail there and pass on your change. A green suite alone is not accepted.
+- **Single-threaded engine** — One deterministic step loop: plan, fan tools out
+  in parallel, observe, compact if noisy, repeat. No coordinator or multi-agent
+  swarm.
+- **Prompt-cache-native memory** — Lessons saved with `save_memory` load once at
+  session start into a byte-stable system prompt (~0.1× input cost).
+- **Code graph** — A tree-sitter symbol/import index (Rust, TS/JS, Python, SQL)
+  queried by the agent and the `stella graph` command instead of grepping.
+- **Local-only telemetry** — Executions, events, token/cost telemetry, and the
+  files-touched ledger in `.stella/store.db`. The only network traffic Stella
+  produces is to the model provider you chose.
+- **Budget enforcement** — A `--budget` flag aborts cleanly between steps, never
+  mid-tool.
+- **Goal & fleet modes** — `goal` works in judged rounds; `fleet` fans a task DAG
+  out to parallel workers, each in its own git worktree.
+- **Lifecycle hooks** — Shell-command hooks (`SessionStart`, `PreToolUse`,
+  `PostToolUse`) configurable in `settings.json`.
 
 ## Prerequisites
 
 - **macOS or Linux**, `x86_64` or `arm64`.
-- For the prebuilt / Homebrew paths: nothing but `curl`.
-- For `cargo install` / building from source: **Rust 1.90+** (via [rustup](https://rustup.rs)) and `git`.
-- **An API key** for any one supported provider — *or* a local OpenAI-compatible
-  model server (Ollama, vLLM, LM Studio, llama.cpp) and no key at all.
-- Optional: [`ripgrep`](https://github.com/BurntSushi/ripgrep) and [`fd`](https://github.com/sharkdp/fd) on `PATH` (the `grep`/`glob` tools shell out to them), and `gh` for the CI/issue tools.
+- For prebuilt / Homebrew install: `curl`.
+- For building from source: **Rust 1.90+** (via [rustup](https://rustup.rs)) and `git`.
+- An API key for any supported provider, *or* a local OpenAI-compatible model
+  server (Ollama, vLLM, LM Studio, llama.cpp).
+- Optional: [`ripgrep`](https://github.com/BurntSushi/ripgrep) and
+  [`fd`](https://github.com/sharkdp/fd) on `PATH` (used by the `grep`/`glob`
+  tools), and `gh` for the CI/issue tools.
 
 ## Install
 
-**Prebuilt binary (`curl | sh`)** — installs the latest tagged release for your
-platform, verifies its SHA-256, and falls back to `cargo install` where no prebuilt
-binary is published:
+**Prebuilt binary:**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/oxageninc/stella/main/install.sh | sh
 stella --version
 ```
 
-**Homebrew** — installs the prebuilt binary from the tap (no Rust toolchain
-needed); the release workflow keeps the formula in sync on every tag:
+The installer downloads the latest release tarball, verifies its SHA-256, and
+falls back to `cargo install` when no prebuilt binary matches your platform.
+
+**Homebrew:**
 
 ```bash
 brew install oxageninc/stella/stella
-# equivalently: brew tap oxageninc/stella && brew install stella
 ```
 
-To build from source instead, use the local formula in
-`packaging/homebrew/stella.rb` (`brew install --build-from-source ./packaging/homebrew/stella.rb`).
+To build from source via Homebrew:
+`brew install --build-from-source ./packaging/homebrew/stella.rb`.
 
 **From cargo** (requires Rust 1.90+ and git):
 
@@ -364,33 +99,28 @@ cargo build --release
 ./target/release/stella --version
 ```
 
-> The `curl | sh` and Homebrew paths fetch binaries published by the release workflow
-> (`.github/workflows/release.yml`), which runs on `v*` tags. Until the first tagged
-> release, use the cargo or from-source path.
-
 ## Set your API key
 
-Stella is **bring-your-own-key** and auto-detects the provider from whichever keys
-you have set. No account, no sign-up.
+Stella is BYOK and auto-detects the provider from whichever keys you have set.
 
 | Provider | Env var | Default model |
 |---|---|---|
+| **Z.ai** (GLM) | `ZAI_API_KEY` | `glm-5.2` |
 | **Anthropic** (Claude) | `ANTHROPIC_API_KEY` | `claude-fable-5` |
 | **OpenAI** (GPT) | `OPENAI_API_KEY` | `gpt-5.5` |
-| **Google Gemini** | `GEMINI_API_KEY` (alias `GOOGLE_API_KEY`) | `gemini-3-pro` |
-| **Google Vertex AI** | `VERTEX_ACCESS_TOKEN` + `VERTEX_PROJECT_ID` | `gemini-3-pro` |
-| **Amazon Bedrock** | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` | Claude via Converse |
 | **xAI** (Grok) | `XAI_API_KEY` | `grok-4` |
 | **DeepSeek** | `DEEPSEEK_API_KEY` | `deepseek-chat` |
-| **Z.ai** (GLM) | `ZAI_API_KEY` | `glm-5.2` |
+| **Google Gemini** | `GEMINI_API_KEY` (alias `GOOGLE_API_KEY`) | `gemini-3-pro` |
 | **OpenRouter** | `OPENROUTER_API_KEY` | `auto` |
+| **Google Vertex AI** | `VERTEX_ACCESS_TOKEN` + `VERTEX_PROJECT_ID` | `gemini-3-pro` |
+| **Amazon Bedrock** | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` | Claude via Converse |
 | **Local** | *none* — pass `--base-url` | whatever your server hosts |
 
 ```bash
-export ANTHROPIC_API_KEY=your_key_here     # or OPENAI_API_KEY, GEMINI_API_KEY, ZAI_API_KEY …
+export ANTHROPIC_API_KEY=your_key_here     # or OPENAI_API_KEY, GEMINI_API_KEY, …
 ```
 
-With several keys set, pin one per invocation (or for the whole shell):
+Pin a provider/model per run or shell:
 
 ```bash
 stella --model anthropic/claude-fable-5 run "refactor the database layer"
@@ -403,22 +133,21 @@ export STELLA_MODEL=openai/gpt-5.5
 stella --model local/llama3.3 --base-url http://localhost:11434/v1 chat
 ```
 
-> **Z.ai GLM Coding Plan:** set `ZAI_GLM_CODING_PLAN=1` alongside `ZAI_API_KEY` to
-> route through the dedicated coding endpoint (`https://api.z.ai/api/coding/paas/v4`).
+**Z.ai GLM Coding Plan:** set `ZAI_GLM_CODING_PLAN=1` alongside `ZAI_API_KEY` to
+route through the dedicated coding endpoint.
 
-**The credential chain** (first hit wins): `--api-key` flag → provider env var →
+**Credential chain** (first hit wins): `--api-key` flag → provider env var →
 `settings.json` `api_key` → `~/.config/stella/credentials.toml` → interactive prompt.
 
 ```bash
-stella models    # every provider, its models, and key status
-stella config    # the fully resolved configuration
+stella models    # list providers, models, and key status
+stella config    # show the fully resolved configuration
 ```
 
 ### Custom providers via `settings.json`
 
-Point Stella at **any** OpenAI-compatible (or Anthropic/Gemini-dialect) endpoint —
-Together, Fireworks, Groq, a private gateway — without a code change, and override
-built-in provider defaults, from a `settings.json`:
+Point Stella at any OpenAI-compatible (or Anthropic/Gemini-dialect) endpoint
+without a code change, and override built-in defaults, from a `settings.json`:
 
 | Scope | Path | Wins over |
 |---|---|---|
@@ -446,17 +175,7 @@ built-in provider defaults, from a `settings.json`:
 ```
 
 Then: `stella --model together/meta-llama/Llama-3.3-70B-Instruct-Turbo run "…"`.
-Config-defined providers join auto-detection (after the built-ins) and judge
-routing, and show up in `stella models`. Prefer `api_key_env` over a literal
-`api_key` — settings files get committed, credentials should not. Entries merge
-per field across scopes, so an org-managed `base_url` and a user-scope
-`api_key_env` compose.
-
-<div align="center">
-
-`·  ·  ✦  ·  ·  ───────────────────────────────────────────────  ·  ·  ✦  ·  ·`
-
-</div>
+Prefer `api_key_env` over a literal `api_key` — settings files get committed.
 
 ## Usage
 
@@ -466,12 +185,9 @@ per field across scopes, so an org-managed `base_url` and a user-scope
 stella            # or: stella chat
 ```
 
-On a real terminal this opens the **Command Deck** — the tabbed TUI (Session ·
-Agents · Traces · Graph · Files) with PR-style diffs and an editable prompt
-queue; `--plain` (or `STELLA_PLAIN=1`, or piped stdio) falls back to the line
-REPL. Type a prompt, press Enter — Stella thinks (live status line), calls
-tools (read files, run commands, search code), responds, and prints a
-cost/token summary.
+On a TTY this opens the **Command Deck** — a tabbed TUI (Session · Agents ·
+Traces · Graph · Files) with PR-style diffs and an editable prompt queue. `--plain`
+(or `STELLA_PLAIN=1`, or piped stdio) falls back to the line REPL.
 
 **In-chat commands:**
 
@@ -480,7 +196,7 @@ cost/token summary.
 | `/goal <text>` | Work in judged rounds until the goal is met |
 | `/files` | Show the Files-Touched panel — `[C·R·U·D] path` per file |
 | `/models` `/config` | List providers/models · show resolved configuration |
-| `/rename <name>` `/color <name>` | Rename the tab · switch accent color (tell windows apart) |
+| `/rename <name>` `/color <name>` | Rename the tab · switch accent color |
 | `/clear` `/help` | Clear history · show help |
 | `/exit` or `Ctrl-D` | Exit |
 
@@ -491,91 +207,102 @@ stella run "fix the failing test in src/auth.rs"
 stella run "add a health check endpoint to the API"
 ```
 
-### Goal mode — don't stop until a judge says done
+### Goal mode
 
 ```bash
 stella goal "the login flow has a passing e2e test and CI is green"
 stella monitor main          # drive a branch/PR's CI to green as a judged goal
 ```
 
-### Fleet mode — fan a plan out to parallel workers
+### Fleet mode
 
 ```bash
 stella fleet "fix the flaky auth test" "tighten the CI cache key"   # two isolated tasks
 stella fleet --plan .stella/fleet.toml --max-concurrency 2 --budget 5.0
 ```
 
-One git worktree + `fleet/<task>` branch per isolated task, wave-scheduled by
-dependency, every attempt/commit/dollar recorded in `.stella/fleet.db` —
-worktrees are left in place for review (`git worktree list`). A plan file is
-the serde form of the fleet DAG: `[[tasks]]` entries with `id`, `title`,
-`prompt`, plus optional `depends_on = [...]` and `isolation = "shared_tree"`.
+One git worktree + `fleet/<task>` branch per task, wave-scheduled by dependency,
+recorded in `.stella/fleet.db`. A plan file is the serde form of the fleet DAG:
+`[[tasks]]` entries with `id`, `title`, `prompt`, optional `depends_on`, and
+`isolation`.
 
-### Ask the code graph
+### Code graph queries
 
 ```bash
 stella graph definitions run_turn     # where is this symbol defined?
 stella graph importers src/auth.rs    # which files import it?
 ```
 
-The same frames the agent gets from its `code_graph` tool — built by
-`stella init`, answered offline, no API key needed.
+Built by `stella init`, answered offline, no API key needed.
 
 ### Project setup & introspection
 
 ```bash
 stella init      # infer this workspace's domain taxonomy (.stella/domains.toml)
 stella tools     # list every tool available to the agent this session
-stella stats     # cost, tokens, and $/resolved task per provider/model from
-                 # local telemetry (--format table|json|csv, --provider <id>)
+stella stats     # cost, tokens, and $/resolved task per provider/model
+                 # (--format table|json|csv, --provider <id>)
 ```
 
 ### Global flags
 
 `--model provider/id` · `--api-key` · `--base-url` · `--budget <usd>` ·
 `--output-format text|json|stream-json` (also as `STELLA_MODEL`,
-`STELLA_BASE_URL`, `STELLA_BUDGET`, and `STELLA_OUTPUT_FORMAT`; API keys come
-from provider-specific env vars or `~/.config/stella/credentials.toml`). The
-`json` / `stream-json` formats are for headless one-shot `stella run`; the
-interactive `chat` / `goal` / `monitor` modes always render human-readable
-output. `stella run` executes through the staged pipeline by default; pass
-`--no-pipeline` to fall back to the raw step-loop.
-
-<div align="center">
-
-`·  ·  ✦  ·  ·  ───────────────────────────────────────────────  ·  ·  ✦  ·  ·`
-
-</div>
+`STELLA_BASE_URL`, `STELLA_BUDGET`, `STELLA_OUTPUT_FORMAT`). The `json` /
+`stream-json` formats are for headless one-shot `stella run`; interactive
+`chat` / `goal` / `monitor` modes render human-readable output. `stella run`
+uses the staged pipeline by default; `--no-pipeline` falls back to the raw
+step-loop.
 
 ## Built-in tools
 
 | Tool | Description |
 |---|---|
-| `read_file` · `write_file` · `edit_file` · `delete_file` | The full CRUD ledger — surgical exact-substring edits, parent-dir creation |
+| `read_file` · `write_file` · `edit_file` · `delete_file` | File CRUD with surgical exact-substring edits |
 | `bash` | Run a shell command (timeout kill; `trace: true` echoes each line) |
 | `grep` · `glob` | Regex content search (ripgrep) · glob file discovery (fd) |
-| `code_graph` | Query the indexed code graph instead of grepping: symbol definitions/references, a file's imports/importers/neighborhood — registered once `stella init` has built the index |
-| `build_project` · `run_tests` | Build/test with the workspace's own toolchain (cargo/npm/go/make) |
-| `verify_done` | The **deterministic definition of done** — the witness gate above |
+| `code_graph` | Query the indexed code graph: symbol definitions/references, file imports/importers/neighborhood — available after `stella init` |
+| `build_project` · `run_tests` | Build/test with the workspace's toolchain (cargo/npm/go/make) |
+| `verify_done` | Replay new test files against `git HEAD` to prove the change works |
 | `explorations` · `save_exploration` | Shared codebase maps — explore once, reuse everywhere |
 | `save_memory` | Persist a lesson into every future session's system prompt |
-| `ci_status` | CI runs + failure logs via `gh` (judge-usable, read-only) |
+| `ci_status` | CI runs + failure logs via `gh` |
 | `screenshot` | Capture the screen as verification evidence |
-| `generate_image` | Text-to-image via your own provider key (Z.ai CogView or OpenAI gpt-image), saved under `.stella/artifacts/` — registered **only when a media-capable key is set** |
-| `create_issue` · `update_issue` · `close_issue` · `search_issues` · `start_work_on_issue` | Issue tracking — registered **only when configured** |
+| `generate_image` | Text-to-image via your provider key, saved under `.stella/artifacts/` — registered only when a media-capable key is set |
+| `create_issue` · `update_issue` · `close_issue` · `search_issues` · `start_work_on_issue` | Issue tracking — registered only when configured |
 
-All file tools are **workspace-root-pinned**. Every read/write/edit/delete lands in
-the **Files-Touched** ledger, rendered per turn as `[C·R·U·D] path` (also `/files`).
+All file tools are workspace-root-pinned, and every read/write/edit/delete is
+recorded in the Files-Touched ledger (shown per turn as `[C·R·U·D] path`, also
+via `/files`).
 
-**Issue tools are conditional:** set `LINEAR_API_KEY` for the Linear backend (it wins),
-or have `gh auth login` done for GitHub Issues. With neither, they aren't registered —
-no dead schema, no wasted tokens. The same discipline gates `code_graph` (needs the
-`stella init` index) and `generate_image` (needs `ZAI_API_KEY` or `OPENAI_API_KEY`).
+**Conditional tools:** issue tools need `LINEAR_API_KEY` or a `gh auth login`;
+`code_graph` needs the `stella init` index; `generate_image` needs
+`ZAI_API_KEY` or `OPENAI_API_KEY`. Without their prerequisites, these tools are
+not registered.
 
-## Lifecycle hooks — your own gates around the agent
+## Memory and context
 
-Declare shell-command hooks in any `settings.json` scope and they fire on
-agent lifecycle events, receiving the event payload as JSON on stdin:
+Lessons saved with `save_memory` (or written as markdown in
+`.stella/memories/`) load once at session start into a byte-stable system
+prompt, so every model call considers them at prompt-cache prices. New memories
+take effect the next session — hot-injection would invalidate the cache.
+
+Every working turn is also recorded as an **episode** (summary, files touched,
+outcome, time window) in `.stella/context.db`, and `stella init` writes the
+domain taxonomy as bi-temporal facts. Recall fans out through the OCP host to
+the memory store and the code graph, fused by score under one budget.
+
+## Telemetry
+
+Executions are recorded, best-effort, in `.stella/store.db`: the full event
+stream, per-model-call telemetry (tokens, cache hits, cost), and the
+Files-Touched ledger. The store is never a dependency of a turn — a session
+runs even if the file can't be opened. Query it with any SQLite client.
+
+## Lifecycle hooks
+
+Declare shell-command hooks in any `settings.json` scope; they fire on agent
+lifecycle events, receiving the event payload as JSON on stdin:
 
 ```jsonc
 {
@@ -591,88 +318,78 @@ agent lifecycle events, receiving the event payload as JSON on stdin:
 ```
 
 - **`SessionStart`** — stdout is appended to the system prompt as session
-  context (once per session, so the prompt stays byte-stable and cached).
-- **`PreToolUse`** — a non-zero exit **blocks the tool**; the model sees the
-  hook's message instead. `matcher` is a glob over the tool name.
+  context (once per session).
+- **`PreToolUse`** — a non-zero exit blocks the tool; the model sees the hook's
+  message instead. `matcher` is a glob over the tool name.
 - **`PostToolUse`** — observation only, never blocks.
 
-Scopes **concatenate** (any scope can add a gate; none can remove
-another's). Hooks from a repo's own `.stella/settings.json` are a trust
-boundary — they load only with `STELLA_PROJECT_HOOKS=1`, so cloning an
-untrusted repo never auto-executes its commands. User and org-managed
-hooks always load.
+Scopes concatenate (any scope can add a gate; none can remove another's). Hooks
+from a repo's own `.stella/settings.json` load only with
+`STELLA_PROJECT_HOOKS=1`, so cloning an untrusted repo never auto-executes its
+commands.
 
-## Self-improving & prompt-cache-native
+## Architecture
 
-Lessons saved with `save_memory` (or written by you as markdown in `.stella/memories/`)
-load once at session start into a **byte-stable** system prompt — so every model call
-considers them at prompt-cache-hit prices (~0.1× input). New memories take effect the
-*next* session by design: hot-injection would invalidate the cache on every save.
+`stella-core` has no I/O of its own: it drives model calls through the
+`Provider` port and tools through the `ToolExecutor` port, emitting an
+`AgentEvent` stream over a channel. All decision logic — compaction, eviction,
+loop detection, budget — is plain synchronous functions over owned data, so a
+new vendor or tool is an adapter, never a rewrite.
 
-Alongside those baked lessons, every turn that does real work is recorded as an
-**episode** (summary, files touched, outcome, time window) in `.stella/context.db`,
-and `stella init` writes the domain taxonomy as bi-temporal **facts** — corrections
-supersede, never delete, so "what did we believe then" still answers. Every recall
-fans out through the **OCP host** to the memory store *and* the code graph, fused
-by score under one frame/token budget — the graph's symbols join "what do we
-remember" at prompt time.
-
-## Local telemetry — SQLite, on your disk
-
-Executions are recorded, best-effort, in `.stella/store.db` (the store is never a
-dependency of a turn — a session runs even if it can't be opened): the full event
-stream (chain-of-thought deltas included), per-model-call telemetry (tokens in/out,
-cache read hit/miss, cost from the model card's pricing), and the Files-Touched ledger
-(`file_locks` and `graph_nodes` / `graph_edges` tables exist in the schema as
-reserved seams for the context plane; no shipping command writes them yet). Query it
-with any SQLite client. **Nothing leaves your machine** — the only network traffic
-Stella produces is to the model provider you chose.
-
-<div align="center">
-
-`·  ·  ✦  ·  ·  ───────────────────────────────────────────────  ·  ·  ✦  ·  ·`
-
-</div>
+```mermaid
+flowchart TD
+    U(["stella · the CLI (stella-cli)<br/>REPL · run · goal · monitor"]) --> CORE
+    subgraph CORE["stella-core · the engine (NO I/O)"]
+      ENG["step driver · goal loop · budget<br/>retry · compaction · loop-detection · router"]
+    end
+    CORE -->|Provider port| MODEL["stella-model — adapters<br/>anthropic · openai · gemini · vertex · bedrock · zai<br/>(+ any OpenAI-compatible: xai · deepseek · openrouter · local)"]
+    CORE -->|ToolExecutor port| TOOLS["stella-tools<br/>CRUD · bash · grep · glob · build · test · verify_done · issues · CI"]
+    MCP["stella-mcp<br/>external MCP servers"] -.->|merges tools into registry| TOOLS
+    CORE -->|emits AgentEvent stream| STORE["stella-store<br/>SQLite: executions · events · telemetry"]
+    U -->|"recall · episodes · bi-temporal facts"| CTX["stella-context — context plane<br/>recall · embeddings · memory"]
+    GRAPH["stella-graph — tree-sitter code index"] -->|"indexed on `stella init` · queried via `code_graph` + `stella graph`"| DB[("SQLite code graph<br/>.stella/codegraph.db")]
+    MODEL -.->|versioned serde| PROTO["stella-protocol — shared types + Provider/tool ports"]
+    TOOLS -.-> PROTO
+    STORE -.-> PROTO
+```
 
 ## Design principles
 
-The invariants the whole design hangs on:
-
-- **Ports, not concretions** — `stella-core` never imports a provider SDK, a filesystem call, or a terminal library; it drives through traits.
-- **No I/O in the engine** — all decision logic is synchronous functions over owned data, so the whole engine is property-testable.
+- **Ports, not concretions** — `stella-core` never imports a provider SDK, a
+  filesystem call, or a terminal library; it drives through traits.
+- **No I/O in the engine** — all decision logic is synchronous functions over
+  owned data, so the whole engine is property-testable.
 - **No phone-home** — zero network calls other than your chosen model provider.
 - **BYOK** — any provider key, any combination, no account.
-- **Serde-first** — every cross-boundary type round-trips through `serde_json` byte-for-byte.
-- **Fail loud, recover gracefully** — typed, named errors; never a bare string, never a `panic`.
-- **Budget is enforced at safe boundaries only** — never mid-tool; an abort recommendation is acted on between steps.
+- **Serde-first** — every cross-boundary type round-trips through `serde_json`
+  byte-for-byte.
+- **Fail loud, recover gracefully** — typed, named errors; never a bare string,
+  never a `panic`.
+- **Budget enforced at safe boundaries only** — never mid-tool; an abort
+  recommendation is acted on between steps.
 
 ## Workspace layout
 
-Sixteen crates. **✅ = wired into the shipping CLI today · ◑ = partially wired ·
-🧪 = complete, property-tested library, not yet wired into the CLI** (contribution
-targets — see the architecture status note above).
+Seventeen crates total: fourteen `stella-*` crates plus the three `ocp-*` crates
+that implement the Open Context Protocol (the retrieval abstraction Stella's
+recall routes through).
 
-| Crate | Status | Role |
-|---|---|---|
-| `stella` (`stella-cli`) | ✅ | CLI binary — clap surface + agent loop wiring |
-| `stella-core` | ✅ | The step-driver engine (no I/O): parallel tools, goal loop, budget, retry, compaction, loop detection, router |
-| `stella-tools` | ✅ | The built-in tools (CRUD, `bash`, `grep`/`glob`, build/test, `verify_done`, issues, CI) — workspace-root-pinned |
-| `stella-model` | ✅ | The `Provider` port's adapters: anthropic, openai, gemini, vertex, bedrock, zai (SSE, tool-call dialects, SigV4, pricing) |
-| `stella-store` | ✅ | SQLite persistence — executions, events (full CoT), telemetry, files-touched |
-| `stella-mcp` | ✅ | MCP client (stdio + HTTP, protocol `2025-06-18`) merging external tools into the registry; per-call timeouts isolate dead servers |
-| `stella-protocol` | ✅ | Zero-logic, zero-I/O stability contract: shared serde types + the `Provider`/tool ports |
-| `stella-context` | ✅ | The context plane: reflection-memory recall + embedding index, an episode recorded for every working turn, and bi-temporal `covers_path` facts written at `stella init` — all recalled through one fused, budgeted pipeline |
-| `stella-graph` | ✅ | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL). Indexed on `stella init`, read by the schema gate at session start, and queried at runtime via the `code_graph` tool and `stella graph` |
-| `stella-pipeline` | ✅ | The orchestration plane above the engine — the default `stella run` path: triage → plan (split context) → scope review → execute → verify → judge, with bounded revision (`--no-pipeline` opts out) |
-| `stella-fleet` | ✅ | The multi-agent fleet behind `stella fleet`: DAG planner + wave scheduling, git-worktree isolation per task, SQLite lineage + per-task spend ledger |
-| `stella-media` | ◑ | Multimodal generation behind one `MediaProvider` port — image generation wired as the BYOK-conditional `generate_image` tool; SVG/video pipelines library-complete, not yet exposed |
-| `stella-context` | ◑ | The context plane. Reflection-memory recall + embedding index are wired; the bi-temporal property graph and episodic memory are built and tested but not yet consulted at runtime |
-| `stella-graph` | ◑ | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL). Indexed on `stella init`; the schema gate reads it at session start, broader runtime retrieval not yet wired |
-| `stella-pipeline` | ✅ | The orchestration plane above the engine — the default `stella run` path: triage → plan (split context) → scope review → execute → verify → judge, with bounded revision (`--no-pipeline` opts out) |
-| `stella-fleet` | 🧪 | The multi-agent fleet: DAG planner + wave scheduling, git-worktree isolation per task, SQLite lineage + per-task spend ledger |
-| `stella-media` | 🧪 | Multimodal generation (image/SVG/video) behind one `MediaProvider` port — BYOK, artifact discipline, cost-gated |
-| `stella-tui` | ✅ | The Command Deck — a pure event-fold core (`SessionModel`/`WorkspaceModel`) + thin crossterm shell; the default `stella chat` surface on a TTY (`--plain` opts out) |
-| `ocp-types` · `ocp-host` · `ocp-conformance` | ✅ | Open Context Protocol — wire types, host runtime, and the public conformance suite; the CLI's recall now routes through `ocp-host` (`workspace-memory` + `code-graph` as in-process providers), and any external provider proves itself against the suite |
+| Crate | Role |
+|---|---|
+| `stella-cli` | CLI binary — clap surface + agent loop wiring |
+| `stella-core` | The step-driver engine (no I/O): parallel tools, goal loop, budget, retry, compaction, loop detection, router |
+| `stella-tools` | The built-in tools (CRUD, `bash`, `grep`/`glob`, build/test, `verify_done`, issues, CI) |
+| `stella-model` | The `Provider` port's adapters: anthropic, openai, gemini, vertex, bedrock, zai (SSE, tool-call dialects, SigV4, pricing) |
+| `stella-store` | SQLite persistence — executions, events, telemetry, files-touched |
+| `stella-mcp` | MCP client (stdio + HTTP, protocol `2025-06-18`) merging external tools into the registry |
+| `stella-protocol` | Zero-logic, zero-I/O stability contract: shared serde types + the `Provider`/tool ports |
+| `stella-context` | The context plane: reflection-memory recall + embedding index, episodes, bi-temporal facts |
+| `stella-graph` | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL) |
+| `stella-pipeline` | The orchestration plane above the engine — the default `stella run` path: triage → plan → scope review → execute → verify → judge |
+| `stella-fleet` | The multi-agent fleet behind `stella fleet`: DAG planner + wave scheduling, git-worktree isolation per task |
+| `stella-media` | Multimodal generation behind one `MediaProvider` port — image generation wired as the `generate_image` tool; SVG/video library-complete, not yet exposed as tools |
+| `stella-tui` | The Command Deck — a pure event-fold core + thin crossterm shell |
+| `ocp-types` · `ocp-host` · `ocp-conformance` | Open Context Protocol — wire types, host runtime, and the public conformance suite |
 
 ## Development
 
@@ -683,132 +400,31 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p stella-cli -- models
 ```
 
-### Dev mode — test a checkout from any workspace
-
-To try your working copy against real projects *before* baking a release,
-install it as `stella-dev` — it lives side by side with the released
-`stella` and never shadows it:
+To try your working copy against real projects before a release, install it as
+`stella-dev` — it lives side by side with the released `stella`:
 
 ```bash
 scripts/dev.sh install        # build (release) + link ~/.local/bin/stella-dev
 cd ~/any/other/repo
-stella-dev                    # the tabbed Command Deck, running your checkout
-stella-dev version            # e.g. 0.1.16-dev.3f2c9aa+dirty — sha of the build
+stella-dev                    # the Command Deck, running your checkout
+scripts/dev.sh status         # show what both binaries resolve to
+scripts/dev.sh uninstall      # remove the link
 ```
 
-The link points into this checkout's `target/`, so iterating is just a
-rebuild — `scripts/dev.sh build` (or plain `cargo build --release -p
-stella-cli`) and every open workspace immediately runs the fresh binary.
-`--debug` builds the debug profile for faster compiles;
-`scripts/dev.sh status` shows what both binaries resolve to, and
-`scripts/dev.sh uninstall` removes the link.
+## Contributing
 
-<div align="center">
-
-`·  ·  ✦  ·  ·  ───────────────────────────────────────────────  ·  ·  ✦  ·  ·`
-
-</div>
-
-## Research & further reading
-
-Stella is opinionated because the literature is. Every differentiator above is grounded
-in primary research — the same sources cited by the field manual it implements. Read the
-primaries; they're better than any summary.
-
-**The definition of done — tests as contracts** *(engine §2, Field Manual Part 10)*
-- Jimenez et al. — *SWE-bench: Can Language Models Resolve Real-World GitHub Issues?* ICLR 2024. [arXiv:2310.06770](https://arxiv.org/abs/2310.06770)
-- Yang, Jimenez et al. — *SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering.* NeurIPS 2024. [arXiv:2405.15793](https://arxiv.org/abs/2405.15793)
-- Zhang, Ruan, Fan & Roychoudhury — *AutoCodeRover: Autonomous Program Improvement.* ISSTA 2024. [arXiv:2404.05427](https://arxiv.org/abs/2404.05427)
-
-**Why Stella is single-threaded, not a swarm** *(engine §1, Field Manual Part 9)*
-- Cemri et al. (UC Berkeley) — *Why Do Multi-Agent LLM Systems Fail? (MAST).* NeurIPS 2025. [arXiv:2503.13657](https://arxiv.org/abs/2503.13657)
-- Xia, Deng, Dunn & Zhang — *Agentless: Demystifying LLM-based Software Engineering Agents.* FSE 2025. [arXiv:2407.01489](https://arxiv.org/abs/2407.01489)
-- Yan (Cognition) — *Don't Build Multi-Agents.* 2025. [cognition.ai](https://cognition.ai/blog/dont-build-multi-agents)
-
-**Reproducible, cost-aware measurement** *(engine §3, Field Manual Part 13)*
-- Kapoor, Stroebl, Siegel, Nadgir & Narayanan (Princeton) — *AI Agents That Matter.* TMLR 2025. [arXiv:2407.01502](https://arxiv.org/abs/2407.01502)
-
-**Context compaction beats a bigger window** *(engine §1 compaction, Field Manual Part 7)*
-- Liu et al. — *Lost in the Middle: How Language Models Use Long Contexts.* TACL 2024. [arXiv:2307.03172](https://arxiv.org/abs/2307.03172)
-- Hong, Troynikov & Huber (Chroma) — *Context Rot: How Increasing Input Tokens Impacts LLM Performance.* 2025. [research.trychroma.com](https://research.trychroma.com/context-rot)
-- Shannon, C. E. — *A Mathematical Theory of Communication.* Bell System Technical Journal, 1948.
-
-**Code is a graph — grep is the wrong engine** *(context plane, Field Manual Parts 4 & 12)*
-- Gauthier (Aider) — *Building a better repository map with tree-sitter.* 2023. [aider.chat](https://aider.chat/2023/10/22/repomap.html)
-- Edge et al. (Microsoft Research) — *From Local to Global: A Graph RAG Approach.* 2024. [arXiv:2404.16130](https://arxiv.org/abs/2404.16130)
-
-**Prompt-cache-native working memory** *(memory, Field Manual Parts 6 & 11)*
-- Anthropic — *Prompt caching with Claude* (cache-read ≈ 0.1× input price). 2024. [anthropic.com](https://www.anthropic.com/news/prompt-caching)
-- Packer et al. (UC Berkeley) — *MemGPT: Towards LLMs as Operating Systems.* 2023. [arXiv:2310.08560](https://arxiv.org/abs/2310.08560)
-
-> 📖 **The capstone.** Anderson, M. — ***Engineering Deterministic AI Coding Agents —
-> A Field Manual in 14 Parts.*** Oxagen Inc., 2026. The playbook Stella is the reference
-> implementation of. **[Read it →](https://oxagen.sh/#field-manual)**
-
-<div align="center">
-
-`·  ·  ✦  ·  ·  ───────────────────────────────────────────────  ·  ·  ✦  ·  ·`
-
-</div>
-
-## Stella and the Oxagen CLI
-
-Stella is **not** the `oxagen` CLI. The `oxagen` CLI is a client for the Oxagen
-platform — it authenticates against your org, queries your workspace knowledge graph,
-and meters usage. Stella is a standalone, open-source, BYOK coding agent with no
-platform attached. Want a terminal agent grounded in your org's graph? Use `oxagen`.
-Want a fast, self-contained agent in any repo? Use Stella.
-
-## Contributing & community
-
-```text
-   ·  .  ✦   ·   stella is built in the open — come build her with us   ·   ✦  .  ·
-```
-
-Stella is young, ambitious, and genuinely open — MIT OR Apache-2.0, DCO not CLA,
-no corporate gatekeeping. Every kind of contribution moves her forward:
-
-
-```text
-   ·  .  ✦   ·   stella is built in the open — come build her with us   ·   ✦  .  ·
-```
-
-Stella is young, ambitious, and genuinely open — MIT OR Apache-2.0, DCO not CLA,
-no corporate gatekeeping. Every kind of contribution moves her forward:
+Contributions are welcome — MIT OR Apache-2.0, DCO not CLA. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for dev setup, a tour of the crates, the
+witness-test contract, and style rules. CI runs `fmt`, `clippy -D warnings`,
+tests, and a release build on every PR.
 
 | You have… | Do this |
 |---|---|
-| ⏱ 10 seconds | **Star the repo** — stars are how other people find Stella |
-| 🐛 A bug | [File it with a repro](https://github.com/oxageninc/stella/issues/new?template=bug_report.yml) — reproducible bugs get fixed fast |
-| 💡 An idea | [Open a feature request](https://github.com/oxageninc/stella/issues/new?template=feature_request.yml) or start a [discussion](https://github.com/oxageninc/stella/discussions) |
-| 🌙 An evening | Grab a [`good first issue`](https://github.com/oxageninc/stella/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — [`CONTRIBUTING.md`](CONTRIBUTING.md) has the full map |
-| 🔑 An API budget | **The single highest-value contribution:** an [⚔ arena run](#the-arena) — officially scored, fully receipted, win or lose |
-
-New contributors: [`CONTRIBUTING.md`](CONTRIBUTING.md) walks you from
-`git clone` to merged PR — dev setup, a tour of all sixteen crates, the
-witness-test contract, and the style rules. CI runs `fmt`,
-`clippy -D warnings`, tests, and a release build on every PR; what you check
-locally is exactly what the gate checks.
-
-### Support Stella 💛
-
-Stella phones nothing home, sells nothing, and meters nothing — which also
-means she earns nothing. If she saves you tokens or time, consider
-[**sponsoring the project**](https://github.com/sponsors/macanderson):
-sponsorship pays for the arena runs, release infrastructure, and maintainer
-time that keep her sharp. Can't sponsor? A star, a receipted benchmark, or a
-war story in a bug report are worth just as much.
+| A bug | [File it with a repro](https://github.com/oxageninc/stella/issues/new?template=bug_report.yml) |
+| An idea | [Open a feature request](https://github.com/oxageninc/stella/issues/new?template=feature_request.yml) or start a [discussion](https://github.com/oxageninc/stella/discussions) |
+| An evening | Grab a [`good first issue`](https://github.com/oxageninc/stella/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) |
 
 ## License
 
 Dual-licensed under **MIT OR Apache-2.0** — see [`LICENSE-MIT`](LICENSE-MIT) and
-[`LICENSE-APACHE`](LICENSE-APACHE). From the makers of [Oxagen](https://docs.oxagen.sh),
-Los Angeles.
-
-<div align="center">
-
-`·  .  ✦   ·   built in Rust · verified, not vibed · your keys, your data, your disk   ·   ✦  .  ·`
-
-**⚔ See you in [the arena](#the-arena).**
-
-</div>
+[`LICENSE-APACHE`](LICENSE-APACHE).

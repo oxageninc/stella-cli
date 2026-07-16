@@ -27,6 +27,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use unicode_width::UnicodeWidthChar;
 
 use stella_protocol::{BudgetMode, FileChangeKind, MediaKind, PrStatus, StageKind};
 
@@ -88,7 +89,7 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
     let transcript_area = cols[0];
     let right_area = cols[1];
 
-    let t_lines = transcript_lines(model, ui.thinking_expanded);
+    let t_lines = transcript_lines(model, ui.thinking_expanded, inner_width(transcript_area));
     let t_total = t_lines.len();
     let t_inner_h = inner_height(transcript_area);
     let t_window = ui.scroll.window(t_total, t_inner_h);
@@ -101,7 +102,9 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
     let (diff_total, diff_inner_h) = if ui.diff_open {
         let file = model.files.get(ui.selected_file);
         let diff_text = file.and_then(|f| f.latest_diff.as_deref());
-        let d_lines = diff_text.map(diff::body_lines).unwrap_or_default();
+        let d_lines = diff_text
+            .map(|d| diff::body_lines(d, file.map(|f| f.path.as_str())))
+            .unwrap_or_default();
         let (added, removed) = diff_text.map(diff::count_diff_lines).unwrap_or((0, 0));
         let d_total = d_lines.len();
         let d_inner_h = inner_height(right_area);
@@ -175,6 +178,105 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
 /// The usable interior height of a single-border panel.
 pub(crate) fn inner_height(area: Rect) -> usize {
     area.height.saturating_sub(2) as usize
+}
+
+/// The usable interior width of a single-border panel.
+pub(crate) fn inner_width(area: Rect) -> usize {
+    area.width.saturating_sub(2) as usize
+}
+
+// ---------------------------------------------------------------------------
+// Word-aware line wrapping (pre-wrap so scroll math stays line-exact, L-T4)
+// ---------------------------------------------------------------------------
+
+/// Pre-wrap styled lines to fit `max_width` display columns. Lines that
+/// already fit pass through unchanged; lines that overflow are split at word
+/// boundaries (preferring spaces, hard-breaking long words) into multiple
+/// `Line`s, each preserving the original span styles.
+///
+/// This runs *before* the scroll window calculation so the line-exact scroll
+/// math operates on visual (wrapped) rows — the rendered text never overflows
+/// horizontally and the scroll offset stays accurate.
+pub(crate) fn wrap_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
+    if max_width == 0 {
+        return lines;
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.width() <= max_width {
+            out.push(line);
+        } else {
+            wrap_one(line, max_width, &mut out);
+        }
+    }
+    out
+}
+
+/// Wrap a single overflowing line into multiple lines of at most `max_width`.
+fn wrap_one(line: Line<'static>, max_width: usize, out: &mut Vec<Line<'static>>) {
+    // Flatten the line's spans into (char, style) pairs so we can measure and
+    // split at arbitrary positions while preserving styling.
+    let styled: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+        .collect();
+
+    let mut current: Vec<(char, Style)> = Vec::new();
+    let mut current_w = 0usize;
+
+    let flush = |cur: &mut Vec<(char, Style)>, out: &mut Vec<Line<'static>>| {
+        if !cur.is_empty() {
+            out.push(Line::from(styled_chars_to_spans(std::mem::take(cur))));
+        }
+    };
+
+    for (ch, style) in styled {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_w + cw > max_width && !current.is_empty() {
+            // Prefer breaking at the last space so words stay intact.
+            if let Some(space_idx) = current.iter().rposition(|(c, _)| *c == ' ') {
+                let remainder: Vec<(char, Style)> = current.split_off(space_idx);
+                // `current` now holds everything before the space.
+                flush(&mut current, out);
+                current = remainder;
+                current_w = current
+                    .iter()
+                    .map(|(c, _)| UnicodeWidthChar::width(*c).unwrap_or(0))
+                    .sum();
+            } else {
+                flush(&mut current, out);
+                current_w = 0;
+            }
+        }
+        current.push((ch, style));
+        current_w += cw;
+    }
+    flush(&mut current, out);
+}
+
+/// Coalesce adjacent same-styled characters into spans for compact output.
+fn styled_chars_to_spans(chars: Vec<(char, Style)>) -> Vec<Span<'static>> {
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut style = chars[0].1;
+    for (ch, st) in chars {
+        if st != style && !buf.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut buf), style));
+            style = st;
+        }
+        if buf.is_empty() {
+            style = st;
+        }
+        buf.push(ch);
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, style));
+    }
+    spans
 }
 
 // ---------------------------------------------------------------------------
@@ -549,18 +651,115 @@ fn render_composer(line: &str, focused: bool, area: Rect, buf: &mut Buffer) {
 }
 
 // ---------------------------------------------------------------------------
+// Two-column transcript layout
+// ---------------------------------------------------------------------------
+
+/// Width of the right-aligned label column: 20 chars for `[name]` (right-aligned),
+/// then `:` and one space. Content always begins at column 22.
+pub(crate) const LABEL_COL: usize = 22;
+
+/// Format a label as `[name]` right-aligned in 20 chars, followed by `: `.
+fn label_tag(name: &str) -> String {
+    let bracketed = format!("[{name}]");
+    format!("{:>20}: ", bracketed)
+}
+
+/// Indent string for wrapped continuation lines — exactly `LABEL_COL` spaces.
+fn cont_indent() -> String {
+    " ".repeat(LABEL_COL)
+}
+
+/// Wrap a single styled line into multiple lines of at most `max_width`,
+/// with continuation lines indented by `indent` spaces. The first line
+/// passes through unchanged (it already has its label prefix).
+fn wrap_one_indent(
+    line: Line<'static>,
+    max_width: usize,
+    indent: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    let line_width = line.width();
+    if line_width <= max_width || max_width == 0 {
+        out.push(line);
+        return;
+    }
+    let styled: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+        .collect();
+
+    let content_width = max_width.saturating_sub(indent);
+    let mut current: Vec<(char, Style)> = Vec::new();
+    let mut current_w = 0usize;
+
+    let flush = |cur: &mut Vec<(char, Style)>,
+                 first: bool,
+                 out: &mut Vec<Line<'static>>| {
+        if !cur.is_empty() {
+            let pairs = std::mem::take(cur);
+            if first {
+                out.push(Line::from(styled_chars_to_spans(pairs)));
+            } else {
+                let mut spans = vec![Span::raw(" ".repeat(indent))];
+                spans.extend(styled_chars_to_spans(pairs));
+                out.push(Line::from(spans));
+            }
+        }
+    };
+
+    let mut is_first = true;
+    for (ch, style) in styled {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_w + cw > content_width && !current.is_empty() {
+            if let Some(space_idx) = current.iter().rposition(|(c, _)| *c == ' ') {
+                let remainder: Vec<(char, Style)> = current.split_off(space_idx);
+                flush(&mut current, is_first, out);
+                is_first = false;
+                current = remainder;
+                current_w = current
+                    .iter()
+                    .map(|(c, _)| UnicodeWidthChar::width(*c).unwrap_or(0))
+                    .sum();
+            } else {
+                flush(&mut current, is_first, out);
+                is_first = false;
+                current_w = 0;
+            }
+        }
+        current.push((ch, style));
+        current_w += cw;
+    }
+    flush(&mut current, is_first, out);
+}
+
+/// Wrap a vector of lines where the first line has a label prefix and
+/// continuation lines should indent to `LABEL_COL`.
+fn wrap_labeled(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines;
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        wrap_one_indent(line, width, LABEL_COL, &mut out);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Pure content builders (unit-tested directly)
 // ---------------------------------------------------------------------------
 
-/// The full visual-line list for the transcript, one-or-more lines per entry.
-/// Text/reasoning entries split on newlines so the scroll math stays
-/// line-exact (L-T4); everything else is a single styled line.
-/// `expand_thinking` mirrors the `ctrl+r` toggle: collapsed (the default),
-/// each reasoning entry is one line whose live tail moves as deltas stream.
-pub(crate) fn transcript_lines(model: &SessionModel, expand_thinking: bool) -> Vec<Line<'static>> {
+/// The full visual-line list for the transcript. Each entry is rendered with
+/// per-entry wrapping so continuation lines respect the label column.
+pub(crate) fn transcript_lines(
+    model: &SessionModel,
+    expand_thinking: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for entry in &model.transcript {
-        entry_lines(entry, expand_thinking, &mut out);
+        entry_lines(entry, expand_thinking, width, &mut out);
     }
     out
 }
@@ -568,38 +767,99 @@ pub(crate) fn transcript_lines(model: &SessionModel, expand_thinking: bool) -> V
 pub(crate) fn entry_lines(
     entry: &TranscriptEntry,
     expand_thinking: bool,
+    width: usize,
     out: &mut Vec<Line<'static>>,
 ) {
     match entry {
+        TranscriptEntry::User(text) => {
+            let md = crate::markdown::render(text);
+            let mut entry_out: Vec<Line<'static>> = Vec::new();
+            for (i, line) in md.into_iter().enumerate() {
+                if i == 0 {
+                    let mut spans = vec![Span::styled(label_tag("user"), theme::accent())];
+                    spans.extend(line.spans);
+                    entry_out.push(Line::from(spans));
+                } else {
+                    let mut spans = vec![Span::raw(cont_indent())];
+                    spans.extend(line.spans);
+                    entry_out.push(Line::from(spans));
+                }
+            }
+            out.extend(wrap_labeled(entry_out, width));
+        }
         TranscriptEntry::Stage(name) => out.push(Line::from(Span::styled(
             format!("── {} ──", stage_label(*name)),
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))),
         TranscriptEntry::Text(text) => {
-            for l in text.split('\n') {
-                out.push(Line::from(Span::raw(l.to_string())));
+            let md = crate::markdown::render(text);
+            let mut entry_out: Vec<Line<'static>> = Vec::new();
+            for (i, line) in md.into_iter().enumerate() {
+                if i == 0 {
+                    let mut spans = vec![Span::styled(label_tag("agent"), theme::accent())];
+                    spans.extend(line.spans);
+                    entry_out.push(Line::from(spans));
+                } else {
+                    let mut spans = vec![Span::raw(cont_indent())];
+                    spans.extend(line.spans);
+                    entry_out.push(Line::from(spans));
+                }
             }
+            out.extend(wrap_labeled(entry_out, width));
         }
         TranscriptEntry::Reasoning(text) => {
+            let total_lines = text.lines().count().max(1);
+            let chevron = if expand_thinking { "⏶" } else { "⏵" };
+            out.push(Line::from(vec![
+                Span::styled(format!("{chevron} "), Style::new().fg(theme::AMBER)),
+                Span::styled(
+                    format!("thinking · {total_lines} lines"),
+                    Style::new().fg(theme::AMBER),
+                ),
+            ]));
+            let reasoning_style = Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC);
             if expand_thinking {
                 for l in text.split('\n') {
                     out.push(Line::from(Span::styled(
-                        l.to_string(),
-                        Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        format!("  {l}"),
+                        reasoning_style,
                     )));
                 }
             } else {
-                out.push(collapsed_thinking_line(text));
+                let preview_count = 3;
+                let mut shown = 0;
+                for l in text.lines() {
+                    if shown >= preview_count {
+                        break;
+                    }
+                    if !l.trim().is_empty() {
+                        out.push(Line::from(Span::styled(
+                            format!("  {l}"),
+                            reasoning_style,
+                        )));
+                        shown += 1;
+                    }
+                }
+                if total_lines > preview_count {
+                    out.push(Line::from(Span::styled(
+                        "  ⋯ ctrl+r to expand",
+                        Style::new().fg(Color::DarkGray),
+                    )));
+                }
             }
         }
-        TranscriptEntry::ToolStart { name, input, .. } => out.push(Line::from(vec![
-            Span::styled("→ ", Style::new().fg(Color::Blue)),
-            Span::styled(
-                name.clone(),
-                Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!(" {input}"), Style::new().fg(Color::DarkGray)),
-        ])),
+        TranscriptEntry::ToolStart { name, input, .. } => {
+            let line = Line::from(vec![
+                Span::styled(
+                    label_tag(name),
+                    Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(input.clone(), Style::new().fg(Color::DarkGray)),
+            ]);
+            wrap_one_indent(line, width, LABEL_COL, out);
+        }
         TranscriptEntry::ToolResult {
             ok,
             summary,
@@ -611,11 +871,18 @@ pub(crate) fn entry_lines(
             } else {
                 ("✗", Color::Red)
             };
-            out.push(Line::from(vec![
-                Span::styled(format!("{glyph} "), Style::new().fg(color)),
+            let line = Line::from(vec![
+                Span::styled(
+                    label_tag(glyph),
+                    Style::new().fg(color).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(summary.clone()),
-                Span::styled(format!("  ({duration_ms}ms)"), Style::new().fg(Color::DarkGray)),
-            ]));
+                Span::styled(
+                    format!("  ({duration_ms}ms)"),
+                    Style::new().fg(Color::DarkGray),
+                ),
+            ]);
+            wrap_one_indent(line, width, LABEL_COL, out);
         }
         TranscriptEntry::Retry { attempt, reason } => out.push(Line::from(Span::styled(
             format!("↻ retry #{attempt}: {reason}"),
@@ -738,37 +1005,6 @@ pub(crate) fn entry_lines(
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
         ))),
     }
-}
-
-/// The collapsed one-line view of a reasoning entry: a brand-amber glyph, a
-/// line count, and the *live tail* of the stream — the tail changes with
-/// every delta, so a collapsed thought still visibly moves while the model
-/// thinks (the reassurance signal, without the wall of text).
-fn collapsed_thinking_line(text: &str) -> Line<'static> {
-    const TAIL: usize = 56;
-    let line_count = text.lines().count().max(1);
-    let flat = text.replace(['\n', '\r'], " ");
-    let trimmed = flat.trim();
-    let chars: Vec<char> = trimmed.chars().collect();
-    let tail = if chars.len() <= TAIL {
-        trimmed.to_string()
-    } else {
-        let cut: String = chars[chars.len() - TAIL..].iter().collect();
-        format!("…{cut}")
-    };
-    Line::from(vec![
-        Span::styled("✳ ", Style::new().fg(theme::AMBER)),
-        Span::styled(
-            format!("thinking · {line_count} lines · "),
-            Style::new().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            tail,
-            Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        ),
-    ])
 }
 
 fn file_line(file: &FileState, selected: bool) -> Line<'static> {
@@ -966,47 +1202,67 @@ mod tests {
         let collapsed = draw(&model, &mut ui, 100, 24);
         assert!(
             collapsed.contains("thinking · 3 lines"),
-            "collapsed summary line:\n{collapsed}"
+            "collapsed header:\n{collapsed}"
         );
-        // Collapsed = exactly one visual line for the whole entry.
-        assert_eq!(transcript_lines(&model, false).len(), 1);
+        // Collapsed = header + 3 preview lines (all 3 fit within preview count).
+        let c_lines = transcript_lines(&model, false, 0);
+        assert_eq!(c_lines.len(), 4, "header + 3 preview lines");
+        // Preview shows the reasoning content.
+        let c_text: String = c_lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            c_text.contains("alpha"),
+            "collapsed shows first line:\n{c_text}"
+        );
+
         ui.thinking_expanded = true;
         let expanded = draw(&model, &mut ui, 100, 24);
         assert!(
             expanded.contains("alpha") && expanded.contains("gamma"),
             "expanded shows the full reasoning:\n{expanded}"
         );
-        assert_eq!(transcript_lines(&model, true).len(), 3);
+        // Expanded = header + 3 content lines.
+        assert_eq!(transcript_lines(&model, true, 0).len(), 4);
     }
 
     #[test]
-    fn collapsed_thinking_elides_to_the_tail_of_a_long_stream() {
+    fn collapsed_thinking_shows_preview_lines_not_the_full_wall() {
         let mut model = SessionModel::new();
         let long = format!("{}THE-TAIL", "reasoning noise ".repeat(20));
         model.apply(&AgentEvent::Reasoning { delta: long });
-        let lines = transcript_lines(&model, false);
-        assert_eq!(lines.len(), 1);
-        let text: String = lines[0].spans.iter().map(|s| s.content.clone()).collect();
-        assert!(text.ends_with("THE-TAIL"), "keeps the tail: {text}");
-        assert!(text.contains('…'), "marks the elision: {text}");
+        let lines = transcript_lines(&model, false, 0);
+        // 1 line of text → header + 1 preview = 2 lines.
+        assert_eq!(lines.len(), 2);
+        // The preview should be visible.
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("reasoning"), "preview shows content:\n{text}");
     }
 
     #[test]
-    fn collapsed_thinking_tail_moves_as_deltas_stream() {
+    fn collapsed_thinking_preview_updates_as_deltas_stream() {
         let mut model = SessionModel::new();
         model.apply(&AgentEvent::Reasoning {
             delta: "planning the refactor".into(),
         });
-        let before = transcript_lines(&model, false);
+        let before = transcript_lines(&model, false, 0);
         model.apply(&AgentEvent::Reasoning {
             delta: " now checking tests".into(),
         });
-        let after = transcript_lines(&model, false);
-        assert_eq!(before.len(), 1);
-        assert_eq!(after.len(), 1, "still one collapsed line");
+        let after = transcript_lines(&model, false, 0);
+        // Both produce header + 1 preview = 2 lines.
+        assert_eq!(before.len(), 2);
+        assert_eq!(after.len(), 2, "still header + 1 preview line");
+        // The preview line (index 1) visibly changes with each delta.
         assert_ne!(
-            before[0], after[0],
-            "the collapsed line visibly changes with each delta"
+            before[1], after[1],
+            "the preview visibly changes with each delta"
         );
     }
 
@@ -1173,7 +1429,7 @@ mod tests {
             },
             duration_ms: 12,
         });
-        let lines = transcript_lines(&model, false);
+        let lines = transcript_lines(&model, false, 0);
         let joined: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))

@@ -294,6 +294,44 @@ mod tests {
     }
 
     #[test]
+    fn large_multi_fragment_tool_payload_reassembles_when_fed_one_byte_at_a_time() {
+        // Build a large tool-call JSON, fragment it into many SSE events, and
+        // feed the whole wire stream ONE BYTE AT A TIME — the worst possible
+        // chunk boundary alignment. Then reassemble the `partial_json`
+        // fragments and assert the JSON round-trips. This exercises the SSE
+        // decoder's boundary handling far past what a loopback mock server
+        // (which delivers large chunks) can.
+        let mut content = String::new();
+        for i in 0..300 {
+            content.push_str(&format!("line {i}: \"quoted\" \\ and more\n"));
+        }
+        let full = serde_json::json!({"path": "README.md", "content": content});
+        let full_json = serde_json::to_string(&full).unwrap();
+
+        let chars: Vec<char> = full_json.chars().collect();
+        let mut wire = String::new();
+        for piece in chars.chunks(13) {
+            let frag: String = piece.iter().collect();
+            let escaped = serde_json::to_string(&frag).unwrap();
+            wire.push_str(&format!(
+                "event: content_block_delta\ndata: {{\"partial_json\":{escaped}}}\n\n"
+            ));
+        }
+
+        let mut decoder = SseDecoder::new();
+        let mut assembled = String::new();
+        for b in wire.as_bytes() {
+            decoder.push_bytes(&[*b]).expect("valid utf8");
+            for ev in decoder.poll() {
+                let v: serde_json::Value = serde_json::from_str(&ev.data).unwrap();
+                assembled.push_str(v["partial_json"].as_str().unwrap());
+            }
+        }
+        let reparsed: serde_json::Value = serde_json::from_str(&assembled).unwrap();
+        assert_eq!(reparsed, full);
+    }
+
+    #[test]
     fn sse_decoder_push_bytes_survives_a_multibyte_split_across_chunks() {
         // The end-to-end fix: an SSE data line carrying a multi-byte char
         // split across two network chunks must parse cleanly.

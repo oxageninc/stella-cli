@@ -110,6 +110,42 @@ where
     }
 }
 
+/// Longest raw-snippet prefix (in characters) echoed back in a truncated
+/// tool-input error — enough to identify the call without dumping a
+/// multi-kilobyte partial payload into the log.
+const TOOL_INPUT_SNIPPET_CHARS: usize = 200;
+
+/// Build the terminal error for a streamed tool call whose argument JSON was
+/// cut off at the output-token limit before it finished. Shared by every
+/// adapter that assembles tool calls from stream fragments: `provider` names
+/// the concrete backend, `limit_signal` the wire-level evidence
+/// (`stop_reason=max_tokens`, `finish_reason=length`). Non-retryable:
+/// re-issuing the identical request re-truncates identically (the very
+/// "stuck-loop" this error replaces), so the actionable fix — a larger
+/// `max_output_tokens` or a smaller payload — is surfaced in the message
+/// along with a bounded snippet of the RAW accumulated string.
+pub(crate) fn truncated_tool_input_error(
+    provider: &str,
+    name: &str,
+    raw: &str,
+    limit_signal: &str,
+) -> ProviderError {
+    let total_chars = raw.chars().count();
+    let snippet: String = raw.chars().take(TOOL_INPUT_SNIPPET_CHARS).collect();
+    let ellipsis = if total_chars > TOOL_INPUT_SNIPPET_CHARS {
+        "…"
+    } else {
+        ""
+    };
+    ProviderError::Terminal(format!(
+        "{provider} tool call `{name}` was cut off at the output-token limit \
+         ({limit_signal}) before its arguments finished streaming — the \
+         accumulated JSON is incomplete and cannot be parsed ({total_chars} chars: \
+         `{snippet}{ellipsis}`). Raise max_output_tokens or have the model emit a \
+         smaller payload, then retry."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

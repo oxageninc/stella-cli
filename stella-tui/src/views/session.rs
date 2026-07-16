@@ -14,7 +14,8 @@ use ratatui::widgets::{Paragraph, Widget};
 use crate::deck::{AgentEntry, WorkspaceModel};
 use crate::deck_ui::DeckUi;
 use crate::render::{
-    entry_lines, inner_height, render_ask_user, render_hud, render_scope_review, render_transcript,
+    entry_lines, inner_height, inner_width, render_ask_user, render_hud, render_scope_review,
+    render_transcript,
 };
 use crate::theme;
 
@@ -59,9 +60,10 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
 
     // Transcript: fold the focused agent's entries into styled lines, then reuse
     // the line-exact scrolling transcript renderer.
+    let width = inner_width(bands[4]);
     let mut lines: Vec<Line<'static>> = Vec::new();
     for entry in &sm.transcript {
-        entry_lines(entry, ui.thinking_expanded, &mut lines);
+        entry_lines(entry, ui.thinking_expanded, width, &mut lines);
     }
     let height = inner_height(bands[4]);
     ui.metrics.session_total = lines.len();

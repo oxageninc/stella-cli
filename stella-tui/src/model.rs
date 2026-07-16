@@ -74,6 +74,10 @@ pub struct AskUserPrompt {
 /// is applied by [`crate::render`]; this type carries only content.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptEntry {
+    /// A user-submitted prompt. Not an `AgentEvent` — the deck driver pushes
+    /// this when `PromptStarted` arrives so the user's message is visible
+    /// inline in the transcript, matching the Crush-style conversational layout.
+    User(String),
     /// A stage boundary marker (`triage`, `plan`, `execute`, …).
     Stage(StageKind),
     /// Accumulated assistant natural-language output.
@@ -85,6 +89,11 @@ pub enum TranscriptEntry {
         call_id: String,
         name: String,
         input: String,
+        /// The workspace-relative path the call targets, parsed from its
+        /// input's `path` field (every file tool uses that key). Retained so a
+        /// mutating tool's `ToolResult` can be correlated back to the file it
+        /// touched without re-parsing the elided input summary.
+        path: Option<String>,
     },
     /// A tool invocation finished — `ok` is `false` for a typed tool error.
     ToolResult {
@@ -92,6 +101,13 @@ pub enum TranscriptEntry {
         ok: bool,
         summary: String,
         duration_ms: u64,
+        /// For a *successful* file-mutating tool
+        /// (`write_file`/`edit_file`/`delete_file`), the reference the
+        /// renderer uses to show this call's diff inline. `None` for reads,
+        /// non-file tools, and failed calls — which gates the inline diff to
+        /// mutations that actually happened. The diff itself is never stored
+        /// here (L-T5: one event-borne diff path).
+        diff: Option<InlineDiffRef>,
     },
     /// A model call was retried (surfaced only once the step commits — the
     /// engine defers these, L-E10).
@@ -170,6 +186,21 @@ pub enum TranscriptEntry {
     Complete { model: String, cost_usd: f64 },
 }
 
+/// A mutating tool result's handle on the diff it may render inline: the
+/// path into [`SessionModel::files`] plus the value of that file's `changes`
+/// counter when the result folded. The renderer shows the inline diff only
+/// while the counter still matches — a later mutation of the same path bumps
+/// it, so a historical entry can never display a diff its call didn't
+/// produce. Only the *reference* lives here; the diff bytes stay on the
+/// single event-borne path (L-T5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineDiffRef {
+    /// The key into [`SessionModel::files`].
+    pub path: String,
+    /// [`FileState::changes`] at fold time — stale (hidden) once it differs.
+    pub seq: u32,
+}
+
 /// The state of one file in the files-touched panel. `latest_diff` is
 /// literally the diff carried by the most recent `FileChange` for this path
 /// — the single event-borne data path (L-T5).
@@ -223,7 +254,8 @@ impl SessionModel {
                 self.transcript.push(TranscriptEntry::ToolStart {
                     call_id: call.call_id.clone(),
                     name: call.name.clone(),
-                    input: summarize(&compact_json(&call.input)),
+                    input: format_tool_input(&call.name, &call.input),
+                    path: tool_input_path(&call.input),
                 });
             }
             AgentEvent::ToolResult {
@@ -235,11 +267,31 @@ impl SessionModel {
                     ToolOutput::Ok { content } => (true, summarize(content)),
                     ToolOutput::Error { message } => (false, summarize(message)),
                 };
+                // Only a *successful* mutation gets an inline-diff reference —
+                // a failed call produced no `FileChange`, and rendering the
+                // path's previous diff under its ✗ would attribute a change
+                // the call never made. The engine's `FileChangeTap` emits the
+                // `FileChange` during the tool's execution, so by the time
+                // this result folds, `files[path].changes` already counts this
+                // call's own change — that value is the freshness tag.
+                let diff = if ok {
+                    self.mutated_path_for(call_id).map(|path| {
+                        let seq = self
+                            .files
+                            .iter()
+                            .find(|f| f.path == path)
+                            .map_or(0, |f| f.changes);
+                        InlineDiffRef { path, seq }
+                    })
+                } else {
+                    None
+                };
                 self.transcript.push(TranscriptEntry::ToolResult {
                     call_id: call_id.clone(),
                     ok,
                     summary,
                     duration_ms: *duration_ms,
+                    diff,
                 });
                 // The answer to an `ask_user` question comes back as this very
                 // tool result (correlated by id) — there is no separate answer
@@ -436,6 +488,36 @@ impl SessionModel {
         }
     }
 
+    /// Push a user-submitted prompt into the transcript. This is **not** an
+    /// `AgentEvent` fold — the deck driver calls this when `PromptStarted`
+    /// arrives so user messages appear inline in the conversational scrollback.
+    pub fn push_user_prompt(&mut self, text: &str) {
+        self.transcript
+            .push(TranscriptEntry::User(text.to_string()));
+    }
+
+    /// If tool call `call_id` was a file mutation, the path it touched —
+    /// recovered by correlating back to its `ToolStart` (which is already on
+    /// the transcript by the time the result folds). `None` for reads and
+    /// non-file tools, which is what gates the transcript's inline diff to
+    /// mutations. The diff itself is *not* looked up here — the renderer reads
+    /// it from [`SessionModel::files`] at draw time (L-T5).
+    fn mutated_path_for(&self, call_id: &str) -> Option<String> {
+        self.transcript
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                TranscriptEntry::ToolStart {
+                    call_id: cid,
+                    name,
+                    path,
+                    ..
+                } if cid == call_id => Some((name.clone(), path.clone())),
+                _ => None,
+            })
+            .and_then(|(name, path)| is_file_mutation(&name).then_some(path).flatten())
+    }
+
     /// Record a file touch, retaining the latest diff for the path (L-T5).
     fn touch_file(&mut self, path: &str, kind: FileChangeKind, diff: &Option<String>) {
         if let Some(existing) = self.files.iter_mut().find(|f| f.path == path) {
@@ -458,6 +540,82 @@ impl SessionModel {
 /// the model never panics on a tool card.
 fn compact_json(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
+}
+
+/// Format a tool-call input as a human-readable one-liner. Instead of raw
+/// JSON, this extracts the most relevant field(s) per tool name so the
+/// transcript reads naturally — `path` for file tools, `cmd` for shell, the
+/// query for search tools, and so on.
+fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
+    let str_field = |key: &str| -> Option<String> {
+        input.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    };
+
+    // Primary field per tool — the one the user cares about at a glance.
+    if let Some(p) = str_field("path").or_else(|| str_field("file_path")) {
+        return match name {
+            "edit_file" => {
+                let old = str_field("old_string").map(|s| truncate_field(&s, 40));
+                let new = str_field("new_string").map(|s| truncate_field(&s, 40));
+                match (old, new) {
+                    (Some(o), Some(n)) => format!("{p}  {o} → {n}"),
+                    _ => p,
+                }
+            }
+            "write_file" => {
+                let lines = str_field("content").map(|c| c.lines().count()).unwrap_or(0);
+                format!("{p}  ({lines} lines)")
+            }
+            _ => p,
+        };
+    }
+
+    if let Some(cmd) = str_field("cmd").or_else(|| str_field("command")) {
+        return truncate_field(&cmd, 120);
+    }
+
+    if let Some(query) = str_field("query").or_else(|| str_field("pattern"))
+        .or_else(|| str_field("symbol"))
+    {
+        return truncate_field(&query, 80);
+    }
+
+    if let Some(prompt) = str_field("question").or_else(|| str_field("prompt")) {
+        return truncate_field(&prompt, 80);
+    }
+
+    // Fallback: compact JSON, summarized.
+    summarize(&compact_json(input))
+}
+
+/// Truncate a field value to `max` chars with an ellipsis.
+fn truncate_field(s: &str, max: usize) -> String {
+    let flat = s.replace(['\n', '\r'], " ");
+    let chars: Vec<char> = flat.chars().collect();
+    if chars.len() <= max {
+        return flat;
+    }
+    let head: String = chars[..max.saturating_sub(1)].iter().collect();
+    format!("{head}…")
+}
+
+/// The workspace-relative path a file tool targets. Every built-in file tool
+/// (`read_file`/`write_file`/`edit_file`/`delete_file`) takes its path under
+/// the `path` key, and the engine emits `FileChange` for that same path — so
+/// this is the join key between a tool result and its diff.
+fn tool_input_path(input: &serde_json::Value) -> Option<String> {
+    input
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// Whether a tool name is one of the file-*mutating* built-ins — the only
+/// tools whose result should carry an inline diff (reads must not). Must
+/// stay in lockstep with `file_change_of` in stella-cli's `command_deck.rs`,
+/// the `FileChange` emitter that owns this list.
+fn is_file_mutation(name: &str) -> bool {
+    matches!(name, "write_file" | "edit_file" | "delete_file")
 }
 
 /// Truncate a summary to [`SUMMARY_BUDGET`] chars with a middle-out elision —
