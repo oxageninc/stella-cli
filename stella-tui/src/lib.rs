@@ -33,6 +33,7 @@ pub mod model;
 pub mod render;
 pub mod scroll;
 pub mod shell;
+pub(crate) mod term;
 pub mod ui;
 
 // ── Command Deck: the multi-tab, multi-agent operations workspace ───────────

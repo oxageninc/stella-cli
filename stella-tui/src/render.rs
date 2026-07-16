@@ -184,6 +184,11 @@ pub(crate) fn inner_height(area: Rect) -> usize {
 /// Render one panel into a throwaway buffer under `catch_unwind`; on panic,
 /// substitute a visible error card. See the module docs for the soundness
 /// argument behind `AssertUnwindSafe`.
+///
+/// The [`crate::term::PanelBoundary`] marker tells the panic hook this panic
+/// is caught here (in unwind builds), so it must not restore the terminal
+/// mid-session; in abort builds the catch is inert and the hook restores
+/// unconditionally — the process is about to die either way.
 pub(crate) fn guarded_panel<F>(frame: &mut Frame, area: Rect, label: &str, draw: F)
 where
     F: Fn(&mut Buffer),
@@ -191,11 +196,14 @@ where
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut buf = Buffer::empty(area);
-        draw(&mut buf);
-        buf
-    }));
+    let drawn = {
+        let _boundary = crate::term::PanelBoundary::enter();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut buf = Buffer::empty(area);
+            draw(&mut buf);
+            buf
+        }))
+    };
     let buf = match drawn {
         Ok(buf) => buf,
         Err(payload) => error_card(area, label, &panic_message(&*payload)),

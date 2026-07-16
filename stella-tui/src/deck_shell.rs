@@ -20,11 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::io::AsyncReadExt;
@@ -38,6 +34,7 @@ use crate::envelope::{AgentMeta, AgentStatus, Inbound, WorkspaceInput};
 use crate::graph::GraphSnapshot;
 use crate::resource::ResourceMonitor;
 use crate::shell::DebugLog;
+use crate::term::{PanicHookGuard, TerminalGuard};
 
 /// The repaint / sample cadence. ~30 fps keeps animations smooth and the CPU
 /// gauge / elapsed timers live without busy-spinning.
@@ -65,54 +62,6 @@ pub struct DeckOptions {
     /// The slash-command vocabulary for the `/` popup (the caller owns the
     /// real list, exactly like the single-session `RunOptions`).
     pub slash_commands: Vec<SlashCommand>,
-}
-
-/// Restores the terminal on drop, including during a panic unwind.
-///
-/// Each terminal state is flagged as it is acquired, and the guard exists
-/// BEFORE the first acquisition — so an error partway through `enter` (raw
-/// mode on, alternate screen failed) still drops the guard and rolls back
-/// exactly the states that were entered, never stranding the user's terminal
-/// in raw mode.
-struct TerminalGuard {
-    raw: bool,
-    alt: bool,
-    mouse: bool,
-}
-
-impl TerminalGuard {
-    fn enter(mouse: bool) -> io::Result<Self> {
-        let mut guard = Self {
-            raw: false,
-            alt: false,
-            mouse: false,
-        };
-        let mut out = io::stdout();
-        enable_raw_mode()?;
-        guard.raw = true;
-        execute!(out, EnterAlternateScreen)?;
-        guard.alt = true;
-        if mouse {
-            execute!(out, EnableMouseCapture)?;
-            guard.mouse = true;
-        }
-        Ok(guard)
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let mut out = io::stdout();
-        if self.mouse {
-            let _ = execute!(out, DisableMouseCapture);
-        }
-        if self.alt {
-            let _ = execute!(out, LeaveAlternateScreen);
-        }
-        if self.raw {
-            let _ = disable_raw_mode();
-        }
-    }
 }
 
 fn now_ms() -> u64 {
@@ -311,7 +260,10 @@ pub async fn run_deck(
     let debug = DebugLog::new(opts.debug_log_path.clone());
     debug.note("deck session start");
 
+    // The hook shares the guard's state so a panic restores the terminal even
+    // in abort builds, where Drop never runs (see `crate::term`).
     let _guard = TerminalGuard::enter(opts.mouse_capture)?;
+    let _hook_guard = PanicHookGuard::install(opts.debug_log_path.clone(), &_guard);
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut model = WorkspaceModel::new();
