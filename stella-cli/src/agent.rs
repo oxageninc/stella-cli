@@ -1282,11 +1282,6 @@ pub(crate) async fn init_workspace(
     // directories — idempotent, never clobbers, never fatal.
     crate::extensions::sync_extensions(workspace_root, emit);
 
-    // Adopt commands/skills/agents other code agents keep in `.claude/` and
-    // `.agents/` (workspace + user scope) as symlinks into stella's own
-    // directories — idempotent, never clobbers, never fatal.
-    crate::extensions::sync_extensions(workspace_root, emit);
-
     let path = domains.save(workspace_root)?;
 
     // Persist the taxonomy into the context plane too: domain descriptions
