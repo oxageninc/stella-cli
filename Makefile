@@ -137,6 +137,14 @@ release-major: ## Cut a major release (0.1.0 -> 1.0.0)
 clean: ## Remove all build artifacts
 	cargo clean
 
+.PHONY: reap-agents
+reap-agents: ## List orphaned stella agents/tool-subprocesses idle 20m+ (dry run)
+	scripts/reap-agents.sh --dry-run --verbose
+
+.PHONY: reap-agents-kill
+reap-agents-kill: ## Kill orphaned stella agents/tool-subprocesses idle 20m+ (asks first)
+	scripts/reap-agents.sh
+
 .PHONY: audit
 audit: ## Run full codebase audit (clippy, tests, supply-chain, dead-code scan)
 	@printf '\033[1m=== Clippy ===\033[0m\n'

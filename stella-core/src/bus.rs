@@ -623,9 +623,16 @@ impl HookBus {
     /// in registration order, folding `Modify` into the payload, stopping
     /// at the first `Deny`/`RequireApproval`. Records the final decision in
     /// a `policy.evaluated` event plus one of `policy.allowed` /
-    /// `policy.blocked` / `approval.requested`. The chain sees the **raw**
-    /// payload (interception needs it); the recorded policy events carry
-    /// only the decision, never the payload.
+    /// `policy.blocked` / `approval.requested`.
+    ///
+    /// The blocking event itself is delivered **only to blocking handlers**
+    /// ([`HookBus::on_blocking`]) — never to observers ([`HookBus::on`]).
+    /// That is the payload-hygiene boundary: the raw payload (which may carry
+    /// full file contents or a shell command) reaches only the explicitly
+    /// privileged interception point. Observers see the *outcome* — the
+    /// `policy.*` records (decision only, no payload) — plus whatever
+    /// sanitized observable events the emitter chooses to also send (e.g. the
+    /// registry's `tool.call.started`).
     pub fn emit_blocking(&self, draft: HookEventDraft) -> PolicyOutcome {
         let mut event = self.seal(draft);
         let chain: Vec<(String, Arc<BlockingFn>)> = {
@@ -1361,13 +1368,19 @@ mod tests {
             0,
             "handlers after a deny never run"
         );
-        let evaluated = &seen.lock().unwrap()[0];
-        assert_eq!(evaluated.name, "policy.evaluated");
-        assert_eq!(evaluated.payload["decision"]["action"], "deny");
-        assert_eq!(
-            evaluated.payload["decision"]["reason"],
-            "workspace is read-only"
-        );
+        // Scope the guard: binding `&seen.lock()...[0]` would hold the lock
+        // across the `names_of(&seen)` re-lock below and deadlock (std Mutex
+        // is not reentrant).
+        {
+            let events = seen.lock().unwrap();
+            let evaluated = &events[0];
+            assert_eq!(evaluated.name, "policy.evaluated");
+            assert_eq!(evaluated.payload["decision"]["action"], "deny");
+            assert_eq!(
+                evaluated.payload["decision"]["reason"],
+                "workspace is read-only"
+            );
+        }
         assert_eq!(names_of(&seen)[1], "policy.blocked");
     }
 
