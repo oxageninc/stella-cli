@@ -154,7 +154,17 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
         .with_pid(std::process::id());
     lead_meta.model = Some(format!("{}/{}", cfg.provider.id, cfg.model_id));
     let _ = in_tx.send(Inbound::Register(lead_meta));
-    // An idle lead is waiting on the human, not queued behind a supervisor.
+    // Custom definitions that failed to load are reported into the
+    // transcript up front — stdout belongs to the alternate screen, and a
+    // silently-missing /command is otherwise undiagnosable.
+    if let Some(report) = custom.problems_report() {
+        let _ = in_tx.send(Inbound::Event {
+            agent: LEAD.to_string(),
+            event: AgentEvent::Text { delta: report },
+        });
+    }
+    // An idle lead is waiting on the human, not queued behind a supervisor
+    // (sent after the problems report — a Text event folds to `Running`).
     let _ = in_tx.send(Inbound::Status {
         agent: LEAD.to_string(),
         status: AgentStatus::WaitingInput,
@@ -240,9 +250,21 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
                     let _ = in_tx.send(Inbound::GraphSnapshot(snapshot));
                 }
                 // `/init` may also have adopted new custom commands/skills —
-                // reload them and refresh the deck's slash menu in place.
+                // reload them and refresh the deck's slash menu in place,
+                // reporting anything that failed to load (then restoring the
+                // idle status the report's Text event flipped).
                 custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
                 let _ = in_tx.send(Inbound::SlashCommands(deck_slash_commands(&custom)));
+                if let Some(report) = custom.problems_report() {
+                    let _ = in_tx.send(Inbound::Event {
+                        agent: LEAD.to_string(),
+                        event: AgentEvent::Text { delta: report },
+                    });
+                    let _ = in_tx.send(Inbound::Status {
+                        agent: LEAD.to_string(),
+                        status: AgentStatus::WaitingInput,
+                    });
+                }
                 continue 'session;
             }
         };
@@ -413,20 +435,35 @@ enum DeckCommand {
     InitCompleted,
 }
 
+/// The deck's productized vocabulary, as `(name, menu description)`. One
+/// source of truth for the menu's 🔒 rows and the reserved-name guard: a
+/// custom definition can never run under one of these names — not from the
+/// menu (`slash_entries` drops it) and not typed with arguments either
+/// (`expand` refuses reserved heads).
+const DECK_BUILTINS: &[(&str, &str)] = &[
+    ("/help", "show commands"),
+    ("/clear", "reset the conversation"),
+    ("/models", "list providers & models"),
+    ("/init", "index the workspace: domains + code graph"),
+    ("/agents", "list custom agents"),
+    ("/files", "open the Files tab"),
+    ("/diff", "open the diff viewer"),
+    ("/graph", "open the code-graph tab"),
+];
+
+/// The deck's reserved command names — see [`DECK_BUILTINS`].
+fn deck_reserved() -> Vec<&'static str> {
+    DECK_BUILTINS.iter().map(|(name, _)| *name).collect()
+}
+
 /// The deck's slash vocabulary: the productized commands (🔒) followed by
 /// every custom command/skill (⚡) currently on disk. Rebuilt after `/init`
 /// so just-adopted definitions appear without a restart.
 fn deck_slash_commands(custom: &crate::extensions::CustomExtensions) -> Vec<SlashCommand> {
-    let mut commands = vec![
-        SlashCommand::new("/help", "show commands"),
-        SlashCommand::new("/clear", "reset the conversation"),
-        SlashCommand::new("/models", "list providers & models"),
-        SlashCommand::new("/init", "index the workspace: domains + code graph"),
-        SlashCommand::new("/agents", "list custom agents"),
-        SlashCommand::new("/files", "open the Files tab"),
-        SlashCommand::new("/diff", "open the diff viewer"),
-        SlashCommand::new("/graph", "open the code-graph tab"),
-    ];
+    let mut commands: Vec<SlashCommand> = DECK_BUILTINS
+        .iter()
+        .map(|(name, description)| SlashCommand::new(*name, *description))
+        .collect();
     let customs = custom.slash_entries(&commands);
     commands.extend(customs);
     commands
@@ -511,8 +548,10 @@ async fn run_deck_command(
         "/files" | "/diff" | "/graph" => {}
         _ => {
             // A custom command/skill (⚡): expand its template — arguments
-            // and all — into the prompt the model turn runs.
-            if let Some(expanded) = custom.expand(trimmed) {
+            // and all — into the prompt the model turn runs. Reserved names
+            // never reach a custom definition (`/init do the thing` stays a
+            // model prompt even if a custom `init` exists).
+            if let Some(expanded) = custom.expand(trimmed, &deck_reserved()) {
                 return DeckCommand::Expanded(expanded);
             }
             // A bare unknown /word is a typo'd command, not a prompt — say so

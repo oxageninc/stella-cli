@@ -285,6 +285,13 @@ pub struct SyncEntry {
     pub path: String,
     /// `true` when the entry is itself a symlink (`fs::symlink_metadata`).
     pub is_symlink: bool,
+    /// The name the definition will *load* under — the frontmatter `name:`
+    /// when the scanner could parse one, else the filename-derived slug.
+    /// Collision precedence is decided on this, not on `name`: two files
+    /// with different basenames but the same frontmatter name are the same
+    /// definition, and linking both would leave the loader's merge order
+    /// (destination-lexicographic) to pick a winner instead of source order.
+    pub definition_name: String,
 }
 
 /// The scanned contents of one source directory for one kind, in the
@@ -301,11 +308,13 @@ pub enum SyncSkipReason {
     /// The source entry is itself a symlink — following it would duplicate
     /// the definition it points at, whose real home is also scanned.
     SourceIsSymlink,
-    /// The destination already has this name (a previous sync or a
+    /// The destination already has this file name (a previous sync or a
     /// user-authored definition) — never clobbered, which is also what makes
     /// re-running the sync idempotent.
     DestinationExists,
-    /// An earlier source directory already claimed this name this run.
+    /// A definition with this *loaded* name is already claimed — by an
+    /// earlier source directory this run, or by something already in the
+    /// destination under a different file name.
     DuplicateName,
 }
 
@@ -340,22 +349,46 @@ impl SyncPlan {
     }
 }
 
+/// What already occupies one kind's destination directory, as scanned by the
+/// CLI: the entry basenames (the never-clobber check is filesystem-level) and
+/// the names those entries' definitions load under (so a re-run — or a
+/// differently-named file carrying the same frontmatter `name:` — is not
+/// adopted a second time).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExistingTargets {
+    pub file_names: Vec<String>,
+    pub definition_names: Vec<String>,
+}
+
 /// Plan the adoption of scanned source entries into one destination root.
 /// `sources` are in precedence order (e.g. `.claude/<kind>` before
-/// `.agents/<kind>`); `existing` maps each kind to the names already present
-/// in the destination directory. Deterministic: actions come out in scan
-/// order. See the module doc for the two rules (never link a symlink, never
-/// clobber).
+/// `.agents/<kind>`); `existing` describes each kind's destination directory.
+/// Deterministic: actions come out in scan order. See the module doc for the
+/// two rules (never link a symlink, never clobber); collision precedence
+/// between sources is decided on [`SyncEntry::definition_name`].
 pub fn plan_extension_sync(
     sources: &[SyncSource],
-    existing: &dyn Fn(ExtensionKind) -> Vec<String>,
+    existing: &dyn Fn(ExtensionKind) -> ExistingTargets,
 ) -> SyncPlan {
     let mut plan = SyncPlan::default();
     let mut claimed: std::collections::HashSet<(ExtensionKind, String)> =
         std::collections::HashSet::new();
+    let mut present_files: std::collections::HashMap<
+        ExtensionKind,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     for source in sources {
-        let present: std::collections::HashSet<String> =
-            existing(source.kind).into_iter().collect();
+        if !present_files.contains_key(&source.kind) {
+            let targets = existing(source.kind);
+            present_files.insert(source.kind, targets.file_names.into_iter().collect());
+            // Definitions already in the destination claim their names up
+            // front, so a same-named-but-differently-filed source entry is
+            // skipped instead of linked alongside.
+            for name in targets.definition_names {
+                claimed.insert((source.kind, name));
+            }
+        }
+        let present = &present_files[&source.kind];
         for entry in &source.entries {
             let skip = |reason| SyncSkip {
                 kind: source.kind,
@@ -367,7 +400,7 @@ pub fn plan_extension_sync(
                 plan.skips.push(skip(SyncSkipReason::SourceIsSymlink));
             } else if present.contains(&entry.name) {
                 plan.skips.push(skip(SyncSkipReason::DestinationExists));
-            } else if !claimed.insert((source.kind, entry.name.clone())) {
+            } else if !claimed.insert((source.kind, entry.definition_name.clone())) {
                 plan.skips.push(skip(SyncSkipReason::DuplicateName));
             } else {
                 plan.links.push(PlannedLink {
@@ -491,11 +524,15 @@ mod tests {
             name: name.to_string(),
             path: path.to_string(),
             is_symlink,
+            // Tests that exercise frontmatter-name collisions build their
+            // own entries; everywhere else the definition name is the file
+            // name minus a `.md` suffix, like the scanner's fallback.
+            definition_name: name.strip_suffix(".md").unwrap_or(name).to_string(),
         }
     }
 
-    fn no_existing(_: ExtensionKind) -> Vec<String> {
-        Vec::new()
+    fn no_existing(_: ExtensionKind) -> ExistingTargets {
+        ExistingTargets::default()
     }
 
     #[test]
@@ -544,12 +581,60 @@ mod tests {
         }];
         let existing = |kind: ExtensionKind| {
             assert_eq!(kind, ExtensionKind::Commands);
-            vec!["deploy".to_string()]
+            ExistingTargets {
+                file_names: vec!["deploy".to_string()],
+                definition_names: vec!["deploy".to_string()],
+            }
         };
         let plan = plan_extension_sync(&sources, &existing);
         assert_eq!(plan.links.len(), 1);
         assert_eq!(plan.links[0].name, "new-cmd");
         assert_eq!(plan.skips[0].reason, SyncSkipReason::DestinationExists);
+    }
+
+    #[test]
+    fn plan_resolves_collisions_on_the_frontmatter_name_not_the_file_name() {
+        // Two differently-named files whose frontmatter says `name: deploy`:
+        // linking both would leave the loader's merge order to pick a winner.
+        // Source precedence (`.claude` first) must decide instead.
+        let deploy = |name: &str, path: &str| SyncEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            is_symlink: false,
+            definition_name: "deploy".to_string(),
+        };
+        let sources = vec![
+            SyncSource {
+                kind: ExtensionKind::Commands,
+                entries: vec![deploy("ship.md", "/ws/.claude/commands/ship.md")],
+            },
+            SyncSource {
+                kind: ExtensionKind::Commands,
+                entries: vec![deploy("release.md", "/ws/.agents/commands/release.md")],
+            },
+        ];
+        let plan = plan_extension_sync(&sources, &no_existing);
+        assert_eq!(plan.links.len(), 1);
+        assert_eq!(plan.links[0].source_path, "/ws/.claude/commands/ship.md");
+        assert_eq!(plan.skips[0].reason, SyncSkipReason::DuplicateName);
+    }
+
+    #[test]
+    fn plan_skips_a_source_whose_definition_name_is_already_in_the_destination() {
+        // The destination holds `mine.md` with frontmatter `name: deploy`;
+        // a source file `deploy.md` (same loaded name, different file name)
+        // must not be linked alongside it.
+        let sources = vec![SyncSource {
+            kind: ExtensionKind::Commands,
+            entries: vec![entry("deploy.md", "/ws/.claude/commands/deploy.md", false)],
+        }];
+        let existing = |_: ExtensionKind| ExistingTargets {
+            file_names: vec!["mine.md".to_string()],
+            definition_names: vec!["deploy".to_string()],
+        };
+        let plan = plan_extension_sync(&sources, &existing);
+        assert!(plan.links.is_empty());
+        assert_eq!(plan.skips[0].reason, SyncSkipReason::DuplicateName);
     }
 
     #[test]
@@ -579,7 +664,10 @@ mod tests {
         let first = plan_extension_sync(&sources, &no_existing);
         assert_eq!(first.links.len(), 1);
         // Second run: the destination now contains what the first run linked.
-        let after: Vec<String> = first.links.iter().map(|l| l.name.clone()).collect();
+        let after = ExistingTargets {
+            file_names: first.links.iter().map(|l| l.name.clone()).collect(),
+            definition_names: first.links.iter().map(|l| l.name.clone()).collect(),
+        };
         let second = plan_extension_sync(&sources, &move |_| after.clone());
         assert!(second.links.is_empty());
         assert_eq!(second.skips[0].reason, SyncSkipReason::DestinationExists);

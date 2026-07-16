@@ -68,8 +68,9 @@ pub struct SessionMemory {
 }
 
 /// Filesystem-backed [`SkillSource`] reading the workspace + user-global
-/// skill directories.
-pub(crate) struct FsSkillSource;
+/// skill directories. Private: outside consumers go through
+/// [`load_workspace_skills`] / [`load_workspace_skills_with_diagnostics`].
+struct FsSkillSource;
 
 impl SkillSource for FsSkillSource {
     fn read_skill_files(&self, roots: &[String]) -> Vec<skills::SkillFile> {
@@ -132,7 +133,16 @@ pub(crate) fn user_skills_dir() -> String {
 /// custom-extensions surface (`crate::extensions`), which offers the same
 /// files as ⚡ slash-menu entries.
 pub(crate) fn load_workspace_skills(workspace_root: &Path) -> Vec<Skill> {
-    skills::load_skills(
+    load_workspace_skills_with_diagnostics(workspace_root).skills
+}
+
+/// Same load, keeping the per-file skip diagnostics — the custom-extensions
+/// surface reports these so a malformed `SKILL.md` is visible instead of
+/// silently absent from the slash menu.
+pub(crate) fn load_workspace_skills_with_diagnostics(
+    workspace_root: &Path,
+) -> skills::LoadedSkills {
+    skills::load_skills_with_diagnostics(
         &FsSkillSource,
         &LoadSkillsOptions {
             workspace_skills_dir: workspace_skills_dir(workspace_root),

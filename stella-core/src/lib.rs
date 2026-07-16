@@ -28,9 +28,9 @@ pub use budget::{BudgetGuard, BudgetOutcome};
 pub use driver::{Engine, EngineConfig, TurnOutcome};
 pub use estimator::{Calibration, CalibrationMap};
 pub use extensions::{
-    AgentDef, CommandDef, ExtensionDiagnostic, ExtensionKind, ExtensionProblem, PlannedLink,
-    SyncEntry, SyncPlan, SyncSkip, SyncSkipReason, SyncSource, agent_from_file, command_from_file,
-    expand_command, merge_by_name, plan_extension_sync,
+    AgentDef, CommandDef, ExistingTargets, ExtensionDiagnostic, ExtensionKind, ExtensionProblem,
+    PlannedLink, SyncEntry, SyncPlan, SyncSkip, SyncSkipReason, SyncSource, agent_from_file,
+    command_from_file, expand_command, merge_by_name, plan_extension_sync,
 };
 pub use goal::{GoalConfig, GoalOutcome};
 pub use hooks::{HookEvent, HookPayload, HookRunOutcome, HookRunner, Hooks, run_hooks};
