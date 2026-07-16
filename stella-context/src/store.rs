@@ -1063,21 +1063,23 @@ pub(crate) fn tag_edge_domains(
     Ok(added)
 }
 
-/// The domain names tagged on a node, sorted for stable citation display.
-pub(crate) fn domains_for_node(
+/// Every node's domain names in one scan, sorted per node for stable
+/// citation display — the batched form of the old per-node query. Recall
+/// runs this once per prompt; one statement per live node was an N+1 whose
+/// cost grew with lifetime memory size.
+pub(crate) fn domains_by_node(
     conn: &Connection,
-    node_id: i64,
-) -> Result<Vec<String>, ContextError> {
+) -> Result<std::collections::HashMap<i64, Vec<String>>, ContextError> {
     let mut stmt = conn.prepare(
-        "SELECT d.name FROM node_domains nd
+        "SELECT nd.node_id, d.name FROM node_domains nd
          JOIN domain d ON d.id = nd.domain_id
-         WHERE nd.node_id = ?1
-         ORDER BY d.name",
+         ORDER BY nd.node_id, d.name",
     )?;
-    let rows = stmt.query_map(params![node_id], |r| r.get::<_, String>(0))?;
-    let mut out = Vec::new();
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
     for r in rows {
-        out.push(r?);
+        let (id, name) = r?;
+        out.entry(id).or_default().push(name);
     }
     Ok(out)
 }

@@ -20,7 +20,7 @@ use ocp_types::{ContextFrame, ContextQuery, Provenance};
 
 use crate::error::ContextError;
 use crate::store::{
-    ContextStore, NodeRow, domains_for_node, live_nodes, neighbors, node_ids_excluded_by_scope,
+    ContextStore, NodeRow, domains_by_node, live_nodes, neighbors, node_ids_excluded_by_scope,
     node_ids_for_uris, vectors_for_fingerprint,
 };
 
@@ -154,10 +154,10 @@ impl ContextStore {
                 nodes.retain(|n| !excluded.contains(&n.id));
                 vectors.retain(|(id, _)| !excluded.contains(id));
             }
-            let mut domains_by_id: HashMap<i64, Vec<String>> = HashMap::new();
-            for n in &nodes {
-                domains_by_id.insert(n.id, domains_for_node(&conn, n.id)?);
-            }
+            // One grouped scan instead of one statement per live node —
+            // entries for filtered-out nodes are harmless (lookups below are
+            // keyed by candidate id only).
+            let domains_by_id: HashMap<i64, Vec<String>> = domains_by_node(&conn)?;
             (nodes, vectors, anchor_ids, domains_by_id)
         };
 
