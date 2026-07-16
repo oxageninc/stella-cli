@@ -25,7 +25,9 @@ mod extensions;
 mod fleet_cmd;
 mod interactive;
 mod memory;
+mod memory_cmd;
 mod ocp;
+mod rules;
 mod runtime;
 mod settings;
 mod stats;
@@ -186,7 +188,8 @@ enum Command {
         tasks: Vec<String>,
 
         /// A plan file instead: .json or .toml with [[tasks]] entries
-        /// (id, title, prompt, optional depends_on + isolation)
+        /// (id, title, prompt, optional depends_on + isolation + claims —
+        /// paths held as cooperative file locks while the task runs)
         #[arg(long, value_name = "FILE", conflicts_with = "tasks")]
         plan: Option<std::path::PathBuf>,
 
@@ -197,6 +200,13 @@ enum Command {
         /// Git ref isolated worktrees branch from (default: current HEAD)
         #[arg(long)]
         base_ref: Option<String>,
+
+        /// After the fan-out, watch each fleet branch's CI to completion and
+        /// reconcile its PR status via `gh` (the fleet PR/CI monitor). Exits
+        /// non-zero if any watched branch ends red. Meaningful once the
+        /// branches are pushed — e.g. task prompts that push and open PRs.
+        #[arg(long)]
+        watch: bool,
     },
 
     /// Query the code graph built by `stella init` — symbol definitions and
@@ -228,11 +238,43 @@ enum Command {
         provider: Option<String>,
     },
 
+    /// Inspect the project's memories through the citation feedback loop —
+    /// most-cited first, usefulness scores, truthfulness — and promote an
+    /// eligible memory to a project rule (.stella/rules/). Reads local state
+    /// only; needs no API key.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
+
     /// Show current configuration
     Config,
 
     /// Print the version and exit
     Version,
+}
+
+/// `stella memory` subcommands — the inspection and promotion surface of the
+/// memory-citation loop (agents cite the memories that informed a turn via
+/// the `cite_memory` tool; the citations aggregate into the eligibility gate
+/// `promote` enforces).
+#[derive(Subcommand)]
+enum MemoryCmd {
+    /// List memories ranked by citation count, with average usefulness,
+    /// truthfulness rate, and rule-promotion eligibility
+    List {
+        /// Output format: table (aligned) or json
+        #[arg(long, value_enum, default_value = "table")]
+        format: memory_cmd::MemoryFormat,
+    },
+    /// Promote an eligible memory to a project rule at
+    /// .stella/rules/<slug>.md. Eligibility is strict: cited successfully
+    /// MORE THAN 10 consecutive times since its last negative remark — one
+    /// negative citation resets the count until it is re-earned.
+    Promote {
+        /// The memory's stable id (nod_…) as shown by `stella memory list`
+        id: String,
+    },
 }
 
 /// The version string shown by `--version` and `stella version`: the crate
@@ -359,6 +401,14 @@ fn run(cli: Cli) -> Result<(), String> {
             // it is `Copy`, so deref rather than move.
             return stats::run_stats(*format, provider.as_deref());
         }
+        Some(Command::Memory { cmd }) => {
+            // Reads local stores only (list) / writes one rule file
+            // (promote) — works with zero API keys.
+            return match cmd {
+                MemoryCmd::List { format } => memory_cmd::run_memory_list(*format),
+                MemoryCmd::Promote { id } => memory_cmd::run_memory_promote(id),
+            };
+        }
         Some(Command::Version) => {
             println!("stella v{}", version_string());
             return Ok(());
@@ -413,6 +463,7 @@ fn run(cli: Cli) -> Result<(), String> {
             plan,
             max_concurrency,
             base_ref,
+            watch,
         } => {
             rt()?.block_on(fleet_cmd::run_fleet(
                 &cfg,
@@ -421,6 +472,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 base_ref.as_deref(),
                 max_concurrency,
                 cli.budget,
+                watch,
             ))?;
         }
         Command::Monitor { target } => {
@@ -440,7 +492,11 @@ fn run(cli: Cli) -> Result<(), String> {
             // real terminal; `--plain` / STELLA_PLAIN=1 / a non-TTY stream
             // falls back to the line-based REPL.
             if use_deck(cli.plain) {
-                rt()?.block_on(command_deck::run_deck_session(&cfg, cli.budget, cli.no_anim))?;
+                rt()?.block_on(command_deck::run_deck_session(
+                    &cfg,
+                    cli.budget,
+                    cli.no_anim,
+                ))?;
             } else {
                 rt()?.block_on(agent::run_interactive(&cfg, cli.budget))?;
             }
@@ -452,6 +508,7 @@ fn run(cli: Cli) -> Result<(), String> {
         | Command::Tools { .. }
         | Command::Graph { .. }
         | Command::Stats { .. }
+        | Command::Memory { .. }
         | Command::Models
         | Command::Version => {
             unreachable!("handled before provider resolution")

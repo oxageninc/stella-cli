@@ -60,10 +60,19 @@ pub struct Task {
     /// from serialized input.
     #[serde(default)]
     pub isolation: Isolation,
+    /// Workspace-relative paths this task declares it will touch. The fleet
+    /// claims them as cooperative file locks (`stella-store`'s `file_locks`)
+    /// before the worker starts and releases them when the attempt settles;
+    /// a path already claimed — by a sibling or another run in the same
+    /// workspace — fails the dispatch by name. Matched as exact strings, so
+    /// a plan should spell each path one way. Empty (the default) means the
+    /// task claims nothing.
+    #[serde(default)]
+    pub claims: Vec<String>,
 }
 
 impl Task {
-    /// A dependency-free, isolate-by-default task.
+    /// A dependency-free, isolate-by-default task claiming no paths.
     pub fn new(id: impl Into<TaskId>, title: impl Into<String>, prompt: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -71,12 +80,20 @@ impl Task {
             prompt: prompt.into(),
             depends_on: Vec::new(),
             isolation: Isolation::Isolated,
+            claims: Vec::new(),
         }
     }
 
     /// Add dependency edges (builder style).
     pub fn depends_on(mut self, deps: impl IntoIterator<Item = impl Into<TaskId>>) -> Self {
         self.depends_on.extend(deps.into_iter().map(Into::into));
+        self
+    }
+
+    /// Declare workspace-relative paths this task will touch (builder
+    /// style) — the fleet claims them for the attempt's duration.
+    pub fn claims(mut self, paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.claims.extend(paths.into_iter().map(Into::into));
         self
     }
 
@@ -476,10 +493,12 @@ mod tests {
         let plan: Plan = serde_json::from_str(json).unwrap();
         assert_eq!(plan.tasks[0].isolation, Isolation::Isolated);
         assert!(plan.tasks[0].depends_on.is_empty());
+        assert!(plan.tasks[0].claims.is_empty(), "claims default to none");
 
-        let shared = Task::new("b", "t", "p").shared_tree();
+        let shared = Task::new("b", "t", "p").shared_tree().claims(["src/a.rs"]);
         let back: Task = serde_json::from_str(&serde_json::to_string(&shared).unwrap()).unwrap();
         assert_eq!(back.isolation, Isolation::SharedTree);
+        assert_eq!(back.claims, vec!["src/a.rs".to_string()]);
     }
 
     // ---- Properties ---------------------------------------------------

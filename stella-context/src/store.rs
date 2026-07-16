@@ -445,6 +445,39 @@ impl ContextStore {
         let conn = lock(&self.conn);
         list_domains(&conn)
     }
+
+    /// Every live Memory-kind node, newest first — the inspection surface
+    /// behind `stella memory` (its citation stats join on `public_id`, the
+    /// same stable id recalled frames carry).
+    pub fn memory_nodes(&self) -> Result<Vec<NodeRow>, ContextError> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT id, public_id, kind, display_name, content, content_hash, uri, recorded_at
+             FROM node WHERE kind = 'memory' AND superseded_at IS NULL
+             ORDER BY recorded_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], map_node_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// A live node by its stable public id (`nod_…`) — how `stella memory
+    /// promote` resolves a cited id back to the memory's content.
+    pub fn node_by_public_id(&self, public_id: &str) -> Result<Option<NodeRow>, ContextError> {
+        let conn = lock(&self.conn);
+        let row = conn
+            .query_row(
+                "SELECT id, public_id, kind, display_name, content, content_hash, uri, recorded_at
+                 FROM node WHERE public_id = ?1 AND superseded_at IS NULL",
+                params![public_id],
+                map_node_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
 }
 
 /// Lock a mutex, recovering the guard even if a previous holder panicked. This
@@ -1237,6 +1270,49 @@ mod tests {
         assert_eq!(a, b, "same identity → same rowid");
         let node = node_by_id(&conn, a).unwrap().unwrap();
         assert_eq!(node.content, "v2");
+    }
+
+    #[test]
+    fn memory_nodes_and_public_id_lookup_serve_the_inspection_surface() {
+        let (_dir, store) = tmp_store();
+        {
+            let conn = store.conn();
+            upsert_node(
+                &conn,
+                &NodeInput::new(NodeKind::Memory, "prefer rg over grep")
+                    .with_content("prefer rg over grep in this workspace"),
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+            upsert_node(
+                &conn,
+                &NodeInput::new(NodeKind::Memory, "tests live next to code")
+                    .with_content("tests live next to code, not in tests/"),
+                "2026-01-02T00:00:00Z",
+            )
+            .unwrap();
+            // A non-memory node must never surface in the memory listing.
+            upsert_node(
+                &conn,
+                &NodeInput::new(NodeKind::Concept, "budgeting").with_content("c"),
+                "2026-01-03T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let memories = store.memory_nodes().unwrap();
+        assert_eq!(memories.len(), 2, "only Memory-kind nodes");
+        assert_eq!(
+            memories[0].display_name, "tests live next to code",
+            "newest first"
+        );
+        assert!(memories.iter().all(|m| m.kind == NodeKind::Memory));
+
+        let looked_up = store
+            .node_by_public_id(&memories[0].public_id)
+            .unwrap()
+            .expect("public id resolves");
+        assert_eq!(looked_up.content, "tests live next to code, not in tests/");
+        assert!(store.node_by_public_id("nod_missing").unwrap().is_none());
     }
 
     #[test]

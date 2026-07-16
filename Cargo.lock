@@ -2688,6 +2688,7 @@ dependencies = [
  "serde_json",
  "stella-core",
  "stella-protocol",
+ "stella-store",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

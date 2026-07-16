@@ -545,11 +545,18 @@ pub(crate) fn render_ask_user(
         .render(area, buf);
 }
 
+/// Most command rows the slash popup shows at once before it scrolls. The
+/// list grows to this, then windows around the selection (see
+/// [`scroll_window_start`]) so ↑/↓ can walk a long menu without the highlight
+/// ever leaving the frame.
+pub(crate) const SLASH_POPUP_MAX_ROWS: usize = 8;
+
 /// Where the slash popup floats: anchored to the composer's left edge,
-/// opening upward, tall enough for the matches (capped) and clamped to the
-/// frame on small terminals.
+/// opening upward, tall enough for the matches (capped at
+/// [`SLASH_POPUP_MAX_ROWS`]) and clamped to the frame on small terminals. The
+/// `+3` reserves the two borders and the one-line key legend.
 pub(crate) fn slash_popup_area(root: Rect, composer: Rect, matches: usize) -> Rect {
-    let h = ((matches.min(8) as u16) + 3).min(root.height);
+    let h = ((matches.min(SLASH_POPUP_MAX_ROWS) as u16) + 3).min(root.height);
     let w = root.width.min(56);
     Rect {
         x: composer.x,
@@ -559,17 +566,41 @@ pub(crate) fn slash_popup_area(root: Rect, composer: Rect, matches: usize) -> Re
     }
 }
 
+/// The first visible row of a scrolling list of `len` rows that shows
+/// `visible` at a time, chosen so `selected` stays on screen — the window
+/// only moves once the selection would fall off an edge. Mirrors the
+/// composer's cursor-row windowing ([`render_composer`]) so the slash popup
+/// and the textarea scroll with identical feel.
+pub(crate) fn scroll_window_start(len: usize, selected: usize, visible: usize) -> usize {
+    if visible == 0 || len <= visible {
+        return 0;
+    }
+    let selected = selected.min(len - 1);
+    // Keep `selected` inside [first, first + visible); clamp so the last
+    // window never shows blank rows past the end.
+    (selected + 1).saturating_sub(visible).min(len - visible)
+}
+
 /// The floating slash-command menu: an accent-bordered popup with the
 /// selected row highlighted and a one-line key legend. Shared by the
 /// single-session REPL and the deck (both anchor it above their composer).
+///
+/// When more commands match than fit, the rows window around `selected` so
+/// arrow-key navigation always keeps the highlight visible, and the legend
+/// shows how many rows are hidden above (`▲`) / below (`▼`).
 pub(crate) fn render_slash_popup(menu: &SlashMenu, selected: usize, area: Rect, buf: &mut Buffer) {
     ratatui::widgets::Clear.render(area, buf);
-    let mut lines: Vec<Line<'static>> = menu
-        .matches
+    let total = menu.matches.len();
+    let selected = selected.min(total.saturating_sub(1));
+    // The interior minus the legend line is what the command rows scroll in.
+    let visible = inner_height(area).saturating_sub(1).max(1);
+    let first = scroll_window_start(total, selected, visible);
+    let last = (first + visible).min(total);
+    let mut lines: Vec<Line<'static>> = menu.matches[first..last]
         .iter()
         .enumerate()
-        .map(|(i, c)| {
-            let is_sel = i == selected;
+        .map(|(offset, c)| {
+            let is_sel = first + offset == selected;
             let marker = if is_sel { "▸ " } else { "  " };
             let mut name_style = theme::accent();
             let mut desc_style = theme::muted();
@@ -586,14 +617,19 @@ pub(crate) fn render_slash_popup(menu: &SlashMenu, selected: usize, area: Rect, 
             ])
         })
         .collect();
-    lines.push(Line::from(Span::styled(
-        " ↑/↓ choose · tab complete · enter run · esc dismiss",
-        theme::muted(),
-    )));
+    let hidden_above = first;
+    let hidden_below = total.saturating_sub(last);
+    let legend = if hidden_above > 0 || hidden_below > 0 {
+        // Compact when scrolling so the ▲/▼ affordance still fits the width.
+        format!(" ↑↓ choose · tab fill · ⏎ run · esc · ▲{hidden_above} ▼{hidden_below}")
+    } else {
+        " ↑/↓ choose · tab complete · enter run · esc dismiss".to_string()
+    };
+    lines.push(Line::from(Span::styled(legend, theme::muted())));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::accent())
-        .title(format!(" / commands · {} ", menu.matches.len()));
+        .title(format!(" / commands · {total} "));
     Paragraph::new(Text::from(lines))
         .block(block)
         .render(area, buf);
@@ -820,16 +856,23 @@ pub(crate) fn entry_lines(
                 .add_modifier(Modifier::ITALIC),
         ))),
         TranscriptEntry::User(text) => {
-            push_labeled_block(
-                "user",
-                theme::accent(),
-                crate::markdown::render(text),
-                width,
-                out,
-            );
+            // The one transcript entry rendered in a single color end to end:
+            // the `[user]:` tag and every line of the prompt ride the same
+            // violet as the composer's keybind glyphs and the
+            // "deterministic-first" chip (`deck_render`) — the interactive-
+            // chrome accent, never the ember heat. Rendered as plain lines
+            // (not markdown) so nothing tints part of the prompt a 2nd color.
+            let violet = Style::new().fg(theme::VIOLET);
+            let lines: Vec<Line<'static>> = text
+                .split('\n')
+                .map(|l| Line::from(Span::styled(l.to_owned(), violet)))
+                .collect();
+            push_labeled_block("user", violet, lines, width, out);
         }
         TranscriptEntry::Stage(name) => {
-            let style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            let style = Style::new()
+                .fg(theme::EMBER_FLAME)
+                .add_modifier(Modifier::BOLD);
             push_labeled(
                 "stage",
                 style,
@@ -851,7 +894,7 @@ pub(crate) fn entry_lines(
             let total_lines = text.lines().count().max(1);
             let show_all = expand_thinking || expanded;
             let chevron = if show_all { "⏶" } else { "⏵" };
-            let header_style = Style::new().fg(theme::AMBER);
+            let header_style = Style::new().fg(theme::AGENT_AMBER);
             let reasoning_style = Style::new()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC);
@@ -895,7 +938,9 @@ pub(crate) fn entry_lines(
         } => {
             push_labeled(
                 name,
-                Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(theme::EMBER_FLAME)
+                    .add_modifier(Modifier::BOLD),
                 vec![Span::styled(
                     input.clone(),
                     Style::new().fg(Color::DarkGray),
@@ -932,9 +977,9 @@ pub(crate) fn entry_lines(
             ..
         } => {
             let (glyph, color) = if *ok {
-                ("✓", Color::Green)
+                ("✓", theme::EMBER_GOLD)
             } else {
-                ("✗", Color::Red)
+                ("✗", theme::EMBER_CRIMSON)
             };
             // The result labels itself with the tool it answers (resolved
             // from the start entry) so call/result rows read as a pair.
@@ -990,7 +1035,7 @@ pub(crate) fn entry_lines(
             }
         }
         TranscriptEntry::Retry { attempt, reason } => {
-            let style = Style::new().fg(Color::Yellow);
+            let style = Style::new().fg(theme::WARNING_BRIGHT);
             push_labeled(
                 "↻ retry",
                 style,
@@ -1005,7 +1050,7 @@ pub(crate) fn entry_lines(
             evicted,
             deduped,
         } => {
-            let style = Style::new().fg(Color::Blue);
+            let style = Style::new().fg(theme::EMBER_FLAME);
             push_labeled(
                 "⇣ compacted",
                 style,
@@ -1025,7 +1070,7 @@ pub(crate) fn entry_lines(
             mode,
         } => {
             let limit = limit_usd.map(|l| format!("/${l:.2}")).unwrap_or_default();
-            let style = Style::new().fg(Color::DarkGray);
+            let style = Style::new().fg(theme::WARNING);
             push_labeled(
                 "spend",
                 style,
@@ -1038,7 +1083,7 @@ pub(crate) fn entry_lines(
             );
         }
         TranscriptEntry::ProviderFallback { from, to, reason } => {
-            let style = Style::new().fg(Color::Magenta);
+            let style = Style::new().fg(theme::EMBER_FLAME);
             push_labeled(
                 "⚡ fallback",
                 style,
@@ -1053,7 +1098,7 @@ pub(crate) fn entry_lines(
             labels,
         } => {
             let cited = labels.join(", ");
-            let style = Style::new().fg(Color::Blue);
+            let style = Style::new().fg(theme::EMBER_FLAME);
             push_labeled(
                 "◉ recalled",
                 style,
@@ -1070,7 +1115,7 @@ pub(crate) fn entry_lines(
             upserts,
             superseded,
         } => {
-            let style = Style::new().fg(Color::Blue);
+            let style = Style::new().fg(theme::EMBER_FLAME);
             push_labeled(
                 "✎ memory",
                 style,
@@ -1087,7 +1132,7 @@ pub(crate) fn entry_lines(
             kind,
             state,
         } => {
-            let style = Style::new().fg(Color::Magenta);
+            let style = Style::new().fg(theme::EMBER_FLAME);
             push_labeled(
                 "🎞 media",
                 style,
@@ -1104,7 +1149,9 @@ pub(crate) fn entry_lines(
             );
         }
         TranscriptEntry::MediaComplete { label, path, kind } => {
-            let style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+            let style = Style::new()
+                .fg(theme::EMBER_FLAME)
+                .add_modifier(Modifier::BOLD);
             push_labeled(
                 "🎨 media",
                 style,
@@ -1122,9 +1169,9 @@ pub(crate) fn entry_lines(
             deterministic,
         } => {
             let (glyph, color) = if *passed {
-                ("✓", Color::Green)
+                ("✓", theme::EMBER_GOLD)
             } else {
-                ("✗", Color::Red)
+                ("✗", theme::EMBER_CRIMSON)
             };
             let tag = if *deterministic {
                 "deterministic"
@@ -1147,7 +1194,9 @@ pub(crate) fn entry_lines(
             steps,
             estimated_files,
         } => {
-            let style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+            let style = Style::new()
+                .fg(theme::WARNING_BRIGHT)
+                .add_modifier(Modifier::BOLD);
             push_labeled(
                 "⏸ scope",
                 style,
@@ -1160,7 +1209,9 @@ pub(crate) fn entry_lines(
             );
         }
         TranscriptEntry::AskUser { question, options } => {
-            let style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            let style = Style::new()
+                .fg(theme::WARNING_BRIGHT)
+                .add_modifier(Modifier::BOLD);
             push_labeled(
                 "? ask",
                 style,
@@ -1174,7 +1225,7 @@ pub(crate) fn entry_lines(
         }
         TranscriptEntry::Commit { sha, message } => {
             let short = sha.chars().take(9).collect::<String>();
-            let style = Style::new().fg(Color::Cyan);
+            let style = Style::new().fg(theme::EMBER_FLAME);
             push_labeled(
                 "● commit",
                 style,
@@ -1203,7 +1254,9 @@ pub(crate) fn entry_lines(
         }
         TranscriptEntry::Error { message, retryable } => {
             let tag = if *retryable { " (retryable)" } else { "" };
-            let style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
+            let style = Style::new()
+                .fg(theme::EMBER_CRIMSON)
+                .add_modifier(Modifier::BOLD);
             push_labeled(
                 "✗ error",
                 style,
@@ -1213,8 +1266,9 @@ pub(crate) fn entry_lines(
             );
         }
         TranscriptEntry::Complete { model, cost_usd } => {
-            // Fully muted on purpose: completion is a footnote, not an event.
-            let style = Style::new().fg(theme::MUTED);
+            // A quiet footnote, not an event — the dimmest ember tier keeps it
+            // inside the warm family without shouting.
+            let style = Style::new().fg(theme::WARNING);
             push_labeled(
                 "cost",
                 style,
@@ -1227,11 +1281,14 @@ pub(crate) fn entry_lines(
 }
 
 fn pr_status_color(status: PrStatus) -> Color {
+    // Kept inside the ember family so the `[⇢ pr]:` gutter reads with the rest
+    // of the transcript: quiet amber draft, flame while open, gold on merge,
+    // crimson on close.
     match status {
-        PrStatus::Draft => Color::DarkGray,
-        PrStatus::Open => Color::Green,
-        PrStatus::Merged => Color::Magenta,
-        PrStatus::Closed => Color::Red,
+        PrStatus::Draft => theme::WARNING,
+        PrStatus::Open => theme::EMBER_FLAME,
+        PrStatus::Merged => theme::EMBER_GOLD,
+        PrStatus::Closed => theme::EMBER_CRIMSON,
     }
 }
 
@@ -1696,6 +1753,93 @@ mod tests {
         );
     }
 
+    // ---- Slash-popup windowing ---------------------------------------------
+
+    #[test]
+    fn scroll_window_start_holds_still_until_the_selection_leaves_the_edge() {
+        // Fits entirely: never scrolls.
+        assert_eq!(scroll_window_start(5, 4, 8), 0);
+        // Selection inside the first window: no movement.
+        assert_eq!(scroll_window_start(20, 0, 8), 0);
+        assert_eq!(scroll_window_start(20, 7, 8), 0);
+        // One past the window's last row: scroll down by one.
+        assert_eq!(scroll_window_start(20, 8, 8), 1);
+        // The tail clamps so the final window is full, never blank-padded.
+        assert_eq!(scroll_window_start(20, 19, 8), 12);
+        // Selecting back at the top pulls the window all the way up.
+        assert_eq!(scroll_window_start(20, 0, 8), 0);
+        // A stale selection past the end (e.g. the filter just shrank the
+        // match list) clamps to the last full window instead of panicking.
+        assert_eq!(scroll_window_start(20, 999, 8), 12);
+        // Degenerate inputs don't panic.
+        assert_eq!(scroll_window_start(0, 0, 8), 0);
+        assert_eq!(scroll_window_start(5, 0, 0), 0);
+    }
+
+    /// Rendering a slash popup taller than its window keeps the *selected*
+    /// row on screen and pushes the ones scrolled past off it — the concrete
+    /// symptom of the un-windowed version (selection navigable but invisible).
+    #[test]
+    fn slash_popup_windows_the_selection_into_view() {
+        let cmds: Vec<SlashCommand> = (0..15)
+            .map(|i| SlashCommand::new(format!("/cmd{i:02}"), "desc"))
+            .collect();
+        let menu = SlashMenu::filter(&cmds, "/");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 56,
+            height: (SLASH_POPUP_MAX_ROWS as u16) + 3,
+        };
+        // Select the very last command: without windowing it renders off the
+        // bottom of the popup box and never appears in the buffer.
+        let mut buf = Buffer::empty(area);
+        render_slash_popup(&menu, 14, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("/cmd14"), "selected row is visible:\n{text}");
+        assert!(
+            !text.contains("/cmd00"),
+            "the top rows scrolled out of view:\n{text}"
+        );
+        // The legend advertises the hidden rows above.
+        assert!(text.contains('▲'), "scroll affordance shown:\n{text}");
+
+        // Selecting the top shows the head and hides the tail instead.
+        let mut buf = Buffer::empty(area);
+        render_slash_popup(&menu, 0, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("/cmd00"), "top row visible:\n{text}");
+        assert!(!text.contains("/cmd14"), "tail hidden:\n{text}");
+        assert!(text.contains('▼'), "hidden-below affordance shown:\n{text}");
+    }
+
+    /// A stale-high selection (the match list shrank under the cursor before
+    /// the upstream clamp caught up) must still render a sane, in-bounds
+    /// window rather than panic on the slice.
+    #[test]
+    fn slash_popup_survives_a_selection_past_the_filtered_end() {
+        let cmds: Vec<SlashCommand> = (0..3)
+            .map(|i| SlashCommand::new(format!("/cmd{i:02}"), "desc"))
+            .collect();
+        let menu = SlashMenu::filter(&cmds, "/");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 56,
+            height: (SLASH_POPUP_MAX_ROWS as u16) + 3,
+        };
+        let mut buf = Buffer::empty(area);
+        // selected far past the 3 matches — the render-side clamp keeps it in
+        // view; all three rows fit so nothing scrolls.
+        render_slash_popup(&menu, 99, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("/cmd02"), "last row still shown:\n{text}");
+        assert!(
+            !text.contains('▲') && !text.contains('▼'),
+            "short list shows no scroll affordance:\n{text}"
+        );
+    }
+
     #[test]
     fn transcript_scrolls_line_exact_to_show_the_tail() {
         let mut model = SessionModel::new();
@@ -1804,6 +1948,107 @@ mod tests {
         assert_eq!(out.len(), 1, "the marker costs exactly one visual row");
         let text: String = out[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "… 1234 earlier entries evicted");
+    }
+
+    // ---- Transcript prefix colors (ember gutter + violet user prompt) ----
+
+    /// The user prompt is the single exception to the ember gutter: its
+    /// `[user]:` tag AND every line of the prompt render in exactly the violet
+    /// used for the composer's keybind glyphs and the deterministic-first
+    /// chip — as one flat color, with no markdown tinting and no ember heat.
+    #[test]
+    fn user_prompt_entry_is_one_violet_color_end_to_end() {
+        let mut out = Vec::new();
+        // Markdown that WOULD tint under `markdown::render` (a code span goes
+        // `theme::WARN`, a heading goes bold `INK`): proof none of it leaks.
+        entry_lines(
+            &TranscriptEntry::User("fix the `parser` bug\nand **ship** it".to_string()),
+            false,
+            false,
+            80,
+            &mut out,
+        );
+        let mut saw_text = false;
+        for line in &out {
+            for span in &line.spans {
+                // Skip pure-whitespace gutter/continuation indent (no fg).
+                if span.content.trim().is_empty() {
+                    continue;
+                }
+                saw_text = true;
+                assert_eq!(
+                    span.style.fg,
+                    Some(theme::VIOLET),
+                    "user entry span {:?} is not the violet accent",
+                    span.content
+                );
+                // Belt and suspenders: no ember heat anywhere on the entry.
+                for banned in [theme::EMBER_GOLD, theme::EMBER_CRIMSON, theme::WARN] {
+                    assert_ne!(
+                        span.style.fg,
+                        Some(banned),
+                        "user entry leaks an ember color: {:?}",
+                        span.content
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_text,
+            "the prompt rendered at least one styled text span"
+        );
+    }
+
+    /// Every other entry's `[label]:` prefix stays inside the warm ember
+    /// family — failure crimson, success gold — so no raw ANSI cyan/blue/
+    /// magenta survives from before the ember theme landed.
+    #[test]
+    fn transcript_prefix_colors_stay_in_the_ember_family() {
+        let prefix_fg = |entry: &TranscriptEntry| -> Option<Color> {
+            let mut out = Vec::new();
+            entry_lines(entry, false, false, 80, &mut out);
+            out[0].spans[0].style.fg
+        };
+        assert_eq!(
+            prefix_fg(&TranscriptEntry::Error {
+                message: "boom".into(),
+                retryable: false,
+            }),
+            Some(theme::EMBER_CRIMSON),
+            "error prefix is crimson",
+        );
+        assert_eq!(
+            prefix_fg(&TranscriptEntry::ToolResult {
+                call_id: "c1".into(),
+                name: "read_file".into(),
+                ok: true,
+                summary: "ok".into(),
+                full: "ok".into(),
+                duration_ms: 3,
+                diff: None,
+            }),
+            Some(theme::EMBER_GOLD),
+            "successful tool-result prefix is gold",
+        );
+        assert_eq!(
+            prefix_fg(&TranscriptEntry::ToolResult {
+                call_id: "c2".into(),
+                name: "read_file".into(),
+                ok: false,
+                summary: "no".into(),
+                full: "no".into(),
+                duration_ms: 3,
+                diff: None,
+            }),
+            Some(theme::EMBER_CRIMSON),
+            "failed tool-result prefix is crimson",
+        );
+        // The stage marker moved off raw cyan onto ember flame.
+        assert_eq!(
+            prefix_fg(&TranscriptEntry::Stage(StageKind::Execute)),
+            Some(theme::EMBER_FLAME),
+            "stage prefix is ember flame",
+        );
     }
 
     // ---- Replay determinism (L-T1) ------------------------------------

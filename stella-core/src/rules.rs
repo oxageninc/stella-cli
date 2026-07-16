@@ -9,10 +9,17 @@
 //! self-correct. Rules are authored as markdown under `.stella/rules/*.md`
 //! (`02-architecture.md` §6, ADR-008 filesystem-first).
 //!
-//! Status: this engine is implemented and tested here, but is **not yet wired
-//! into the shipping CLI** — there is no production [`RuleSource`] and the
-//! agent loop does not yet load rules or call [`evaluate_guards`]. Wiring it in
-//! is tracked as a contribution target.
+//! Status: wired into the shipping CLI (issue #103). The production
+//! [`RuleSource`] lives in `stella-cli`'s `rules` module: the on-disk rule
+//! files (fs-backed) merged — through this module's precedence merge — with
+//! extension-authored rules read from the workspace store
+//! (`stella_store::Store::list_rules`). Each session driver loads rules
+//! once at assembly, renders the Tier-1 section into its system prompt, and
+//! arms Tier-2 guards at the tool boundary by registering an
+//! [`evaluate_guards`] policy handler on the tool registry's
+//! `tool.call.requested` blocking chain ([`crate::bus`],
+//! `stella-tools::registry`) — a violation denies the call and returns the
+//! rule text to the model.
 //!
 //! # No I/O in this module (`02-architecture.md` §1.3)
 //!

@@ -104,6 +104,7 @@ pub const RESERVED_NAMES: &[&str] = &[
     "explorations",
     "save_exploration",
     "save_memory",
+    "cite_memory",
     // The definition of done + build/test
     "verify_done",
     "build_project",
@@ -111,12 +112,17 @@ pub const RESERVED_NAMES: &[&str] = &[
     // CI & evidence
     "ci_status",
     "screenshot",
+    // Media generation: generate_svg is client-side and always registered.
+    "generate_svg",
     // Conditionally registered tools: code_graph only when a code-graph index
-    // exists, generate_image only when a media key is configured. The
-    // registry-driven drift test can't see these (a bare registry never
-    // advertises them), so they must be listed here by hand.
+    // exists, generate_image (and the video pair, when the key family has a
+    // video adapter) only when a media key is configured. The registry-driven
+    // drift test can't see these (a bare registry never advertises them), so
+    // they must be listed here by hand.
     "code_graph",
     "generate_image",
+    "generate_video",
+    "poll_video",
     // Issue tracking (registered only when a backend is configured)
     "create_issue",
     "update_issue",

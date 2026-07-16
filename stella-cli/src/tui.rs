@@ -525,5 +525,4 @@ mod tests {
         assert_eq!(stellar_color_at(-1.0), STELLAR_STOPS[0]);
         assert_eq!(stellar_color_at(2.0), STELLAR_STOPS[3]);
     }
-
 }

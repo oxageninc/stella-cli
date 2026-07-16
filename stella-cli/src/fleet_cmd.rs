@@ -2,7 +2,11 @@
 //! `stella-fleet`'s one dispatch seam: a DAG of tasks (from positional
 //! prompts or a `--plan` file), a git worktree per isolated task, wave
 //! scheduling with bounded concurrency, and every attempt/commit/dollar
-//! stamped into the SQLite ledger (`.stella/fleet.db`).
+//! stamped into the SQLite ledger (`.stella/fleet.db`). A task that declares
+//! `claims` (workspace-relative paths it will touch) holds them as
+//! cooperative file locks in `.stella/store.db` for the attempt's duration —
+//! a path another task (or another run) already claims fails that dispatch
+//! by name instead of letting two agents edit the same file.
 //!
 //! Each worker is a full Stella engine turn (the raw step-loop) running in
 //! its task's workspace with the standard tool registry — headless: no MCP,
@@ -15,16 +19,23 @@
 //! Worktrees are deliberately left in place after the run — the branches
 //! (`fleet/<task>`) carry the work product for the user to review and merge.
 //! `git worktree list` shows them; the report names each one.
+//!
+//! With `--watch`, the run ends in the fleet PR/CI monitor
+//! (`stella_fleet::Monitor` over the real `gh`): every branch that carries
+//! successful work is watched to CI completion as a capped deferred wait,
+//! its PR status is reconciled live, and a red branch fails the command.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use colored::Colorize;
 use stella_core::{Engine, TurnOutcome};
 use stella_fleet::{
-    CommitRecord, Fleet, FleetConfig, FleetRunReport, FleetWorker, Ledger, Plan, SystemGitCli,
-    Task, WorkerOutcome, WorktreeManager,
+    CiWatchOutcome, CommitRecord, Fleet, FleetConfig, FleetRunReport, FleetWorker, GhCli, Ledger,
+    Monitor, MonitorError, Plan, SystemGhCli, SystemGitCli, Task, TaskId, TimeoutReason,
+    WatchConfig, WorkerOutcome, WorktreeManager,
 };
-use stella_protocol::{AgentEvent, CompletionMessage};
+use stella_protocol::{AgentEvent, CompletionMessage, PrStatus};
 use stella_tools::ToolRegistry;
 use stella_tools::hook_runner::ShellHookRunner;
 use tokio::sync::mpsc;
@@ -37,7 +48,8 @@ use crate::tui;
 /// Cap on the per-task summary line so the report table stays a table.
 const SUMMARY_CHARS: usize = 96;
 
-/// Run a fleet: build/load the plan, dispatch it wave by wave, report.
+/// Run a fleet: build/load the plan, dispatch it wave by wave, report —
+/// then, with `watch`, hold the fleet PR/CI monitor on the branches.
 pub async fn run_fleet(
     cfg: &Config,
     prompts: &[String],
@@ -45,6 +57,7 @@ pub async fn run_fleet(
     base_ref: Option<&str>,
     max_concurrency: usize,
     budget_limit: Option<f64>,
+    watch: bool,
 ) -> Result<(), String> {
     let root = cfg.workspace_root.clone();
     let plan = load_plan(prompts, plan_file)?;
@@ -111,6 +124,18 @@ pub async fn run_fleet(
         FleetConfig::new(&run_id, &base_sha).with_max_concurrency(max_concurrency.max(1)),
     )
     .map_err(|e| format!("could not start the fleet: {e}"))?;
+    // File claims live in the workspace store (`.stella/store.db`), opened
+    // only when the plan declares any: enforcing claims requires the store
+    // (a claim silently unenforced defeats its purpose), but a claim-free
+    // run must not grow a new failure mode.
+    let fleet = if plan.tasks.iter().any(|t| !t.claims.is_empty()) {
+        let store = stella_store::Store::open(&root).map_err(|e| {
+            format!("this plan declares file claims but the workspace store cannot open: {e}")
+        })?;
+        fleet.with_claim_store(store)
+    } else {
+        fleet
+    };
 
     let report = fleet
         .run_plan(&plan)
@@ -124,8 +149,47 @@ pub async fn run_fleet(
             report.total_cost_usd()
         ));
     }
+
+    // Post-fanout PR/CI watch (`--watch`): the fleet monitor over the real
+    // `gh`. Only branches carrying successful work are watched — failed
+    // tasks already fail the run below.
+    let mut red_branches: Vec<String> = Vec::new();
+    if watch {
+        let targets = watch_targets(&report);
+        if targets.is_empty() {
+            println!(
+                "  {}\n",
+                "nothing to watch — no successful task landed commits".dimmed()
+            );
+        } else {
+            let config = WatchConfig::default();
+            let monitor =
+                Monitor::new(SystemGhCli, Box::new(SystemClock::new())).with_config(config);
+            println!(
+                "  watching CI for {} fleet branch(es) — polling every {}s, wall cap {}m\n",
+                targets.len(),
+                config.poll_interval_ms / 1_000,
+                config.max_total_ms / 60_000,
+            );
+            for (task_id, branch) in &targets {
+                let watched = watch_branch(&monitor, task_id, branch).await;
+                render_watch_line(&watched);
+                if !watched.is_green() {
+                    red_branches.push(watched.branch);
+                }
+            }
+            println!();
+        }
+    }
+
     if !report.all_succeeded() {
         return Err("one or more fleet tasks failed — see the report above".to_string());
+    }
+    if !red_branches.is_empty() {
+        return Err(format!(
+            "CI is not green for: {} — see the watch report above",
+            red_branches.join(", ")
+        ));
     }
     Ok(())
 }
@@ -161,6 +225,110 @@ fn load_plan(prompts: &[String], plan_file: Option<&Path>) -> Result<Plan, Strin
             })
             .collect(),
     ))
+}
+
+/// One fleet branch's post-fanout verdict: the capped CI watch outcome plus
+/// the branch's reconciled PR status. `pr` is `None` when the branch has no
+/// PR yet — branches are left for review, so that is a normal state, not an
+/// error.
+struct BranchWatch {
+    task_id: TaskId,
+    branch: String,
+    ci: Result<CiWatchOutcome, MonitorError>,
+    pr: Option<PrStatus>,
+}
+
+impl BranchWatch {
+    /// Green iff CI completed with a passing overall conclusion — a timeout,
+    /// a monitor error, and a failing conclusion are all red.
+    fn is_green(&self) -> bool {
+        matches!(
+            &self.ci,
+            Ok(CiWatchOutcome::Completed { conclusion, .. }) if !conclusion.is_failure()
+        )
+    }
+}
+
+/// The branches worth watching after the fan-out: every successful task that
+/// landed commits, keyed by the branch its commits actually record (correct
+/// for isolated worktrees and shared-tree tasks alike), deduped so a branch
+/// shared by several tasks is watched once.
+fn watch_targets(report: &FleetRunReport) -> Vec<(TaskId, String)> {
+    let mut seen = HashSet::new();
+    report
+        .handles
+        .iter()
+        .filter(|h| h.outcome.success)
+        .filter_map(|h| {
+            let branch = h.outcome.commits.last()?.branch.clone();
+            seen.insert(branch.clone())
+                .then(|| (h.task_id.clone(), branch))
+        })
+        .collect()
+}
+
+/// Watch one fleet branch: its CI to completion (the monitor's capped
+/// deferred wait, L-E4), then a live PR-status reconcile — `gh pr view`
+/// resolves a branch name to its PR.
+async fn watch_branch<H: GhCli>(monitor: &Monitor<H>, task_id: &str, branch: &str) -> BranchWatch {
+    let ci = monitor.watch_ci(branch).await;
+    let pr = monitor.pr_status(branch).await.ok();
+    BranchWatch {
+        task_id: task_id.to_string(),
+        branch: branch.to_string(),
+        ci,
+        pr,
+    }
+}
+
+/// One report line per watched branch: verdict mark, CI outcome, PR status.
+fn render_watch_line(watch: &BranchWatch) {
+    let mark = if watch.is_green() {
+        "✓".green()
+    } else {
+        "✗".red()
+    };
+    let ci = match &watch.ci {
+        Ok(CiWatchOutcome::Completed {
+            conclusion,
+            summary,
+        }) => {
+            let verdict = if conclusion.is_failure() {
+                "red"
+            } else {
+                "green"
+            };
+            format!("CI {verdict} — {summary}")
+        }
+        Ok(CiWatchOutcome::TimedOut {
+            reason,
+            last_observed,
+            waited_ms,
+        }) => {
+            let reason = match reason {
+                TimeoutReason::CumulativeCap => "cumulative cap",
+                TimeoutReason::Stalled => "stalled",
+                TimeoutReason::NoRunsStarted => "no CI runs started",
+            };
+            format!(
+                "CI watch timed out ({reason}) after {}m — last: {last_observed}",
+                waited_ms / 60_000
+            )
+        }
+        Err(e) => format!("CI watch failed: {e}"),
+    };
+    let pr = match watch.pr {
+        Some(PrStatus::Draft) => "PR draft",
+        Some(PrStatus::Open) => "PR open",
+        Some(PrStatus::Merged) => "PR merged",
+        Some(PrStatus::Closed) => "PR closed",
+        None => "no PR",
+    };
+    println!(
+        "  {mark} {} {} — {ci} · {pr}",
+        watch.task_id.bold(),
+        watch.branch.bright_blue()
+    );
 }
 
 /// The engine-backed [`FleetWorker`]: one raw step-loop turn per task, in
@@ -224,6 +392,7 @@ async fn run_task(
     cfg.workspace_root = root.to_path_buf();
     let provider = agent::build_provider(&cfg)?;
     let registry = ToolRegistry::new_detected(root.to_path_buf()).await;
+    crate::rules::enforce_workspace_rules(&registry, root);
 
     let mut messages = vec![
         CompletionMessage::system(
@@ -416,12 +585,15 @@ mod tests {
             prompt = "add the /users endpoint"
             depends_on = ["schema"]
             isolation = "shared_tree"
+            claims = ["src/users.rs"]
         "#;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("plan.toml");
         std::fs::write(&path, toml_plan).expect("write");
         let plan = load_plan(&[], Some(&path)).expect("toml plan");
         assert_eq!(plan.tasks[1].depends_on, vec!["schema".to_string()]);
+        assert_eq!(plan.tasks[1].claims, vec!["src/users.rs".to_string()]);
+        assert!(plan.tasks[0].claims.is_empty(), "claims default to none");
         plan.validate().expect("valid");
 
         let json_path = dir.path().join("plan.json");
@@ -447,5 +619,167 @@ mod tests {
         assert!(!out.contains('\n'));
         assert!(out.chars().count() <= SUMMARY_CHARS + 1);
         assert!(out.ends_with('…'));
+    }
+
+    // ---- the post-fanout PR/CI watch (--watch) --------------------------
+
+    use std::sync::{Arc, Mutex};
+
+    use stella_core::BudgetOutcome;
+    use stella_fleet::{CiConclusion, GhError, GhOutput, TaskHandle};
+
+    /// A routed fake `gh`: `run list` answers with the scripted CI snapshot,
+    /// `pr view` with the scripted PR json (or the real "no pull requests"
+    /// failure shape when the branch has no PR). Records every call.
+    struct RoutedGh {
+        runs: String,
+        pr: Option<String>,
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl RoutedGh {
+        fn new(runs: &str, pr: Option<&str>) -> Self {
+            Self {
+                runs: runs.to_string(),
+                pr: pr.map(str::to_string),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GhCli for RoutedGh {
+        async fn run(&self, args: &[&str]) -> Result<GhOutput, GhError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(args.iter().map(|s| s.to_string()).collect());
+            if args.first() == Some(&"run") {
+                Ok(GhOutput::ok(self.runs.clone()))
+            } else {
+                match &self.pr {
+                    Some(json) => Ok(GhOutput::ok(json.clone())),
+                    None => Ok(GhOutput::failed(1, "no pull requests found")),
+                }
+            }
+        }
+    }
+
+    fn handle(task_id: &str, success: bool, branch: Option<&str>) -> TaskHandle {
+        TaskHandle {
+            task_id: task_id.to_string(),
+            attempt_id: 1,
+            outcome: WorkerOutcome {
+                cost_usd: 0.0,
+                commits: branch
+                    .map(|b| {
+                        vec![CommitRecord {
+                            sha: format!("sha-{task_id}"),
+                            branch: b.to_string(),
+                            task_id: task_id.to_string(),
+                            message: "m".to_string(),
+                            timestamp_ms: 1,
+                        }]
+                    })
+                    .unwrap_or_default(),
+                summary: String::new(),
+                success,
+            },
+            worktree: None,
+            budget: BudgetOutcome::Continue,
+        }
+    }
+
+    #[test]
+    fn watch_targets_are_successful_committed_branches_watched_once() {
+        let report = FleetRunReport {
+            handles: vec![
+                handle("t1", true, Some("fleet/t1-a")),
+                // No commits → nothing on the branch to watch.
+                handle("t2", true, None),
+                // Failed → already fails the run; not watched.
+                handle("t3", false, Some("fleet/t3-c")),
+                // Same branch as t1 (shared-tree) → watched once.
+                handle("t4", true, Some("fleet/t1-a")),
+            ],
+            ..FleetRunReport::default()
+        };
+        assert_eq!(
+            watch_targets(&report),
+            vec![("t1".to_string(), "fleet/t1-a".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_branch_reports_green_ci_and_open_pr() {
+        let gh = RoutedGh::new(
+            r#"[{"status":"completed","conclusion":"success","name":"ci"}]"#,
+            Some(r#"{"state":"OPEN","isDraft":false}"#),
+        );
+        let calls = gh.calls.clone();
+        let monitor = Monitor::new(gh, Box::new(SystemClock::new()));
+
+        let watched = watch_branch(&monitor, "t1", "fleet/t1-abc").await;
+        assert!(watched.is_green());
+        assert_eq!(watched.pr, Some(PrStatus::Open));
+
+        // The CI poll and the PR reconcile both targeted the fleet branch.
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("run")
+                    && c.iter().any(|a| a == "fleet/t1-abc"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("pr")
+                    && c.iter().any(|a| a == "fleet/t1-abc"))
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_branch_red_ci_and_a_missing_pr_are_states_not_errors() {
+        let gh = RoutedGh::new(
+            r#"[{"status":"completed","conclusion":"failure","name":"ci"}]"#,
+            None,
+        );
+        let monitor = Monitor::new(gh, Box::new(SystemClock::new()));
+
+        let watched = watch_branch(&monitor, "t1", "fleet/t1-abc").await;
+        assert!(!watched.is_green());
+        assert_eq!(watched.pr, None, "no PR for the branch is a normal state");
+        assert!(matches!(
+            watched.ci,
+            Ok(CiWatchOutcome::Completed {
+                conclusion: CiConclusion::Failure,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn watch_branch_treats_a_ci_timeout_as_red() {
+        // No runs ever appear and the startup grace is already spent at the
+        // first decision (elapsed >= grace with a 0ms grace) — the watch ends
+        // as NoRunsStarted without sleeping, and the branch is red.
+        let gh = RoutedGh::new("[]", None);
+        let monitor = Monitor::new(gh, Box::new(SystemClock::new())).with_config(WatchConfig {
+            poll_interval_ms: 1,
+            max_total_ms: 60_000,
+            stall_timeout_ms: 60_000,
+            startup_grace_ms: 0,
+        });
+
+        let watched = watch_branch(&monitor, "t1", "fleet/t1-abc").await;
+        assert!(!watched.is_green());
+        assert!(matches!(
+            watched.ci,
+            Ok(CiWatchOutcome::TimedOut {
+                reason: TimeoutReason::NoRunsStarted,
+                ..
+            })
+        ));
     }
 }

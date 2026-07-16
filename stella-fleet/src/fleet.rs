@@ -1,6 +1,8 @@
 //! THE dispatch seam (L-E9). Subagent fan-out goes through exactly one
-//! API — [`Fleet::dispatch`] — that allocates the task's workspace (a git
-//! worktree per [`Isolation`], isolate-by-default), records the attempt in the
+//! API — [`Fleet::dispatch`] — that claims the task's declared paths
+//! (cooperative file locks in the workspace [`Store`], held for the
+//! attempt's duration), allocates the task's workspace (a git worktree per
+//! [`Isolation`], isolate-by-default), records the attempt in the
 //! [`Ledger`], invokes the [`FleetWorker`] port, stamps the resulting commits
 //! and parent→child lineage into the ledger, and **meters the child's spend
 //! into the parent [`BudgetGuard`]**. No ad-hoc process spawning for agents:
@@ -23,6 +25,7 @@ use std::sync::{Mutex, MutexGuard};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use stella_core::{BudgetGuard, BudgetOutcome, Clock};
+use stella_store::Store;
 
 use crate::git::{GitCli, Worktree, WorktreeError, WorktreeManager};
 use crate::ledger::{
@@ -144,12 +147,32 @@ pub enum FleetError {
     Worktree(#[from] WorktreeError),
     #[error(transparent)]
     Ledger(#[from] LedgerError),
+    /// A declared path is already claimed — by a sibling in this run or by
+    /// another run in the same workspace. The holder is named so the user
+    /// can tell a live conflict from a crashed run's leftover claim (the
+    /// holder embeds its run id).
+    #[error("task `{task}` claims `{path}`, already claimed by `{holder}`")]
+    ClaimConflict {
+        task: TaskId,
+        path: String,
+        holder: String,
+    },
+    /// The plan declares claims but no claim store is wired
+    /// ([`Fleet::with_claim_store`]) — refusing to run unenforced claims
+    /// silently.
+    #[error("task `{task}` declares file claims but the fleet has no claim store")]
+    ClaimsWithoutStore { task: TaskId },
+    #[error(transparent)]
+    Claims(#[from] stella_store::StoreError),
 }
 
 /// The fleet orchestrator. Owns the worker, the worktree manager, the ledger,
 /// and the parent budget guard (the last two behind `Mutex`es so concurrent
 /// wave dispatch serializes their fast synchronous writes — a lock is never
-/// held across an `.await`).
+/// held across an `.await`). Optionally owns the workspace [`Store`] whose
+/// `file_locks` back task claims: workers are in-process, so this single
+/// orchestrator-held store is the multi-process "lock-holder" the store's
+/// concurrency contract prescribes.
 pub struct Fleet<W: FleetWorker, G: GitCli, C: Clock> {
     worker: W,
     worktrees: WorktreeManager<G>,
@@ -157,6 +180,7 @@ pub struct Fleet<W: FleetWorker, G: GitCli, C: Clock> {
     budget: Mutex<BudgetGuard>,
     clock: C,
     config: FleetConfig,
+    claims: Option<Store>,
 }
 
 impl<W, G, C> Fleet<W, G, C>
@@ -188,7 +212,17 @@ where
             budget: Mutex::new(budget),
             clock,
             config,
+            claims: None,
         })
+    }
+
+    /// Back task claims with the workspace store's `file_locks` table
+    /// (builder style). Without this, a plan that declares claims fails
+    /// dispatch with [`FleetError::ClaimsWithoutStore`] — claims are never
+    /// silently unenforced.
+    pub fn with_claim_store(mut self, store: Store) -> Self {
+        self.claims = Some(store);
+        self
     }
 
     /// Recover the mutex guard even if a prior holder panicked — the fleet
@@ -203,11 +237,26 @@ where
         self.budget.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// THE one dispatch entry point (L-E9). Allocates the workspace per the
-    /// task's isolation, records the attempt, runs the worker, then stamps
-    /// its commits + lineage + spend into the ledger (one transaction) and
-    /// meters its cost into the parent budget — returning a [`TaskHandle`].
+    /// THE one dispatch entry point (L-E9). Claims the task's declared
+    /// paths, allocates the workspace per the task's isolation, records the
+    /// attempt, runs the worker, then stamps its commits + lineage + spend
+    /// into the ledger (one transaction) and meters its cost into the parent
+    /// budget — returning a [`TaskHandle`].
     pub async fn dispatch(&self, task: &Task) -> Result<TaskHandle, FleetError> {
+        // 0. Claim the declared paths before anything else exists for this
+        //    attempt — a conflict is a plain dispatch failure with nothing
+        //    (worktree, ledger rows) to clean up.
+        self.acquire_claims(task)?;
+        let result = self.dispatch_claimed(task).await;
+        // Claims are per-attempt: released even when the worker failed (its
+        // work sits committed on its branch; holding on would starve
+        // dependents and retries).
+        self.release_claims(task);
+        result
+    }
+
+    /// [`dispatch`](Self::dispatch) after the task's claims are held.
+    async fn dispatch_claimed(&self, task: &Task) -> Result<TaskHandle, FleetError> {
         // 1. Allocate the workspace. Isolate by default.
         let worktree = match task.isolation {
             Isolation::Isolated => Some(
@@ -276,6 +325,65 @@ where
             worktree,
             budget,
         })
+    }
+
+    /// The lock-table identity a task claims under: run-scoped, so a crashed
+    /// run's leftover claim is distinguishable from this run's by eye (the
+    /// run id embeds its start time and pid).
+    fn claim_holder(&self, task: &Task) -> String {
+        format!("{}/{}", self.config.run_id, task.id)
+    }
+
+    /// Acquire every path in `task.claims` — all-or-nothing: on a conflict
+    /// (or a store error) the paths already acquired roll back and the error
+    /// names what blocked. Acquisition is re-entrant per holder, so a
+    /// duplicate path within one task is harmless.
+    fn acquire_claims(&self, task: &Task) -> Result<(), FleetError> {
+        if task.claims.is_empty() {
+            return Ok(());
+        }
+        let Some(store) = &self.claims else {
+            return Err(FleetError::ClaimsWithoutStore {
+                task: task.id.clone(),
+            });
+        };
+        let holder = self.claim_holder(task);
+        for (i, path) in task.claims.iter().enumerate() {
+            let failure = match store.acquire_file_lock(path, &holder) {
+                Ok(true) => continue,
+                Ok(false) => FleetError::ClaimConflict {
+                    task: task.id.clone(),
+                    path: path.clone(),
+                    holder: store
+                        .file_lock_holder(path)
+                        .ok()
+                        .flatten()
+                        // The holder released between the two reads — the
+                        // conflict was real when acquisition failed.
+                        .unwrap_or_else(|| "(already released)".to_string()),
+                },
+                Err(e) => FleetError::Claims(e),
+            };
+            for claimed in &task.claims[..i] {
+                let _ = store.release_file_lock(claimed, &holder);
+            }
+            return Err(failure);
+        }
+        Ok(())
+    }
+
+    /// Release the task's claims. Best-effort by design: release only
+    /// deletes rows owned by this holder, and a failed delete leaves a row
+    /// that NAMES this run — the next claimant's conflict error points
+    /// straight back here, never a silent corruption.
+    fn release_claims(&self, task: &Task) {
+        let Some(store) = &self.claims else {
+            return;
+        };
+        let holder = self.claim_holder(task);
+        for path in &task.claims {
+            let _ = store.release_file_lock(path, &holder);
+        }
     }
 
     /// Dispatch a wave of dependency-ready tasks concurrently, bounded by
@@ -591,6 +699,165 @@ mod tests {
                 .iter()
                 .any(|c| c.first().map(String::as_str) == Some("worktree")),
             "shared-tree dispatch must not create a worktree"
+        );
+    }
+
+    // ---- claims: cooperative file locks through the workspace store ---
+
+    fn fleet_with_claims(worker: FakeWorker) -> Fleet<FakeWorker, OkGit, SeqClock> {
+        fleet(
+            worker,
+            OkGit::new(),
+            BudgetGuard::new(BudgetMode::Observed, None, None),
+            FleetConfig::new("run1", "HEAD").with_max_concurrency(2),
+        )
+        .with_claim_store(Store::in_memory().unwrap())
+    }
+
+    /// A worker that parks until the test grants a permit — keeps its
+    /// task's attempt (and claims) open so a sibling's acquire genuinely
+    /// races a HELD claim instead of a released one.
+    struct GatedWorker {
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+    #[async_trait]
+    impl FleetWorker for GatedWorker {
+        async fn run(&self, task: &Task, _workspace_root: &Path) -> WorkerOutcome {
+            if let Ok(permit) = self.gate.acquire().await {
+                permit.forget(); // one permit releases exactly one worker
+            }
+            WorkerOutcome {
+                cost_usd: 0.0,
+                commits: Vec::new(),
+                summary: format!("did {}", task.id),
+                success: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_siblings_claiming_the_same_path_conflict_once() {
+        // Two independent tasks in one concurrent wave, both claiming the
+        // same path: exactly one wins the claim and runs; the other is a
+        // recorded dispatch failure naming the conflict.
+        let plan = Plan::new(vec![
+            Task::new("t1", "t1", "p").claims(["src/shared.rs"]),
+            Task::new("t2", "t2", "p").claims(["src/shared.rs"]),
+        ]);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let f = Fleet::new(
+            GatedWorker { gate: gate.clone() },
+            WorktreeManager::new(OkGit::new(), "/repo"),
+            Ledger::open_in_memory().unwrap(),
+            BudgetGuard::new(BudgetMode::Observed, None, None),
+            SeqClock::new(),
+            FleetConfig::new("run1", "HEAD").with_max_concurrency(2),
+        )
+        .unwrap()
+        .with_claim_store(Store::in_memory().unwrap());
+
+        // On this current-thread test runtime both dispatches reach their
+        // claim before the permits below land: the winner parks in its
+        // gated worker still holding the claim, so the loser's acquire is a
+        // true mid-attempt conflict.
+        let (report, ()) = tokio::join!(f.run_plan(&plan), async {
+            gate.add_permits(2);
+        });
+        let report = report.unwrap();
+        assert_eq!(report.handles.len(), 1, "exactly one claimant ran");
+        assert!(report.handles[0].outcome.success);
+        assert_eq!(report.dispatch_failures.len(), 1);
+        let (loser, reason) = &report.dispatch_failures[0];
+        assert_ne!(loser, &report.handles[0].task_id);
+        assert!(
+            reason.contains("claims `src/shared.rs`") && reason.contains("run1/"),
+            "the conflict names the path and the winning holder: {reason}"
+        );
+
+        // Both the winner's claim and the loser's rollback released: a fresh
+        // task can claim the same path (one gate permit is left for it).
+        let retry = Task::new("t3", "t3", "p").claims(["src/shared.rs"]);
+        f.dispatch(&retry).await.expect("path released after wave");
+    }
+
+    #[tokio::test]
+    async fn dependent_tasks_reclaim_a_path_released_by_their_prerequisite() {
+        // Claims are per-attempt, so a dependent editing the same file
+        // acquires it in the next wave.
+        let plan = Plan::new(vec![
+            Task::new("a", "a", "p").claims(["src/shared.rs"]),
+            Task::new("b", "b", "p")
+                .depends_on(["a"])
+                .claims(["src/shared.rs"]),
+        ]);
+        let f = fleet_with_claims(FakeWorker::new(0.10));
+        let report = f.run_plan(&plan).await.unwrap();
+        assert!(report.all_succeeded(), "sequential claimants never clash");
+        assert_eq!(report.handles.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_worker_still_releases_its_claims() {
+        let f = fleet_with_claims(FakeWorker::failing(0.10));
+        let task = Task::new("t1", "t1", "p").claims(["src/a.rs"]);
+        let handle = f.dispatch(&task).await.unwrap();
+        assert!(!handle.outcome.success);
+
+        // The failed attempt released its claim — a retry can acquire it.
+        let retry = Task::new("t2", "t2", "p").claims(["src/a.rs"]);
+        f.dispatch(&retry).await.expect("claim released on failure");
+    }
+
+    #[tokio::test]
+    async fn a_foreign_claim_fails_dispatch_by_name_and_rolls_back() {
+        // A claim held by another run (or a crashed one) in the same
+        // workspace: dispatch fails naming that holder, and the paths this
+        // task had already acquired roll back.
+        let store = Store::in_memory().unwrap();
+        assert!(store.acquire_file_lock("src/b.rs", "fleet-9/t9").unwrap());
+        let f = fleet(
+            FakeWorker::new(0.10),
+            OkGit::new(),
+            BudgetGuard::new(BudgetMode::Observed, None, None),
+            FleetConfig::new("run1", "HEAD"),
+        )
+        .with_claim_store(store);
+
+        let task = Task::new("t1", "t1", "p").claims(["src/a.rs", "src/b.rs"]);
+        match f.dispatch(&task).await {
+            Err(FleetError::ClaimConflict { task, path, holder }) => {
+                assert_eq!((task.as_str(), path.as_str()), ("t1", "src/b.rs"));
+                assert_eq!(holder, "fleet-9/t9");
+            }
+            other => panic!("expected a claim conflict, got {other:?}"),
+        }
+        // src/a.rs was acquired before the conflict and must have rolled
+        // back — a sibling can claim it.
+        let sibling = Task::new("t2", "t2", "p").claims(["src/a.rs"]);
+        f.dispatch(&sibling)
+            .await
+            .expect("partial claims roll back");
+    }
+
+    #[tokio::test]
+    async fn claims_without_a_store_are_a_named_dispatch_failure() {
+        // No claim store wired: a task that declares claims must fail loudly
+        // (through the same recorded-dispatch-failure path as any other
+        // dispatch error), never run with its claims silently unenforced.
+        let plan = Plan::new(vec![Task::new("t1", "t1", "p").claims(["src/a.rs"])]);
+        let f = fleet(
+            FakeWorker::new(0.10),
+            OkGit::new(),
+            BudgetGuard::new(BudgetMode::Observed, None, None),
+            FleetConfig::new("run1", "HEAD"),
+        );
+        let report = f.run_plan(&plan).await.unwrap();
+        assert!(report.handles.is_empty());
+        assert_eq!(report.dispatch_failures.len(), 1);
+        assert!(
+            report.dispatch_failures[0].1.contains("no claim store"),
+            "{}",
+            report.dispatch_failures[0].1
         );
     }
 

@@ -19,6 +19,18 @@
 //!   normalized workspace-relative path, carrying its deduplicated CRUD
 //!   letters, session line-delta totals, and the ordered JSON audit log of
 //!   every individual touch (event, reason, per-touch line delta).
+//! - **memory_citations** — the self-improvement feedback loop: one row per
+//!   memory the agent explicitly cited as having informed a turn (the
+//!   `cite_memory` tool), carrying the agent's usefulness score, whether the
+//!   memory's content still held true, and a short remark. Aggregated by
+//!   [`Store::memory_citation_stats`] into the rule-promotion eligibility
+//!   gate `stella memory` surfaces.
+//! - **rules** — extension-authored workspace rules: one row per rule id,
+//!   holding the full rule markdown in the `.stella/rules/*.md` authoring
+//!   format (the store never parses it — `stella_core::rules` does).
+//!   Written by extension providers via [`Store::upsert_rule`]; read at
+//!   session start by `stella-cli`, which merges these (lowest precedence)
+//!   with the on-disk rule files.
 //! - **file_locks** — schema + API for cooperative file claims in multi-agent
 //!   work. Reserved: no shipping command acquires locks yet.
 //! - **graph_nodes / graph_edges** — schema reserved as a future seam for a
@@ -34,7 +46,9 @@
 //! still serializes writers per file; one `Store` per session process is the
 //! contract, and internally a `Mutex<Connection>` serializes writers across
 //! in-process parallel agents. Multi-PROCESS fleets need a lock-holder (or
-//! one store per worker + merge) — documented limitation, not a silent one.
+//! one store per worker + merge) — `stella fleet` follows exactly that: its
+//! workers are threads, and the single orchestrator process holds the one
+//! `Store` that acquires and releases their file claims.
 //!
 //! # Schema versioning
 //!
@@ -123,6 +137,74 @@ pub struct FileTouchRow {
     pub lines_added: u64,
     pub lines_removed: u64,
     pub events_json: String,
+}
+
+/// One memory citation, ready to persist: the cited memory's stable public
+/// id (the `nod_…` id the recall block showed the model), the agent's
+/// usefulness score (1–5), whether the memory's content still held true this
+/// turn, and a short free-text remark.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryCitationRow {
+    pub memory_id: String,
+    pub useful_score: i64,
+    pub truthful: bool,
+    pub remark: String,
+}
+
+impl MemoryCitationRow {
+    /// Whether this citation counts as a *positive* use of the memory for
+    /// promotion purposes: the content still held true AND the score clears
+    /// [`POSITIVE_SCORE_MIN`]. Anything else is a negative remark.
+    pub fn is_positive(&self) -> bool {
+        self.truthful && self.useful_score >= POSITIVE_SCORE_MIN
+    }
+}
+
+/// Minimum usefulness score (on the 1–5 scale `cite_memory` enforces) for a
+/// citation to count as positive.
+pub const POSITIVE_SCORE_MIN: i64 = 3;
+
+/// A memory must be cited successfully STRICTLY MORE THAN this many times to
+/// become rule-promotion eligible (spec: "more than 10 times" — exactly 10
+/// is not enough).
+pub const PROMOTION_CITATIONS_REQUIRED: i64 = 10;
+
+/// Per-memory citation aggregate — the data behind `stella memory` and the
+/// rule-promotion eligibility gate.
+///
+/// Eligibility semantics (deliberately strict, per spec): a memory is
+/// eligible once its **positive streak** — consecutive positive citations
+/// since (and not counting) its most recent negative one, in citation order —
+/// strictly exceeds [`PROMOTION_CITATIONS_REQUIRED`]. One negative remark
+/// resets the streak to zero, disqualifying the memory until it re-earns
+/// MORE THAN 10 fresh all-positive citations. A memory that was never cited
+/// negatively has `positive_streak == citations`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryCitationStats {
+    pub memory_id: String,
+    /// Total citations recorded, positive and negative.
+    pub citations: i64,
+    /// Mean usefulness score across every citation.
+    pub avg_score: f64,
+    /// Fraction of citations whose `truthful` flag was set.
+    pub truthful_rate: f64,
+    /// Citations that were NOT positive ([`MemoryCitationRow::is_positive`]).
+    pub negatives: i64,
+    /// Consecutive positive citations since the most recent negative one.
+    pub positive_streak: i64,
+    /// `positive_streak > PROMOTION_CITATIONS_REQUIRED` — the promotion gate.
+    pub eligible: bool,
+/// One extension-authored workspace rule, as stored: the full rule markdown
+/// in the `.stella/rules/*.md` authoring format plus the writer's label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleRow {
+    /// The rule id — the analog of a rule file's filename stem.
+    pub rule_id: String,
+    /// Full rule markdown (optional frontmatter + body). Opaque to the
+    /// store; `stella_core::rules::rule_from_file` parses it.
+    pub contents: String,
+    /// Opaque label naming the writer (extension/provider id).
+    pub source: String,
 }
 
 /// One aggregated analytics row per (provider, model): the numbers behind
@@ -228,13 +310,18 @@ type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// a file at `user_version` i to i + 1. Fresh files never run these — they
 /// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
 /// directly.
-const MIGRATIONS: [Migration; 2] = [
+const MIGRATIONS: [Migration; 3] = [
     // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
     // their write paths have always assumed.
     migrate_v0_to_v1,
     // v1 → v2: files_touched grows line-delta totals + the JSON audit log,
     // and the UNIQUE (execution_id, path) key.
     migrate_v1_to_v2,
+    // v2 → v3: the memory_citations table (purely additive — no existing
+    // table changes shape).
+    // v2 → v3: the additive `rules` table (extension-authored workspace
+    // rules for the stella-core rules engine).
+    migrate_v2_to_v3,
 ];
 
 /// The schema version this build writes — the `PRAGMA user_version` of
@@ -245,11 +332,13 @@ const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// Every table the store owns — the allowlist for [`Store::count`] and the
 /// fresh-file probe in [`Store::migrate`].
-const TABLES: [&str; 7] = [
+const TABLES: [&str; 8] = [
     "executions",
     "events",
     "telemetry",
     "files_touched",
+    "memory_citations",
+    "rules",
     "file_locks",
     "graph_nodes",
     "graph_edges",
@@ -362,6 +451,22 @@ fn telemetry_ddl(table: &str) -> String {
     )
 }
 
+/// `rules` DDL — one row per extension-authored workspace rule, keyed by
+/// rule id (the analog of a rule file's filename stem). `contents` is the
+/// FULL rule markdown in the `.stella/rules/*.md` authoring format
+/// (optional `---` frontmatter — `description:`/`guard-*:` keys — plus the
+/// rule statement body); the store never parses it, `stella_core::rules`
+/// does. `source` is an opaque label naming the writer (extension/provider
+/// id). `IF NOT EXISTS` so one batch serves both the fresh-file schema and
+/// the v2 → v3 migration.
+const RULES_TABLE: &str = "CREATE TABLE IF NOT EXISTS rules (
+       rule_id TEXT PRIMARY KEY,
+       contents TEXT NOT NULL,
+       source TEXT NOT NULL,
+       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+     );";
+
 /// `drift_samples` filters (provider, model) and sorts (execution_id DESC,
 /// step DESC) at EVERY session start, over a table that grows one row per
 /// model call forever — without this index it full-scans. Non-unique on
@@ -369,6 +474,26 @@ fn telemetry_ddl(table: &str) -> String {
 /// query's covering access path.
 const TELEMETRY_INDEX: &str = "CREATE INDEX IF NOT EXISTS telemetry_by_model
        ON telemetry(provider, model, execution_id, step);";
+
+/// `memory_citations` DDL at [`SCHEMA_VERSION`].
+///
+/// UNIQUE (execution_id, memory_id): one citation per memory per execution —
+/// the session ledger keeps only the model's latest judgment of a memory
+/// before persisting, so a duplicate pair is a double-write, not data.
+/// `truthful` is 0/1. The by-memory index is the access path of
+/// [`Store::memory_citation_stats`], which scans per memory in citation
+/// order; the UNIQUE key's implicit (execution_id, …) index can't serve it.
+const MEMORY_CITATIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS memory_citations (
+       execution_id INTEGER NOT NULL,
+       memory_id TEXT NOT NULL,
+       ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       useful_score INTEGER NOT NULL,
+       truthful INTEGER NOT NULL,
+       remark TEXT NOT NULL DEFAULT '',
+       UNIQUE (execution_id, memory_id)
+     );
+     CREATE INDEX IF NOT EXISTS memory_citations_by_memory
+       ON memory_citations(memory_id, execution_id);";
 
 /// The full latest schema, applied in one shot to fresh databases only.
 /// Existing files never see this — [`MIGRATIONS`] upgrades them shape by
@@ -378,7 +503,9 @@ fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(&events_ddl("events"))?;
     tx.execute_batch(&telemetry_ddl("telemetry"))?;
     tx.execute_batch(&files_touched_ddl("files_touched"))?;
+    tx.execute_batch(RULES_TABLE)?;
     tx.execute_batch(TELEMETRY_INDEX)?;
+    tx.execute_batch(MEMORY_CITATIONS_DDL)?;
     Ok(())
 }
 
@@ -562,6 +689,14 @@ fn migrate_v1_to_v2(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         // rebuild, create the v2 shape fresh.
         tx.execute_batch(&files_touched_ddl("files_touched"))?;
     }
+    Ok(())
+}
+
+/// v2 → v3: the `memory_citations` table. Purely additive — no existing
+/// table is touched, so no rebuild, no dedupe, no backfill.
+fn migrate_v2_to_v3(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(MEMORY_CITATIONS_DDL)?;
+    tx.execute_batch(RULES_TABLE)?;
     Ok(())
 }
 
@@ -817,6 +952,71 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the memory citations for an execution: one row per cited
+    /// memory. UNIQUE (execution_id, memory_id) makes a duplicate citation of
+    /// the same memory within one execution an error instead of a silent
+    /// double-count — the session ledger already collapses re-cites to the
+    /// model's latest judgment before handing rows in.
+    pub fn record_memory_citations(
+        &self,
+        execution_id: i64,
+        citations: &[MemoryCitationRow],
+    ) -> Result<()> {
+        let conn = self.lock();
+        for row in citations {
+            conn.execute(
+                "INSERT INTO memory_citations \
+                 (execution_id, memory_id, useful_score, truthful, remark) \
+                 VALUES (?, ?, ?, ?, ?)",
+                params![
+                    execution_id,
+                    row.memory_id,
+                    row.useful_score,
+                    row.truthful,
+                    row.remark,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Per-memory citation aggregates ([`MemoryCitationStats`]) — the data
+    /// behind `stella memory` and the rule-promotion eligibility gate. Rows
+    /// are ordered most-cited first (ties broken by memory_id, so output is
+    /// deterministic).
+    ///
+    /// Citation order for the positive-streak fold is `(execution_id, rowid)`
+    /// ascending: execution ids are AUTOINCREMENT (monotonic across sessions)
+    /// and the table is append-only, so this IS chronological order. The fold
+    /// itself is [`fold_citation_stats`] — plain logic over owned rows,
+    /// boundary-tested directly.
+    pub fn memory_citation_stats(&self) -> Result<Vec<MemoryCitationStats>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT memory_id, useful_score, truthful, remark FROM memory_citations
+             ORDER BY memory_id ASC, execution_id ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(MemoryCitationRow {
+                memory_id: row.get(0)?,
+                useful_score: row.get(1)?,
+                truthful: row.get(2)?,
+                remark: row.get(3)?,
+            })
+        })?;
+        let mut citations = Vec::new();
+        for row in rows {
+            citations.push(row?);
+        }
+        let mut stats = fold_citation_stats(&citations);
+        stats.sort_by(|a, b| {
+            b.citations
+                .cmp(&a.citations)
+                .then_with(|| a.memory_id.cmp(&b.memory_id))
+        });
+        Ok(stats)
+    }
+
     /// Close an execution record.
     pub fn finish_execution(&self, execution_id: i64, outcome: &str, cost_usd: f64) -> Result<()> {
         self.lock().execute(
@@ -830,30 +1030,42 @@ impl Store {
     /// Cooperative file lock: succeeds only if `path` is unclaimed or
     /// already held by `holder` (re-entrant). Returns whether the lock is
     /// now held.
+    ///
+    /// `INSERT … DO NOTHING` + read-back rather than check-then-insert: two
+    /// PROCESSES racing for the same path (two fleet runs in one workspace)
+    /// resolve to one winner — the losing INSERT is a no-op, never a
+    /// primary-key error — and the read-back reports honestly for both.
     pub fn acquire_file_lock(&self, path: &str, holder: &str) -> Result<bool> {
         let conn = self.lock();
-        // Only "no such lock row" means unclaimed. A genuine query error must
-        // propagate — `.optional()` maps just the no-rows case to `None`;
-        // every other error still propagates via `?`. Swallowing a real error
-        // as "unclaimed" would drive a spurious INSERT (then a PK conflict),
-        // corrupting lock state.
-        let existing: Option<String> = conn
+        conn.execute(
+            "INSERT INTO file_locks (path, holder) VALUES (?, ?) \
+             ON CONFLICT (path) DO NOTHING",
+            params![path, holder],
+        )?;
+        // A row that vanished between the two statements means the competing
+        // holder released cross-process in that window; "not held" is the
+        // conservative truthful answer for THIS call.
+        let current: Option<String> = conn
             .query_row(
                 "SELECT holder FROM file_locks WHERE path = ?",
                 params![path],
                 |row| row.get(0),
             )
             .optional()?;
-        match existing {
-            Some(current) => Ok(current == holder),
-            None => {
-                conn.execute(
-                    "INSERT INTO file_locks (path, holder) VALUES (?, ?)",
-                    params![path, holder],
-                )?;
-                Ok(true)
-            }
-        }
+        Ok(current.as_deref() == Some(holder))
+    }
+
+    /// Who currently holds the claim on `path`, if anyone — the read half a
+    /// consumer uses to NAME the conflicting holder in its error.
+    pub fn file_lock_holder(&self, path: &str) -> Result<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT holder FROM file_locks WHERE path = ?",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     /// Release a lock (only the holder's release removes it).
@@ -863,6 +1075,49 @@ impl Store {
             params![path, holder],
         )?;
         Ok(())
+    }
+
+    /// Upsert one extension-authored workspace rule — the write seam an
+    /// extension provider uses to publish a rule without touching
+    /// `.stella/rules/`. `contents` is the full rule markdown in the
+    /// authoring format `stella_core::rules::rule_from_file` parses; the
+    /// store treats it as opaque text. Re-publishing an existing `rule_id`
+    /// replaces its contents and source and bumps `updated_at`.
+    pub fn upsert_rule(&self, rule_id: &str, contents: &str, source: &str) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO rules (rule_id, contents, source) VALUES (?, ?, ?) \
+             ON CONFLICT (rule_id) DO UPDATE SET contents = excluded.contents, \
+             source = excluded.source, updated_at = CURRENT_TIMESTAMP",
+            params![rule_id, contents, source],
+        )?;
+        Ok(())
+    }
+
+    /// Delete one extension-authored rule; returns whether a row existed.
+    pub fn delete_rule(&self, rule_id: &str) -> Result<bool> {
+        let deleted = self
+            .lock()
+            .execute("DELETE FROM rules WHERE rule_id = ?", params![rule_id])?;
+        Ok(deleted > 0)
+    }
+
+    /// Every stored rule, ordered by rule id — deterministic, so the rules
+    /// section assembled from these into a session's system prompt stays
+    /// byte-stable (the prompt-cache contract).
+    pub fn list_rules(&self) -> Result<Vec<RuleRow>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT rule_id, contents, source FROM rules ORDER BY rule_id")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RuleRow {
+                    rule_id: row.get(0)?,
+                    contents: row.get(1)?,
+                    source: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Upsert a graph node — the context plane's write seam.
@@ -1000,6 +1255,51 @@ impl Store {
     }
 }
 
+/// Fold chronologically-ordered citations (grouped by `memory_id` — the shape
+/// [`Store::memory_citation_stats`]'s query produces) into per-memory
+/// aggregates. The positive streak counts consecutive positive citations from
+/// the end of each memory's history back to (not through) its most recent
+/// negative one; eligibility is a STRICT `> PROMOTION_CITATIONS_REQUIRED` on
+/// that streak, so one negative remark disqualifies the memory until it
+/// re-earns more than 10 fresh all-positive citations.
+pub fn fold_citation_stats(rows: &[MemoryCitationRow]) -> Vec<MemoryCitationStats> {
+    let mut stats: Vec<MemoryCitationStats> = Vec::new();
+    let mut score_sum: i64 = 0;
+    let mut truthful_count: i64 = 0;
+
+    for row in rows {
+        let fresh = stats.last().is_none_or(|s| s.memory_id != row.memory_id);
+        if fresh {
+            score_sum = 0;
+            truthful_count = 0;
+            stats.push(MemoryCitationStats {
+                memory_id: row.memory_id.clone(),
+                citations: 0,
+                avg_score: 0.0,
+                truthful_rate: 0.0,
+                negatives: 0,
+                positive_streak: 0,
+                eligible: false,
+            });
+        }
+        // `stats` is non-empty from here on (a fresh group just pushed).
+        let entry = stats.last_mut().expect("group entry just ensured");
+        entry.citations += 1;
+        score_sum += row.useful_score;
+        truthful_count += i64::from(row.truthful);
+        if row.is_positive() {
+            entry.positive_streak += 1;
+        } else {
+            entry.negatives += 1;
+            entry.positive_streak = 0;
+        }
+        entry.avg_score = score_sum as f64 / entry.citations as f64;
+        entry.truthful_rate = truthful_count as f64 / entry.citations as f64;
+        entry.eligible = entry.positive_streak > PROMOTION_CITATIONS_REQUIRED;
+    }
+    stats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1119,6 +1419,119 @@ mod tests {
             .unwrap();
     }
 
+    /// A citation row with the fields the eligibility policy reads.
+    fn citation(memory_id: &str, score: i64, truthful: bool, remark: &str) -> MemoryCitationRow {
+        MemoryCitationRow {
+            memory_id: memory_id.into(),
+            useful_score: score,
+            truthful,
+            remark: remark.into(),
+        }
+    }
+
+    #[test]
+    fn memory_citations_roundtrip_and_reject_a_duplicate_per_execution() {
+        let store = Store::in_memory().unwrap();
+        let id = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_memory_citations(
+                id,
+                &[
+                    citation("nod_aaa", 5, true, "pinpointed the failing module"),
+                    citation("nod_bbb", 2, false, "path has moved since"),
+                ],
+            )
+            .unwrap();
+        assert!(
+            store
+                .record_memory_citations(id, &[citation("nod_aaa", 4, true, "again")])
+                .is_err(),
+            "a second citation of the same memory in one execution must violate UNIQUE"
+        );
+        // The same memory under a DIFFERENT execution is a fresh citation.
+        let other = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_memory_citations(other, &[citation("nod_aaa", 4, true, "held again")])
+            .unwrap();
+        assert_eq!(store.count("memory_citations").unwrap(), 3);
+
+        let stats = store.memory_citation_stats().unwrap();
+        assert_eq!(
+            stats
+                .iter()
+                .map(|s| s.memory_id.as_str())
+                .collect::<Vec<_>>(),
+            ["nod_aaa", "nod_bbb"],
+            "most-cited first"
+        );
+        let aaa = &stats[0];
+        assert_eq!(aaa.citations, 2);
+        assert!((aaa.avg_score - 4.5).abs() < 1e-12);
+        assert!((aaa.truthful_rate - 1.0).abs() < 1e-12);
+        assert_eq!(aaa.negatives, 0);
+        assert_eq!(aaa.positive_streak, 2);
+        assert!(!aaa.eligible, "2 positives is nowhere near the >10 gate");
+        let bbb = &stats[1];
+        assert_eq!((bbb.negatives, bbb.positive_streak), (1, 0));
+        assert!((bbb.truthful_rate - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn promotion_eligibility_requires_strictly_more_than_ten_positive_citations() {
+        let positives = |n: usize| -> Vec<MemoryCitationRow> {
+            (0..n).map(|_| citation("nod_x", 5, true, "held")).collect()
+        };
+        // Exactly 10 all-positive: NOT eligible (spec: MORE THAN 10).
+        assert!(!fold_citation_stats(&positives(10))[0].eligible);
+        // 11 all-positive: eligible.
+        assert!(fold_citation_stats(&positives(11))[0].eligible);
+        // 11 with one negative anywhere: NOT eligible — one negative remark
+        // resets the streak, wherever it lands.
+        for negative_at in [0, 5, 10] {
+            let mut rows = positives(11);
+            rows[negative_at] = citation("nod_x", 1, true, "wasted the turn");
+            let s = &fold_citation_stats(&rows)[0];
+            assert!(
+                !s.eligible,
+                "negative at {negative_at} must disqualify (streak {})",
+                s.positive_streak
+            );
+        }
+        // An untruthful citation is negative regardless of its score.
+        let mut rows = positives(11);
+        rows[10] = citation("nod_x", 5, false, "the convention changed");
+        assert!(!fold_citation_stats(&rows)[0].eligible);
+        // Re-earned: after a negative, MORE THAN 10 fresh positives requalify.
+        let mut rows = vec![citation("nod_x", 1, false, "stale")];
+        rows.extend(positives(11));
+        let s = &fold_citation_stats(&rows)[0];
+        assert_eq!((s.citations, s.negatives, s.positive_streak), (12, 1, 11));
+        assert!(
+            s.eligible,
+            "the streak since the last negative is what gates"
+        );
+    }
+
+    #[test]
+    fn v3_migration_adds_memory_citations_to_a_legacy_database() {
+        let root = temp_root("v3_memory_citations");
+        {
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
+            conn.execute_batch(LEGACY_V0_SCHEMA).unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+        assert_eq!(store.count("memory_citations").unwrap(), 0);
+        // The new-shape write path works on the migrated file.
+        let id = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_memory_citations(id, &[citation("nod_aaa", 4, true, "held")])
+            .unwrap();
+        assert_eq!(store.count("memory_citations").unwrap(), 1);
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn v2_migration_rebuilds_files_touched_with_dedupe_and_backfill() {
         let root = temp_root("v2_files_touched");
@@ -1163,6 +1576,55 @@ mod tests {
         store
             .record_files_touched(1, &[touch_row("src/new.rs", "C", 7, 0)])
             .unwrap();
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rules_upsert_list_delete_roundtrip() {
+        let store = Store::in_memory().unwrap();
+        store
+            .upsert_rule("no-force-push", "Never force-push.", "ext:policy")
+            .unwrap();
+        store
+            .upsert_rule("a-first", "Sort me first.", "ext:policy")
+            .unwrap();
+        // Re-publishing an id replaces contents and source, never duplicates.
+        store
+            .upsert_rule(
+                "no-force-push",
+                "---\nguard-tool: Bash\nguard-deny-command: git push --force*\n---\nNever force-push.",
+                "ext:policy-v2",
+            )
+            .unwrap();
+
+        let rules = store.list_rules().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].rule_id, "a-first", "ordered by rule id");
+        assert_eq!(rules[1].source, "ext:policy-v2");
+        assert!(rules[1].contents.contains("guard-tool: Bash"));
+
+        assert!(store.delete_rule("a-first").unwrap());
+        assert!(
+            !store.delete_rule("a-first").unwrap(),
+            "a second delete reports no row"
+        );
+        assert_eq!(store.count("rules").unwrap(), 1);
+    }
+
+    #[test]
+    fn v3_migration_adds_the_rules_table_to_a_legacy_file() {
+        // A legacy file upgraded through the whole migration chain must end
+        // at SCHEMA_VERSION with the rules table present and writable.
+        let root = temp_root("v3_rules");
+        {
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
+            conn.execute_batch(LEGACY_V0_SCHEMA).unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+        store.upsert_rule("r", "rule text", "ext").unwrap();
+        assert_eq!(store.count("rules").unwrap(), 1);
         drop(store);
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1661,6 +2123,20 @@ mod tests {
         assert!(!store.acquire_file_lock("src/a.rs", "agent-2").unwrap());
         store.release_file_lock("src/a.rs", "agent-1").unwrap();
         assert!(store.acquire_file_lock("src/a.rs", "agent-2").unwrap());
+    }
+
+    #[test]
+    fn file_lock_holder_names_the_current_holder() {
+        let store = Store::in_memory().unwrap();
+        assert_eq!(store.file_lock_holder("src/a.rs").unwrap(), None);
+        store.acquire_file_lock("src/a.rs", "agent-1").unwrap();
+        assert_eq!(
+            store.file_lock_holder("src/a.rs").unwrap(),
+            Some("agent-1".to_string()),
+            "a loser's conflict error must be able to name the winner"
+        );
+        store.release_file_lock("src/a.rs", "agent-1").unwrap();
+        assert_eq!(store.file_lock_holder("src/a.rs").unwrap(), None);
     }
 
     #[test]

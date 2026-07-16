@@ -7,7 +7,7 @@
 //! Data flow per turn:
 //!
 //! ```text
-//! prompt ──> recall_block(): store.recall_scoped(domains) + select_skills()
+//! prompt ──> recall_block(): registry-routed recall (crate::ocp) + select_skills()
 //!            └─ volatile message AFTER the byte-stable system prefix (L-E8)
 //! turn runs …
 //! outcome ─> reflect_and_record(): one cheap model call -> 0-3 lessons
@@ -223,16 +223,8 @@ impl SessionMemory {
         // Routed through the session's OCP host: workspace memory + the
         // code graph answer concurrently, isolated and budget-audited.
         let frames = crate::ocp::recall_via_host(&self.host, &query).await;
-        let lines: Vec<String> = frames
-            .iter()
-            .filter_map(|f| {
-                f.citation_label
-                    .as_deref()
-                    .map(|label| format!("- {} — {}", label, f.content.trim()))
-            })
-            .collect();
-        if !lines.is_empty() {
-            sections.push(format!("Relevant context:\n{}", lines.join("\n")));
+        if let Some(section) = render_context_section(&frames) {
+            sections.push(section);
         }
 
         let all_skills = self.load_skills();
@@ -540,6 +532,44 @@ impl ContextRecallPort for SessionMemory {
     }
 }
 
+/// Render recalled frames as the "Relevant context" section of the recall
+/// block. Memory-kind frames carry their stable `[nod_…]` id inline — the
+/// handle the `cite_memory` tool ties feedback to — and their presence
+/// appends the citation instruction, so the model is asked to cite exactly
+/// when there is something citable. Other frame kinds (code-graph hits,
+/// episodes) keep the plain label form: they are grounding, not memories,
+/// and never enter the citation → promotion loop. `None` when no frame has
+/// a citation label (L-C4 filters the rest).
+fn render_context_section(frames: &[ocp_types::ContextFrame]) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut citable = false;
+    for f in frames {
+        let Some(label) = f.citation_label.as_deref() else {
+            continue;
+        };
+        if f.kind == ocp_types::FrameKind::Memory {
+            citable = true;
+            lines.push(format!("- [{}] {} — {}", f.id, label, f.content.trim()));
+        } else {
+            lines.push(format!("- {} — {}", label, f.content.trim()));
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut section = format!("Relevant context:\n{}", lines.join("\n"));
+    if citable {
+        section.push_str(
+            "\n\nWhen a memory above (a [nod_…]-tagged line) actually informs your work this \
+             turn, call cite_memory with that id once you can judge it: useful_score 1-5 for \
+             how much it helped the actual work, truthful for whether its content still holds \
+             (verify against the workspace, don't assume), and a one-sentence remark. Cite \
+             only memories you genuinely used — no courtesy citations.",
+        );
+    }
+    Some(section)
+}
+
 /// Refresh (or insert) the volatile recalled-context message at index 1 —
 /// immediately after the byte-stable system prompt, before all history
 /// (L-E8). Replacing in place keeps exactly one recall block per
@@ -759,6 +789,80 @@ mod tests {
         inject_recall_block(&mut messages, Some(format!("{RECALL_MARKER}\nstuff")));
         inject_recall_block(&mut messages, None);
         assert_eq!(messages.len(), 1, "nothing relevant -> no block at all");
+    }
+
+    fn frame(
+        id: &str,
+        kind: ocp_types::FrameKind,
+        label: &str,
+        content: &str,
+    ) -> ocp_types::ContextFrame {
+        ocp_types::ContextFrame {
+            id: id.into(),
+            kind,
+            title: label.into(),
+            content: content.into(),
+            uri: None,
+            score: 0.5,
+            token_cost: 10,
+            valid_from: None,
+            valid_to: None,
+            recorded_at: None,
+            provenance: vec![],
+            citation_label: Some(label.into()),
+            embedding: None,
+            relations: vec![],
+        }
+    }
+
+    #[test]
+    fn recall_section_tags_memory_frames_with_ids_and_asks_for_citations() {
+        let frames = vec![
+            frame(
+                "nod_0123456789abcdef01234567",
+                ocp_types::FrameKind::Memory,
+                "prefer rg",
+                "prefer rg over grep here",
+            ),
+            frame(
+                "nod_bbb",
+                ocp_types::FrameKind::Snippet,
+                "src/lib.rs",
+                "fn main",
+            ),
+        ];
+        let section = render_context_section(&frames).unwrap();
+        assert!(
+            section
+                .contains("- [nod_0123456789abcdef01234567] prefer rg — prefer rg over grep here"),
+            "memory frames carry the citable id: {section}"
+        );
+        assert!(
+            section.contains("- src/lib.rs — fn main"),
+            "non-memory frames keep the plain label form: {section}"
+        );
+        assert!(
+            section.contains("cite_memory"),
+            "instruction present: {section}"
+        );
+    }
+
+    #[test]
+    fn recall_section_without_memories_never_asks_for_citations() {
+        let frames = vec![frame(
+            "nod_ccc",
+            ocp_types::FrameKind::Snippet,
+            "src/lib.rs",
+            "fn main",
+        )];
+        let section = render_context_section(&frames).unwrap();
+        assert!(!section.contains("cite_memory"));
+
+        // No labeled frames at all → no section (an empty block only burns
+        // cache).
+        let mut unlabeled = frame("nod_ddd", ocp_types::FrameKind::Memory, "x", "y");
+        unlabeled.citation_label = None;
+        assert!(render_context_section(&[unlabeled]).is_none());
     }
 
     #[test]

@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ocp_types::frame::FrameEmbedding;
-use ocp_types::{ContextFrame, ContextQuery, Provenance};
+use ocp_types::{ContextFrame, ContextQuery, ContextQueryResult, Provenance};
 
 use crate::error::ContextError;
 use crate::store::{
@@ -92,10 +92,23 @@ impl RecallResult {
     }
 }
 
+/// The OCP wire shape of a recall — the drop report survives as
+/// `truncated`/`dropped_estimate`, so adapting a recall to the provider seam
+/// never silently discards it (`L-C5`).
+impl From<RecallResult> for ContextQueryResult {
+    fn from(result: RecallResult) -> Self {
+        ContextQueryResult {
+            truncated: !result.dropped.is_empty(),
+            dropped_estimate: u32::try_from(result.dropped.len()).ok(),
+            frames: result.frames,
+        }
+    }
+}
+
 impl ContextStore {
     /// Hybrid retrieval with no domain scope — grounding drawn from the whole
     /// workspace. The OCP-shaped `ContextProvider::query` adapts this down to
-    /// `Vec<ContextFrame>`.
+    /// a [`ContextQueryResult`].
     pub async fn recall(&self, q: &ContextQuery) -> Result<RecallResult, ContextError> {
         self.recall_scoped(q, &[]).await
     }

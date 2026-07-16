@@ -119,16 +119,35 @@ Rules:
 const MEMORY_PROMPT_BUDGET_CHARS: usize = 16_000;
 
 /// Assemble the session's system prompt from a `base` instruction set plus
-/// the workspace's saved memories. Memories are loaded ONCE per session and
-/// concatenated in filename order so the resulting prefix is byte-stable
-/// across every model call — that stability is what lets the whole prompt
-/// (instructions + memories) ride the provider's prompt cache instead of
-/// being re-billed. Memories saved mid-session deliberately do NOT appear
-/// until the next session: hot-injecting them would invalidate the cached
-/// prefix on every save. This coexists with `SessionMemory`'s per-turn
-/// recall block (memory.rs) — the baked prefix carries durable lessons, the
-/// recall block carries turn-relevant memories and skills.
+/// the workspace's saved memories and the workspace rules section (Tier 1
+/// soft adherence, `stella_core::rules`). Both are loaded ONCE per session
+/// and concatenated deterministically so the resulting prefix is
+/// byte-stable across every model call — that stability is what lets the
+/// whole prompt (instructions + memories + rules) ride the provider's
+/// prompt cache instead of being re-billed. Memories saved mid-session
+/// deliberately do NOT appear until the next session: hot-injecting them
+/// would invalidate the cached prefix on every save. This coexists with
+/// `SessionMemory`'s per-turn recall block (memory.rs) — the baked prefix
+/// carries durable lessons, the recall block carries turn-relevant memories
+/// and skills. The rules rendered here are the same set whose Tier-2 guards
+/// `crate::rules::enforce_workspace_rules` arms at the tool boundary.
 fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> String {
+    let mut prompt = base.to_string();
+    append_workspace_memories(&mut prompt, workspace_root);
+    let rules_section = stella_core::rules::render_rules_section(
+        &crate::rules::load_workspace_rules(workspace_root),
+    );
+    if !rules_section.is_empty() {
+        prompt.push('\n');
+        prompt.push_str(&rules_section);
+    }
+    prompt
+}
+
+/// The memories half of [`assemble_system_prompt`]: append the workspace's
+/// saved memories (filename order, budget-capped) to `prompt`, or leave it
+/// untouched when there are none.
+fn append_workspace_memories(prompt: &mut String, workspace_root: &std::path::Path) {
     let dir = workspace_root.join(".stella/memories");
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .map(|entries| {
@@ -139,7 +158,7 @@ fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> Strin
         })
         .unwrap_or_default();
     if files.is_empty() {
-        return base.to_string();
+        return;
     }
     files.sort();
 
@@ -170,21 +189,20 @@ fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> Strin
         memories.push_str(&entry);
     }
     if memories.is_empty() {
-        return base.to_string();
+        return;
     }
-    let mut prompt = format!(
-        "{base}
+    prompt.push_str(&format!(
+        "
 
 Workspace memories (lessons from previous sessions — apply them):
 {memories}"
-    );
+    ));
     if dropped > 0 {
         prompt.push_str(&format!(
             "
 ({dropped} additional memories exceeded the prompt budget and were omitted —              consolidate .stella/memories/ to bring them back)"
         ));
     }
-    prompt
 }
 
 /// EngineConfig for a session: defaults, with the workspace root as the
@@ -269,6 +287,7 @@ async fn run_pipeline_one_shot(
     let registry: Arc<ToolRegistry> =
         Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let mcp = connect_mcp(cfg, registry.clone(), format == OutputFormat::Text).await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
@@ -399,7 +418,9 @@ async fn run_pipeline_one_shot(
             Err(_) => ("error", 0.0),
         };
         if !record_execution_end(store, *id, &registry, outcome_label, cost) {
-            warn_store_write_failed("the audit record (files touched / outcome)");
+            warn_store_write_failed(
+                "the audit record (files touched / memory citations / outcome)",
+            );
         }
     }
 
@@ -715,6 +736,7 @@ async fn run_raw_one_shot(
     let registry: std::sync::Arc<ToolRegistry> =
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let mcp = connect_mcp(cfg, registry.clone(), format == OutputFormat::Text).await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
@@ -810,6 +832,7 @@ pub async fn run_goal_cmd(
     let registry: std::sync::Arc<ToolRegistry> =
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let mcp = connect_mcp(cfg, registry.clone(), true).await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
@@ -888,6 +911,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     let mcp = connect_mcp(cfg, registry.clone(), true).await;
     populate_schema_index(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -1871,7 +1895,9 @@ async fn run_turn(
             TurnOutcome::Aborted { .. } => ("aborted", 0.0),
         };
         if !record_execution_end(store, *id, registry, outcome_label, cost) {
-            warn_store_write_failed("the audit record (files touched / outcome)");
+            warn_store_write_failed(
+                "the audit record (files touched / memory citations / outcome)",
+            );
         }
     }
 
@@ -2001,11 +2027,13 @@ fn spawn_renderer(
 }
 
 /// Best-effort end-of-execution records: the session's file-touch telemetry
-/// (read straight off the registry's ledger) and how the run ended. A
-/// failure must not abort the turn, but it must not vanish either — the
-/// store is the durable audit record of what the agent did. Returns `false`
-/// when either write failed so the caller can surface a warning on its own
-/// channel (stderr for the CLI surfaces, a deck event for the TUI, where
+/// (read straight off the registry's ledger), the memory citations the
+/// `cite_memory` tool collected this turn (drained, so each lands under
+/// exactly one execution — the promotion gate counts them), and how the run
+/// ended. A failure must not abort the turn, but it must not vanish either —
+/// the store is the durable audit record of what the agent did. Returns
+/// `false` when any write failed so the caller can surface a warning on its
+/// own channel (stderr for the CLI surfaces, a deck event for the TUI, where
 /// stderr belongs to the alternate screen).
 pub(crate) fn record_execution_end(
     store: &Store,
@@ -2016,10 +2044,14 @@ pub(crate) fn record_execution_end(
 ) -> bool {
     let files = file_touch_rows(registry);
     let files_ok = store.record_files_touched(execution_id, &files).is_ok();
+    let citations = memory_citation_rows(registry);
+    let citations_ok = store
+        .record_memory_citations(execution_id, &citations)
+        .is_ok();
     let finish_ok = store
         .finish_execution(execution_id, outcome_label, cost_usd)
         .is_ok();
-    files_ok && finish_ok
+    files_ok && citations_ok && finish_ok
 }
 
 /// The registry's session file-touch telemetry as store rows: one per
@@ -2036,6 +2068,23 @@ fn file_touch_rows(registry: &ToolRegistry) -> Vec<stella_store::FileTouchRow> {
             lines_removed: record.lines_removed,
             events_json: serde_json::to_string(&record.events).unwrap_or_else(|_| "[]".into()),
             path: record.path,
+        })
+        .collect()
+}
+
+/// The registry's memory citations as store rows. This DRAINS the ledger
+/// (unlike the cumulative file-touch snapshot) so each citation persists
+/// under exactly one execution — the >10 promotion count must never be
+/// inflated by re-persisting a citation under later turns.
+fn memory_citation_rows(registry: &ToolRegistry) -> Vec<stella_store::MemoryCitationRow> {
+    registry
+        .take_memory_citations()
+        .into_iter()
+        .map(|c| stella_store::MemoryCitationRow {
+            memory_id: c.memory_id,
+            useful_score: c.useful_score,
+            truthful: c.truthful,
+            remark: c.remark,
         })
         .collect()
 }
@@ -2195,7 +2244,9 @@ async fn run_goal_turn(
             GoalOutcome::Unmet { cost_usd, .. } => ("goal_unmet", *cost_usd),
         };
         if !record_execution_end(store, *id, registry, outcome_label, cost) {
-            warn_store_write_failed("the audit record (files touched / outcome)");
+            warn_store_write_failed(
+                "the audit record (files touched / memory citations / outcome)",
+            );
         }
     }
     tui::files_touched_panel(&files);
@@ -2574,6 +2625,31 @@ mod tests {
         assert_eq!(
             row.cache_write_tokens, 640,
             "the event's cache-write count must reach the store, never a hard-coded 0"
+        );
+    }
+
+    /// Tier-1 rule wiring (issue #103): a workspace rule renders into the
+    /// assembled system prompt, appended after the untouched base prefix.
+    #[test]
+    fn system_prompt_carries_the_workspace_rules_section() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let rules_dir = root.path().join(".stella/rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(
+            rules_dir.join("no-force-push.md"),
+            "---\nguard-tool: Bash\nguard-deny-command: git push --force*\n---\nNever force-push.",
+        )
+        .unwrap();
+
+        let prompt = build_system_prompt(root.path());
+        assert!(
+            prompt.starts_with(SYSTEM_PROMPT),
+            "rules append to the prompt; the base prefix must stay intact"
+        );
+        assert!(prompt.contains("## Workspace rules"));
+        assert!(
+            prompt.contains("Never force-push.  [enforced]"),
+            "a guarded rule must render with the enforced marker: {prompt}"
         );
     }
 
