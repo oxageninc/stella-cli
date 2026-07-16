@@ -378,17 +378,16 @@ pub fn plan_extension_sync(
         std::collections::HashSet<String>,
     > = std::collections::HashMap::new();
     for source in sources {
-        if !present_files.contains_key(&source.kind) {
+        let present = present_files.entry(source.kind).or_insert_with(|| {
             let targets = existing(source.kind);
-            present_files.insert(source.kind, targets.file_names.into_iter().collect());
             // Definitions already in the destination claim their names up
             // front, so a same-named-but-differently-filed source entry is
             // skipped instead of linked alongside.
             for name in targets.definition_names {
                 claimed.insert((source.kind, name));
             }
-        }
-        let present = &present_files[&source.kind];
+            targets.file_names.into_iter().collect()
+        });
         for entry in &source.entries {
             let skip = |reason| SyncSkip {
                 kind: source.kind,
