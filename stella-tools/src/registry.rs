@@ -640,7 +640,11 @@ impl ToolRegistry {
                     lines_removed,
                 },
             );
-            (touched.revision(), touched.get(&path).cloned(), touched.len())
+            (
+                touched.revision(),
+                touched.get(&path).cloned(),
+                touched.len(),
+            )
         };
         if let Some(bus) = bus {
             let fact = match pending.op {
@@ -1419,7 +1423,11 @@ mod tests {
     }
 
     fn event_names(seen: &StdArc<StdMutex<Vec<HookEvent>>>) -> Vec<String> {
-        seen.lock().unwrap().iter().map(|e| e.name.clone()).collect()
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect()
     }
 
     #[tokio::test]
@@ -1443,7 +1451,10 @@ mod tests {
             ToolOutput::Error { message } => assert!(message.contains("read-only"), "{message}"),
             _ => unreachable!(),
         }
-        assert!(dir.path().join("f.rs").exists(), "denied delete must not run");
+        assert!(
+            dir.path().join("f.rs").exists(),
+            "denied delete must not run"
+        );
         assert!(
             reg.file_touch_telemetry().files_touched.is_empty(),
             "a blocked op records no file touch"
@@ -1477,7 +1488,10 @@ mod tests {
             hook_names::FILE_CREATED,
             hook_names::FILES_TOUCHED_UPDATED,
         ] {
-            assert!(names.iter().any(|n| n == expected), "missing {expected} in {names:?}");
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing {expected} in {names:?}"
+            );
         }
         // The raw blocking event never reaches an observer.
         assert!(
