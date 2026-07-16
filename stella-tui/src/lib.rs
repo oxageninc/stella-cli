@@ -56,7 +56,7 @@ pub mod theme;
 pub mod views;
 
 pub use composer::{
-    Composer, ComposerEntry, DEFAULT_PASTE_LINE_THRESHOLD, SlashCommand, SlashMenu,
+    Composer, ComposerEntry, DEFAULT_PASTE_LINE_THRESHOLD, SlashCommand, SlashKind, SlashMenu,
 };
 pub use input::{ScopeDecision, UserInput};
 pub use model::{FileState, Hud, SessionModel, TranscriptEntry};

@@ -183,11 +183,16 @@ pub enum DeckAction {
 
 /// Fold one inbound envelope and keep the ephemeral UI in range.
 pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut DeckUi) {
-    // A refreshed graph snapshot is out-of-band view state (the Graph tab),
-    // not a model fold — apply it straight to the UI. Everything else folds
-    // into the model, then selections are re-clamped.
+    // A refreshed graph snapshot or slash vocabulary is out-of-band view
+    // state, not a model fold — apply it straight to the UI. Everything else
+    // folds into the model, then selections are re-clamped.
     if let Inbound::GraphSnapshot(snapshot) = inbound {
         ui.graph = Some(snapshot.clone());
+        return;
+    }
+    if let Inbound::SlashCommands(commands) = inbound {
+        ui.slash_commands = commands.clone();
+        ui.slash_selected = 0;
         return;
     }
     model.apply_inbound(inbound);

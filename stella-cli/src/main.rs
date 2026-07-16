@@ -22,6 +22,7 @@ mod arena;
 mod command_deck;
 mod config;
 mod domains;
+mod extensions;
 mod fleet_cmd;
 mod interactive;
 mod memory;

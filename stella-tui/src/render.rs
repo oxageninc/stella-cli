@@ -559,6 +559,7 @@ pub(crate) fn render_slash_popup(menu: &SlashMenu, selected: usize, area: Rect, 
             }
             Line::from(vec![
                 Span::styled(marker.to_string(), name_style),
+                Span::styled(format!("{} ", c.kind.glyph()), name_style),
                 Span::styled(c.name.clone(), name_style),
                 Span::styled("  ", desc_style),
                 Span::styled(c.description.clone(), desc_style),
@@ -1343,13 +1344,38 @@ mod tests {
         );
         ui.slash_selected = 1;
         let text = draw(&model, &mut ui, 100, 30);
+        // The glyph is double-width: its trailing filler cell dumps as an
+        // extra space before the explicit separator.
         assert!(
-            text.contains("▸ /diff"),
-            "selection marker on the second row:\n{text}"
+            text.contains("▸ 🔒  /diff"),
+            "selection marker + builtin glyph on the second row:\n{text}"
         );
         assert!(
             text.contains("/ commands · 2"),
             "popup title with the match count:\n{text}"
+        );
+    }
+
+    #[test]
+    fn slash_popup_glyphs_distinguish_builtin_from_custom_commands() {
+        let model = SessionModel::new();
+        let mut composer = Composer::new();
+        composer.insert_char('/');
+        let mut ui = UiState::new(
+            composer,
+            vec![
+                SlashCommand::new("/help", "show help"),
+                SlashCommand::custom("/fix-bug", "fix the named bug"),
+            ],
+        );
+        let text = draw(&model, &mut ui, 100, 30);
+        assert!(
+            text.contains("🔒  /help"),
+            "productized commands carry the lock glyph:\n{text}"
+        );
+        assert!(
+            text.contains("⚡  /fix-bug"),
+            "custom commands carry the lightning glyph:\n{text}"
         );
     }
 

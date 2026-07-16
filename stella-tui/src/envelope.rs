@@ -131,6 +131,12 @@ pub enum Inbound {
     /// sends one after `/init` rebuilds the index so the tab reflects it
     /// without a restart.
     GraphSnapshot(GraphSnapshot),
+    /// A refreshed slash-command vocabulary for the `/` popup. Out-of-band
+    /// view state exactly like [`Inbound::GraphSnapshot`]: applied straight
+    /// to `DeckUi::slash_commands` by [`crate::deck_ui::ingest_inbound`],
+    /// ignored by the model fold. The driver sends one after `/init` adopts
+    /// custom commands/skills so the menu reflects them without a restart.
+    SlashCommands(Vec<crate::composer::SlashCommand>),
 }
 
 /// What the deck sends back to the caller / engine. The single-session

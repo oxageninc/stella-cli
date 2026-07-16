@@ -239,10 +239,11 @@ impl WorkspaceModel {
                     self.agents[idx].model.push_user_prompt(text);
                 }
             }
-            // The graph snapshot is an out-of-band read-model, not part of the
-            // event-log fold — the view state owns it, applied in
-            // `ingest_inbound`, so the model deliberately ignores it here.
-            Inbound::GraphSnapshot(_) => {}
+            // The graph snapshot and the slash vocabulary are out-of-band
+            // read-models, not part of the event-log fold — the view state
+            // owns them, applied in `ingest_inbound`, so the model
+            // deliberately ignores them here.
+            Inbound::GraphSnapshot(_) | Inbound::SlashCommands(_) => {}
         }
     }
 

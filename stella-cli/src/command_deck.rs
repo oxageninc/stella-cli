@@ -134,6 +134,9 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
     // `warn: false`: past this point diagnostics would land on the alternate
     // screen; a memory-less session degrades silently here.
     let mut memory = SessionMemory::open(&cfg.workspace_root, false);
+    // Custom extensions: ⚡ commands/skills in the slash menu, custom agents
+    // behind `/agents`. Reloaded after `/init`, which may adopt new ones.
+    let mut custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
 
     // ── Channels: engine → deck (Inbound) and deck → driver (WorkspaceInput)
     let (in_tx, in_rx) = mpsc::unbounded_channel::<Inbound>();
@@ -165,15 +168,7 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
 
     let opts = DeckOptions {
         debug_log_path: debug_log_path(),
-        slash_commands: vec![
-            SlashCommand::new("/help", "show commands"),
-            SlashCommand::new("/clear", "reset the conversation"),
-            SlashCommand::new("/models", "list providers & models"),
-            SlashCommand::new("/init", "index the workspace: domains + code graph"),
-            SlashCommand::new("/files", "open the Files tab"),
-            SlashCommand::new("/diff", "open the diff viewer"),
-            SlashCommand::new("/graph", "open the code-graph tab"),
-        ],
+        slash_commands: deck_slash_commands(&custom),
         initial_graph: agent::graph_snapshot(&cfg.workspace_root),
         ..Default::default()
     };
@@ -217,9 +212,10 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
             &*provider,
             &registry,
             cfg,
+            &custom,
         )
         .await;
-        if !matches!(command, DeckCommand::Prompt) {
+        if matches!(command, DeckCommand::Handled | DeckCommand::InitCompleted) {
             // A handled command emits its answer as `Text`, which flips the
             // lead to `Running` in the deck's fold — but no turn is in flight.
             // Return it to `WaitingInput` so the dashboard reflects reality.
@@ -228,8 +224,12 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
                 status: AgentStatus::WaitingInput,
             });
         }
-        match command {
-            DeckCommand::Prompt => {}
+        let prompt = match command {
+            DeckCommand::Prompt => prompt,
+            // A custom command/skill invocation: the transcript already shows
+            // what was typed (`PromptStarted` above); the model runs the
+            // expanded template.
+            DeckCommand::Expanded(text) => text,
             DeckCommand::Handled => continue 'session,
             DeckCommand::InitCompleted => {
                 // `/init` changed the taxonomy and rebuilt the index. Re-open
@@ -239,9 +239,13 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
                 if let Some(snapshot) = agent::graph_snapshot(&cfg.workspace_root) {
                     let _ = in_tx.send(Inbound::GraphSnapshot(snapshot));
                 }
+                // `/init` may also have adopted new custom commands/skills —
+                // reload them and refresh the deck's slash menu in place.
+                custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
+                let _ = in_tx.send(Inbound::SlashCommands(deck_slash_commands(&custom)));
                 continue 'session;
             }
-        }
+        };
 
         // Per-turn conversation bookkeeping, mirroring `run_interactive`:
         // refresh the volatile recall block, then append the user prompt.
@@ -398,23 +402,48 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
 enum DeckCommand {
     /// Not a command — run the model turn as usual.
     Prompt,
+    /// A custom command/skill invocation — run the model turn with this
+    /// expanded prompt instead of the raw `/name args` input.
+    Expanded(String),
     /// Handled as a command; skip the model turn.
     Handled,
     /// `/init` finished successfully; skip the turn AND refresh the session's
-    /// derived state (memory domains, Graph tab) which the new taxonomy/index
-    /// changed.
+    /// derived state (memory domains, Graph tab, custom extensions) which the
+    /// new taxonomy/index changed.
     InitCompleted,
+}
+
+/// The deck's slash vocabulary: the productized commands (🔒) followed by
+/// every custom command/skill (⚡) currently on disk. Rebuilt after `/init`
+/// so just-adopted definitions appear without a restart.
+fn deck_slash_commands(custom: &crate::extensions::CustomExtensions) -> Vec<SlashCommand> {
+    let mut commands = vec![
+        SlashCommand::new("/help", "show commands"),
+        SlashCommand::new("/clear", "reset the conversation"),
+        SlashCommand::new("/models", "list providers & models"),
+        SlashCommand::new("/init", "index the workspace: domains + code graph"),
+        SlashCommand::new("/agents", "list custom agents"),
+        SlashCommand::new("/files", "open the Files tab"),
+        SlashCommand::new("/diff", "open the diff viewer"),
+        SlashCommand::new("/graph", "open the code-graph tab"),
+    ];
+    let customs = custom.slash_entries(&commands);
+    commands.extend(customs);
+    commands
 }
 
 /// Handle a session-level slash command. Output goes into the lead agent's
 /// transcript as `Text` events — the deck renders exclusively from events, so
 /// printing to stdout (which the alternate screen owns) is never an option.
 ///
-/// Vocabulary: `/help`, `/clear`, `/models`, `/init`. `/files`, `/diff`,
-/// `/graph` are deck-local (tab switches) and consumed TUI-side; an unknown
-/// bare `/command` gets a hint rather than a wasted model call. Every command
-/// is no-argument, so the *whole* trimmed input is matched — `/init do the
-/// thing` is a model prompt, not a silent reindex that discards the rest.
+/// Vocabulary: `/help`, `/clear`, `/models`, `/init`, `/agents`. `/files`,
+/// `/diff`, `/graph` are deck-local (tab switches) and consumed TUI-side; an
+/// unknown bare `/command` gets a hint rather than a wasted model call. Every
+/// productized command is no-argument, so the *whole* trimmed input is
+/// matched — `/init do the thing` is a model prompt, not a silent reindex
+/// that discards the rest. Custom commands/skills (⚡) DO take arguments:
+/// `/fix-bug issue-42` expands the `fix-bug` template with `issue-42`.
+#[allow(clippy::too_many_arguments)]
 async fn run_deck_command(
     prompt: &str,
     in_tx: &UnboundedSender<Inbound>,
@@ -423,6 +452,7 @@ async fn run_deck_command(
     provider: &dyn Provider,
     registry: &ToolRegistry,
     cfg: &Config,
+    custom: &crate::extensions::CustomExtensions,
 ) -> DeckCommand {
     let trimmed = prompt.trim();
     if !trimmed.starts_with('/') {
@@ -436,12 +466,20 @@ async fn run_deck_command(
     };
     match trimmed {
         "/help" => {
-            say(
-                "commands: /help · /clear (reset conversation) · /models (list providers) · \
-                 /init (index the workspace: domains + code graph) · /files · /diff · /graph \
-                 (switch tabs) — anything else is a prompt. ctrl+t queue · ? overlay help"
-                    .to_string(),
-            );
+            let mut help = "commands: /help · /clear (reset conversation) · /models (list \
+                 providers) · /init (index the workspace: domains + code graph) · /agents \
+                 (list custom agents) · /files · /diff · /graph (switch tabs) — anything \
+                 else is a prompt. ctrl+t queue · ? overlay help"
+                .to_string();
+            let customs = custom.slash_entries(&[]);
+            if !customs.is_empty() {
+                let names: Vec<&str> = customs.iter().map(|c| c.name.as_str()).collect();
+                help.push_str(&format!("\ncustom (⚡): {}", names.join(" · ")));
+            }
+            say(help);
+        }
+        "/agents" => {
+            say(custom.render_agent_list());
         }
         "/clear" => {
             messages.clear();
@@ -471,15 +509,22 @@ async fn run_deck_command(
         // one reaches here — accept it as handled (a no-op) rather than
         // calling it "unknown".
         "/files" | "/diff" | "/graph" => {}
-        // A bare unknown /word is a typo'd command, not a prompt — say so
-        // instead of spending a model call. Anything with arguments (e.g.
-        // `/src/main.rs explain`) falls through and stays a prompt.
-        _ if !trimmed.contains(char::is_whitespace) => {
+        _ => {
+            // A custom command/skill (⚡): expand its template — arguments
+            // and all — into the prompt the model turn runs.
+            if let Some(expanded) = custom.expand(trimmed) {
+                return DeckCommand::Expanded(expanded);
+            }
+            // A bare unknown /word is a typo'd command, not a prompt — say so
+            // instead of spending a model call. Anything with arguments (e.g.
+            // `/src/main.rs explain`) falls through and stays a prompt.
+            if trimmed.contains(char::is_whitespace) {
+                return DeckCommand::Prompt;
+            }
             say(format!(
-                "unknown command `{trimmed}` — try /help, /clear, /models, /init, /files, /diff, /graph"
+                "unknown command `{trimmed}` — try /help, /clear, /models, /init, /agents, /files, /diff, /graph"
             ));
         }
-        _ => return DeckCommand::Prompt,
     }
     DeckCommand::Handled
 }
