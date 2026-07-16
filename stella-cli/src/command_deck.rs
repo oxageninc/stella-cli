@@ -209,7 +209,7 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
         // Session-level slash commands are the driver's, never the model's —
         // the deck's popup enqueues them like any prompt (tab switches and
         // the help overlay were already handled TUI-side and never reach us).
-        match run_deck_command(
+        let command = run_deck_command(
             &prompt,
             &in_tx,
             &mut messages,
@@ -218,8 +218,17 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
             &registry,
             cfg,
         )
-        .await
-        {
+        .await;
+        if !matches!(command, DeckCommand::Prompt) {
+            // A handled command emits its answer as `Text`, which flips the
+            // lead to `Running` in the deck's fold — but no turn is in flight.
+            // Return it to `WaitingInput` so the dashboard reflects reality.
+            let _ = in_tx.send(Inbound::Status {
+                agent: LEAD.to_string(),
+                status: AgentStatus::WaitingInput,
+            });
+        }
+        match command {
             DeckCommand::Prompt => {}
             DeckCommand::Handled => continue 'session,
             DeckCommand::InitCompleted => {
@@ -433,6 +442,10 @@ async fn run_deck_command(
                     // A fresh index may name tables/types the schema gate
                     // should know about this session, not just the next one.
                     agent::populate_schema_index(registry, &cfg.workspace_root);
+                    // Expose the `code_graph` tool for the rest of the session
+                    // now that the index exists (it is registered only when an
+                    // index is present at construction).
+                    registry.enable_code_graph_if_available(&cfg.workspace_root);
                     return DeckCommand::InitCompleted;
                 }
                 Err(e) => say(format!("init failed: {e}")),

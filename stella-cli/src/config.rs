@@ -782,17 +782,32 @@ impl Config {
             if PROVIDERS.iter().any(|p| p.id == id.as_str()) || id == LOCAL_PROVIDER.id {
                 continue;
             }
-            let Ok(p) = custom_provider(id, entry) else {
-                continue;
+            // A malformed provider entry surfaces as a warning line rather than
+            // silently vanishing — the ANSI renderer warns here too, and a
+            // deck user needs to see that their settings.json is broken.
+            let p = match custom_provider(id, entry) {
+                Ok(p) => p,
+                Err(e) => {
+                    lines.push(format!("  ! provider `{id}` is misconfigured: {e}"));
+                    continue;
+                }
             };
             if !printed_header {
                 lines.push("Config-defined providers (settings.json):".to_string());
                 printed_header = true;
             }
+            // Key status must consider the provider's env var (settable via
+            // `api_key_env` or the derived default), not only the settings
+            // literal — otherwise a provider keyed through the environment
+            // wrongly shows ✗ (matching the built-in branch above).
             let settings_key = entry.api_key.as_deref().is_some_and(|k| !k.is_empty());
+            let has_key = settings_key
+                || std::iter::once(&p.env_var)
+                    .chain(p.env_var_aliases)
+                    .any(|var| env::var(var).map(|v| !v.is_empty()).unwrap_or(false));
             lines.push(format!(
                 "  {} {}/{}  {}",
-                if settings_key { "✓" } else { "✗" },
+                if has_key { "✓" } else { "✗" },
                 p.id,
                 if p.default_model.is_empty() {
                     "<model>"

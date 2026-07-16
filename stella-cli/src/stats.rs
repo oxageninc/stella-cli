@@ -49,15 +49,24 @@ pub fn run_stats(format: StatsFormat, provider: Option<&str>) -> Result<(), Stri
 
     if rows.is_empty() {
         // An empty store is a state, not an error — but keep stdout valid
-        // for the machine formats.
+        // for the machine formats. If the SQLite store has no rows yet a
+        // pre-migration DuckDB file is present, say so explicitly: "no
+        // executions" would otherwise imply the workspace has no telemetry
+        // when in fact the old telemetry simply isn't read by this version.
+        let legacy_duckdb = workspace_root.join(".stella").join("stella.duckdb");
+        let message = if legacy_duckdb.exists() {
+            legacy_duckdb_message(provider)
+        } else {
+            empty_message(provider)
+        };
         match format {
-            StatsFormat::Table => println!("{}", empty_message(provider)),
+            StatsFormat::Table => println!("{message}"),
             StatsFormat::Json => {
-                eprintln!("{}", empty_message(provider));
+                eprintln!("{message}");
                 println!("[]");
             }
             StatsFormat::Csv => {
-                eprintln!("{}", empty_message(provider));
+                eprintln!("{message}");
                 println!("{}", csv_header());
             }
         }
@@ -85,6 +94,24 @@ fn empty_message(provider: Option<&str>) -> String {
                  generate local telemetry in .stella/store.db."
             .to_string(),
     }
+}
+
+/// Shown when the current SQLite store is empty/absent but a pre-migration
+/// `.stella/stella.duckdb` is present: the telemetry exists, this version just
+/// doesn't read the old format. Explicit so a migrated workspace is never
+/// silently reported as having no history.
+fn legacy_duckdb_message(provider: Option<&str>) -> String {
+    let scope = match provider {
+        Some(p) => format!(" for provider `{p}`"),
+        None => String::new(),
+    };
+    format!(
+        "No executions in the SQLite store{scope}, but a legacy .stella/stella.duckdb was \
+         found. Stella migrated its telemetry store from DuckDB to SQLite (.stella/store.db); \
+         the old DuckDB file is not read by this version and is not migrated automatically. \
+         New runs record to .stella/store.db; the historical DuckDB data is preserved on disk \
+         but not shown here."
+    )
 }
 
 /// The TOTAL row across every displayed row, computed in Rust (weighted,
