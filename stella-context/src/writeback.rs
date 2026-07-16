@@ -279,12 +279,6 @@ impl ContextDelta {
         Self::default()
     }
 
-    /// Define a domain (name + optional description).
-    pub fn with_domain(mut self, domain: DomainInput) -> Self {
-        self.domains.push(domain);
-        self
-    }
-
     /// Add a content node.
     pub fn with_node(mut self, node: NodeInput) -> Self {
         self.nodes.push(node);
@@ -294,12 +288,6 @@ impl ContextDelta {
     /// Add an episode.
     pub fn with_episode(mut self, ep: EpisodeInput) -> Self {
         self.episodes.push(ep);
-        self
-    }
-
-    /// Add a memory (reflection etc.).
-    pub fn with_memory(mut self, memory: MemoryInput) -> Self {
-        self.memories.push(memory);
         self
     }
 

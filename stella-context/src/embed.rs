@@ -131,16 +131,6 @@ impl HashEmbedder {
         }
     }
 
-    /// Construct with an explicit dimension count (for tests that want a tiny,
-    /// hand-checkable vector) and revision.
-    pub fn with_dims_and_revision(dims: usize, revision: impl Into<String>) -> Self {
-        Self {
-            dims,
-            ngram: 3,
-            revision: revision.into(),
-        }
-    }
-
     /// The pure projection, exposed for direct testing and reuse by
     /// [`Embedder::embed`].
     pub fn project(&self, text: &str) -> Vec<f32> {

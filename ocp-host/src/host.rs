@@ -97,11 +97,6 @@ impl Host {
         &self.consent
     }
 
-    /// The consent store (mutable), e.g. to restore persisted decisions.
-    pub fn consent_mut(&mut self) -> &mut ConsentStore {
-        &mut self.consent
-    }
-
     /// The ids of every registered provider, in registration order.
     pub fn provider_ids(&self) -> Vec<&str> {
         self.providers.iter().map(|p| p.id()).collect()

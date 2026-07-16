@@ -116,12 +116,6 @@ impl RoleTable {
         Self::default()
     }
 
-    /// Build a table directly from a pre-populated pin map (e.g. loaded
-    /// from `config.toml`).
-    pub fn from_pins(pins: HashMap<Role, ModelRef>) -> Self {
-        Self { pins }
-    }
-
     /// Set (or replace) an explicit pin for `role`. Returns `&mut Self` for
     /// chaining multiple pins during construction.
     pub fn pin(&mut self, role: Role, model: ModelRef) -> &mut Self {
@@ -397,21 +391,9 @@ impl Router {
         &self.role_table
     }
 
-    /// Mutable access so the future `stella-cli` slash-command layer
-    /// (`/worker-model`, `/triage-model`, `/judge-model`, …) can pin/unpin
-    /// roles at runtime without rebuilding the whole `Router`.
-    pub fn role_table_mut(&mut self) -> &mut RoleTable {
-        &mut self.role_table
-    }
-
     /// The configured providers, in preference order.
     pub fn providers(&self) -> &[ProviderProfile] {
         &self.profiles
-    }
-
-    /// `provider_id`'s current breaker disposition.
-    pub fn breaker_status(&self, provider_id: &str) -> BreakerStatus {
-        self.breaker.status(provider_id)
     }
 
     /// Feed a successful call outcome into the breaker for `provider_id`.
