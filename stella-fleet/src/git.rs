@@ -255,12 +255,6 @@ impl<G: GitCli> WorktreeManager<G> {
         }
     }
 
-    /// Override where worktree checkouts are placed (builder style).
-    pub fn with_worktrees_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.worktrees_root = root.into();
-        self
-    }
-
     /// Scope worktree/branch names to one run (builder style): the scope is
     /// hashed into every slug, so two runs sharing task ids never collide on
     /// a directory or branch left behind by the earlier run.

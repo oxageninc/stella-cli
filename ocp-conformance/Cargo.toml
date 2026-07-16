@@ -28,7 +28,6 @@ ocp-types = { path = "../ocp-types", version = ">=0.1.0" }
 ocp-host = { path = "../ocp-host", version = ">=0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 clap.workspace = true
@@ -45,4 +44,3 @@ name = "ocp-example-docs"
 path = "src/bin/ocp-example-docs.rs"
 
 [dev-dependencies]
-tempfile.workspace = true

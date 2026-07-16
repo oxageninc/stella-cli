@@ -298,20 +298,20 @@ async fn collect_commits(root: &Path, start_sha: &str, task_id: &str) -> Vec<Com
 }
 
 /// Run `git -C root <args>` and return trimmed stdout, or the stderr as the
-/// error. Non-interactive by construction (`GIT_TERMINAL_PROMPT=0`).
+/// error. Routed through fleet's [`stella_fleet::SystemGitCli`] — the
+/// workspace's one git spawn point — so this path inherits its
+/// non-interactive (`GIT_TERMINAL_PROMPT=0`) *and* `kill_on_drop`
+/// discipline; the old local `Command` copy could leak a hung git child.
 async fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+    use stella_fleet::{GitCli, SystemGitCli};
+    let output = SystemGitCli
+        .run(root, args)
         .await
         .map_err(|e| format!("git did not run: {e}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    if !output.success {
+        return Err(output.stderr.trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(output.stdout.trim().to_string())
 }
 
 fn truncate(s: &str) -> String {

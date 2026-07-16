@@ -31,6 +31,22 @@ mod settings;
 mod stats;
 mod tui;
 
+/// Serializes tests that mutate process environment variables. `setenv` /
+/// `getenv` from concurrent threads is documented UB on POSIX, and the test
+/// harness runs this binary's test modules on parallel threads — so every
+/// test that calls `std::env::set_var`/`remove_var` (agent.rs provider
+/// routing, config.rs key resolution) must hold this lock for its whole
+/// mutate-read-cleanup window.
+#[cfg(test)]
+pub(crate) mod test_env {
+    /// Acquire the env lock, recovering from a poisoned mutex (a prior
+    /// env-mutating test that panicked mid-hold must not cascade).
+    pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 use std::io::IsTerminal;
 use std::process::ExitCode;
 

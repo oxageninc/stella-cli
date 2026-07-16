@@ -148,12 +148,17 @@ impl SkillRegistry {
         let Some((program, args)) = argv.split_first() else {
             return Err("empty registry command".into());
         };
+        // kill_on_drop: when the timeout below fires, wait_with_output is
+        // dropped and the child must die with it — otherwise a wedged npx
+        // install keeps running (and downloading) long after the tool
+        // reported failure.
         let child = tokio::process::Command::new(program)
             .args(args)
             .current_dir(&self.workspace_root)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("failed to run `{program}`: {e} (is Node/npx installed?)"))?;
         let output = tokio::time::timeout(

@@ -340,14 +340,22 @@ impl<'a> Pipeline<'a> {
             messages.push(CompletionMessage::system(DEFAULT_SYSTEM_PROMPT));
         }
 
-        // --- 1. Evaluate (triage). Never hangs, never fails the run. -------
-        let task_class = self.triage(goal, budget, &mut total_cost).await;
-
-        // --- 2. Enhance + recall. ------------------------------------------
-        self.emit(AgentEvent::Stage {
-            name: StageKind::ContextRecall,
-        });
-        let frames = self.recall.recall(goal).await;
+        // --- 1+2. Evaluate (triage) + context recall, overlapped. ----------
+        // Triage's class first gates stage 3 and recall consumes only the
+        // goal — no data dependency — so the triage model call and the
+        // recall embedding/store scan run concurrently instead of paying
+        // both latencies back-to-back on every prompt. Stage-event order is
+        // unchanged: join polls triage first (it emits Stage::Triage before
+        // its first await), then the recall future emits
+        // Stage::ContextRecall before its own first await.
+        let recall_future = async {
+            self.emit(AgentEvent::Stage {
+                name: StageKind::ContextRecall,
+            });
+            self.recall.recall(goal).await
+        };
+        let (task_class, frames) =
+            tokio::join!(self.triage(goal, budget, &mut total_cost), recall_future);
         self.emit_context_recall(&frames);
         // The volatile recall+goal message rides AFTER the stable system
         // prefix (L-E8) — see assemble_user_message.
@@ -1836,14 +1844,20 @@ mod tests {
         let unchanged: HashMap<String, String> =
             std::iter::once(("src/huge.rs".to_string(), "v2".to_string())).collect();
         let (lines2, _) = pipeline.gather_diff(&unchanged).await;
-        assert_eq!(lines2, 0, "a pre-existing untracked file is not this turn's change");
+        assert_eq!(
+            lines2, 0,
+            "a pre-existing untracked file is not this turn's change"
+        );
 
         // Present before but at a DIFFERENT fingerprint → the turn edited an
         // already-untracked file; it must be visible (the P1 regression).
         let modified: HashMap<String, String> =
             std::iter::once(("src/huge.rs".to_string(), "v1".to_string())).collect();
         let (lines3, text3) = pipeline.gather_diff(&modified).await;
-        assert_eq!(lines3, 5000, "an edit to an already-untracked file is counted");
+        assert_eq!(
+            lines3, 5000,
+            "an edit to an already-untracked file is counted"
+        );
         assert!(text3.contains("src/huge.rs"));
     }
 

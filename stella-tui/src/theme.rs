@@ -22,6 +22,10 @@ pub const MUTED: Color = Color::Rgb(140, 146, 156);
 /// Panel border / rule.
 pub const RULE: Color = Color::Rgb(58, 62, 70);
 
+/// Background tint for the transcript entry selected with the arrow keys —
+/// a barely-there warm lift so the highlight reads without shouting.
+pub const SELECT_BG: Color = Color::Rgb(46, 42, 32);
+
 // ── Semantic ────────────────────────────────────────────────────────────────
 
 /// Success / positive / added lines.

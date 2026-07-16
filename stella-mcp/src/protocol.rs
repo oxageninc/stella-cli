@@ -201,6 +201,25 @@ pub struct Tool {
     /// engine's `ToolSchema` — no second schema language.
     #[serde(rename = "inputSchema", default)]
     pub input_schema: Value,
+    /// Server-advertised behavior hints. Absent ⇒ all-false, the safe
+    /// direction (treat the tool as mutating and non-idempotent).
+    #[serde(default)]
+    pub annotations: ToolAnnotations,
+}
+
+/// MCP `ToolAnnotations` behavior hints. These are *untrusted* server
+/// claims: the client may use them only to keep behavior at least as safe
+/// as the un-annotated default (e.g. allowing a transparent retry it would
+/// otherwise skip), never to widen a tool's privileges.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolAnnotations {
+    /// The tool does not modify its environment.
+    #[serde(rename = "readOnlyHint", default)]
+    pub read_only_hint: bool,
+    /// Calling the tool twice with the same arguments has no additional
+    /// effect — a duplicate delivery is harmless.
+    #[serde(rename = "idempotentHint", default)]
+    pub idempotent_hint: bool,
 }
 
 /// `tools/call` params.

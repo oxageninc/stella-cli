@@ -130,7 +130,9 @@ impl HttpTransport {
             let chunk = chunk.map_err(|e| {
                 McpError::Transport(format!("SSE stream from `{}` broke: {e}", self.server_name))
             })?;
-            decoder.push(&String::from_utf8_lossy(&chunk));
+            decoder.push_bytes(&chunk).map_err(|e| {
+                McpError::Transport(format!("SSE stream from `{}`: {e}", self.server_name))
+            })?;
             for event in decoder.poll() {
                 if event.data.trim().is_empty() {
                     continue;

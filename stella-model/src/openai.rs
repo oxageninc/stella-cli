@@ -361,18 +361,6 @@ fn to_openai_tools(tools: &[stella_protocol::tool::ToolSchema]) -> Vec<OpenAiToo
         .collect()
 }
 
-/// Parse the `retry-after` header (seconds, per RFC 9110 §10.2.3) into a
-/// millisecond hint for the retry policy — `stella-core/src/retry.rs`
-/// already honors `RateLimited.retry_after_ms` when present. `zai.rs` and
-/// `anthropic.rs` populate this field the same way; OpenAI reliably sends the
-/// header on its 429s, so this adapter fills it in rather than leaving a hint
-/// the retry policy already knows how to use sitting on the floor.
-fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    let value = headers.get(reqwest::header::RETRY_AFTER)?;
-    let seconds: u64 = value.to_str().ok()?.trim().parse().ok()?;
-    Some(seconds.saturating_mul(1000))
-}
-
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn id(&self) -> &str {
@@ -403,31 +391,16 @@ impl Provider for OpenAiProvider {
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(ProviderError::Auth("OpenAI rejected the API key".into()));
-        }
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after_ms = parse_retry_after_ms(response.headers());
-            return Err(ProviderError::RateLimited {
-                message: "OpenAI rate limit".into(),
-                retry_after_ms,
-            });
-        }
-        // 5xx is a transient server-side failure — retryable Transport, not
-        // the terminal bucket below.
-        if response.status().is_server_error() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Transport(format!(
-                "OpenAI HTTP {status}: {text}"
-            )));
-        }
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Terminal(format!(
-                "OpenAI HTTP {status}: {text}"
-            )));
+            let retry_after_ms = http::parse_retry_after_ms(response.headers());
+            let body = response.text().await.unwrap_or_default();
+            return Err(http::classify_http_status(
+                "OpenAI",
+                status,
+                retry_after_ms,
+                &body,
+            ));
         }
 
         let (text, tool_calls, usage) = aggregate_openai_stream(response).await?;
@@ -799,6 +772,34 @@ mod tests {
 
         let provider =
             OpenAiProvider::new(ApiKey::new("bad-key"), "gpt-5.5").with_base_url(server.uri());
+
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage::user("hi")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+        };
+
+        let err = provider.complete(req).await.unwrap_err();
+        assert!(matches!(err, ProviderError::Auth(_)));
+        assert!(!err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn complete_maps_403_to_auth_error() {
+        // A permission-denied key is a credential failure, not a generic
+        // terminal error. Regression for the drift where only 401 was mapped
+        // to Auth here while sibling adapters mapped 401|403.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAiProvider::new(ApiKey::new("limited-key"), "gpt-5.5").with_base_url(server.uri());
 
         let req = CompletionRequest {
             messages: vec![CompletionMessage::user("hi")],

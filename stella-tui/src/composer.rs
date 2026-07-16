@@ -734,6 +734,12 @@ mod tests {
     }
 
     #[test]
+    fn slash_command_constructors_set_the_kind() {
+        assert_eq!(SlashCommand::new("/help", "d").kind, SlashKind::Builtin);
+        assert_eq!(SlashCommand::custom("/x", "d").kind, SlashKind::Custom);
+    }
+
+    #[test]
     fn slash_menu_is_inactive_when_chips_are_present() {
         let cmds = commands();
         let mut c = Composer::with_paste_threshold(2);

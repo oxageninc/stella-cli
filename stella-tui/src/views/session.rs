@@ -11,13 +11,109 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
+use std::collections::HashSet;
+use std::ops::Range;
+
 use crate::deck::{AgentEntry, WorkspaceModel};
 use crate::deck_ui::DeckUi;
+use crate::model::TranscriptEntry;
 use crate::render::{
     entry_lines, inner_height, inner_width, render_ask_user, render_hud, render_scope_review,
-    render_transcript,
+    render_transcript_window,
 };
 use crate::theme;
+
+/// Incremental transcript fold for the Session tab.
+///
+/// Everything before the last entry is *settled* — streaming deltas only ever
+/// mutate the final entry — so settled entries fold (markdown, labels, wrap)
+/// exactly once and are cached with their visual-row ranges; only the tail
+/// entry re-folds per frame. The cache invalidates whole when anything that
+/// changes how settled entries render changes: focused agent, the thinking
+/// toggle, a ctrl+o expansion, or the pane width. This turns the old
+/// O(whole-history) fold per frame into O(tail) — typing latency no longer
+/// grows with session length.
+#[derive(Debug, Clone, Default)]
+pub struct SessionFold {
+    key: Option<(String, bool, u64, usize)>,
+    settled: usize,
+    prefix: Vec<Line<'static>>,
+    entry_rows: Vec<Range<usize>>,
+    tail: Vec<Line<'static>>,
+}
+
+impl SessionFold {
+    /// Bring the cache up to date for this frame.
+    fn refresh(
+        &mut self,
+        agent: &str,
+        transcript: &[TranscriptEntry],
+        thinking: bool,
+        expanded: &HashSet<usize>,
+        expanded_rev: u64,
+        width: usize,
+    ) {
+        let key = (agent.to_string(), thinking, expanded_rev, width);
+        if self.key.as_ref() != Some(&key) || self.settled > transcript.len().saturating_sub(1) {
+            self.key = Some(key);
+            self.settled = 0;
+            self.prefix.clear();
+            self.entry_rows.clear();
+        }
+        let target = transcript.len().saturating_sub(1);
+        while self.settled < target {
+            let i = self.settled;
+            let start = self.prefix.len();
+            entry_lines(
+                &transcript[i],
+                thinking,
+                expanded.contains(&i),
+                width,
+                &mut self.prefix,
+            );
+            self.entry_rows.push(start..self.prefix.len());
+            self.settled += 1;
+        }
+        self.tail.clear();
+        if let Some(last) = transcript.last() {
+            entry_lines(
+                last,
+                thinking,
+                expanded.contains(&target),
+                width,
+                &mut self.tail,
+            );
+        }
+    }
+
+    /// Total visual rows (settled prefix + live tail).
+    pub fn total(&self) -> usize {
+        self.prefix.len() + self.tail.len()
+    }
+
+    /// The visual-row range entry `idx` occupies (the live tail entry spans
+    /// everything past the prefix).
+    pub fn rows_of(&self, idx: usize) -> Range<usize> {
+        if idx < self.entry_rows.len() {
+            self.entry_rows[idx].clone()
+        } else {
+            self.prefix.len()..self.total()
+        }
+    }
+
+    /// Materialize just the rows in `window` — ≤ one viewport of clones.
+    fn window_lines(&self, window: Range<usize>) -> Vec<Line<'static>> {
+        window
+            .filter_map(|r| {
+                if r < self.prefix.len() {
+                    self.prefix.get(r).cloned()
+                } else {
+                    self.tail.get(r - self.prefix.len()).cloned()
+                }
+            })
+            .collect()
+    }
+}
 
 pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
     let Some(agent) = model.agents.get(ui.focused) else {
@@ -58,18 +154,63 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
         render_ask_user(prompt, false, bands[3], buf);
     }
 
-    // Transcript: fold the focused agent's entries into styled lines, then reuse
-    // the line-exact scrolling transcript renderer.
+    // Transcript: fold through the incremental cache (settled entries fold
+    // once; only the streaming tail re-folds per frame), then reuse the
+    // line-exact scroll window over the cached rows.
     let width = inner_width(bands[4]);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for entry in &sm.transcript {
-        entry_lines(entry, ui.thinking_expanded, width, &mut lines);
-    }
+    let empty = HashSet::new();
+    let expanded_set = ui.expanded.get(&agent.meta.id).unwrap_or(&empty);
+    ui.session_fold.refresh(
+        &agent.meta.id,
+        &sm.transcript,
+        ui.thinking_expanded,
+        expanded_set,
+        ui.expanded_rev,
+        width,
+    );
     let height = inner_height(bands[4]);
-    ui.metrics.session_total = lines.len();
+    let total = ui.session_fold.total();
+
+    // A selection move from the key handler lands here, where visual-row
+    // ranges are known: nudge the scroll window until the entry is visible,
+    // then pin it. Follow drops even when no nudge was needed — a streaming
+    // tail must not slide the highlight out of view (↓ past the tail, or
+    // scrolling back to the bottom, re-arms follow).
+    if let Some(sel) = ui.session_pending_scroll.take() {
+        let rows = ui.session_fold.rows_of(sel);
+        let current = ui.session_scroll.window(total, height);
+        ui.session_scroll.top = if rows.start < current.start {
+            rows.start
+        } else if rows.end > current.end {
+            rows.end.saturating_sub(height)
+        } else {
+            current.start
+        };
+        ui.session_scroll.follow = false;
+    }
+
+    ui.metrics.session_total = total;
     ui.metrics.session_height = height;
-    let window = ui.session_scroll.window(lines.len(), height);
-    render_transcript(&lines, window, ui.session_scroll.follow, bands[4], buf);
+    let window = ui.session_scroll.window(total, height);
+    let mut visible = ui.session_fold.window_lines(window.clone());
+    if let Some(sel) = ui.session_selected {
+        // A quiet warm background lift on the selected entry's rows.
+        for r in ui.session_fold.rows_of(sel) {
+            if window.contains(&r)
+                && let Some(line) = visible.get_mut(r - window.start)
+            {
+                line.style = line.style.bg(theme::SELECT_BG);
+            }
+        }
+    }
+    render_transcript_window(
+        visible,
+        window,
+        total,
+        ui.session_scroll.follow,
+        bands[4],
+        buf,
+    );
 }
 
 /// The one-line identity header: `▶ lead · running   goal…`.
@@ -171,6 +312,48 @@ mod tests {
         assert!(
             text.contains("Which database should the cache use?"),
             "ask-user card visible alongside the scope review:\n{text}"
+        );
+    }
+
+    #[test]
+    fn applying_a_selection_pins_the_window_against_a_streaming_tail() {
+        let mut model = WorkspaceModel::new();
+        model.apply_inbound(&Inbound::Register(AgentMeta::new("lead", "goal", 0)));
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Text {
+                delta: "first-message".into(),
+            },
+        });
+
+        // Select the (already fully visible) first entry.
+        let mut ui = DeckUi {
+            session_selected: Some(0),
+            session_pending_scroll: Some(0),
+            ..DeckUi::default()
+        };
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buf = Buffer::empty(area);
+        render(&model, &mut ui, area, &mut buf);
+        assert!(
+            !ui.session_scroll.follow,
+            "a selection pins the window even when no scroll nudge was needed"
+        );
+
+        // A streaming tail grows past the viewport — the pinned window must
+        // keep the selected entry visible instead of following the tail.
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Text {
+                delta: "\nnoise".repeat(40),
+            },
+        });
+        let mut buf2 = Buffer::empty(area);
+        render(&model, &mut ui, area, &mut buf2);
+        let text = buffer_text(&buf2);
+        assert!(
+            text.contains("first-message"),
+            "selected entry still visible under streaming:\n{text}"
         );
     }
 }

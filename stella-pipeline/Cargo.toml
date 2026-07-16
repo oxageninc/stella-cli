@@ -18,5 +18,4 @@ tokio.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 proptest.workspace = true

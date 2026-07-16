@@ -8,7 +8,40 @@
 //! per-adapter status handling in `stella-model`'s chat adapters
 //! (`zai.rs`/`openai.rs`), kept DRY here because three adapters share it.
 
+use std::time::Duration;
+
 use crate::error::MediaError;
+
+/// How long to wait for the initial TCP/TLS connection before giving up —
+/// mirrors `stella-model`'s policy: a black-holed endpoint must fail fast
+/// and retryably, not block the turn on the OS connect timeout.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-read stall bound. Media responses are single JSON bodies or binary
+/// downloads (no long-lived SSE gaps), so a connection that goes silent for
+/// this long is dead. Generous enough for slow generation endpoints that
+/// stream their body slowly; it bounds silence, not total transfer time.
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A `reqwest::Client` bounded by [`CONNECT_TIMEOUT`] and [`READ_TIMEOUT`].
+/// Every media adapter must use this instead of `reqwest::Client::new()`:
+/// an unbounded client turns a stalled provider into an agent turn that
+/// hangs forever (there is no outer tool-level timeout on the media path).
+/// Falls back to the default client only if the builder itself fails
+/// (broken TLS backend — catastrophic and unrelated to any one request).
+pub(crate) fn client() -> reqwest::Client {
+    client_with(CONNECT_TIMEOUT, READ_TIMEOUT)
+}
+
+/// Builder core behind [`client`], parameterized so the stall path is
+/// unit-testable in milliseconds; adapters always go through [`client`].
+pub(crate) fn client_with(connect: Duration, read: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .read_timeout(read)
+        .build()
+        .unwrap_or_default()
+}
 
 /// Parse a `Retry-After` header (delta-seconds, RFC 9110 §10.2.3) into
 /// milliseconds. HTTP-date form is not handled (providers send seconds on
@@ -199,6 +232,32 @@ mod tests {
             HeaderValue::from_static("Wed, 21 Oct 2099 07:28:00 GMT"),
         );
         assert_eq!(parse_retry_after_ms(&bad), None);
+    }
+
+    #[tokio::test]
+    async fn client_read_timeout_turns_a_stalled_response_into_an_error_not_a_hang() {
+        // Failure-mode simulation for the timeout this module adds: the
+        // server accepts the request and then goes silent longer than the
+        // read timeout. An unbounded client (the old Client::new()) would
+        // hang here forever; the bounded one must surface a timeout error.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_with(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(100),
+        );
+        let err = client
+            .get(server.uri())
+            .send()
+            .await
+            .expect_err("stalled response must error, not hang");
+        assert!(err.is_timeout(), "expected a timeout error, got: {err:?}");
     }
 
     #[test]

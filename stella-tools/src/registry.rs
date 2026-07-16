@@ -412,6 +412,38 @@ mod tests {
     }
 
     #[test]
+    fn every_registry_tool_is_reserved_against_custom_shadowing() {
+        // RESERVED_NAMES (custom.rs) hand-mirrors the registry so a custom
+        // manifest can never shadow a built-in. Its comment says "keep this
+        // in sync if either set changes" — this test IS that sync: a new
+        // built-in that isn't reserved would be silently shadowable.
+        let reg =
+            ToolRegistry::with_issue_backend(PathBuf::from("/tmp"), Some(IssueBackend::GitHub));
+        for schema in reg.schemas() {
+            assert!(
+                crate::custom::RESERVED_NAMES.contains(&schema.name.as_str()),
+                "built-in tool `{}` is missing from custom::RESERVED_NAMES — \
+                 a custom manifest could shadow it",
+                schema.name
+            );
+        }
+
+        // Conditionally-registered tools never show up in a bare registry's
+        // schemas (code_graph needs an index on disk, generate_image needs a
+        // media key), so the registry-driven loop above can't catch them
+        // drifting out of RESERVED_NAMES. Pin them explicitly — if you add a
+        // new conditionally-registered tool, add its name to this array.
+        const CONDITIONALLY_REGISTERED: &[&str] = &["code_graph", "generate_image"];
+        for name in CONDITIONALLY_REGISTERED {
+            assert!(
+                crate::custom::RESERVED_NAMES.contains(name),
+                "conditionally-registered tool `{name}` is missing from \
+                 custom::RESERVED_NAMES — a custom manifest could shadow it"
+            );
+        }
+    }
+
+    #[test]
     fn registry_advertises_the_full_tool_set() {
         let reg =
             ToolRegistry::with_issue_backend(PathBuf::from("/tmp"), Some(IssueBackend::GitHub));

@@ -699,7 +699,10 @@ mod tests {
         );
 
         let report = f.run_plan(&plan).await.unwrap();
-        assert!(!report.all_succeeded(), "a failed → the run did not succeed");
+        assert!(
+            !report.all_succeeded(),
+            "a failed → the run did not succeed"
+        );
         assert!(
             !report.completed.contains("a"),
             "a failed, so it is not in the succeeded set"

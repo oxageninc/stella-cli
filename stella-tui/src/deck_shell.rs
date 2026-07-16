@@ -20,16 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    supports_keyboard_enhancement,
-};
+use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::io::AsyncReadExt;
@@ -43,6 +34,7 @@ use crate::envelope::{AgentMeta, AgentStatus, Inbound, WorkspaceInput};
 use crate::graph::GraphSnapshot;
 use crate::resource::ResourceMonitor;
 use crate::shell::DebugLog;
+use crate::term::{PanicHookGuard, TerminalGuard};
 
 /// The repaint / sample cadence. ~30 fps keeps animations smooth and the CPU
 /// gauge / elapsed timers live without busy-spinning.
@@ -70,80 +62,6 @@ pub struct DeckOptions {
     /// The slash-command vocabulary for the `/` popup (the caller owns the
     /// real list, exactly like the single-session `RunOptions`).
     pub slash_commands: Vec<SlashCommand>,
-}
-
-/// Restores the terminal on drop, including during a panic unwind.
-///
-/// Each terminal state is flagged as it is acquired, and the guard exists
-/// BEFORE the first acquisition — so an error partway through `enter` (raw
-/// mode on, alternate screen failed) still drops the guard and rolls back
-/// exactly the states that were entered, never stranding the user's terminal
-/// in raw mode.
-struct TerminalGuard {
-    raw: bool,
-    alt: bool,
-    paste: bool,
-    mouse: bool,
-    /// Whether the kitty keyboard protocol was pushed. When it is active, a
-    /// modified Enter (`⌘⏎`/`⌃⏎`) is reportable and the composer runs full
-    /// textarea semantics; without it the deck falls back to Enter-submits.
-    kitty: bool,
-}
-
-impl TerminalGuard {
-    fn enter(mouse: bool) -> io::Result<Self> {
-        let mut guard = Self {
-            raw: false,
-            alt: false,
-            paste: false,
-            mouse: false,
-            kitty: false,
-        };
-        let mut out = io::stdout();
-        enable_raw_mode()?;
-        guard.raw = true;
-        execute!(out, EnterAlternateScreen)?;
-        guard.alt = true;
-        execute!(out, EnableBracketedPaste)?;
-        guard.paste = true;
-        if mouse {
-            execute!(out, EnableMouseCapture)?;
-            guard.mouse = true;
-        }
-        // The kitty keyboard protocol disambiguates modified keys, letting
-        // `⌘⏎`/`⌃⏎` submit while plain `⏎` inserts a line break. Probing
-        // needs raw mode, so this comes last; best-effort (`false` on any
-        // probe error → legacy Enter semantics).
-        if matches!(supports_keyboard_enhancement(), Ok(true)) {
-            execute!(
-                out,
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )?;
-            guard.kitty = true;
-        }
-        Ok(guard)
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let mut out = io::stdout();
-        if self.kitty {
-            let _ = execute!(out, PopKeyboardEnhancementFlags);
-        }
-        if self.mouse {
-            let _ = execute!(out, DisableMouseCapture);
-        }
-        if self.paste {
-            let _ = execute!(out, DisableBracketedPaste);
-        }
-        if self.alt {
-            let _ = execute!(out, LeaveAlternateScreen);
-        }
-        if self.raw {
-            let _ = disable_raw_mode();
-        }
-    }
 }
 
 fn now_ms() -> u64 {
@@ -342,7 +260,10 @@ pub async fn run_deck(
     let debug = DebugLog::new(opts.debug_log_path.clone());
     debug.note("deck session start");
 
+    // The hook shares the guard's state so a panic restores the terminal even
+    // in abort builds, where Drop never runs (see `crate::term`).
     let guard = TerminalGuard::enter(opts.mouse_capture)?;
+    let _hook_guard = PanicHookGuard::install(opts.debug_log_path.clone(), &guard);
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut model = WorkspaceModel::new();
@@ -351,8 +272,8 @@ pub async fn run_deck(
     ui.graph = opts.initial_graph.clone();
     ui.slash_commands = opts.slash_commands.clone();
     // Enter semantics follow the terminal's actual capability (see
-    // `TerminalGuard::kitty` and `crate::composer::classify_enter`).
-    ui.enter_submits = !guard.kitty;
+    // `crate::term::TerminalGuard::kitty` and `crate::composer::classify_enter`).
+    ui.enter_submits = !guard.kitty();
     let mut resources = ResourceMonitor::new();
 
     // Synthetic-event lane for `!` shell commands: spawned commands report
@@ -440,8 +361,10 @@ pub async fn run_deck(
                             DeckAction::Handled | DeckAction::Ignored => {}
                         }
                     }
-                    // Bracketed paste lands in the composer with its line
-                    // breaks intact (large pastes collapse to a chip, L-T3).
+                    // Bracketed paste: the whole paste arrives as one event
+                    // (the guard enabled it), so the composer can fold it
+                    // into a chip instead of replaying N raw Enter keys —
+                    // each of which would have submitted a separate prompt.
                     Some(Event::Paste(text)) => {
                         ui.composer.paste(&text);
                     }

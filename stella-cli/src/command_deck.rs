@@ -154,7 +154,17 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
         .with_pid(std::process::id());
     lead_meta.model = Some(format!("{}/{}", cfg.provider.id, cfg.model_id));
     let _ = in_tx.send(Inbound::Register(lead_meta));
-    // An idle lead is waiting on the human, not queued behind a supervisor.
+    // Custom definitions that failed to load are reported into the
+    // transcript up front — stdout belongs to the alternate screen, and a
+    // silently-missing /command is otherwise undiagnosable.
+    if let Some(report) = custom.problems_report() {
+        let _ = in_tx.send(Inbound::Event {
+            agent: LEAD.to_string(),
+            event: AgentEvent::Text { delta: report },
+        });
+    }
+    // An idle lead is waiting on the human, not queued behind a supervisor
+    // (sent after the problems report — a Text event folds to `Running`).
     let _ = in_tx.send(Inbound::Status {
         agent: LEAD.to_string(),
         status: AgentStatus::WaitingInput,
@@ -240,9 +250,21 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
                     let _ = in_tx.send(Inbound::GraphSnapshot(snapshot));
                 }
                 // `/init` may also have adopted new custom commands/skills —
-                // reload them and refresh the deck's slash menu in place.
+                // reload them and refresh the deck's slash menu in place,
+                // reporting anything that failed to load (then restoring the
+                // idle status the report's Text event flipped).
                 custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
                 let _ = in_tx.send(Inbound::SlashCommands(deck_slash_commands(&custom)));
+                if let Some(report) = custom.problems_report() {
+                    let _ = in_tx.send(Inbound::Event {
+                        agent: LEAD.to_string(),
+                        event: AgentEvent::Text { delta: report },
+                    });
+                    let _ = in_tx.send(Inbound::Status {
+                        agent: LEAD.to_string(),
+                        status: AgentStatus::WaitingInput,
+                    });
+                }
                 continue 'session;
             }
         };
@@ -355,9 +377,23 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
                 // Erase the partial turn: the next prompt continues from the
                 // last committed conversation state.
                 messages.truncate(turn_base);
-                if let Some((store, id)) = &execution {
-                    let _ = store.finish_execution(*id, "cancelled", 0.0);
+                if let Some((store, id)) = &execution
+                    && store.finish_execution(*id, "cancelled", 0.0).is_err()
+                {
+                    let _ = in_tx.send(Inbound::Event {
+                        agent: LEAD.to_string(),
+                        event: AgentEvent::Error {
+                            message: "store write failed — this cancelled execution was not \
+                                      recorded"
+                                .to_string(),
+                            retryable: true,
+                        },
+                    });
                 }
+                // Must stay AFTER the store warning above: the warning is
+                // retryable (folds to Running) while this one is not (folds
+                // to Failed), so this event is what leaves the lead in a
+                // terminal state on the dashboard.
                 let _ = in_tx.send(Inbound::Event {
                     agent: LEAD.to_string(),
                     event: AgentEvent::Error {
@@ -399,20 +435,35 @@ enum DeckCommand {
     InitCompleted,
 }
 
+/// The deck's productized vocabulary, as `(name, menu description)`. One
+/// source of truth for the menu's 🔒 rows and the reserved-name guard: a
+/// custom definition can never run under one of these names — not from the
+/// menu (`slash_entries` drops it) and not typed with arguments either
+/// (`expand` refuses reserved heads).
+const DECK_BUILTINS: &[(&str, &str)] = &[
+    ("/help", "show commands"),
+    ("/clear", "reset the conversation"),
+    ("/models", "list providers & models"),
+    ("/init", "index the workspace: domains + code graph"),
+    ("/agents", "list custom agents"),
+    ("/files", "open the Files tab"),
+    ("/diff", "open the diff viewer"),
+    ("/graph", "open the code-graph tab"),
+];
+
+/// The deck's reserved command names — see [`DECK_BUILTINS`].
+fn deck_reserved() -> Vec<&'static str> {
+    DECK_BUILTINS.iter().map(|(name, _)| *name).collect()
+}
+
 /// The deck's slash vocabulary: the productized commands (🔒) followed by
 /// every custom command/skill (⚡) currently on disk. Rebuilt after `/init`
 /// so just-adopted definitions appear without a restart.
 fn deck_slash_commands(custom: &crate::extensions::CustomExtensions) -> Vec<SlashCommand> {
-    let mut commands = vec![
-        SlashCommand::new("/help", "show commands"),
-        SlashCommand::new("/clear", "reset the conversation"),
-        SlashCommand::new("/models", "list providers & models"),
-        SlashCommand::new("/init", "index the workspace: domains + code graph"),
-        SlashCommand::new("/agents", "list custom agents"),
-        SlashCommand::new("/files", "open the Files tab"),
-        SlashCommand::new("/diff", "open the diff viewer"),
-        SlashCommand::new("/graph", "open the code-graph tab"),
-    ];
+    let mut commands: Vec<SlashCommand> = DECK_BUILTINS
+        .iter()
+        .map(|(name, description)| SlashCommand::new(*name, *description))
+        .collect();
     let customs = custom.slash_entries(&commands);
     commands.extend(customs);
     commands
@@ -497,8 +548,10 @@ async fn run_deck_command(
         "/files" | "/diff" | "/graph" => {}
         _ => {
             // A custom command/skill (⚡): expand its template — arguments
-            // and all — into the prompt the model turn runs.
-            if let Some(expanded) = custom.expand(trimmed) {
+            // and all — into the prompt the model turn runs. Reserved names
+            // never reach a custom definition (`/init do the thing` stays a
+            // model prompt even if a custom `init` exists).
+            if let Some(expanded) = custom.expand(trimmed, &deck_reserved()) {
                 return DeckCommand::Expanded(expanded);
             }
             // A bare unknown /word is a typo'd command, not a prompt — say so
@@ -575,12 +628,32 @@ async fn run_lead_turn(
 
     let files = registry.files_touched();
     if let Some((store, id)) = &execution {
-        let _ = store.record_files_touched(*id, &files);
         let (outcome_label, cost) = match &outcome {
             TurnOutcome::Completed { cost_usd, .. } => ("completed", *cost_usd),
             TurnOutcome::Aborted { .. } => ("aborted", 0.0),
         };
-        let _ = store.finish_execution(*id, outcome_label, cost);
+        if !agent::record_execution_end(store, *id, &files, outcome_label, cost) {
+            let _ = in_tx.send(Inbound::Event {
+                agent: LEAD.to_string(),
+                event: AgentEvent::Error {
+                    message: "store write failed — the audit record (files touched / \
+                              outcome) for this execution is incomplete"
+                        .to_string(),
+                    retryable: true,
+                },
+            });
+            // That warning lands AFTER the turn's Complete event, and the
+            // deck's status fold maps a retryable Error back to Running — so
+            // without this re-assert a finished turn would show as running
+            // forever. Restate the turn's terminal status explicitly.
+            let _ = in_tx.send(Inbound::Status {
+                agent: LEAD.to_string(),
+                status: match &outcome {
+                    TurnOutcome::Completed { .. } => AgentStatus::Done,
+                    TurnOutcome::Aborted { .. } => AgentStatus::Failed,
+                },
+            });
+        }
     }
 
     match outcome {
@@ -592,8 +665,10 @@ async fn run_lead_turn(
 /// Drain one turn's engine events: persist each (via the shared
 /// [`agent::persist_event`] write path) and forward it to the deck as the
 /// lead agent's `Inbound::Event`. The deck-mode replacement for
-/// [`agent::spawn_renderer`] — persistence failures degrade silently here
-/// because stderr belongs to the alternate screen.
+/// [`agent::spawn_renderer`]. stderr belongs to the alternate screen here,
+/// so a persistence failure warns *through the deck* instead — once — as a
+/// transcript-visible error event; silently losing the audit trail (disk
+/// full, DB locked) is not acceptable.
 fn spawn_forwarder(
     mut rx: UnboundedReceiver<AgentEvent>,
     execution: Option<(Arc<Store>, i64)>,
@@ -602,9 +677,21 @@ fn spawn_forwarder(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut seq = 0u64;
+        let mut store_warned = false;
         while let Some(event) = rx.recv().await {
             if let Some((store, id)) = &execution {
-                let _ = agent::persist_event(store, *id, seq, &event, &provider_id);
+                if !agent::persist_event(store, *id, seq, &event, &provider_id) && !store_warned {
+                    store_warned = true;
+                    let _ = inbound.send(Inbound::Event {
+                        agent: LEAD.to_string(),
+                        event: AgentEvent::Error {
+                            message: "store write failed — the persisted event/telemetry \
+                                      record for this session is incomplete"
+                                .to_string(),
+                            retryable: true,
+                        },
+                    });
+                }
                 seq += 1;
             }
             let _ = inbound.send(Inbound::Event {

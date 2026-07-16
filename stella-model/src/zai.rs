@@ -264,22 +264,6 @@ fn classify_zai_429(body: &str, retry_after_ms: Option<u64>) -> ProviderError {
     }
 }
 
-/// Parse a `Retry-After` response header into milliseconds. Z.ai (like most
-/// OpenAI-compatible gateways) sends it as an integer number of seconds; the
-/// alternative HTTP-date form is tolerated by being ignored — the caller
-/// falls back to computed backoff. `None` when the header is absent or not a
-/// bare integer.
-fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|secs| secs.saturating_mul(1_000))
-}
-
 #[derive(Deserialize, Debug)]
 struct ZaiStreamChoice {
     #[serde(default)]
@@ -423,52 +407,33 @@ impl Provider for ZaiProvider {
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        if matches!(
-            response.status(),
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) {
-            // Both a bad key (401) and a permission-denied key (403) are
-            // credential failures: surface them as non-retryable Auth so the
-            // user is pointed at their key rather than shown a generic
-            // terminal error.
-            return Err(ProviderError::Auth(format!(
-                "{} rejected the API key",
-                self.label
-            )));
-        }
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            // Z.ai overloads HTTP 429: besides genuine throttling it also
-            // returns 429 for BILLING problems — an account with no credit
-            // answers with `{"error":{"code":"1113","message":"Insufficient
-            // balance or no resource package. Please recharge."}}`. Blindly
-            // mapping every 429 to a retryable `RateLimited` both mislabels
-            // that as a rate limit (the user sees "provider rate limited" on
-            // their very first call, which can't be a real throttle) AND burns
-            // three pointless retries on a condition backoff will never clear.
+            // Vendor pre-check ahead of the shared ladder — Z.ai overloads
+            // HTTP 429: besides genuine throttling it also returns 429 for
+            // BILLING problems — an account with no credit answers with
+            // `{"error":{"code":"1113","message":"Insufficient balance or no
+            // resource package. Please recharge."}}`. Blindly mapping every
+            // 429 to a retryable `RateLimited` both mislabels that as a rate
+            // limit (the user sees "provider rate limited" on their very
+            // first call, which can't be a real throttle) AND burns three
+            // pointless retries on a condition backoff will never clear.
             // Read the body and classify: a real throttle stays retryable, a
             // billing/quota failure is terminal, and either way Z.ai's own
             // message is surfaced instead of a hard-coded string.
-            let retry_after_ms = parse_retry_after_ms(response.headers());
+            let retry_after_ms = http::parse_retry_after_ms(response.headers());
             let body = response.text().await.unwrap_or_default();
             return Err(classify_zai_429(&body, retry_after_ms));
         }
-        // 5xx (incl. 529 overloaded) is a transient server-side failure — map
-        // to a retryable Transport error, not the terminal bucket below.
-        if response.status().is_server_error() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Transport(format!(
-                "{} HTTP {status}: {text}",
-                self.label
-            )));
-        }
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Terminal(format!(
-                "{} HTTP {status}: {text}",
-                self.label
-            )));
+            let retry_after_ms = http::parse_retry_after_ms(response.headers());
+            let body = response.text().await.unwrap_or_default();
+            return Err(http::classify_http_status(
+                &self.label,
+                status,
+                retry_after_ms,
+                &body,
+            ));
         }
 
         let (text, tool_calls, usage) = aggregate_zai_stream(response, &self.label).await?;

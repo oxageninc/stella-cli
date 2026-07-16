@@ -38,7 +38,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 futures-util = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 colored = "3"
-indicatif = "0.18"
 libc = "0.2"
 rand = "0.10"
 proptest = "1"

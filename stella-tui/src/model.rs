@@ -89,6 +89,9 @@ pub enum TranscriptEntry {
         call_id: String,
         name: String,
         input: String,
+        /// The call's compact-JSON arguments, capped — the expanded (ctrl+o)
+        /// view pretty-prints these; `input` stays the humanized one-liner.
+        raw: String,
         /// The workspace-relative path the call targets, parsed from its
         /// input's `path` field (every file tool uses that key). Retained so a
         /// mutating tool's `ToolResult` can be correlated back to the file it
@@ -98,8 +101,14 @@ pub enum TranscriptEntry {
     /// A tool invocation finished — `ok` is `false` for a typed tool error.
     ToolResult {
         call_id: String,
+        /// Resolved from the matching `ToolStart` at fold time so call and
+        /// result rows read as one aligned pair.
+        name: String,
         ok: bool,
         summary: String,
+        /// The output, capped at [`OUTPUT_BUDGET`] chars — the collapsed row
+        /// shows one line; ctrl+o reveals this.
+        full: String,
         duration_ms: u64,
         /// For a *successful* file-mutating tool
         /// (`write_file`/`edit_file`/`delete_file`), the reference the
@@ -255,6 +264,7 @@ impl SessionModel {
                     call_id: call.call_id.clone(),
                     name: call.name.clone(),
                     input: format_tool_input(&call.name, &call.input),
+                    raw: cap_input_json(&call.input, INPUT_BUDGET),
                     path: tool_input_path(&call.input),
                 });
             }
@@ -263,10 +273,29 @@ impl SessionModel {
                 output,
                 duration_ms,
             } => {
-                let (ok, summary) = match output {
-                    ToolOutput::Ok { content } => (true, summarize(content)),
-                    ToolOutput::Error { message } => (false, summarize(message)),
+                let (ok, summary, full) = match output {
+                    ToolOutput::Ok { content } => {
+                        (true, summarize(content), cap_middle(content, OUTPUT_BUDGET))
+                    }
+                    ToolOutput::Error { message } => (
+                        false,
+                        summarize(message),
+                        cap_middle(message, OUTPUT_BUDGET),
+                    ),
                 };
+                // Resolve the tool's name from its start entry (results only
+                // carry the call id on the wire).
+                let name = self
+                    .transcript
+                    .iter()
+                    .rev()
+                    .find_map(|e| match e {
+                        TranscriptEntry::ToolStart {
+                            call_id: cid, name, ..
+                        } if cid == call_id => Some(name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "tool".to_string());
                 // Only a *successful* mutation gets an inline-diff reference —
                 // a failed call produced no `FileChange`, and rendering the
                 // path's previous diff under its ✗ would attribute a change
@@ -288,8 +317,10 @@ impl SessionModel {
                 };
                 self.transcript.push(TranscriptEntry::ToolResult {
                     call_id: call_id.clone(),
+                    name,
                     ok,
                     summary,
+                    full,
                     duration_ms: *duration_ms,
                     diff,
                 });
@@ -540,6 +571,89 @@ impl SessionModel {
 /// the model never panics on a tool card.
 fn compact_json(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
+}
+
+/// Char budget for a tool call's retained compact-JSON arguments.
+pub(crate) const INPUT_BUDGET: usize = 4_096;
+/// Char budget for a tool result's retained output (outputs are already
+/// capped upstream by the tools; this bounds transcript memory).
+pub(crate) const OUTPUT_BUDGET: usize = 16_384;
+
+/// Middle-out char cap preserving head and tail (first error + final summary
+/// both matter), on char boundaries.
+fn cap_middle(text: &str, budget: usize) -> String {
+    cap_middle_with(text, budget, "\n[… truncated …]\n")
+}
+
+/// [`cap_middle`] with a caller-chosen elision marker. Slices at
+/// `char_indices` boundaries instead of materializing a `Vec<char>`, so a
+/// multi-megabyte payload costs no allocation beyond the capped result.
+fn cap_middle_with(text: &str, budget: usize, marker: &str) -> String {
+    // Byte length bounds char count, so an in-budget payload returns without
+    // scanning; an over-budget one probes just past the boundary instead.
+    if text.len() <= budget || text.char_indices().nth(budget).is_none() {
+        return text.to_string();
+    }
+    let keep = budget.saturating_sub(marker.chars().count());
+    let head = keep / 2;
+    let tail = keep - head;
+    let head_end = text.char_indices().nth(head).map_or(text.len(), |(i, _)| i);
+    let tail_start = if tail == 0 {
+        text.len()
+    } else {
+        text.char_indices().nth_back(tail - 1).map_or(0, |(i, _)| i)
+    };
+    format!("{}{marker}{}", &text[..head_end], &text[tail_start..])
+}
+
+/// Per-leaf caps for [`cap_input_json`]: generous enough to keep any one
+/// argument readable, small enough that leaf capping alone usually lands the
+/// whole object under [`INPUT_BUDGET`].
+const INPUT_STR_CAP: usize = 512;
+const INPUT_ARR_CAP: usize = 32;
+
+/// Cap a tool call's retained arguments **inside** the JSON: long string
+/// leaves are middle-capped and oversized arrays elided, so the compact form
+/// stays *valid* JSON and ctrl+o can still pretty-print it. Only a
+/// pathological object that remains oversized after leaf capping falls back
+/// to the raw char cap (which the renderer shows as wrapped plain text).
+fn cap_input_json(value: &serde_json::Value, budget: usize) -> String {
+    let compact = compact_json(value);
+    if compact.len() <= budget {
+        return compact;
+    }
+    let mut capped = value.clone();
+    cap_json_leaves(&mut capped);
+    cap_middle(&compact_json(&capped), budget)
+}
+
+/// Recursively shrink the leaves of `value` in place (strings middle-capped
+/// on one line, arrays truncated with a `+N more` marker) without disturbing
+/// the object structure.
+fn cap_json_leaves(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            if s.len() > INPUT_STR_CAP {
+                *s = cap_middle_with(s, INPUT_STR_CAP, " […] ");
+            }
+        }
+        serde_json::Value::Array(items) => {
+            if items.len() > INPUT_ARR_CAP {
+                let dropped = items.len() - INPUT_ARR_CAP;
+                items.truncate(INPUT_ARR_CAP);
+                items.push(serde_json::Value::String(format!("[… +{dropped} more …]")));
+            }
+            for item in items.iter_mut() {
+                cap_json_leaves(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                cap_json_leaves(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Format a tool-call input as a human-readable one-liner. Instead of raw
@@ -850,6 +964,48 @@ mod tests {
             }
             other => panic!("expected a tool result entry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oversized_tool_args_stay_valid_pretty_printable_json() {
+        let mut model = SessionModel::new();
+        let big = "x".repeat(INPUT_BUDGET * 2);
+        model.apply(&AgentEvent::ToolStart {
+            call: ToolCall {
+                call_id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({ "path": "a.rs", "content": big }),
+            },
+        });
+        match model.transcript.last() {
+            Some(TranscriptEntry::ToolStart { raw, .. }) => {
+                assert!(
+                    raw.chars().count() <= INPUT_BUDGET,
+                    "retained args stay within budget ({} chars)",
+                    raw.chars().count()
+                );
+                // The cap lands *inside* the JSON, so the expanded (ctrl+o)
+                // view can still pretty-print the arguments.
+                let v: serde_json::Value =
+                    serde_json::from_str(raw).expect("capped raw stays valid JSON");
+                assert_eq!(v.get("path").and_then(|p| p.as_str()), Some("a.rs"));
+                let content = v.get("content").and_then(|c| c.as_str()).unwrap();
+                assert!(content.contains("[…]"), "long leaf carries the marker");
+            }
+            other => panic!("expected a tool start entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cap_middle_respects_char_boundaries_on_multibyte_text() {
+        let text = "é".repeat(100);
+        let capped = cap_middle(&text, 50);
+        assert!(capped.chars().count() <= 50);
+        assert!(capped.contains("truncated"), "marker present: {capped}");
+        assert!(
+            capped.starts_with('é') && capped.ends_with('é'),
+            "head and tail preserved without splitting a char: {capped}"
+        );
     }
 
     #[test]

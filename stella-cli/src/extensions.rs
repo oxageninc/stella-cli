@@ -38,10 +38,47 @@ const SOURCE_DIRS: [&str; 2] = [".claude", ".agents"];
 // Scanning + symlink sync
 // ============================================================================
 
+/// The per-directory definition file each kind accepts alongside flat
+/// `<slug>.md` (the `npx skills` ecosystem layout, generalized).
+fn nested_file(kind: ExtensionKind) -> &'static str {
+    match kind {
+        ExtensionKind::Commands => "COMMAND.md",
+        ExtensionKind::Skills => "SKILL.md",
+        ExtensionKind::Agents => "AGENT.md",
+    }
+}
+
+/// The name a definition at `path` will *load* under: the frontmatter
+/// `name:` when readable (a directory entry is read through its
+/// `SKILL.md`-style nested file), else the filename-derived slug. Sync
+/// collision precedence keys on this — see `SyncEntry::definition_name`.
+fn definition_name_for(path: &Path, kind: ExtensionKind) -> String {
+    let fallback = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .map(|n| n.strip_suffix(".md").unwrap_or(&n).to_string())
+        .unwrap_or_default();
+    let file = if path.is_dir() {
+        path.join(nested_file(kind))
+    } else {
+        path.to_path_buf()
+    };
+    std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|raw| {
+            stella_core::rules::parse_frontmatter(&raw)
+                .data
+                .get("name")
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+        })
+        .unwrap_or(fallback)
+}
+
 /// Scan one source directory for one kind (`<source_root>/<kind>`), with
-/// per-entry symlink detection. Hidden entries (`.DS_Store`,
-/// `.skill-lock.json`, …) are ignored. Sorted by name so plans — and
-/// therefore init output — are deterministic.
+/// per-entry symlink detection and best-effort frontmatter-name resolution.
+/// Hidden entries (`.DS_Store`, `.skill-lock.json`, …) are ignored. Sorted by
+/// name so plans — and therefore init output — are deterministic.
 fn scan_source(source_root: &Path, kind: ExtensionKind) -> SyncSource {
     let dir = source_root.join(kind.dir_name());
     let mut entries: Vec<SyncEntry> = std::fs::read_dir(&dir)
@@ -59,6 +96,7 @@ fn scan_source(source_root: &Path, kind: ExtensionKind) -> SyncSource {
                 .map(|m| m.file_type().is_symlink())
                 .unwrap_or(false);
             Some(SyncEntry {
+                definition_name: definition_name_for(&entry.path(), kind),
                 name,
                 path: entry.path().display().to_string(),
                 is_symlink,
@@ -69,15 +107,21 @@ fn scan_source(source_root: &Path, kind: ExtensionKind) -> SyncSource {
     SyncSource { kind, entries }
 }
 
-/// Every name already present in `dir` — real files, dirs, and symlinks
-/// alike (a dangling symlink still occupies the name).
-fn existing_names(dir: &Path) -> Vec<String> {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect()
+/// What already occupies one kind's destination directory: every entry
+/// basename — real files, dirs, and symlinks alike (a dangling symlink still
+/// occupies the name) — plus the names those definitions load under.
+fn existing_targets(dir: &Path, kind: ExtensionKind) -> stella_core::extensions::ExistingTargets {
+    let mut targets = stella_core::extensions::ExistingTargets::default();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with('.') {
+            targets
+                .definition_names
+                .push(definition_name_for(&entry.path(), kind));
+        }
+        targets.file_names.push(name);
+    }
+    targets
 }
 
 /// The relative path from inside `from_dir` to `target` — symlinks are
@@ -141,7 +185,7 @@ fn sync_into(dest_root: &Path, source_roots: &[PathBuf]) -> SyncOutcome {
         .flat_map(|kind| source_roots.iter().map(|root| scan_source(root, *kind)))
         .filter(|s| !s.entries.is_empty())
         .collect();
-    let existing = |kind: ExtensionKind| existing_names(&dest_root.join(kind.dir_name()));
+    let existing = |kind: ExtensionKind| existing_targets(&dest_root.join(kind.dir_name()), kind);
     let plan = plan_extension_sync(&sources, &existing);
 
     let mut outcome = SyncOutcome {
@@ -220,8 +264,14 @@ pub fn sync_extensions(workspace_root: &Path, emit: &mut dyn FnMut(String)) {
 
 /// Read one kind's definition files from `dir`: flat `<slug>.md` plus the
 /// nested `<slug>/<nested_file>` layout, both read *through* symlinks (that
-/// is the point of the sync). Returns `(path, content)` pairs.
-fn read_definition_files(dir: &Path, nested_file: &str) -> Vec<(String, String)> {
+/// is the point of the sync). Returns `(path, content)` pairs; a file that
+/// exists but cannot be read (e.g. a dangling symlink left by a deleted
+/// source) lands in `problems` instead of vanishing.
+fn read_definition_files(
+    dir: &Path,
+    nested_file: &str,
+    problems: &mut Vec<String>,
+) -> Vec<(String, String)> {
     let mut files = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -238,17 +288,34 @@ fn read_definition_files(dir: &Path, nested_file: &str) -> Vec<(String, String)>
             continue;
         }
         if path.extension().is_some_and(|e| e == "md") {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                files.push((path.display().to_string(), content));
+            match std::fs::read_to_string(&path) {
+                Ok(content) => files.push((path.display().to_string(), content)),
+                Err(e) => problems.push(format!("{}: {e}", path.display())),
             }
         } else if path.is_dir() {
             let nested = path.join(nested_file);
-            if let Ok(content) = std::fs::read_to_string(&nested) {
-                files.push((nested.display().to_string(), content));
+            match std::fs::read_to_string(&nested) {
+                Ok(content) => files.push((nested.display().to_string(), content)),
+                // A directory without its nested definition file is not an
+                // error (other agents keep auxiliary dirs here); one whose
+                // definition file exists but won't read is.
+                Err(e) if nested.symlink_metadata().is_ok() => {
+                    problems.push(format!("{}: {e}", nested.display()));
+                }
+                Err(_) => {}
             }
         }
     }
     files
+}
+
+/// One human-readable line for a parse diagnostic.
+fn describe_diagnostic(diag: &stella_core::extensions::ExtensionDiagnostic) -> String {
+    let why = match diag.problem {
+        stella_core::extensions::ExtensionProblem::MissingName => "no usable name",
+        stella_core::extensions::ExtensionProblem::EmptyBody => "empty body",
+    };
+    format!("{}: {why}", diag.path)
 }
 
 /// The `.stella`-side directories one kind is loaded from, lowest precedence
@@ -262,21 +329,29 @@ fn load_dirs(workspace_root: &Path, kind: ExtensionKind) -> Vec<PathBuf> {
     dirs
 }
 
-fn load_commands_from(dirs: &[PathBuf]) -> Vec<CommandDef> {
-    let parsed = dirs
-        .iter()
-        .flat_map(|dir| read_definition_files(dir, "COMMAND.md"))
-        .filter_map(|(path, raw)| command_from_file(&path, &raw).ok())
-        .collect();
+fn load_commands_from(dirs: &[PathBuf], problems: &mut Vec<String>) -> Vec<CommandDef> {
+    let mut parsed = Vec::new();
+    for dir in dirs {
+        for (path, raw) in read_definition_files(dir, "COMMAND.md", problems) {
+            match command_from_file(&path, &raw) {
+                Ok(cmd) => parsed.push(cmd),
+                Err(diag) => problems.push(describe_diagnostic(&diag)),
+            }
+        }
+    }
     merge_by_name(parsed, |c: &CommandDef| c.name.as_str())
 }
 
-fn load_agents_from(dirs: &[PathBuf]) -> Vec<AgentDef> {
-    let parsed = dirs
-        .iter()
-        .flat_map(|dir| read_definition_files(dir, "AGENT.md"))
-        .filter_map(|(path, raw)| agent_from_file(&path, &raw).ok())
-        .collect();
+fn load_agents_from(dirs: &[PathBuf], problems: &mut Vec<String>) -> Vec<AgentDef> {
+    let mut parsed = Vec::new();
+    for dir in dirs {
+        for (path, raw) in read_definition_files(dir, "AGENT.md", problems) {
+            match agent_from_file(&path, &raw) {
+                Ok(agent) => parsed.push(agent),
+                Err(diag) => problems.push(describe_diagnostic(&diag)),
+            }
+        }
+    }
     merge_by_name(parsed, |a: &AgentDef| a.name.as_str())
 }
 
@@ -288,6 +363,10 @@ pub struct CustomExtensions {
     pub commands: Vec<CommandDef>,
     pub skills: Vec<Skill>,
     pub agents: Vec<AgentDef>,
+    /// Definition files that were found but skipped — unreadable, or
+    /// malformed per the core parsers. One human-readable line each, so a
+    /// missing `/name` or `/agents` row is diagnosable instead of silent.
+    pub problems: Vec<String>,
 }
 
 /// What a custom `/name` resolves to.
@@ -300,11 +379,44 @@ impl CustomExtensions {
     /// Load every custom definition visible from `workspace_root`
     /// (user-global + workspace `.stella` directories, workspace wins).
     pub fn load(workspace_root: &Path) -> Self {
-        Self {
-            commands: load_commands_from(&load_dirs(workspace_root, ExtensionKind::Commands)),
-            skills: crate::memory::load_workspace_skills(workspace_root),
-            agents: load_agents_from(&load_dirs(workspace_root, ExtensionKind::Agents)),
+        let mut problems = Vec::new();
+        let commands = load_commands_from(
+            &load_dirs(workspace_root, ExtensionKind::Commands),
+            &mut problems,
+        );
+        let agents = load_agents_from(
+            &load_dirs(workspace_root, ExtensionKind::Agents),
+            &mut problems,
+        );
+        let loaded_skills = crate::memory::load_workspace_skills_with_diagnostics(workspace_root);
+        for diag in &loaded_skills.diagnostics {
+            let why = match diag.problem {
+                stella_core::skills::SkillProblem::MissingName => "no usable name",
+                stella_core::skills::SkillProblem::MissingDescription => "no description",
+                stella_core::skills::SkillProblem::EmptyBody => "empty body",
+            };
+            problems.push(format!("{}: {why}", diag.path));
         }
+        Self {
+            commands,
+            skills: loaded_skills.skills,
+            agents,
+            problems,
+        }
+    }
+
+    /// The skipped-definition report, one line per file, or `None` when
+    /// everything on disk loaded. Both chat surfaces print this so a
+    /// definition that fails to parse is visible, not silently absent.
+    pub fn problems_report(&self) -> Option<String> {
+        if self.problems.is_empty() {
+            return None;
+        }
+        let mut out = format!("! {} custom definition(s) skipped:\n", self.problems.len());
+        for problem in &self.problems {
+            out.push_str(&format!("  ! {problem}\n"));
+        }
+        Some(out)
     }
 
     /// The ⚡ slash-menu rows: commands first, then skills, names prefixed
@@ -346,15 +458,20 @@ impl CustomExtensions {
     }
 
     /// Expand `input` (`/name args…`) into the prompt the model runs, or
-    /// `None` when the name matches no custom command/skill. A command's
-    /// body is its template ([`expand_command`]); a skill's body rides as
-    /// context above the user's task.
-    pub fn expand(&self, input: &str) -> Option<String> {
+    /// `None` when the name is `reserved` (a productized command can never
+    /// be shadowed — not in the menu, and not at invocation time either,
+    /// argument-carrying forms included) or matches no custom
+    /// command/skill. A command's body is its template ([`expand_command`]);
+    /// a skill's body rides as context above the user's task.
+    pub fn expand(&self, input: &str, reserved: &[&str]) -> Option<String> {
         let trimmed = input.trim();
         let (head, args) = match trimmed.split_once(char::is_whitespace) {
             Some((head, args)) => (head, args),
             None => (trimmed, ""),
         };
+        if reserved.contains(&head) {
+            return None;
+        }
         match self.lookup(head)? {
             Invocation::Command(cmd) => Some(expand_command(&cmd.body, args)),
             Invocation::Skill(skill) => Some(skill_invocation_prompt(skill, args)),
@@ -366,7 +483,7 @@ impl CustomExtensions {
     pub fn render_agent_list(&self) -> String {
         if self.agents.is_empty() {
             return "no custom agents found — add markdown definitions to .stella/agents/ \
-                    (or run /init to adopt .claude/.agents ones)"
+                    or ~/.config/stella/agents/ (or run /init to adopt .claude/.agents ones)"
                 .to_string();
         }
         let mut out = format!("custom agents ({}):\n", self.agents.len());
@@ -503,6 +620,32 @@ mod tests {
     }
 
     #[test]
+    fn sync_resolves_frontmatter_name_collisions_by_source_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Different file names, same frontmatter `name: deploy` — only the
+        // earlier source (.claude) is adopted, so the loaded `/deploy` is
+        // decided by source precedence, not destination file-name order.
+        write(
+            &root.join(".claude/commands/ship.md"),
+            "---\nname: deploy\ndescription: from claude\n---\nShip.",
+        );
+        write(
+            &root.join(".agents/commands/release.md"),
+            "---\nname: deploy\ndescription: from agents\n---\nRelease.",
+        );
+        let outcome = sync_into(
+            &root.join(".stella"),
+            &[root.join(".claude"), root.join(".agents")],
+        );
+        assert_eq!(
+            outcome.linked,
+            vec![(ExtensionKind::Commands, "ship.md".to_string())]
+        );
+        assert_eq!(outcome.skipped, 1);
+    }
+
+    #[test]
     fn relative_target_walks_up_and_back_down() {
         assert_eq!(
             relative_symlink_target(
@@ -532,22 +675,40 @@ mod tests {
         );
         write(&ws.join("review/COMMAND.md"), "Review the diff.");
 
-        let commands = load_commands_from(&[user.clone(), ws.clone()]);
+        let mut problems = Vec::new();
+        let commands = load_commands_from(&[user.clone(), ws.clone()], &mut problems);
         let deploy = commands.iter().find(|c| c.name == "deploy").unwrap();
         assert_eq!(deploy.description, "workspace version");
         assert!(
             commands.iter().any(|c| c.name == "review"),
             "nested layout loads"
         );
+        assert!(problems.is_empty(), "{problems:?}");
 
         let agent_dir = tmp.path().join("ws-agents");
         write(
             &agent_dir.join("reviewer.md"),
             "---\nname: reviewer\ndescription: reviews\n---\nYou review.",
         );
-        let agents = load_agents_from(&[agent_dir]);
+        let agents = load_agents_from(&[agent_dir], &mut problems);
         assert_eq!(agents.len(), 1, "flat .md files parse as agents");
         assert_eq!(agents[0].name, "reviewer");
+    }
+
+    #[test]
+    fn loader_reports_malformed_and_unreadable_definitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("commands");
+        write(&dir.join("empty.md"), "---\nname: empty\n---\n");
+        // A dangling symlink: the file exists as an entry but cannot be read.
+        std::os::unix::fs::symlink(tmp.path().join("gone.md"), dir.join("dangling.md")).unwrap();
+
+        let mut problems = Vec::new();
+        let commands = load_commands_from(&[dir], &mut problems);
+        assert!(commands.is_empty());
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("empty body")));
+        assert!(problems.iter().any(|p| p.contains("dangling.md")));
     }
 
     fn custom_fixture() -> CustomExtensions {
@@ -572,6 +733,7 @@ mod tests {
                 body: "You review.".to_string(),
                 source_path: "x/reviewer.md".to_string(),
             }],
+            problems: Vec::new(),
         }
     }
 
@@ -595,21 +757,39 @@ mod tests {
     fn expand_substitutes_command_arguments() {
         let custom = custom_fixture();
         assert_eq!(
-            custom.expand("/fix-bug issue-42").as_deref(),
+            custom.expand("/fix-bug issue-42", &[]).as_deref(),
             Some("Fix issue-42 end to end.")
         );
-        assert!(custom.expand("/unknown thing").is_none());
+        assert!(custom.expand("/unknown thing", &[]).is_none());
+    }
+
+    #[test]
+    fn expand_never_runs_a_custom_definition_under_a_reserved_name() {
+        let mut custom = custom_fixture();
+        custom.commands.push(CommandDef {
+            name: "help".to_string(),
+            description: "shadowed".to_string(),
+            body: "hijacked".to_string(),
+            source_path: "x/help.md".to_string(),
+        });
+        // Hidden from the menu AND unreachable at invocation time — the
+        // argument-carrying form included, which bypasses whole-input
+        // builtin matching in both surfaces.
+        assert!(custom.expand("/help", &["/help"]).is_none());
+        assert!(custom.expand("/help topic", &["/help"]).is_none());
+        // Unreserved names still expand.
+        assert!(custom.expand("/fix-bug x", &["/help"]).is_some());
     }
 
     #[test]
     fn expand_wraps_a_skill_invocation_with_its_body_and_task() {
         let custom = custom_fixture();
-        let prompt = custom.expand("/sql-style tidy my query").unwrap();
+        let prompt = custom.expand("/sql-style tidy my query", &[]).unwrap();
         assert!(prompt.contains("# Skill: sql-style"));
         assert!(prompt.contains("Lowercase keywords."));
         assert!(prompt.contains("## Task\ntidy my query"));
         // Bare invocation: no task section.
-        let bare = custom.expand("/sql-style").unwrap();
+        let bare = custom.expand("/sql-style", &[]).unwrap();
         assert!(!bare.contains("## Task"));
     }
 

@@ -166,8 +166,10 @@ pub enum WorkspaceInput {
 }
 
 /// The agent-control verbs surfaced by the dashboard. `Stop` maps to a clean
-/// `UserInput::Cancel` today; `Pause`/`Resume`/`Restart` are honored by the
-/// fleet supervisor seam (see `COMMAND_DECK_DESIGN.md` → "Backend seams").
+/// `UserInput::Cancel` today; `Pause`/`Resume`/`Restart` are RESERVED for
+/// the fleet supervisor seam (see `COMMAND_DECK_DESIGN.md` → "Backend
+/// seams") — the deck driver currently drops them, so no key is bound to
+/// them (a keypress that visibly does nothing is worse than no key).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentControl {
     Pause,
