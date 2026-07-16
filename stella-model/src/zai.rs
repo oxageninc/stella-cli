@@ -310,6 +310,19 @@ struct ZaiUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    /// OpenAI-compatible cache detail: prompt tokens served from Z.ai's
+    /// implicit (server-side, no opt-in) prompt cache. Unlike Anthropic's
+    /// envelope these are already folded into `prompt_tokens`, so they map
+    /// straight onto the normalized subset invariant (cached ⊆ input) and
+    /// bill at the catalog's cheaper cached rate instead of full input.
+    #[serde(default)]
+    prompt_tokens_details: Option<ZaiPromptTokensDetails>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct ZaiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 fn to_zai_messages(messages: &[CompletionMessage]) -> Vec<ZaiMessage> {
@@ -492,6 +505,10 @@ async fn aggregate_zai_stream(
             if let Some(u) = parsed.usage {
                 usage.input_tokens = u.prompt_tokens;
                 usage.output_tokens = u.completion_tokens;
+                usage.cached_input_tokens = u
+                    .prompt_tokens_details
+                    .map(|d| d.cached_tokens)
+                    .unwrap_or(0);
             }
             for choice in parsed.choices {
                 if choice.finish_reason.as_deref() == Some("length") {
@@ -1062,6 +1079,49 @@ mod tests {
             });
         assert!(result.cost_usd > 0.0, "cost must be non-zero");
         assert_eq!(result.cost_usd, expected);
+    }
+
+    /// Z.ai's implicit prompt cache reports hits via the OpenAI-compatible
+    /// `prompt_tokens_details.cached_tokens` field. Dropping it (the prior
+    /// behavior) overbilled cached tokens at the full input rate and pinned
+    /// the cache-hit stat at zero for every Z.ai run.
+    #[tokio::test]
+    async fn complete_surfaces_cached_tokens_and_bills_them_at_the_cached_rate() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":500,\"prompt_tokens_details\":{\"cached_tokens\":200}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider =
+            ZaiProvider::new(ApiKey::new("sk-test-zai"), "glm-5.2").with_base_url(server.uri());
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage::user("hi")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+        };
+
+        let result = provider.complete(req).await.expect("should succeed");
+        assert_eq!(result.usage.cached_input_tokens, 200);
+        let expected = Catalog::seed()
+            .resolve("glm-5.2")
+            .unwrap()
+            .pricing
+            .cost_usd(&CompletionUsage {
+                input_tokens: 1000,
+                output_tokens: 500,
+                cached_input_tokens: 200,
+                cache_write_tokens: 0,
+            });
+        assert_eq!(result.cost_usd, expected, "200 cached tokens bill cheaper");
     }
 
     #[tokio::test]

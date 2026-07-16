@@ -57,9 +57,20 @@ impl AnthropicProvider {
 struct AnthropicRequest<'a> {
     model: &'a str,
     max_tokens: u32,
-    system: Option<&'a str>,
+    /// System prompt as a content-block array rather than a bare string, so
+    /// the block can carry the `cache_control` breakpoint that caches the
+    /// tools+system prefix tier (prompt caching is opt-in per request on the
+    /// Messages API).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<Vec<AnthropicSystemBlock<'a>>>,
     messages: Vec<AnthropicMessage>,
     stream: bool,
+    /// Top-level auto-cache marker: the API places a breakpoint on the last
+    /// cacheable block of the request, so each agent-loop turn reads the
+    /// prefix written by the previous turn instead of re-paying the whole
+    /// replayed history at the full input rate. Pairs with the system-block
+    /// marker above (two of the four allowed breakpoints).
+    cache_control: AnthropicCacheControl,
     /// Sampling temperature, forwarded from `CompletionRequest.temperature`.
     /// Omitted when `None` so Anthropic applies its own default — dropping it
     /// unconditionally (the prior bug) meant a caller-set temperature was
@@ -68,6 +79,28 @@ struct AnthropicRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicToolSchema>,
+}
+
+/// The opt-in prompt-cache marker (`{"type": "ephemeral"}`, default 5-minute
+/// TTL). The pipeline keeps the system prefix byte-stable and rides volatile
+/// recall after it (L-E8) precisely so these breakpoints hit; this is the
+/// wire half that actually turns the cache on. Reads bill at ~0.1x the input
+/// rate, writes at ~1.25x — break-even after two requests, and the agent
+/// loop replays its prefix every turn.
+#[derive(Serialize, Clone, Copy, Debug)]
+struct AnthropicCacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+const EPHEMERAL_CACHE: AnthropicCacheControl = AnthropicCacheControl { kind: "ephemeral" };
+
+#[derive(Serialize)]
+struct AnthropicSystemBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    cache_control: AnthropicCacheControl,
 }
 
 #[derive(Serialize)]
@@ -320,9 +353,16 @@ impl Provider for AnthropicProvider {
         let body = AnthropicRequest {
             model: &self.model,
             max_tokens: req.max_output_tokens.unwrap_or(4096),
-            system: system.as_deref(),
+            system: system.as_deref().map(|text| {
+                vec![AnthropicSystemBlock {
+                    kind: "text",
+                    text,
+                    cache_control: EPHEMERAL_CACHE,
+                }]
+            }),
             messages,
             stream: true,
+            cache_control: EPHEMERAL_CACHE,
             temperature: req.temperature,
             tools: req
                 .tools
@@ -808,6 +848,35 @@ mod tests {
         assert_eq!(system, Some("You are a coding agent.".to_string()));
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].role, "user");
+    }
+
+    /// Prompt caching is opt-in per request: the serialized body must carry
+    /// both breakpoints — one on the system block (tools+system tier) and
+    /// the top-level auto marker (conversation tail) — or the API silently
+    /// caches nothing and every turn re-pays the full replayed prefix.
+    #[test]
+    fn request_serializes_both_cache_breakpoints() {
+        let body = AnthropicRequest {
+            model: "claude-fable-5",
+            max_tokens: 64,
+            system: Some(vec![AnthropicSystemBlock {
+                kind: "text",
+                text: "You are a coding agent.",
+                cache_control: EPHEMERAL_CACHE,
+            }]),
+            messages: vec![AnthropicMessage {
+                role: "user",
+                content: vec![AnthropicContentBlock::Text { text: "hi".into() }],
+            }],
+            stream: true,
+            cache_control: EPHEMERAL_CACHE,
+            temperature: None,
+            tools: vec![],
+        };
+        let v = serde_json::to_value(&body).expect("request serializes");
+        assert_eq!(v["system"][0]["type"], "text");
+        assert_eq!(v["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(v["cache_control"]["type"], "ephemeral");
     }
 
     #[tokio::test]

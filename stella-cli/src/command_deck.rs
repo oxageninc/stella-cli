@@ -57,11 +57,11 @@ use serde_json::Value;
 use stella_core::ports::ToolExecutor;
 use stella_core::router::{CircuitBreaker, ProviderProfile};
 use stella_core::{BudgetGuard, CalibrationMap, Engine, RoleTable, Router, TurnOutcome};
+use stella_model::provider::Provider;
 use stella_pipeline::{
     AutoApproveGate, ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig, PipelinePorts,
     PipelineStatus, ProviderResolver,
 };
-use stella_model::provider::Provider;
 use stella_protocol::{
     AgentEvent, CompletionMessage, FileChangeKind, ModelRef, ToolOutput, ToolSchema,
 };
@@ -741,7 +741,10 @@ const DECK_BUILTINS: &[(&str, &str)] = &[
     ("/models", "list providers & models"),
     ("/init", "index the workspace: domains + code graph"),
     ("/agents", "list custom agents"),
-    ("/pipeline", "toggle the staged pipeline (witness-verified turns)"),
+    (
+        "/pipeline",
+        "toggle the staged pipeline (witness-verified turns)",
+    ),
     ("/files", "open the Files tab"),
     ("/diff", "open the diff viewer"),
     ("/graph", "open the code-graph tab"),

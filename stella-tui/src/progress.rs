@@ -108,10 +108,7 @@ fn stage_phase(stage: StageKind) -> usize {
         | StageKind::ScopeReview
         | StageKind::Witness => 0,
         StageKind::Execute => 1,
-        StageKind::Verify
-        | StageKind::Judge
-        | StageKind::Reflect
-        | StageKind::ContextWrite => 2,
+        StageKind::Verify | StageKind::Judge | StageKind::Reflect | StageKind::ContextWrite => 2,
         // Complete is handled via `Hud.complete`; treat as end-of-verify.
         StageKind::Complete => 2,
     }
@@ -244,7 +241,10 @@ fn label_line(state: &ProgressState) -> (Vec<Span<'static>>, usize) {
 /// Percent in primary text, the rest dim; ETA omitted (no honest estimate).
 fn telemetry_line(state: &ProgressState) -> (Vec<Span<'static>>, usize) {
     match state.phase {
-        RunPhase::Idle => (vec![Span::styled("idle", Style::default().fg(theme::TEXT_DIM))], 4),
+        RunPhase::Idle => (
+            vec![Span::styled("idle", Style::default().fg(theme::TEXT_DIM))],
+            4,
+        ),
         RunPhase::Complete => (
             vec![Span::styled(
                 "100% · done",
@@ -280,13 +280,7 @@ fn telemetry_line(state: &ProgressState) -> (Vec<Span<'static>>, usize) {
 
 /// Paint the derived state into `area`. Split out from [`render`] so tests can
 /// drive it with a hand-built [`ProgressState`] and a fixed clock.
-fn render_state(
-    state: &ProgressState,
-    now_ms: u64,
-    mode: ColorMode,
-    area: Rect,
-    buf: &mut Buffer,
-) {
+fn render_state(state: &ProgressState, now_ms: u64, mode: ColorMode, area: Rect, buf: &mut Buffer) {
     let y = area.y;
     let total = area.width as usize;
     let (labels, label_w) = label_line(state);
@@ -394,7 +388,11 @@ fn render_track(
             // The fill is a glyph (not a background), so the bar's *shape* reads
             // even under `NO_COLOR`, where every color drops to the terminal
             // default; the ember gradient rides the glyph's foreground.
-            let t = if w > 1 { i as f64 / (w - 1) as f64 } else { 0.0 };
+            let t = if w > 1 {
+                i as f64 / (w - 1) as f64
+            } else {
+                0.0
+            };
             let mut fg = if truecolor {
                 theme::ember_gradient(t)
             } else {
@@ -476,7 +474,11 @@ mod tests {
         let s = ProgressState::derive(focused(&plan), plan.now_ms, false);
         assert_eq!(s.phase, RunPhase::Running);
         assert_eq!(s.segments[0], SegState::Active);
-        assert!((s.fill - 1.0 / 6.0).abs() < 1e-9, "plan → 1/6, got {}", s.fill);
+        assert!(
+            (s.fill - 1.0 / 6.0).abs() < 1e-9,
+            "plan → 1/6, got {}",
+            s.fill
+        );
 
         let exec = agent_running(StageKind::Execute);
         let s = ProgressState::derive(focused(&exec), exec.now_ms, false);
@@ -595,13 +597,19 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_state(&state, 1234, ColorMode::Truecolor, area, &mut buf);
         theme::degrade_buffer(&mut buf, ColorMode::None);
-        let filled = (0..40).filter(|&x| buf.cell((x, 0)).is_some_and(|c| c.symbol() == "█")).count();
-        let track = (0..40).filter(|&x| buf.cell((x, 0)).is_some_and(|c| c.symbol() == "░")).count();
+        let filled = (0..40)
+            .filter(|&x| buf.cell((x, 0)).is_some_and(|c| c.symbol() == "█"))
+            .count();
+        let track = (0..40)
+            .filter(|&x| buf.cell((x, 0)).is_some_and(|c| c.symbol() == "░"))
+            .count();
         assert!(filled > 0, "the fill shape survives NO_COLOR");
         assert!(track > 0, "the track shape survives NO_COLOR");
         // …and every color really was stripped to the default.
         assert!(
-            (0..40).all(|x| buf.cell((x, 0)).is_some_and(|c| c.fg == ratatui::style::Color::Reset)),
+            (0..40).all(|x| buf
+                .cell((x, 0))
+                .is_some_and(|c| c.fg == ratatui::style::Color::Reset)),
             "NO_COLOR leaves no residual color"
         );
     }

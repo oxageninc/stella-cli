@@ -197,6 +197,7 @@ Traces · Graph · Files) with PR-style diffs and an editable prompt queue. `--p
 | `/files` | Show the Files-Touched panel — `[C·R·U·D] path` per file |
 | `/models` `/config` | List providers/models · show resolved configuration |
 | `/rename <name>` `/color <name>` | Rename the tab · switch accent color |
+| `/pipeline` | Toggle witness-verified staged turns (Command Deck; see `docs/pipeline.md`) |
 | `/clear` `/help` | Clear history · show help |
 | `/exit` or `Ctrl-D` | Exit |
 
@@ -252,7 +253,9 @@ stella stats     # cost, tokens, and $/resolved task per provider/model
 `stream-json` formats are for headless one-shot `stella run`; interactive
 `chat` / `goal` / `monitor` modes render human-readable output. `stella run`
 uses the staged pipeline by default; `--no-pipeline` falls back to the raw
-step-loop.
+step-loop. In pipeline mode, `--test-command <cmd>` arms deterministic
+verification with your own test; without it an independent witness author
+writes a failing test whose fail→pass flip proves the work (`docs/pipeline.md`).
 
 ## Built-in tools
 
@@ -397,7 +400,7 @@ recall routes through).
 | `stella-protocol` | Zero-logic, zero-I/O stability contract: shared serde types + the `Provider`/tool ports |
 | `stella-context` | The context plane: reflection-memory recall + embedding index, episodes, bi-temporal facts |
 | `stella-graph` | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL) |
-| `stella-pipeline` | The orchestration plane above the engine — the default `stella run` path: triage → plan → scope review → execute → verify → judge |
+| `stella-pipeline` | The orchestration plane above the engine — the default `stella run` path: triage → plan → scope review → witness → execute → verify → judge (`docs/pipeline.md`) |
 | `stella-fleet` | The multi-agent fleet behind `stella fleet`: DAG planner + wave scheduling, git-worktree isolation per task |
 | `stella-media` | Multimodal generation behind one `MediaProvider` port — image generation wired as the `generate_image` tool (registered when a media-capable key is set); SVG/video library-complete but not yet exposed as tools |
 | `stella-tui` | The Command Deck — a pure event-fold core + thin crossterm shell |

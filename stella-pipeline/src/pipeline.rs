@@ -78,8 +78,7 @@ const DEFAULT_SYSTEM_PROMPT: &str =
 /// The witness author's system prompt — small and fixed. The task prompt
 /// (goal + recall + repo structure, split context like the planner's) is
 /// [`witness_prompt`].
-const WITNESS_SYSTEM_PROMPT: &str =
-    "You are a precise test author. You write minimal failing tests that pin down intended \
+const WITNESS_SYSTEM_PROMPT: &str = "You are a precise test author. You write minimal failing tests that pin down intended \
      behavior. You never modify production code and never fix the problem yourself.";
 
 /// The ports the pipeline orchestrates over. The `stella-cli` glue fills this
@@ -930,7 +929,13 @@ impl<'a> Pipeline<'a> {
                     if self.config.distress_guidance
                         && state.revisions >= 1
                         && let Some(guidance) = self
-                            .judge_guidance(goal, &state.diff_text, &evidence.summary, budget, total)
+                            .judge_guidance(
+                                goal,
+                                &state.diff_text,
+                                &evidence.summary,
+                                budget,
+                                total,
+                            )
                             .await
                     {
                         reason.push_str("\n\nIndependent reviewer course-correction:\n");
@@ -1536,7 +1541,10 @@ impl<'a> Pipeline<'a> {
 
 /// The flip oracle's command for this run: an explicit `--test-command`
 /// always wins; otherwise the witness author's (when one was validated).
-fn effective_test_command<'c>(config: &'c PipelineConfig, witness: Option<&'c Witness>) -> Option<&'c str> {
+fn effective_test_command<'c>(
+    config: &'c PipelineConfig,
+    witness: Option<&'c Witness>,
+) -> Option<&'c str> {
     config
         .test_command
         .as_deref()
@@ -2352,7 +2360,7 @@ mod tests {
             text_result("TEST_COMMAND: always-green"),
             // The repair attempt also yields a command that passes.
             text_result("TEST_COMMAND: still-green"),
-            text_result("done"), // worker
+            text_result("done"),                  // worker
             text_result("PASS matches the goal"), // judge (no flip evidence)
         ]);
         let resolver = OneProvider(&provider);
@@ -2418,7 +2426,7 @@ mod tests {
         let provider = ScriptedProvider::new(vec![
             text_result("single"),
             text_result("TEST_COMMAND: run-witness"),
-            text_result("done"),                    // worker
+            text_result("done"),                     // worker
             text_result("FAIL the test was edited"), // judge on tampered evidence
         ]);
         let resolver = OneProvider(&provider);
@@ -2491,19 +2499,16 @@ mod tests {
     async fn second_consecutive_red_verification_gets_judge_guidance() {
         let provider = ScriptedProvider::new(vec![
             text_result("single"),
-            text_result("done"),              // worker
-            text_result("first fix"),         // revision 1 (no guidance)
+            text_result("done"),      // worker
+            text_result("first fix"), // revision 1 (no guidance)
             text_result("You are patching the symptom; fix the parser instead."), // guidance
-            text_result("second fix"),        // revision 2 (carries guidance)
+            text_result("second fix"), // revision 2 (carries guidance)
         ]);
         let resolver = OneProvider(&provider);
         // baseline (fail), post-execute (fail) → revise; post-revision-1
         // (fail) → distress → guidance → revise; post-revision-2 (fail) →
         // revisions exhausted → deterministic failed verdict.
-        let runner = ScriptedRunner::new(
-            vec![false, false, false, false],
-            "@@ -1 +1 @@\n-a\n+b",
-        );
+        let runner = ScriptedRunner::new(vec![false, false, false, false], "@@ -1 +1 @@\n-a\n+b");
         let tools = EmptyTools;
         let recall = NoContextRecall;
         let repo = NoRepoStructure;

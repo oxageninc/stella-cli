@@ -132,6 +132,14 @@ working tree into the shadow, runs the suite, and expects a failure there.
 is derived from the canonical root-relative path, never the raw model-supplied
 string (an absolute path would make the shadow copy truncate the real file).
 
+The staged pipeline enforces the same contract at runtime: when no
+`--test-command` is configured, its **witness stage** has an independent model
+(the judge's resolution, never the worker) author the failing witness test up
+front, tracks its fail→pass flip in the flip oracle, and refuses to credit the
+flip if the worker modified the witness files (tamper exclusion). See
+`docs/pipeline.md` for the full stage flow, the distress-triggered guidance
+loop, and the `/pipeline` deck toggle.
+
 ---
 
 ## Workspace layout — where a change goes

@@ -215,9 +215,9 @@ mod tests {
     fn watchlist_is_created_and_modified_files_only() {
         let before = fps(&[("stale.txt", "a"), ("edited_test.rs", "old")]);
         let after = fps(&[
-            ("stale.txt", "a"),           // untouched pre-existing dirt
-            ("edited_test.rs", "new"),    // modified by the witness turn
-            ("tests/witness.rs", "w1"),   // created by the witness turn
+            ("stale.txt", "a"),         // untouched pre-existing dirt
+            ("edited_test.rs", "new"),  // modified by the witness turn
+            ("tests/witness.rs", "w1"), // created by the witness turn
         ]);
         let list = witness_watchlist(&before, &after);
         assert_eq!(list.len(), 2);

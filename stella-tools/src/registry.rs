@@ -222,11 +222,18 @@ impl ToolRegistry {
     }
 
     /// All tool schemas, for advertising to the model — primary tools plus any
-    /// late-enabled overlay tools.
+    /// late-enabled overlay tools, sorted by name.
     pub fn schemas(&self) -> Vec<ToolSchema> {
         let mut schemas: Vec<ToolSchema> = self.tools.values().map(|t| t.schema()).collect();
         let late = self.late_tools.read().unwrap_or_else(|p| p.into_inner());
         schemas.extend(late.values().map(|t| t.schema()));
+        // Sort by name: the maps iterate in per-process-randomized HashMap
+        // order, and this list is serialized verbatim at position 0 of the
+        // prompt prefix. Prompt caching is a byte-level prefix match, so a
+        // deterministic order lets two processes (or a restart within the
+        // cache TTL) share the tools+system cache entry instead of each
+        // writing a divergent one.
+        schemas.sort_by(|a, b| a.name.cmp(&b.name));
         schemas
     }
 
@@ -860,6 +867,19 @@ mod tests {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
         assert_eq!(names.len(), 22, "unexpected tool count: {names:?}");
+    }
+
+    /// The schema list is serialized verbatim into the prompt prefix; a
+    /// nondeterministic order (HashMap iteration) breaks byte-level
+    /// prompt-cache prefix matching across processes.
+    #[test]
+    fn schemas_are_sorted_by_name_for_prompt_cache_stability() {
+        let reg =
+            ToolRegistry::with_issue_backend(PathBuf::from("/tmp"), Some(IssueBackend::GitHub));
+        let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "schemas must be name-sorted");
     }
 
     #[test]

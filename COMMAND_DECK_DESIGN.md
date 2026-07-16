@@ -182,6 +182,13 @@ impl WorkspaceModel {
 
 - Live now: per-agent event fold, file +/- from diffs, routing from
   `StepUsage`/`Complete`, graph via `CodeGraph::neighbors`, CPU/MEM via sysinfo.
+- Live now: **staged pipeline routing** — `/pipeline` toggles the lead's turns
+  between the raw `Engine::run_turn` loop and `stella-pipeline`'s staged flow
+  (triage → witness → execute → verify → judge; `docs/pipeline.md`), mirrored
+  to the `PIPELINE` stat box via `Inbound::Pipeline`. Named seam inside it:
+  scope review **auto-approves** in the deck (the `ScopeReview` event is
+  narrated in the transcript, not gated) — a deck-native scope-review card is
+  the follow-up, same seam as the driver's `ScopeDecision` no-op.
 - Seam-fed (no backend supervisor yet — build UI against the seam, drive with
   the scenario feed): multi-agent `Register`/`Status` envelopes and
   `AgentControl` (Pause/Stop/Restart). `Stop` maps to `UserInput::Cancel`

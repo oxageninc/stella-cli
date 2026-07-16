@@ -939,8 +939,7 @@ mod tests {
             status: AgentStatus::WaitingInput,
         });
         assert_eq!(
-            w.agents[0].turn_started_ms,
-            None,
+            w.agents[0].turn_started_ms, None,
             "WaitingInput status must stop the turn clock"
         );
         assert_eq!(
@@ -1283,6 +1282,18 @@ mod tests {
         assert_eq!(q.remove(9), None, "out of range is a no-op");
         q.clear();
         assert_eq!(q.pending(), 0);
+    }
+
+    #[test]
+    fn pipeline_toggle_folds_into_the_model() {
+        // `/pipeline` flips routing driver-side; the stat box must track it
+        // through the fold, both directions.
+        let mut w = WorkspaceModel::new();
+        assert!(!w.pipeline, "the deck starts on the raw engine loop");
+        w.apply_inbound(&Inbound::Pipeline(true));
+        assert!(w.pipeline);
+        w.apply_inbound(&Inbound::Pipeline(false));
+        assert!(!w.pipeline);
     }
 
     #[test]

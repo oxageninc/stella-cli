@@ -433,10 +433,22 @@ mod tests {
         assert!(stage_transition_legal(StageKind::Judge, StageKind::Execute));
         // Witness authoring precedes execution (forward move), and the revise
         // back-edges land AFTER it — re-execution never re-authors.
-        assert!(stage_transition_legal(StageKind::Witness, StageKind::Execute));
-        assert!(stage_transition_legal(StageKind::ScopeReview, StageKind::Witness));
-        assert!(!stage_transition_legal(StageKind::Execute, StageKind::Witness));
-        assert!(!stage_transition_legal(StageKind::Verify, StageKind::Witness));
+        assert!(stage_transition_legal(
+            StageKind::Witness,
+            StageKind::Execute
+        ));
+        assert!(stage_transition_legal(
+            StageKind::ScopeReview,
+            StageKind::Witness
+        ));
+        assert!(!stage_transition_legal(
+            StageKind::Execute,
+            StageKind::Witness
+        ));
+        assert!(!stage_transition_legal(
+            StageKind::Verify,
+            StageKind::Witness
+        ));
         // But you cannot jump backward to planning.
         assert!(!stage_transition_legal(StageKind::Execute, StageKind::Plan));
     }
