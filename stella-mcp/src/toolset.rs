@@ -183,6 +183,12 @@ impl McpToolSet {
         self.clients.len()
     }
 
+    /// The live servers' names, in connect order — the counterpart of
+    /// [`McpToolSet::failed_servers`] for a caller's connect-outcome report.
+    pub fn connected_names(&self) -> Vec<&str> {
+        self.clients.iter().map(|c| c.name()).collect()
+    }
+
     /// Close every connected server's transport in order (best-effort).
     pub async fn close_all(&self) {
         for client in &self.clients {
@@ -357,6 +363,15 @@ mod tests {
         let mut client = McpClient::new(name, Box::new(transport));
         client.initialize().await.unwrap();
         client
+    }
+
+    #[tokio::test]
+    async fn connected_names_lists_live_servers_in_order() {
+        let a = connected_client("files", "read").await;
+        let b = connected_client("search", "grep").await;
+        let set = McpToolSet::from_clients(vec![a, b]);
+        assert_eq!(set.connected_names(), vec!["files", "search"]);
+        assert!(set.failed_servers().is_empty());
     }
 
     #[tokio::test]

@@ -155,10 +155,11 @@ fn relative_symlink_target(from_dir: &Path, target: &Path) -> PathBuf {
 pub struct SyncOutcome {
     /// Created links as `(kind, name)`.
     pub linked: Vec<(ExtensionKind, String)>,
-    /// Entries skipped by the plan (symlink sources, existing names). Not
-    /// yet folded into the init progress line, so only the sync tests read
-    /// it — dead in the bin target alone.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Entries skipped by the plan (symlink sources, existing names). The
+    /// progress line reports only links and errors, so outside of tests this
+    /// count is currently write-only — kept because dropping it would erase
+    /// the only record of "found but not adopted" a future line can report.
+    #[allow(dead_code)]
     pub skipped: usize,
     pub errors: Vec<String>,
 }
