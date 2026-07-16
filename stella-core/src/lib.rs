@@ -16,6 +16,7 @@ mod glob;
 pub mod goal;
 pub mod hooks;
 pub mod loop_detect;
+pub(crate) mod mining;
 pub mod ports;
 pub mod retry;
 pub mod router;
