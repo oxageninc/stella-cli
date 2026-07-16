@@ -262,8 +262,8 @@ pub async fn run_deck(
 
     // The hook shares the guard's state so a panic restores the terminal even
     // in abort builds, where Drop never runs (see `crate::term`).
-    let _guard = TerminalGuard::enter(opts.mouse_capture)?;
-    let _hook_guard = PanicHookGuard::install(opts.debug_log_path.clone(), &_guard);
+    let guard = TerminalGuard::enter(opts.mouse_capture)?;
+    let _hook_guard = PanicHookGuard::install(opts.debug_log_path.clone(), &guard);
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut model = WorkspaceModel::new();
@@ -271,6 +271,9 @@ pub async fn run_deck(
     let mut ui = DeckUi::new(Composer::new());
     ui.graph = opts.initial_graph.clone();
     ui.slash_commands = opts.slash_commands.clone();
+    // Enter semantics follow the terminal's actual capability (see
+    // `crate::term::TerminalGuard::kitty` and `crate::composer::classify_enter`).
+    ui.enter_submits = !guard.kitty();
     let mut resources = ResourceMonitor::new();
 
     // Synthetic-event lane for `!` shell commands: spawned commands report

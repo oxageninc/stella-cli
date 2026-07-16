@@ -9,18 +9,23 @@
 //!
 //! ## Interaction model (the "never blocks input" contract)
 //!
-//! There is one global composer. Printable keys type into it from **any** tab;
-//! `Enter` **always** submits — enqueuing a new prompt without waiting on a busy
-//! agent — unless the focused agent has a pending gate (scope review /
-//! ask-user), in which case `Enter`/the gate keys answer it. Tab hotkeys
-//! (`1`–`5`) and agent controls (`p`/`s`/`r`) only fire when the composer is
-//! empty, so they never eat a keystroke meant for a prompt (the same
-//! "quick-pick only when nothing typed" gate `crate::ui` already uses).
+//! There is one global composer. Printable keys type into it from **any** tab
+//! and it edits like a textarea: plain `⏎` inserts a line break (preserved
+//! verbatim in the submitted prompt) and the `⌘⏎`/`⌃⏎` chord **always**
+//! submits — enqueuing a new prompt without waiting on a busy agent — unless
+//! the focused agent has a pending gate (scope review / ask-user), in which
+//! case the chord/the gate keys answer it. (On legacy terminals that can't
+//! report a modified Enter, plain `⏎` submits and `⌥⏎` is the line break —
+//! see [`crate::composer::classify_enter`].) Tab hotkeys (`1`–`5`) and agent
+//! controls (`p`/`s`/`r`) only fire when the composer is empty, so they never
+//! eat a keystroke meant for a prompt (the same "quick-pick only when nothing
+//! typed" gate `crate::ui` already uses).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::composer::{
-    Composer, SlashCommand, SlashPopupOutcome, handle_slash_popup_key, slash_popup_matches,
+    Composer, EnterAction, SlashCommand, SlashPopupOutcome, classify_enter, handle_edit_key,
+    handle_slash_popup_key, slash_popup_matches,
 };
 use crate::deck::{DeckTab, WorkspaceModel};
 use crate::envelope::{AgentControl, AgentId, Inbound, WorkspaceInput};
@@ -82,6 +87,12 @@ pub struct DeckUi {
     /// Armed by the first `ctrl+d` in the queue editor; the second one clears
     /// the whole queue. Any other key disarms.
     pub queue_confirm_clear: bool,
+    /// Legacy-terminal Enter semantics (see
+    /// [`crate::composer::classify_enter`]): `false` when the kitty keyboard
+    /// protocol is active (plain `⏎` = line break, `⌘⏎`/`⌃⏎` = submit),
+    /// `true` where a modified Enter is unreportable (plain `⏎` = submit,
+    /// `⌥⏎` = line break). The shell sets this from the terminal capability.
+    pub enter_submits: bool,
     /// The transcript entry highlighted with ↑/↓ on the Session tab —
     /// `ctrl+o` toggles its expanded view. `None` = nothing selected.
     pub session_selected: Option<usize>,
@@ -124,6 +135,7 @@ impl Default for DeckUi {
             queue_open: false,
             queue_sel: 0,
             queue_confirm_clear: false,
+            enter_submits: false,
             session_selected: None,
             session_pending_scroll: None,
             expanded: std::collections::HashMap::new(),
@@ -353,12 +365,31 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         return action;
     }
 
+    // Textarea editing beats per-tab navigation once the composer has
+    // content: Enter breaks the line / the chord submits, and cursor motion
+    // moves through the prompt instead of scrolling the active tab. A blank
+    // composer leaves all of these to the tabs (handle_edit_key gates its
+    // motion on the buffer internally).
+    if !ui.composer.is_blank() {
+        match classify_enter(&key, ui.enter_submits) {
+            EnterAction::Submit => return dispatch_submission(ui),
+            EnterAction::Newline => {
+                ui.composer.insert_newline();
+                return DeckAction::Handled;
+            }
+            EnterAction::NotEnter => {}
+        }
+    }
+    if handle_edit_key(key, &mut ui.composer) {
+        return DeckAction::Handled;
+    }
+
     // Per-tab navigation for non-typing keys, then composer editing.
     match ui.tab {
         DeckTab::Agents => handle_agents_key(key, model, ui, composer_empty),
         DeckTab::Traces => handle_traces_key(key, model, ui, composer_empty),
         DeckTab::Graph => handle_graph_key(key, ui, composer_empty),
-        DeckTab::Files => handle_files_key(key, model, ui),
+        DeckTab::Files => handle_files_key(key, model, ui, composer_empty),
         DeckTab::Session => handle_session_key(key, model, ui),
     }
     .unwrap_or_else(|| handle_composer_key(key, ui))
@@ -506,9 +537,15 @@ fn handle_focused_gates(
                     }));
                 }
             }
-            // A `!` line is a shell command even while a question is pending —
-            // it must run immediately, not be swallowed as the answer.
-            KeyCode::Enter if !ui.composer.buffer().trim_start().starts_with('!') => {
+            // The submit chord dispatches the typed free text as the answer.
+            // A plain `⏎` is NOT claimed — it falls through to composer
+            // editing, so the answer can span lines. A `!` line is a shell
+            // command even while a question is pending — it must run
+            // immediately, not be swallowed as the answer.
+            KeyCode::Enter
+                if classify_enter(&key, ui.enter_submits) == EnterAction::Submit
+                    && !ui.composer.buffer().trim_start().starts_with('!') =>
+            {
                 if let Some(answer) = ui.composer.take_submission() {
                     return Some(DeckAction::Send(WorkspaceInput::ToAgent {
                         agent: agent.clone(),
@@ -544,7 +581,7 @@ fn handle_agents_key(
             }
             Some(DeckAction::Handled)
         }
-        KeyCode::Enter if composer_empty => {
+        KeyCode::Enter if composer_empty && key.modifiers.is_empty() => {
             ui.set_tab(DeckTab::Session);
             Some(DeckAction::Handled)
         }
@@ -615,7 +652,12 @@ fn handle_graph_key(key: KeyEvent, ui: &mut DeckUi, composer_empty: bool) -> Opt
     }
 }
 
-fn handle_files_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -> Option<DeckAction> {
+fn handle_files_key(
+    key: KeyEvent,
+    model: &WorkspaceModel,
+    ui: &mut DeckUi,
+    composer_empty: bool,
+) -> Option<DeckAction> {
     let count = model.ledger.records.len();
     if ui.files_diff_open {
         let (total, height) = (ui.metrics.files_diff_total, ui.metrics.files_diff_height);
@@ -646,7 +688,9 @@ fn handle_files_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -> O
             }
             Some(DeckAction::Handled)
         }
-        KeyCode::Enter if count > 0 => {
+        // Only an unmodified Enter with nothing typed toggles the diff — a
+        // failed submit chord or a prompt in progress must never claim it.
+        KeyCode::Enter if count > 0 && composer_empty && key.modifiers.is_empty() => {
             ui.files_diff_open = !ui.files_diff_open;
             ui.files_diff_scroll = ScrollState::default();
             Some(DeckAction::Handled)
@@ -743,39 +787,63 @@ fn handle_session_key(
     }
 }
 
-/// The always-available composer editing + non-blocking submit.
-fn handle_composer_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
-    match key.code {
-        KeyCode::Enter => match ui.composer.take_submission() {
-            // A `!`-prefixed line is a shell command: it executes IMMEDIATELY,
-            // bypassing the prompt queue and any busy agent entirely.
-            Some(text) if text.trim_start().starts_with('!') => {
-                // Strip only the single leading `!` dispatch marker — not
-                // every leading `!` — so a command whose own text starts
-                // with `!` (e.g. `!!foo`, meant as the shell command `!foo`)
-                // is not rewritten into something else.
-                let leading = text.trim_start();
-                let cmd = leading
-                    .strip_prefix('!')
-                    .unwrap_or(leading)
-                    .trim()
-                    .to_string();
-                if cmd.is_empty() {
-                    DeckAction::Ignored
-                } else {
-                    DeckAction::Shell(cmd)
-                }
+/// Dispatch the composer's content: a `!`-prefixed line is a shell command
+/// that executes IMMEDIATELY, bypassing the prompt queue and any busy agent
+/// entirely; any other prompt ALWAYS enqueues — never blocks on a busy agent.
+fn dispatch_submission(ui: &mut DeckUi) -> DeckAction {
+    match ui.composer.take_submission() {
+        Some(text) if text.trim_start().starts_with('!') => {
+            // Strip only the single leading `!` dispatch marker — not
+            // every leading `!` — so a command whose own text starts
+            // with `!` (e.g. `!!foo`, meant as the shell command `!foo`)
+            // is not rewritten into something else.
+            let leading = text.trim_start();
+            let cmd = leading
+                .strip_prefix('!')
+                .unwrap_or(leading)
+                .trim()
+                .to_string();
+            if cmd.is_empty() {
+                DeckAction::Ignored
+            } else {
+                DeckAction::Shell(cmd)
             }
-            // Any other prompt ALWAYS enqueues — never blocks on a busy agent.
-            Some(text) => DeckAction::Send(WorkspaceInput::Enqueue { text }),
-            None => DeckAction::Ignored,
-        },
+        }
+        Some(text) => DeckAction::Send(WorkspaceInput::Enqueue { text }),
+        None => DeckAction::Ignored,
+    }
+}
+
+/// The always-available composer editing + non-blocking submit. (A non-blank
+/// composer's Enter/motion keys were already handled by [`handle_deck_key`]'s
+/// textarea interception; this fallback covers typing plus the blank-composer
+/// Enter, which submits nothing and inserts nothing.)
+fn handle_composer_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    match classify_enter(&key, ui.enter_submits) {
+        EnterAction::Submit => return dispatch_submission(ui),
+        // No line breaks into a fully blank composer — a stray leading
+        // newline is never what an empty ⏎ meant.
+        EnterAction::Newline => {
+            return if ui.composer.is_blank() {
+                DeckAction::Ignored
+            } else {
+                ui.composer.insert_newline();
+                DeckAction::Handled
+            };
+        }
+        EnterAction::NotEnter => {}
+    }
+    match key.code {
         KeyCode::Backspace => {
             ui.composer.backspace();
             ui.slash_selected = 0;
             DeckAction::Handled
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META) =>
+        {
             ui.composer.insert_char(c);
             ui.slash_selected = 0;
             DeckAction::Handled
@@ -813,6 +881,13 @@ mod tests {
     }
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+    /// The submit chord — `⌘⏎` as the kitty keyboard protocol reports it.
+    fn cmd_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER)
+    }
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
     }
 
     fn model_with(ids: &[&str]) -> WorkspaceModel {
@@ -1000,13 +1075,13 @@ mod tests {
     }
 
     #[test]
-    fn enter_always_enqueues_a_prompt_without_blocking() {
+    fn submit_chord_always_enqueues_a_prompt_without_blocking() {
         let model = model_with(&["lead"]);
         let mut ui = ready_ui();
         for c in "do the thing".chars() {
             handle_deck_key(ch(c), &model, &mut ui);
         }
-        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        let action = handle_deck_key(cmd_enter(), &model, &mut ui);
         assert_eq!(
             action,
             DeckAction::Send(WorkspaceInput::Enqueue {
@@ -1017,6 +1092,108 @@ mod tests {
             ui.composer.buffer().is_empty(),
             "composer clears after submit"
         );
+    }
+
+    #[test]
+    fn plain_enter_inserts_a_line_break_preserved_through_submit() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        for c in "line one".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Enter), &model, &mut ui),
+            DeckAction::Handled,
+            "plain ⏎ is a line break, not a submit"
+        );
+        for c in "line two".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_deck_key(cmd_enter(), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::Enqueue {
+                text: "line one\nline two".into()
+            }),
+            "the typed line break survives into the submitted prompt"
+        );
+    }
+
+    #[test]
+    fn plain_enter_on_a_blank_composer_inserts_nothing() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.tab = DeckTab::Graph; // a tab with no Enter binding of its own
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Enter), &model, &mut ui),
+            DeckAction::Ignored
+        );
+        assert!(ui.composer.buffer().is_empty(), "no stray leading newline");
+    }
+
+    #[test]
+    fn alt_brackets_jump_the_cursor_to_start_and_end() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        for c in "abc".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        assert_eq!(ui.composer.cursor(), 3);
+        assert_eq!(
+            handle_deck_key(alt('['), &model, &mut ui),
+            DeckAction::Handled
+        );
+        assert_eq!(ui.composer.cursor(), 0, "⌥[ → before the first character");
+        assert_eq!(
+            handle_deck_key(alt(']'), &model, &mut ui),
+            DeckAction::Handled
+        );
+        assert_eq!(ui.composer.cursor(), 3, "⌥] → one past the last character");
+    }
+
+    #[test]
+    fn legacy_terminals_fall_back_to_enter_submits_and_alt_enter_breaks() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.enter_submits = true; // no kitty keyboard protocol
+        for c in "hi".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(
+            handle_deck_key(alt_enter, &model, &mut ui),
+            DeckAction::Handled,
+            "⌥⏎ is the legacy line break"
+        );
+        assert_eq!(ui.composer.buffer(), "hi\n");
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::Enqueue {
+                text: "hi\n".into()
+            }),
+            "plain ⏎ submits when the chord is unreportable"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_edit_a_multiline_prompt_instead_of_scrolling() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        for c in "ab".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        for c in "cd".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        // ↑ moves the cursor into the first line (not the session scroll,
+        // and NOT the queue editor — the composer is not empty).
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        assert_eq!(ui.composer.cursor(), 2, "column kept on the line above");
+        handle_deck_key(key(KeyCode::Left), &model, &mut ui);
+        handle_deck_key(ch('X'), &model, &mut ui);
+        assert_eq!(ui.composer.buffer(), "aXb\ncd", "typed at the cursor");
     }
 
     #[test]
@@ -1134,7 +1311,7 @@ mod tests {
         for c in "!cargo build".chars() {
             handle_deck_key(ch(c), &model, &mut ui);
         }
-        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        let action = handle_deck_key(cmd_enter(), &model, &mut ui);
         assert_eq!(action, DeckAction::Shell("cargo build".into()));
     }
 
@@ -1148,7 +1325,7 @@ mod tests {
         for c in "!!important".chars() {
             handle_deck_key(ch(c), &model, &mut ui);
         }
-        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        let action = handle_deck_key(cmd_enter(), &model, &mut ui);
         assert_eq!(action, DeckAction::Shell("!important".into()));
     }
 
@@ -1167,7 +1344,7 @@ mod tests {
         for c in "!ls".chars() {
             handle_deck_key(ch(c), &model, &mut ui);
         }
-        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        let action = handle_deck_key(cmd_enter(), &model, &mut ui);
         assert_eq!(
             action,
             DeckAction::Shell("ls".into()),

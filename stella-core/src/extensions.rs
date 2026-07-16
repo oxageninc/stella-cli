@@ -388,8 +388,8 @@ pub fn plan_extension_sync(
             for name in targets.definition_names {
                 claimed.insert((source.kind, name));
             }
-        }
-        let present = &present_files[&source.kind];
+            targets.file_names.into_iter().collect()
+        });
         for entry in &source.entries {
             let skip = |reason| SyncSkip {
                 kind: source.kind,

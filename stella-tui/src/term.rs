@@ -31,10 +31,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 
 /// Which terminal states are currently held. Shared between the guard (for
@@ -46,6 +48,7 @@ struct TermState {
     alt: AtomicBool,
     mouse: AtomicBool,
     paste: AtomicBool,
+    kitty: AtomicBool,
 }
 
 impl TermState {
@@ -54,6 +57,9 @@ impl TermState {
     /// Drop-time restore to redo.
     fn restore(&self) {
         let mut out = io::stdout();
+        if self.kitty.swap(false, Ordering::SeqCst) {
+            let _ = execute!(out, PopKeyboardEnhancementFlags);
+        }
         if self.paste.swap(false, Ordering::SeqCst) {
             let _ = execute!(out, DisableBracketedPaste);
         }
@@ -102,7 +108,26 @@ impl TerminalGuard {
             execute!(out, EnableMouseCapture)?;
             guard.state.mouse.store(true, Ordering::SeqCst);
         }
+        // The kitty keyboard protocol disambiguates modified keys, letting
+        // `⌘⏎`/`⌃⏎` submit while plain `⏎` inserts a line break. Probing
+        // needs raw mode, so this comes last; best-effort (`false` on any
+        // probe error → legacy Enter semantics).
+        if matches!(supports_keyboard_enhancement(), Ok(true)) {
+            execute!(
+                out,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+            guard.state.kitty.store(true, Ordering::SeqCst);
+        }
         Ok(guard)
+    }
+
+    /// Whether the kitty keyboard protocol was pushed. When it is active, a
+    /// modified Enter (`⌘⏎`/`⌃⏎`) is reportable and the composer runs full
+    /// textarea semantics; without it the shell falls back to Enter-submits
+    /// (see `crate::composer::classify_enter`).
+    pub(crate) fn kitty(&self) -> bool {
+        self.state.kitty.load(Ordering::SeqCst)
     }
 }
 

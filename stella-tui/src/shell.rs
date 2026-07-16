@@ -148,8 +148,8 @@ pub async fn run(
 
     // The hook shares the guard's state so a panic restores the terminal even
     // in abort builds, where Drop never runs (see `crate::term`).
-    let _term_guard = TerminalGuard::enter(opts.mouse_capture)?;
-    let _hook_guard = PanicHookGuard::install(opts.debug_log_path.clone(), &_term_guard);
+    let term_guard = TerminalGuard::enter(opts.mouse_capture)?;
+    let _hook_guard = PanicHookGuard::install(opts.debug_log_path.clone(), &term_guard);
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
@@ -158,6 +158,9 @@ pub async fn run(
         Composer::with_paste_threshold(opts.paste_line_threshold),
         opts.slash_commands,
     );
+    // Enter semantics follow the terminal's actual capability (see
+    // `crate::term::TerminalGuard::kitty` and `crate::composer::classify_enter`).
+    ui.enter_submits = !term_guard.kitty();
 
     // A blocking reader thread forwards crossterm input events to the async
     // loop. It polls so it can observe the shutdown flag and exit promptly.

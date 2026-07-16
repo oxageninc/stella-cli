@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Widget};
 use ratatui_comfy_tabs::{TabNav, TabNavState};
 
+use crate::composer::{ComposerLayout, layout as composer_layout, split_row_at};
 use crate::deck::{DeckTab, WorkspaceModel};
 use crate::deck_ui::DeckUi;
 use crate::envelope::AgentStatus;
@@ -40,13 +41,18 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
     }
 
     // tab bar (comfy-tabs needs exactly 3 rows) | content | [activity strip]
-    // | composer | status
+    // | composer | status. The composer band grows with its soft-wrapped
+    // content (textarea semantics) up to a cap, then scrolls to keep the
+    // cursor row visible; text width is the frame minus the 2-column `❯ `
+    // prefix.
     let strip_h: u16 = if activity_strip_active(model) { 1 } else { 0 };
+    let c_layout = composer_layout(&ui.composer, area.width.saturating_sub(2).max(1) as usize);
+    let composer_h = c_layout.rows.len().clamp(1, DECK_COMPOSER_MAX_ROWS) as u16;
     let bands = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
         Constraint::Length(strip_h),
-        Constraint::Length(1),
+        Constraint::Length(composer_h),
         Constraint::Length(1),
     ])
     .split(area);
@@ -66,7 +72,7 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
     if strip_h > 0 {
         render_activity_strip(model, ui, bands[2], buf);
     }
-    render_composer(ui, bands[3], buf);
+    render_composer(ui, &c_layout, bands[3], buf);
     render_status_bar(model, ui, bands[4], buf);
 
     // Floating popups sit above the chrome: the slash menu anchors to the
@@ -245,25 +251,49 @@ fn render_queue_popup(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut
     Paragraph::new(lines).block(block).render(popup, buf);
 }
 
-/// The always-on composer row — typing works from any tab; Enter dispatches.
-fn render_composer(ui: &DeckUi, area: Rect, buf: &mut Buffer) {
-    let text = ui.composer.buffer();
-    let line = if text.is_empty() {
-        Line::from(vec![
+/// Cap on the deck composer's visible rows — it grows with the prompt up to
+/// this, then scrolls to keep the cursor row in view.
+const DECK_COMPOSER_MAX_ROWS: usize = 6;
+
+/// The always-on composer — typing works from any tab. A multi-line textarea:
+/// rows come pre-wrapped from [`crate::composer::layout`], `⏎` breaks the
+/// line, and the `⌘⏎` chord dispatches (plain `⏎` on legacy terminals).
+fn render_composer(ui: &DeckUi, layout: &ComposerLayout, area: Rect, buf: &mut Buffer) {
+    if ui.composer.is_blank() {
+        let hint = if ui.enter_submits {
+            "type a prompt — ⏎ queues (never blocks) · ⌥⏎ newline · ! shell · / commands · ? help"
+        } else {
+            "type a prompt — ⌘⏎ queues (never blocks) · ⏎ newline · ! shell · / commands · ? help"
+        };
+        let line = Line::from(vec![
             Span::styled("❯ ", theme::accent()),
-            Span::styled(
-                "type a prompt — Enter queues (never blocks) · ! shell · / commands · ? help",
-                theme::muted(),
-            ),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("❯ ", theme::accent()),
-            Span::styled(text.to_string(), theme::body()),
-            Span::styled("▏", theme::accent()), // caret
-        ])
-    };
-    Paragraph::new(line).render(area, buf);
+            Span::styled(hint, theme::muted()),
+        ]);
+        Paragraph::new(line).render(area, buf);
+        return;
+    }
+    let visible = (area.height as usize).max(1);
+    let first = (layout.cursor_row + 1).saturating_sub(visible);
+    let cursor_style = theme::accent().add_modifier(Modifier::REVERSED);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, row) in layout.rows.iter().enumerate().skip(first).take(visible) {
+        // The prompt glyph marks the first row; continuations align under it.
+        let prefix = if i == 0 { "❯ " } else { "  " };
+        let mut spans = vec![Span::styled(prefix, theme::accent())];
+        if i == layout.cursor_row {
+            let (before, under, after) = split_row_at(row, layout.cursor_col);
+            spans.push(Span::styled(before, theme::body()));
+            spans.push(Span::styled(
+                under.map(String::from).unwrap_or_else(|| " ".into()),
+                cursor_style,
+            ));
+            spans.push(Span::styled(after, theme::body()));
+        } else {
+            spans.push(Span::styled(row.clone(), theme::body()));
+        }
+        lines.push(Line::from(spans));
+    }
+    Paragraph::new(lines).render(area, buf);
 }
 
 /// The status bar: routed model · global CPU gauge · spend · active · queue.
@@ -339,7 +369,15 @@ fn render_help(area: Rect, buf: &mut Buffer) {
         Line::from(Span::styled("  Tab / ⇧Tab   switch tabs", theme::body())),
         Line::from(Span::styled("  1–5          jump to a tab", theme::body())),
         Line::from(Span::styled(
-            "  Enter        queue prompt (never blocks)",
+            "  ⌘⏎ / ⌃⏎      queue prompt (never blocks)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  ⏎            insert a line break (kept in the prompt)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  ⌥[ / ⌥]      cursor to start / end of the prompt",
             theme::body(),
         )),
         Line::from(Span::styled(

@@ -16,7 +16,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use stella_protocol::AgentEvent;
 
 use crate::composer::{
-    Composer, SlashCommand, SlashPopupOutcome, handle_slash_popup_key, slash_popup_matches,
+    Composer, EnterAction, SlashCommand, SlashPopupOutcome, classify_enter, handle_edit_key,
+    handle_slash_popup_key, slash_popup_matches,
 };
 use crate::input::{ScopeDecision, UserInput};
 use crate::model::{AskUserPrompt, SessionModel};
@@ -25,8 +26,9 @@ use crate::scroll::ScrollState;
 /// Which surface currently has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelFocus {
-    /// The composer: printable keys type, arrows scroll the transcript,
-    /// Enter submits. The resting focus of a REPL.
+    /// The composer: printable keys type into a multi-line textarea (`⏎` is
+    /// a line break, `⌘⏎`/`⌃⏎` submits), arrows scroll the transcript until
+    /// the buffer has content to move through. The resting focus of a REPL.
     #[default]
     Composer,
     /// The files-touched panel: arrows select a file / scroll its diff, Enter
@@ -78,6 +80,12 @@ pub struct UiState {
     /// Whether reasoning entries render in full. Off by default — collapsed
     /// thinking shows a one-line live tail; `ctrl+r` toggles.
     pub thinking_expanded: bool,
+    /// Legacy-terminal Enter semantics (see [`classify_enter`]): `false` on
+    /// terminals with the kitty keyboard protocol, where plain `⏎` is a line
+    /// break and `⌘⏎`/`⌃⏎` submits; `true` where a modified Enter cannot be
+    /// distinguished, so plain `⏎` submits and `⌥⏎` is the line break. The
+    /// shell sets this from the terminal's actual capability.
+    pub enter_submits: bool,
     /// Viewport sizes from the last render (for scroll clamping).
     pub metrics: ViewportMetrics,
 }
@@ -96,6 +104,7 @@ impl Default for UiState {
             slash_commands: Vec::new(),
             slash_selected: 0,
             thinking_expanded: false,
+            enter_submits: false,
             metrics: ViewportMetrics::default(),
         }
     }
@@ -175,13 +184,14 @@ pub fn handle_key(key: KeyEvent, model: &SessionModel, ui: &mut UiState) -> Shel
     }
 
     // A pending, unanswered `ask_user` question: a number key quick-picks an
-    // option (only when nothing is typed), and Enter submits whatever free
-    // text has been typed — the always-available affordance the AskUser
-    // renderer contract mandates. Anything else falls through to normal
-    // composer editing so the user can compose that free-text answer.
+    // option (only when nothing is typed), and the submit chord dispatches
+    // whatever free text has been typed — the always-available affordance
+    // the AskUser renderer contract mandates. Anything else (including a
+    // plain `⏎` line break) falls through to normal composer editing so the
+    // user can compose a multi-line free-text answer.
     if let Some(prompt) = &model.pending_ask_user
         && !ui.ask_answered
-        && let Some(action) = handle_ask_user_key(key.code, prompt, ui)
+        && let Some(action) = handle_ask_user_key(key, prompt, ui)
     {
         return action;
     }
@@ -196,11 +206,11 @@ pub fn handle_key(key: KeyEvent, model: &SessionModel, ui: &mut UiState) -> Shel
 /// (a quick-pick or a free-text submit) or `None` to fall through to normal
 /// composer editing so the user can keep typing a free-text answer.
 fn handle_ask_user_key(
-    code: KeyCode,
+    key: KeyEvent,
     prompt: &AskUserPrompt,
     ui: &mut UiState,
 ) -> Option<ShellAction> {
-    match code {
+    match key.code {
         // A digit quick-picks an option — but only when nothing has been
         // typed, so a free-text answer beginning with a digit is unaffected.
         KeyCode::Char(d @ '1'..='9') if ui.composer.buffer().is_empty() => {
@@ -217,17 +227,22 @@ fn handle_ask_user_key(
                 None => None,
             }
         }
-        KeyCode::Enter => match ui.composer.take_submission() {
-            Some(answer) => {
-                ui.ask_answered = true;
-                Some(ShellAction::Submit(UserInput::AskUserAnswer {
-                    id: prompt.id.clone(),
-                    answer,
-                }))
-            }
-            // Empty Enter while a question is pending: force an explicit choice
-            // rather than submitting a blank answer.
-            None => Some(ShellAction::Ignored),
+        KeyCode::Enter => match classify_enter(&key, ui.enter_submits) {
+            EnterAction::Submit => match ui.composer.take_submission() {
+                Some(answer) => {
+                    ui.ask_answered = true;
+                    Some(ShellAction::Submit(UserInput::AskUserAnswer {
+                        id: prompt.id.clone(),
+                        answer,
+                    }))
+                }
+                // An empty submit while a question is pending: force an
+                // explicit choice rather than submitting a blank answer.
+                None => Some(ShellAction::Ignored),
+            },
+            // A line break: fall through to normal composer editing so the
+            // free-text answer can span lines.
+            _ => None,
         },
         _ => None,
     }
@@ -258,11 +273,35 @@ fn handle_composer_key(key: KeyEvent, ui: &mut UiState) -> ShellAction {
             SlashPopupOutcome::Submit(text) => ShellAction::Submit(UserInput::Prompt { text }),
         };
     }
+    // Enter is a textarea key: plain `⏎` breaks the line (preserved verbatim
+    // in the submitted prompt), the `⌘⏎`/`⌃⏎` chord submits — flipped on
+    // legacy terminals that can't report a modified Enter (`enter_submits`).
+    match classify_enter(&key, ui.enter_submits) {
+        EnterAction::Submit => {
+            return match ui.composer.take_submission() {
+                Some(text) => ShellAction::Submit(UserInput::Prompt { text }),
+                None => ShellAction::Ignored,
+            };
+        }
+        EnterAction::Newline => {
+            // No line breaks into a fully blank composer — a stray leading
+            // newline is never what an empty ⏎ meant.
+            return if ui.composer.is_blank() {
+                ShellAction::Ignored
+            } else {
+                ui.composer.insert_newline();
+                ShellAction::Handled
+            };
+        }
+        EnterAction::NotEnter => {}
+    }
+    // Cursor motion (←/→/↑/↓/Home/End, ⌥[ ⌥] jumps) — gated inside on the
+    // buffer having content, so an empty composer still scrolls the
+    // transcript with these keys.
+    if handle_edit_key(key, &mut ui.composer) {
+        return ShellAction::Handled;
+    }
     match key.code {
-        KeyCode::Enter => match ui.composer.take_submission() {
-            Some(text) => ShellAction::Submit(UserInput::Prompt { text }),
-            None => ShellAction::Ignored,
-        },
         KeyCode::Backspace => {
             ui.composer.backspace();
             ui.slash_selected = 0;
@@ -272,7 +311,11 @@ fn handle_composer_key(key: KeyEvent, ui: &mut UiState) -> ShellAction {
             ui.focus = PanelFocus::Files;
             ShellAction::Handled
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META) =>
+        {
             ui.composer.insert_char(c);
             ui.slash_selected = 0;
             ShellAction::Handled
@@ -390,6 +433,13 @@ mod tests {
     fn ch(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
     }
+    /// The submit chord — `⌘⏎` as the kitty keyboard protocol reports it.
+    fn cmd_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER)
+    }
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
 
     fn model_with_scope() -> SessionModel {
         let mut m = SessionModel::new();
@@ -405,13 +455,13 @@ mod tests {
     }
 
     #[test]
-    fn typing_builds_a_prompt_and_enter_submits_it() {
+    fn typing_builds_a_prompt_and_the_submit_chord_sends_it() {
         let model = SessionModel::new();
         let mut ui = UiState::default();
         for c in "hello".chars() {
             assert_eq!(handle_key(ch(c), &model, &mut ui), ShellAction::Handled);
         }
-        let action = handle_key(key(KeyCode::Enter), &model, &mut ui);
+        let action = handle_key(cmd_enter(), &model, &mut ui);
         assert_eq!(
             action,
             ShellAction::Submit(UserInput::Prompt {
@@ -421,12 +471,104 @@ mod tests {
     }
 
     #[test]
+    fn plain_enter_inserts_a_line_break_preserved_through_submit() {
+        let model = SessionModel::new();
+        let mut ui = UiState::default();
+        for c in "line one".chars() {
+            handle_key(ch(c), &model, &mut ui);
+        }
+        assert_eq!(
+            handle_key(key(KeyCode::Enter), &model, &mut ui),
+            ShellAction::Handled,
+            "plain ⏎ is a line break, not a submit"
+        );
+        for c in "line two".chars() {
+            handle_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_key(cmd_enter(), &model, &mut ui);
+        assert_eq!(
+            action,
+            ShellAction::Submit(UserInput::Prompt {
+                text: "line one\nline two".into()
+            }),
+            "the typed line break survives into the submitted prompt"
+        );
+    }
+
+    #[test]
     fn enter_on_an_empty_composer_is_ignored() {
         let model = SessionModel::new();
         let mut ui = UiState::default();
         assert_eq!(
             handle_key(key(KeyCode::Enter), &model, &mut ui),
-            ShellAction::Ignored
+            ShellAction::Ignored,
+            "no stray leading newline into a blank composer"
+        );
+        assert_eq!(
+            handle_key(cmd_enter(), &model, &mut ui),
+            ShellAction::Ignored,
+            "nothing to submit either"
+        );
+    }
+
+    #[test]
+    fn alt_brackets_jump_the_cursor_to_start_and_end() {
+        let model = SessionModel::new();
+        let mut ui = UiState::default();
+        for c in "abc".chars() {
+            handle_key(ch(c), &model, &mut ui);
+        }
+        assert_eq!(ui.composer.cursor(), 3);
+        assert_eq!(handle_key(alt('['), &model, &mut ui), ShellAction::Handled);
+        assert_eq!(ui.composer.cursor(), 0, "⌥[ → before the first character");
+        assert_eq!(handle_key(alt(']'), &model, &mut ui), ShellAction::Handled);
+        assert_eq!(ui.composer.cursor(), 3, "⌥] → one past the last character");
+    }
+
+    #[test]
+    fn legacy_terminals_fall_back_to_enter_submits_and_alt_enter_breaks() {
+        let model = SessionModel::new();
+        let mut ui = UiState::default();
+        ui.enter_submits = true; // no kitty keyboard protocol
+        for c in "hi".chars() {
+            handle_key(ch(c), &model, &mut ui);
+        }
+        let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(
+            handle_key(alt_enter, &model, &mut ui),
+            ShellAction::Handled,
+            "⌥⏎ is the legacy line break"
+        );
+        assert_eq!(ui.composer.buffer(), "hi\n");
+        let action = handle_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            ShellAction::Submit(UserInput::Prompt {
+                text: "hi\n".into()
+            }),
+            "plain ⏎ submits when the chord is unreportable"
+        );
+    }
+
+    #[test]
+    fn arrows_edit_a_multiline_prompt_and_typing_lands_at_the_cursor() {
+        let model = SessionModel::new();
+        let mut ui = UiState::default();
+        for c in "ab".chars() {
+            handle_key(ch(c), &model, &mut ui);
+        }
+        handle_key(key(KeyCode::Enter), &model, &mut ui);
+        for c in "cd".chars() {
+            handle_key(ch(c), &model, &mut ui);
+        }
+        handle_key(key(KeyCode::Up), &model, &mut ui);
+        assert_eq!(ui.composer.cursor(), 2, "column kept on the line above");
+        handle_key(key(KeyCode::Left), &model, &mut ui);
+        handle_key(ch('X'), &model, &mut ui);
+        assert_eq!(ui.composer.buffer(), "aXb\ncd", "typed at the cursor");
+        assert!(
+            ui.scroll.follow,
+            "cursor motion never touched the transcript scroll"
         );
     }
 
@@ -534,12 +676,35 @@ mod tests {
         for c in "mysql".chars() {
             handle_key(ch(c), &model, &mut ui);
         }
-        let action = handle_key(key(KeyCode::Enter), &model, &mut ui);
+        let action = handle_key(cmd_enter(), &model, &mut ui);
         assert_eq!(
             action,
             ShellAction::Submit(UserInput::AskUserAnswer {
                 id: "call_ask_1".into(),
                 answer: "mysql".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn ask_user_free_text_answer_can_span_lines() {
+        // Plain ⏎ while a question is pending is a line break in the answer,
+        // not a submit — the chord dispatches the whole multi-line text.
+        let model = model_with_ask();
+        let mut ui = UiState::default();
+        for c in "two".chars() {
+            handle_key(ch(c), &model, &mut ui);
+        }
+        handle_key(key(KeyCode::Enter), &model, &mut ui);
+        for c in "lines".chars() {
+            handle_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_key(cmd_enter(), &model, &mut ui);
+        assert_eq!(
+            action,
+            ShellAction::Submit(UserInput::AskUserAnswer {
+                id: "call_ask_1".into(),
+                answer: "two\nlines".into(),
             })
         );
     }

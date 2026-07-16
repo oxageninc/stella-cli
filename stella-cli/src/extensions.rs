@@ -251,8 +251,12 @@ pub fn sync_extensions(workspace_root: &Path, emit: &mut dyn FnMut(String)) {
     for (scope, dest, sources) in scopes {
         let outcome = sync_into(&dest, &sources);
         if let Some(summary) = outcome.summary() {
+            let skipped = match outcome.skipped {
+                0 => String::new(),
+                n => format!(", {n} already present"),
+            };
             emit(format!(
-                "✓ adopted {summary} from .claude/.agents ({scope} scope)"
+                "✓ adopted {summary} from .claude/.agents ({scope} scope{skipped})"
             ));
         }
         for error in &outcome.errors {
