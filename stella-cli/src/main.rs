@@ -18,6 +18,7 @@
 //!   human-readable output).
 
 mod agent;
+mod agents_installed;
 mod command_deck;
 mod config;
 mod domains;

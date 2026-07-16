@@ -57,20 +57,22 @@ use serde_json::Value;
 use stella_core::ports::ToolExecutor;
 use stella_core::router::{CircuitBreaker, ProviderProfile};
 use stella_core::{BudgetGuard, CalibrationMap, Engine, RoleTable, Router, TurnOutcome};
+use stella_model::provider::Provider;
 use stella_pipeline::{
     AutoApproveGate, ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig, PipelinePorts,
     PipelineStatus, ProviderResolver,
 };
-use stella_model::provider::Provider;
 use stella_protocol::{
-    AgentEvent, CompletionMessage, FileChangeKind, ModelRef, ToolOutput, ToolSchema,
+    AgentEvent, CompletionMessage, CompletionRequest, FileChangeKind, ModelRef, ToolOutput,
+    ToolSchema,
 };
 use stella_store::Store;
 use stella_tools::ToolRegistry;
 use stella_tools::custom::{CustomTool, CustomToolSet};
 use stella_tools::hook_runner::ShellHookRunner;
 use stella_tui::{
-    AgentMeta, AgentStatus, DeckOptions, Inbound, SlashCommand, UserInput, WorkspaceInput, run_deck,
+    AgentMeta, AgentScope, AgentStatus, DeckOptions, Inbound, SlashCommand, UserInput,
+    WorkspaceInput, run_deck,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -360,6 +362,10 @@ pub async fn run_deck_session(
     // Session-local, OFF at start — mirrored to the PIPELINE stat box via
     // `Inbound::Pipeline`.
     let mut pipeline_on = false;
+    // An agent-creation request that arrived mid-turn: drafting needs the
+    // provider (borrowed by the running turn), so it parks here and runs
+    // right after the turn settles.
+    let mut pending_create: Option<(String, AgentScope)> = None;
     'session: loop {
         // Take the next prompt: backlog first (unless held), else wait for
         // deck input.
@@ -413,9 +419,21 @@ pub async fn run_deck_session(
                     requeue_front(&mut queue, &in_tx, dispatch.stop_and_hold(None));
                     continue 'session;
                 }
-                // A stray answer/decision/control with no turn in flight has
-                // nothing to act on.
-                Some(_) => continue 'session,
+                // LLM-assisted agent creation needs the provider, which is
+                // free here (no turn in flight) — draft, install, refresh.
+                Some(WorkspaceInput::AgentCreate { description, scope }) => {
+                    handle_agent_create(&description, scope, cfg, &*provider, &in_tx).await;
+                    continue 'session;
+                }
+                // The INSTALLED AGENTS pane's synchronous ops (refresh /
+                // save / pin) are pure filesystem work — the shared helper
+                // serves this idle site and the in-turn site alike. A stray
+                // answer/decision/control with no turn in flight falls
+                // through it with nothing to act on.
+                Some(other) => {
+                    handle_agents_input(&other, cfg, &in_tx);
+                    continue 'session;
+                }
             },
         };
 
@@ -590,6 +608,30 @@ pub async fn run_deck_session(
                         Some(WorkspaceInput::StopAndHold { .. }) => {
                             break TurnEnd::Cancelled { hold: true }
                         }
+                        // The INSTALLED AGENTS pane stays live while a turn
+                        // runs — refresh / save / pin are pure filesystem
+                        // ops, the same shared helper as the idle recv site.
+                        Some(
+                            input @ (WorkspaceInput::AgentsRefresh
+                            | WorkspaceInput::AgentSave { .. }
+                            | WorkspaceInput::AgentPin { .. }),
+                        ) => {
+                            handle_agents_input(&input, cfg, &in_tx);
+                        }
+                        // Creation needs the provider, which the running
+                        // turn is borrowing — park it; it runs the moment
+                        // the turn settles (see `pending_create`).
+                        Some(WorkspaceInput::AgentCreate { description, scope }) => {
+                            pending_create = Some((description, scope));
+                            let _ = in_tx.send(agents_list_inbound(
+                                &cfg.workspace_root,
+                                Some(
+                                    "agent creation queued — it runs when the current turn \
+                                     finishes"
+                                        .to_string(),
+                                ),
+                            ));
+                        }
                         // Scope review is not engine-driven yet, and deep
                         // pause/resume/restart need the fleet supervisor —
                         // both named seams, both no-ops here.
@@ -679,6 +721,12 @@ pub async fn run_deck_session(
             }
             TurnEnd::Quit => break 'session,
         }
+
+        // A creation request parked during the turn: the provider is free
+        // again, so draft + install it before the next dispatch.
+        if let Some((description, scope)) = pending_create.take() {
+            handle_agent_create(&description, scope, cfg, &*provider, &in_tx).await;
+        }
     }
 
     // Closing our inbound sender ends the deck's stream if the user hasn't
@@ -740,8 +788,14 @@ const DECK_BUILTINS: &[(&str, &str)] = &[
     ("/clear", "reset the conversation"),
     ("/models", "list providers & models"),
     ("/init", "index the workspace: domains + code graph"),
-    ("/agents", "list custom agents"),
-    ("/pipeline", "toggle the staged pipeline (witness-verified turns)"),
+    (
+        "/agents",
+        "open the Agents tab: executions & installed agents",
+    ),
+    (
+        "/pipeline",
+        "toggle the staged pipeline (witness-verified turns)",
+    ),
     ("/files", "open the Files tab"),
     ("/diff", "open the diff viewer"),
     ("/graph", "open the code-graph tab"),
@@ -750,6 +804,167 @@ const DECK_BUILTINS: &[(&str, &str)] = &[
 /// The deck's reserved command names — see [`DECK_BUILTINS`].
 fn deck_reserved() -> Vec<&'static str> {
     DECK_BUILTINS.iter().map(|(name, _)| *name).collect()
+}
+
+// ── Installed-agents manager (the AGENTS tab's INSTALLED AGENTS pane) ───────
+
+/// Build an [`Inbound::AgentsList`] from the definitions on disk at both
+/// scopes. `status`, when set, replaces the pane's hint line.
+fn agents_list_inbound(workspace_root: &std::path::Path, status: Option<String>) -> Inbound {
+    let project = crate::agents_installed::project_agents_dir(workspace_root);
+    let user = crate::agents_installed::user_agents_dir();
+    Inbound::AgentsList {
+        entries: crate::agents_installed::discover(user.as_deref(), &project),
+        status,
+    }
+}
+
+/// Handle one synchronous installed-agents op (refresh / save / pin) —
+/// pure filesystem work, answered with a fresh [`Inbound::AgentsList`].
+/// Called from BOTH the idle and the in-turn recv sites, so the manager
+/// works whether or not a turn is running. Returns `true` when the input
+/// was one of the manager's; anything else is left to the caller's arms.
+fn handle_agents_input(
+    input: &WorkspaceInput,
+    cfg: &Config,
+    in_tx: &UnboundedSender<Inbound>,
+) -> bool {
+    let root = &cfg.workspace_root;
+    match input {
+        WorkspaceInput::AgentsRefresh => {
+            let _ = in_tx.send(agents_list_inbound(root, None));
+            true
+        }
+        WorkspaceInput::AgentSave {
+            name,
+            scope,
+            content,
+        } => {
+            let status = save_agent(root, name, *scope, content);
+            let _ = in_tx.send(agents_list_inbound(root, Some(status)));
+            true
+        }
+        WorkspaceInput::AgentPin {
+            name,
+            scope,
+            version,
+        } => {
+            let status = pin_agent(root, name, *scope, *version);
+            let _ = in_tx.send(agents_list_inbound(root, Some(status)));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The edit-save path: archive-then-write a NEW version and pin it (see
+/// `agents_installed::save_new_version`). Returns the pane's status line.
+fn save_agent(root: &std::path::Path, name: &str, scope: AgentScope, content: &str) -> String {
+    let dir = match crate::agents_installed::agents_dir_for(scope, root) {
+        Ok(dir) => dir,
+        Err(e) => return format!("save failed: {e}"),
+    };
+    let slug = crate::agents_installed::find_slug(&dir, name)
+        .unwrap_or_else(|| crate::agents_installed::slugify(name));
+    match crate::agents_installed::save_new_version(&dir, &slug, content) {
+        Ok(version) => format!(
+            "saved {name} — v{version} is now pinned (previous versions preserved under \
+             .versions/{slug}/)"
+        ),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+/// The pin-set path: re-point the pin at an existing version — never
+/// creates one. Returns the pane's status line.
+fn pin_agent(root: &std::path::Path, name: &str, scope: AgentScope, version: u32) -> String {
+    let dir = match crate::agents_installed::agents_dir_for(scope, root) {
+        Ok(dir) => dir,
+        Err(e) => return format!("pin failed: {e}"),
+    };
+    let Some(slug) = crate::agents_installed::find_slug(&dir, name) else {
+        return format!(
+            "no installed agent named {name} at the {} scope",
+            scope.label()
+        );
+    };
+    match crate::agents_installed::pin_version(&dir, &slug, version) {
+        Ok(()) => format!("{name} pinned to v{version} — no new version written"),
+        Err(e) => format!("pin failed: {e}"),
+    }
+}
+
+/// LLM-assisted create-from-prompt: draft the definition through the
+/// session's provider (the same one-shot `Provider::complete` path the
+/// reflection module uses — no hand-rolled HTTP), validate it with the real
+/// loader parser, install it at `scope`, and answer with a fresh list.
+async fn handle_agent_create(
+    description: &str,
+    scope: AgentScope,
+    cfg: &Config,
+    provider: &dyn Provider,
+    in_tx: &UnboundedSender<Inbound>,
+) {
+    let status = match create_agent(description, scope, cfg, provider).await {
+        Ok(status) => status,
+        Err(e) => format!("agent creation failed: {e}"),
+    };
+    let _ = in_tx.send(agents_list_inbound(&cfg.workspace_root, Some(status)));
+}
+
+async fn create_agent(
+    description: &str,
+    scope: AgentScope,
+    cfg: &Config,
+    provider: &dyn Provider,
+) -> Result<String, String> {
+    let req = CompletionRequest {
+        messages: crate::agents_installed::creation_messages(description),
+        max_output_tokens: Some(1200),
+        temperature: Some(0.2),
+        effort: None,
+        tools: vec![],
+    };
+    let result = provider
+        .complete(req)
+        .await
+        .map_err(|e| format!("draft call failed: {e}"))?;
+    let agent = crate::agents_installed::parse_generated_agent(&result.text)?;
+    let dir = crate::agents_installed::agents_dir_for(scope, &cfg.workspace_root)?;
+    let path = crate::agents_installed::install_new_agent(&dir, &agent)?;
+    Ok(format!(
+        "created {} ({} scope) at {} — v1 pinned",
+        agent.name,
+        scope.label(),
+        path.display()
+    ))
+}
+
+/// Cap on the free-text `reason` stamped on an agent-use telemetry row.
+const AGENT_USE_REASON_MAX: usize = 120;
+
+/// Record the agent-usage telemetry for a `/agent-name task…` invocation:
+/// resolution mirrors `CustomExtensions::expand` (commands shadow skills
+/// shadow agents — only a real agent invocation records), `version` is the
+/// definition's pinned version at this moment, `reason` is the task
+/// snippet. The row rides the registry's ledger and is drained into
+/// store.db by `agent::record_execution_end` under the execution the
+/// expanded prompt runs as.
+fn record_agent_invocation(
+    input: &str,
+    custom: &crate::extensions::CustomExtensions,
+    registry: &ToolRegistry,
+) {
+    let trimmed = input.trim();
+    let (head, args) = match trimmed.split_once(char::is_whitespace) {
+        Some((head, args)) => (head, args),
+        None => (trimmed, ""),
+    };
+    if let Some(crate::extensions::Invocation::Agent(agent)) = custom.lookup(head) {
+        let version = crate::agents_installed::active_version_for_source(&agent.source_path);
+        let reason: String = args.trim().chars().take(AGENT_USE_REASON_MAX).collect();
+        registry.record_agent_use(&agent.name, version, &reason);
+    }
 }
 
 /// The deck's slash vocabulary: the productized commands (🔒) followed by
@@ -803,9 +1018,9 @@ async fn run_deck_command(
         "/help" => {
             let mut help = "commands: /help · /clear (reset conversation) · /models (list \
                  providers) · /init (index the workspace: domains + code graph) · /agents \
-                 (list custom agents) · /pipeline (toggle witness-verified staged turns) · \
-                 /files · /diff · /graph (switch tabs) — anything \
-                 else is a prompt. ctrl+t queue · ? overlay help"
+                 (open the Agents tab: executions & installed agents) · /pipeline (toggle \
+                 witness-verified staged turns) · /files · /diff · /graph (switch tabs) — \
+                 anything else is a prompt. ctrl+t queue · ? overlay help"
                 .to_string();
             let customs = custom.slash_entries(&[]);
             if !customs.is_empty() {
@@ -813,9 +1028,6 @@ async fn run_deck_command(
                 help.push_str(&format!("\ncustom (⚡): {}", names.join(" · ")));
             }
             say(help);
-        }
-        "/agents" => {
-            say(custom.render_agent_list());
         }
         "/clear" => {
             messages.clear();
@@ -857,16 +1069,20 @@ async fn run_deck_command(
                 Err(e) => say(format!("init failed: {e}")),
             }
         }
-        // Deck-local tab commands are normally consumed TUI-side, but a queued
-        // one reaches here — accept it as handled (a no-op) rather than
-        // calling it "unknown".
-        "/files" | "/diff" | "/graph" => {}
+        // Deck-local commands (tab switches, `/agents` opening the Agents
+        // tab) are normally consumed TUI-side, but a queued one reaches
+        // here — accept it as handled (a no-op) rather than calling it
+        // "unknown".
+        "/files" | "/diff" | "/graph" | "/agents" => {}
         _ => {
-            // A custom command/skill (⚡): expand its template — arguments
-            // and all — into the prompt the model turn runs. Reserved names
-            // never reach a custom definition (`/init do the thing` stays a
-            // model prompt even if a custom `init` exists).
+            // A custom command/skill/agent (⚡): expand its template —
+            // arguments and all — into the prompt the model turn runs.
+            // Reserved names never reach a custom definition (`/init do the
+            // thing` stays a model prompt even if a custom `init` exists).
+            // An AGENT invocation additionally records a usage-telemetry
+            // row (agent, pinned version, task) on the registry's ledger.
             if let Some(expanded) = custom.expand(trimmed, &deck_reserved()) {
+                record_agent_invocation(trimmed, custom, registry);
                 return DeckCommand::Expanded(expanded);
             }
             // A bare unknown /word is a typo'd command, not a prompt — say so

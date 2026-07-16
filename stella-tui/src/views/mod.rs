@@ -6,5 +6,6 @@
 pub mod agents;
 pub mod files;
 pub mod graph;
+pub mod installed;
 pub mod session;
 pub mod traces;

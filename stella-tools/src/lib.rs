@@ -6,6 +6,7 @@
 //! configured root, and `cd` inside `bash` cannot silently diverge the root
 //! for subsequent file operations (L-S2).
 
+pub mod agent_use;
 pub mod bash;
 pub mod ci;
 pub mod custom;

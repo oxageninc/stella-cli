@@ -400,8 +400,10 @@ pub async fn run_deck(
                     // (the guard enabled it), so the composer can fold it
                     // into a chip instead of replaying N raw Enter keys —
                     // each of which would have submitted a separate prompt.
+                    // Routed by the UI: the agent-definition editor claims
+                    // it while open (`DeckUi::paste`).
                     Some(Event::Paste(text)) => {
-                        ui.composer.paste(&text);
+                        ui.paste(&text);
                     }
                     // Resize / mouse: the next draw picks them up.
                     Some(_) => {}

@@ -2029,11 +2029,13 @@ fn spawn_renderer(
 /// Best-effort end-of-execution records: the session's file-touch telemetry
 /// (read straight off the registry's ledger), the memory citations the
 /// `cite_memory` tool collected this turn (drained, so each lands under
-/// exactly one execution — the promotion gate counts them), and how the run
-/// ended. A failure must not abort the turn, but it must not vanish either —
-/// the store is the durable audit record of what the agent did. Returns
-/// `false` when any write failed so the caller can surface a warning on its
-/// own channel (stderr for the CLI surfaces, a deck event for the TUI, where
+/// exactly one execution — the promotion gate counts them), the
+/// agent-invocation log (also drained — each invocation is attributed to
+/// exactly the execution it happened under), and how the run ended. A
+/// failure must not abort the turn, but it must not vanish either — the
+/// store is the durable audit record of what the agent did. Returns `false`
+/// when any write failed so the caller can surface a warning on its own
+/// channel (stderr for the CLI surfaces, a deck event for the TUI, where
 /// stderr belongs to the alternate screen).
 pub(crate) fn record_execution_end(
     store: &Store,
@@ -2048,10 +2050,20 @@ pub(crate) fn record_execution_end(
     let citations_ok = store
         .record_memory_citations(execution_id, &citations)
         .is_ok();
+    let uses: Vec<stella_store::AgentUseRow> = registry
+        .drain_agent_uses()
+        .into_iter()
+        .map(|u| stella_store::AgentUseRow {
+            agent: u.agent,
+            version: u.version,
+            reason: u.reason,
+        })
+        .collect();
+    let uses_ok = uses.is_empty() || store.record_agent_uses(execution_id, &uses).is_ok();
     let finish_ok = store
         .finish_execution(execution_id, outcome_label, cost_usd)
         .is_ok();
-    files_ok && citations_ok && finish_ok
+    files_ok && citations_ok && uses_ok && finish_ok
 }
 
 /// The registry's session file-touch telemetry as store rows: one per

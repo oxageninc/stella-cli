@@ -76,7 +76,10 @@ pub use deck::{
 pub use deck_render::render_deck;
 pub use deck_shell::{DeckOptions, run_deck};
 pub use deck_ui::{DeckAction, DeckUi, handle_deck_key, ingest_inbound};
-pub use envelope::{AgentControl, AgentId, AgentMeta, AgentStatus, Inbound, WorkspaceInput};
+pub use envelope::{
+    AgentControl, AgentId, AgentMeta, AgentScope, AgentStatus, AgentVersionInfo, Inbound,
+    InstalledAgentEntry, WorkspaceInput,
+};
 pub use graph::{GraphEdge, GraphNode, GraphSnapshot};
 pub use resource::ResourceMonitor;
 pub use splash::SplashState;

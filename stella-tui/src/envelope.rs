@@ -149,6 +149,72 @@ pub enum Inbound {
     /// raw engine loop. Folded into [`crate::deck::WorkspaceModel::pipeline`]
     /// so the `PIPELINE` stat box flips live.
     Pipeline(bool),
+    /// The installed-agents list for the Agents tab's INSTALLED AGENTS pane.
+    /// Out-of-band view state (applied straight to `DeckUi::installed` by
+    /// [`crate::deck_ui::ingest_inbound`], ignored by the model fold). The
+    /// driver — which owns the definitions on disk — sends one when the pane
+    /// asks ([`WorkspaceInput::AgentsRefresh`]) and after every save / pin /
+    /// create so the list stays live. `status`, when set, replaces the
+    /// pane's hint line (op outcomes, errors).
+    AgentsList {
+        entries: Vec<InstalledAgentEntry>,
+        status: Option<String>,
+    },
+}
+
+/// Which config level an installed agent definition lives at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentScope {
+    /// The workspace's `.stella/agents/` directory.
+    Project,
+    /// The user's `~/.config/stella/agents/` directory.
+    User,
+}
+
+impl AgentScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentScope::Project => "project",
+            AgentScope::User => "user",
+        }
+    }
+}
+
+/// One selectable version of an installed agent (the version picker's row).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentVersionInfo {
+    /// 1-based version number.
+    pub version: u32,
+    /// Short display label (e.g. the version file's modification time), or
+    /// empty when none was available.
+    pub label: String,
+}
+
+/// One installed agent as the Agents tab's INSTALLED AGENTS pane lists it
+/// (see [`Inbound::AgentsList`]). Decoupled from `stella-core`'s `AgentDef`
+/// so the TUI crate stays independent of the extensions engine — the driver
+/// maps one to the other and adds the version/scope bookkeeping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledAgentEntry {
+    /// The agent's loaded definition name.
+    pub name: String,
+    /// One-line description shown beside the name.
+    pub description: String,
+    /// The toolbelt grant from the definition's `tools:` frontmatter.
+    /// `None` = the definition does not restrict tools — the agent gets
+    /// **all** tools, and the pane says so honestly.
+    pub tools: Option<Vec<String>>,
+    /// Which config level the definition lives at.
+    pub scope: AgentScope,
+    /// The definition file the loader reads (display/provenance).
+    pub source_path: String,
+    /// The pinned (active) version — 1 for a never-versioned agent.
+    pub version: u32,
+    /// Every version on disk, oldest first. Always contains `version`.
+    pub versions: Vec<AgentVersionInfo>,
+    /// The pinned version's full file content (frontmatter + body) — what
+    /// the editor loads.
+    pub content: String,
 }
 
 /// What the deck sends back to the caller / engine. The single-session
@@ -185,6 +251,33 @@ pub enum WorkspaceInput {
     /// Esc is the plain [`AgentControl::Stop`]: cancel, and the next queued
     /// prompt dispatches automatically.
     StopAndHold { agent: AgentId },
+    /// The INSTALLED AGENTS pane opened (or wants a reload): enumerate the
+    /// agent definitions installed at both scopes and answer with
+    /// [`Inbound::AgentsList`].
+    AgentsRefresh,
+    /// Save an edited agent definition as a NEW version and pin it — the
+    /// prior version is preserved on disk (see `stella-cli`'s
+    /// `agents_installed` module for the on-disk scheme). The driver
+    /// answers with a fresh [`Inbound::AgentsList`].
+    AgentSave {
+        name: String,
+        scope: AgentScope,
+        content: String,
+    },
+    /// Re-pin an existing version WITHOUT editing — the version count never
+    /// changes on a pin (increments happen only on [`WorkspaceInput::AgentSave`]).
+    AgentPin {
+        name: String,
+        scope: AgentScope,
+        version: u32,
+    },
+    /// Create a new agent from a short description with LLM assistance: the
+    /// driver drafts the definition through the session's provider, installs
+    /// it at `scope`, and answers with a fresh [`Inbound::AgentsList`].
+    AgentCreate {
+        description: String,
+        scope: AgentScope,
+    },
     /// Tear down the deck.
     Quit,
 }

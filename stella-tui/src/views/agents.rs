@@ -1,18 +1,24 @@
-//! Agents tab — the flagship `htop`/`claudectl`-style dashboard: one dense
-//! row per agent with live status, spend, resource usage, and activity.
+//! AGENTS tab — a two-pane view behind a one-line secondary nav
+//! (EXECUTIONS | INSTALLED AGENTS, switched with ←/→):
+//!
+//! - **EXECUTIONS** (this module): the flagship `htop`/`claudectl`-style
+//!   dashboard — one dense row per ACTIVE agent with live status, spend,
+//!   resource usage, and activity.
+//! - **INSTALLED AGENTS** ([`crate::views::installed`]): the agents
+//!   configured on disk at the user/project level.
 //!
 //! Every color comes from [`crate::theme`]; every number is read straight off
 //! [`crate::deck::AgentEntry`] (no shadow state, no re-derivation of what the
 //! model already computed).
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Widget};
 
 use crate::deck::{ACTIVITY_WINDOW, AgentEntry, WorkspaceModel};
-use crate::deck_ui::DeckUi;
+use crate::deck_ui::{AgentsPane, DeckUi};
 use crate::theme;
 
 /// Column headers, in display order — matches the `widths` array in
@@ -28,13 +34,52 @@ const HEADERS: [&str; 11] = [
 const GOAL_MAX_CHARS: usize = 56;
 
 pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    // The one-line secondary nav, then the active pane below it.
+    let bands = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    render_pane_nav(ui.agents_pane, bands[0], buf);
+    match ui.agents_pane {
+        AgentsPane::Executions => render_executions(model, ui, bands[1], buf),
+        AgentsPane::Installed => crate::views::installed::render(ui, bands[1], buf),
+    }
+}
+
+/// The secondary nav line: the two pane labels (UPPERCASE, like the deck's
+/// tab labels), active in amber, plus the switch hint.
+fn render_pane_nav(pane: AgentsPane, area: Rect, buf: &mut Buffer) {
+    if area.height == 0 {
+        return;
+    }
+    let style_for = |active: bool| {
+        if active {
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme::muted()
+        }
+    };
+    let line = Line::from(vec![
+        Span::raw("  "),
+        Span::styled("EXECUTIONS", style_for(pane == AgentsPane::Executions)),
+        Span::styled("  │  ", theme::muted()),
+        Span::styled("INSTALLED AGENTS", style_for(pane == AgentsPane::Installed)),
+        Span::styled("   ←/→", theme::muted()),
+    ]);
+    Paragraph::new(line).render(area, buf);
+}
+
+/// The EXECUTIONS pane — the pre-existing active-agents dashboard.
+fn render_executions(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
     if model.agents.is_empty() {
         render_empty(area, buf);
         return;
     }
 
     let title = format!(
-        " Agents — {} active / {} total ",
+        " Executions — {} active / {} total ",
         model.active_count(),
         model.agents.len()
     );
@@ -169,7 +214,7 @@ fn agent_row(entry: &AgentEntry, now_ms: u64, is_focused: bool) -> Row<'static> 
 
 /// The centered, muted "nothing dispatched yet" state.
 fn render_empty(area: Rect, buf: &mut Buffer) {
-    let block = Block::default().borders(Borders::ALL).title(" Agents ");
+    let block = Block::default().borders(Borders::ALL).title(" Executions ");
     let inner = block.inner(area);
     block.render(area, buf);
 
