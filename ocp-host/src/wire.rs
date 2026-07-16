@@ -124,6 +124,52 @@ mod tests {
     }
 
     #[test]
+    fn envelope_kind_matches_the_serialized_type_tag_for_every_variant() {
+        // `envelope_kind` hand-writes the strings serde derives from
+        // `rename_all = "snake_case"`; they feed "expected X, got Y" wire
+        // errors. Without this test, renaming a variant would silently
+        // desynchronize the error text from the actual wire tag.
+        let variants: Vec<Envelope> = vec![
+            Envelope::Handshake {
+                protocol_version: PROTOCOL_VERSION.to_string(),
+            },
+            sample_ack(),
+            Envelope::Query {
+                query: ContextQuery {
+                    goal: "g".into(),
+                    query_text: None,
+                    embedding: None,
+                    kinds: vec![],
+                    anchors: vec![],
+                    max_frames: 1,
+                    max_tokens: 1,
+                    as_of: None,
+                },
+            },
+            Envelope::Frames {
+                result: ContextQueryResult {
+                    frames: vec![],
+                    truncated: false,
+                    dropped_estimate: None,
+                },
+            },
+            Envelope::Shutdown,
+            Envelope::Error {
+                message: "m".into(),
+            },
+        ];
+        for env in &variants {
+            let value: serde_json::Value =
+                serde_json::from_str(encode_line(env).unwrap().trim_end()).unwrap();
+            assert_eq!(
+                value["type"].as_str(),
+                Some(envelope_kind(env)),
+                "envelope_kind drifted from the serde tag for {env:?}"
+            );
+        }
+    }
+
+    #[test]
     fn envelope_roundtrips_through_a_single_ndjson_line() {
         let env = sample_ack();
         let line = encode_line(&env).unwrap();
