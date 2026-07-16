@@ -29,10 +29,11 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use stella_protocol::{BudgetMode, FileChangeKind, MediaKind, PrStatus, StageKind};
+use stella_protocol::FileChangeKind;
 
 use crate::composer::{ComposerLayout, SlashMenu, layout as composer_layout, split_row_at};
 use crate::model::{AskUserPrompt, FileState, Hud, SessionModel, TranscriptEntry};
+use crate::textline::{self, EventLine, Tone, budget_mode_label, stage_label};
 use crate::ui::{PanelFocus, UiState, ViewportMetrics};
 use crate::{diff, theme};
 
@@ -317,7 +318,10 @@ pub(crate) fn render_hud(hud: &Hud, area: Rect, buf: &mut Buffer) {
         Span::raw(hud.model.clone().unwrap_or_else(|| "—".to_string())),
         Span::raw("   "),
         Span::styled("spend: ", Style::new().fg(Color::DarkGray)),
-        Span::styled(spend_label(hud), Style::new().fg(spend_color(hud))),
+        Span::styled(
+            textline::spend_amount(hud.spent_usd, hud.limit_usd),
+            Style::new().fg(spend_color(hud)),
+        ),
     ];
     if let Some(mode) = hud.budget_mode {
         spans.push(Span::styled(
@@ -807,6 +811,12 @@ pub(crate) fn entry_lines(
     out: &mut Vec<Line<'static>>,
 ) {
     match entry {
+        TranscriptEntry::Evicted { count } => out.push(Line::from(Span::styled(
+            format!("… {count} earlier entries evicted"),
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))),
         TranscriptEntry::User(text) => {
             push_labeled_block(
                 "user",
@@ -1232,64 +1242,8 @@ fn file_line(file: &FileState, selected: bool) -> Line<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Labels
+// Labels — wording in `crate::textline`; only palette mapping lives here
 // ---------------------------------------------------------------------------
-
-pub(crate) fn stage_label(stage: StageKind) -> &'static str {
-    match stage {
-        StageKind::Triage => "triage",
-        StageKind::ContextRecall => "context recall",
-        StageKind::Plan => "plan",
-        StageKind::ScopeReview => "scope review",
-        StageKind::Execute => "execute",
-        StageKind::Verify => "verify",
-        StageKind::Judge => "judge",
-        StageKind::Reflect => "reflect",
-        StageKind::ContextWrite => "context write",
-        StageKind::Complete => "complete",
-    }
-}
-
-fn budget_mode_label(mode: BudgetMode) -> &'static str {
-    match mode {
-        BudgetMode::Off => "off",
-        BudgetMode::Observed => "observed",
-        BudgetMode::Enforced => "enforced",
-    }
-}
-
-fn media_kind_label(kind: MediaKind) -> &'static str {
-    match kind {
-        MediaKind::Image => "image",
-        MediaKind::Svg => "svg",
-        MediaKind::Video => "video",
-    }
-}
-
-fn pr_status_label(status: PrStatus) -> &'static str {
-    match status {
-        PrStatus::Draft => "draft",
-        PrStatus::Open => "open",
-        PrStatus::Merged => "merged",
-        PrStatus::Closed => "closed",
-    }
-}
-
-fn pr_status_color(status: PrStatus) -> Color {
-    match status {
-        PrStatus::Draft => Color::DarkGray,
-        PrStatus::Open => Color::Green,
-        PrStatus::Merged => Color::Magenta,
-        PrStatus::Closed => Color::Red,
-    }
-}
-
-fn spend_label(hud: &Hud) -> String {
-    match hud.limit_usd {
-        Some(limit) => format!("${:.4} / ${:.2}", hud.spent_usd, limit),
-        None => format!("${:.4}", hud.spent_usd),
-    }
-}
 
 fn spend_color(hud: &Hud) -> Color {
     match hud.limit_usd {
@@ -1310,7 +1264,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use stella_protocol::{
-        AgentEvent, FileChangeKind, ScopeProposal, StageKind, ToolCall, ToolOutput,
+        AgentEvent, BudgetMode, FileChangeKind, ScopeProposal, StageKind, ToolCall, ToolOutput,
     };
 
     /// Flatten a `TestBackend` buffer to one `String` per row (styling
@@ -1815,6 +1769,21 @@ mod tests {
             joined.contains("[✗ read_file]"),
             "result labels itself with its tool: {joined}"
         );
+    }
+
+    #[test]
+    fn eviction_marker_renders_as_a_one_line_system_note() {
+        let mut out = Vec::new();
+        entry_lines(
+            &TranscriptEntry::Evicted { count: 1234 },
+            false,
+            false,
+            80,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "the marker costs exactly one visual row");
+        let text: String = out[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "… 1234 earlier entries evicted");
     }
 
     // ---- Replay determinism (L-T1) ------------------------------------

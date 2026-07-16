@@ -103,6 +103,14 @@ pub enum AgentEvent {
         input_tokens: u64,
         output_tokens: u64,
         cached_input_tokens: u64,
+        /// Tokens written to the provider's prompt cache by this call
+        /// (`CompletionUsage::cache_write_tokens`). Reported separately from
+        /// `input_tokens`, never a subset of it. `0` when the provider does
+        /// not report cache writes (the OpenAI-compatible dialects) — hence
+        /// `serde(default)`, so streams serialized before this field existed
+        /// still parse.
+        #[serde(default)]
+        cache_write_tokens: u64,
         /// The engine's RAW (uncalibrated) pre-call estimate of the input it
         /// sent — paired with `input_tokens` this is one drift sample, the
         /// feedback that calibrates future estimates per model
@@ -545,6 +553,7 @@ mod tests {
             input_tokens: 12_000,
             output_tokens: 450,
             cached_input_tokens: 9_000,
+            cache_write_tokens: 2_500,
             estimated_input_tokens: 11_200,
             cost_usd: 0.0042,
             duration_ms: 1_830,
@@ -553,11 +562,13 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"step_usage\""), "{json}");
+        assert!(json.contains("\"cache_write_tokens\":2500"), "{json}");
         let back: AgentEvent = serde_json::from_str(&json).unwrap();
         match back {
             AgentEvent::StepUsage {
                 step,
                 cached_input_tokens,
+                cache_write_tokens,
                 estimated_input_tokens,
                 retries,
                 tool_calls,
@@ -565,6 +576,7 @@ mod tests {
             } => {
                 assert_eq!(step, 3);
                 assert_eq!(cached_input_tokens, 9_000);
+                assert_eq!(cache_write_tokens, 2_500);
                 assert_eq!(estimated_input_tokens, 11_200);
                 assert_eq!(retries, 1);
                 assert_eq!(tool_calls, 4);
@@ -591,6 +603,31 @@ mod tests {
             } => {
                 assert_eq!(estimated_input_tokens, 0);
                 assert_eq!(input_tokens, 12_000);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_usage_from_a_pre_cache_write_stream_still_parses() {
+        // Backward compatibility: a `step_usage` line serialized before
+        // `cache_write_tokens` existed (but after `estimated_input_tokens`)
+        // must deserialize with the field defaulting to 0 ("provider
+        // reported no cache writes") — the additive-only wire contract.
+        let legacy = r#"{"type":"step_usage","step":3,"model":"glm-5.2","input_tokens":12000,
+            "output_tokens":450,"cached_input_tokens":9000,"estimated_input_tokens":11200,
+            "cost_usd":0.0042,"duration_ms":1830,"retries":1,"tool_calls":4}"#;
+        let back: AgentEvent = serde_json::from_str(legacy).unwrap();
+        match back {
+            AgentEvent::StepUsage {
+                cache_write_tokens,
+                cached_input_tokens,
+                estimated_input_tokens,
+                ..
+            } => {
+                assert_eq!(cache_write_tokens, 0);
+                assert_eq!(cached_input_tokens, 9_000);
+                assert_eq!(estimated_input_tokens, 11_200);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

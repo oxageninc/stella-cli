@@ -227,6 +227,14 @@ struct AnthropicUsage {
     /// them at the cheaper cache rate rather than dropping them.
     #[serde(default)]
     cache_read_input_tokens: u64,
+    /// Tokens WRITTEN to the prompt cache by this call — also reported
+    /// separately from `input_tokens`. Surfaced as the normalized
+    /// `cache_write_tokens` (telemetry, `stella stats`) but deliberately NOT
+    /// folded into `input_tokens`: Anthropic bills cache writes at a premium
+    /// rate the catalog does not carry yet, so folding them in would
+    /// misprice them as plain input (see `Pricing::cost_usd`).
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
 }
 
 fn to_anthropic_messages(
@@ -410,6 +418,7 @@ async fn aggregate_anthropic_stream(
                     if let Some(u) = message.usage {
                         usage.input_tokens = u.input_tokens + u.cache_read_input_tokens;
                         usage.cached_input_tokens = u.cache_read_input_tokens;
+                        usage.cache_write_tokens = u.cache_creation_input_tokens;
                     }
                 }
                 Ok(AnthropicStreamEvent::ContentBlockStart {
@@ -447,6 +456,9 @@ async fn aggregate_anthropic_stream(
                         }
                         if u.cache_read_input_tokens > 0 {
                             usage.cached_input_tokens = u.cache_read_input_tokens;
+                        }
+                        if u.cache_creation_input_tokens > 0 {
+                            usage.cache_write_tokens = u.cache_creation_input_tokens;
                         }
                         usage.output_tokens = u.output_tokens;
                     }
@@ -841,6 +853,48 @@ mod tests {
         assert_eq!(result.model, "claude-fable-5");
     }
 
+    /// Cache accounting: `message_start` reports `cache_read_input_tokens`
+    /// and `cache_creation_input_tokens` separately from `input_tokens`.
+    /// Reads fold into `input_tokens` (subset invariant) and surface as
+    /// `cached_input_tokens`; writes surface as `cache_write_tokens` WITHOUT
+    /// folding in — the catalog has no cache-write rate, so pricing them as
+    /// plain input would be wrong in the other direction (issue #97).
+    #[tokio::test]
+    async fn complete_reports_cache_write_tokens_from_the_usage_envelope() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":0,\"cache_read_input_tokens\":900,\"cache_creation_input_tokens\":650}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(ApiKey::new("sk-test"), "claude-fable-5")
+            .with_base_url(server.uri());
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage::user("hi")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+        };
+
+        let result = provider.complete(req).await.expect("should succeed");
+        // Reads folded in: 100 fresh + 900 read-from-cache.
+        assert_eq!(result.usage.input_tokens, 1_000);
+        assert_eq!(result.usage.cached_input_tokens, 900);
+        // Writes surfaced, not folded: input_tokens stays 1_000.
+        assert_eq!(result.usage.cache_write_tokens, 650);
+        assert_eq!(result.usage.output_tokens, 7);
+    }
+
     #[tokio::test]
     async fn complete_reassembles_a_streamed_tool_use_block() {
         let server = MockServer::start().await;
@@ -1074,6 +1128,7 @@ mod tests {
                 input_tokens: 1000,
                 output_tokens: 500,
                 cached_input_tokens: 0,
+                cache_write_tokens: 0,
             });
         assert!(result.cost_usd > 0.0, "cost must be non-zero");
         assert_eq!(result.cost_usd, expected);

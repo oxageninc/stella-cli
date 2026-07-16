@@ -97,6 +97,17 @@ pub struct CompletionUsage {
     pub output_tokens: u64,
     #[serde(default)]
     pub cached_input_tokens: u64,
+    /// Tokens WRITTEN to the provider's prompt cache by this call
+    /// (Anthropic `cache_creation_input_tokens`, Bedrock
+    /// `cacheWriteInputTokens`). Unlike `cached_input_tokens` this is NOT a
+    /// subset of `input_tokens` — providers report writes separately, and
+    /// folding them into `input_tokens` would change cost accounting
+    /// (`Pricing::cost_usd` carries no cache-write rate). 0 for providers
+    /// that never report cache writes (the OpenAI-compatible dialects).
+    /// `serde(default)` so envelopes serialized before this field existed
+    /// still parse.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
 }
 
 /// The result of a completion.
@@ -146,6 +157,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 20,
                 cached_input_tokens: 0,
+                cache_write_tokens: 0,
             },
             model: "glm-5.2".into(),
             cost_usd: 0.0012,
@@ -158,6 +170,31 @@ mod tests {
         let back: CompletionResult = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.model, "glm-5.2");
         assert_eq!(back.usage.input_tokens, 100);
+    }
+
+    #[test]
+    fn completion_usage_roundtrips_cache_write_tokens() {
+        let usage = CompletionUsage {
+            input_tokens: 1_000,
+            output_tokens: 50,
+            cached_input_tokens: 400,
+            cache_write_tokens: 600,
+        };
+        let json = serde_json::to_string(&usage).expect("serialize");
+        assert!(json.contains("\"cache_write_tokens\":600"), "{json}");
+        let back: CompletionUsage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, usage);
+    }
+
+    #[test]
+    fn completion_usage_without_cache_write_tokens_still_parses() {
+        // Backward compatibility: a usage envelope serialized before
+        // `cache_write_tokens` existed must deserialize with the field
+        // defaulting to 0 — the `serde(default)` contract.
+        let legacy = r#"{"input_tokens":100,"output_tokens":20,"cached_input_tokens":30}"#;
+        let back: CompletionUsage = serde_json::from_str(legacy).expect("deserialize");
+        assert_eq!(back.cached_input_tokens, 30);
+        assert_eq!(back.cache_write_tokens, 0);
     }
 
     #[test]

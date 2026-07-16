@@ -275,6 +275,18 @@ All file tools are workspace-root-pinned, and every read/write/edit/delete is
 recorded in the Files-Touched ledger (shown per turn as `[C·R·U·D] path`, also
 via `/files`).
 
+**Opt-in bash sandbox:** `STELLA_BASH_SANDBOX=workspace-write` confines `bash`
+file writes to the workspace root plus the standard tmp dirs (network still
+allowed); `restricted` additionally denies all network. Backends:
+`sandbox-exec` (Seatbelt) on macOS, `bwrap` (bubblewrap) on Linux. This bounds
+the blast radius of prompt injection — instructions hidden in a file the agent
+reads can steer the model into running arbitrary commands. The tradeoff is
+capability: the sandbox also blocks legitimate work (`cargo` writing
+`~/.cargo`, `npm`/`pip` caches under `$HOME`, `git push` under `restricted`),
+which is why the default is `off`. Fail-closed: an unknown value, a missing
+`bwrap`, or an unsupported platform fails the tool call rather than silently
+running unsandboxed.
+
 **Conditional tools:** issue tools need `LINEAR_API_KEY` or a `gh auth login`;
 `code_graph` needs the `stella init` index; `generate_image` needs
 `ZAI_API_KEY` or `OPENAI_API_KEY`. Without their prerequisites, these tools are

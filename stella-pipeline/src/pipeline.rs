@@ -94,7 +94,8 @@ pub struct PipelinePorts<'a> {
     /// The interactive scope-review gate (L-E5).
     pub approvals: &'a dyn ApprovalGate,
     /// The delay port for retry backoff — the same testability seam
-    /// `stella-core` uses; production passes `&TokioSleeper`, tests a no-op.
+    /// `stella-core` uses; production passes the CLI's tokio-backed
+    /// sleeper, tests a no-op.
     pub sleeper: &'a dyn Sleeper,
     /// Lifecycle hooks for the execute engine — the parsed config plus the
     /// runner that spawns hook commands (`stella_core::hooks`). `None` runs
@@ -279,6 +280,59 @@ impl CandidateResult {
             score: CandidateScore::Failed,
             diff_lines: 0,
             revisions: 0,
+        }
+    }
+}
+
+/// The candidate-local mutable state one execute+verify+revise pass threads
+/// through its phases — grouped so [`Pipeline::run_candidate`]'s sub-methods
+/// take one argument instead of seven. Every exit path moves it into the
+/// returned [`CandidateResult`].
+struct CandidateState {
+    messages: Vec<CompletionMessage>,
+    final_text: String,
+    /// `FileChange` events observed across this candidate's engine turns —
+    /// one half of the zero-diff guard's "touched files" signal (L-E2).
+    file_changes: u32,
+    oracle: FlipOracle,
+    /// Untracked-file fingerprints snapshotted before the first turn, so
+    /// every diff gather can exclude pre-existing dirty state.
+    untracked_before: HashMap<String, String>,
+    diff_lines: u32,
+    diff_text: String,
+    revisions: u32,
+}
+
+impl CandidateState {
+    /// Finish this candidate with a verification verdict — every verified
+    /// exit (deterministic or judged, passed or failed) funnels through here.
+    fn into_verified(
+        self,
+        passed: bool,
+        evidence: &JudgeEvidence,
+        score: CandidateScore,
+    ) -> CandidateResult {
+        CandidateResult {
+            messages: self.messages,
+            final_text: self.final_text,
+            aborted: None,
+            verdict: Some(Verdict::from_evidence(passed, evidence)),
+            score,
+            diff_lines: self.diff_lines,
+            revisions: self.revisions,
+        }
+    }
+
+    /// Finish a clean lookup: verification skipped, no verdict to report.
+    fn into_unverified(self) -> CandidateResult {
+        CandidateResult {
+            messages: self.messages,
+            final_text: self.final_text,
+            aborted: None,
+            verdict: None,
+            score: CandidateScore::Unverified,
+            diff_lines: self.diff_lines,
+            revisions: self.revisions,
         }
     }
 }
@@ -640,10 +694,6 @@ impl<'a> Pipeline<'a> {
         budget: &mut BudgetGuard,
         total: &mut f64,
     ) -> CandidateResult {
-        let mut messages = base_messages.to_vec();
-        let mut file_changes = 0u32;
-        let mut final_text = String::new();
-
         // Flip oracle: for classes we always verify, take a pre-execute
         // baseline of the test command so a later pass counts as a genuine
         // fail→pass flip (L-E11). Simple lookups skip the baseline — they are
@@ -664,112 +714,134 @@ impl<'a> Pipeline<'a> {
         // edited (fingerprint changed) is.
         let untracked_before = self.repo_status.untracked_fingerprints().await;
 
-        // Execute: one turn for simple/single-task; one turn per plan step for
-        // multi-step (each step guides a fresh engine turn).
-        self.emit(AgentEvent::Stage {
-            name: StageKind::Execute,
-        });
-        let steps: Vec<&PlanStep> = plan.map(|p| p.iter().collect()).unwrap_or_default();
-        if steps.is_empty() {
-            match self
-                .run_engine_turn(engine, &mut messages, budget, &mut file_changes)
-                .await
-            {
-                TurnOutcome::Completed { text, cost_usd } => {
-                    final_text = text;
-                    *total += cost_usd;
-                }
-                TurnOutcome::Aborted { reason } => {
-                    return CandidateResult::aborted(messages, reason);
-                }
-            }
-        } else {
-            let n = steps.len();
-            for (i, step) in steps.iter().enumerate() {
-                messages.push(CompletionMessage::user(format!(
-                    "Step {}/{}: {}",
-                    i + 1,
-                    n,
-                    step.description
-                )));
-                match self
-                    .run_engine_turn(engine, &mut messages, budget, &mut file_changes)
-                    .await
-                {
-                    TurnOutcome::Completed { text, cost_usd } => {
-                        final_text = text;
-                        *total += cost_usd;
-                    }
-                    TurnOutcome::Aborted { reason } => {
-                        return CandidateResult::aborted(messages, reason);
-                    }
-                }
-            }
+        let mut state = CandidateState {
+            messages: base_messages.to_vec(),
+            final_text: String::new(),
+            file_changes: 0,
+            oracle,
+            untracked_before,
+            diff_lines: 0,
+            diff_text: String::new(),
+            revisions: 0,
+        };
+
+        if let Err(reason) = self
+            .execute_plan(plan, engine, budget, total, &mut state)
+            .await
+        {
+            return CandidateResult::aborted(state.messages, reason);
         }
 
         // Decide whether to verify: unconditional for single/multi; for a
         // simple lookup, only if the turn unexpectedly touched files (the
         // zero-diff guard, L-E2). "Touched files" = FileChange events observed
         // OR a non-empty diff.
-        let (mut diff_lines, mut diff_text) = self.gather_diff(&untracked_before).await;
-        let files_touched = file_changes > 0 || !diff_text.trim().is_empty();
+        (state.diff_lines, state.diff_text) = self.gather_diff(&state.untracked_before).await;
+        let files_touched = state.file_changes > 0 || !state.diff_text.trim().is_empty();
         let should_verify = task_class.verifies_unconditionally()
             || (task_class == TaskClass::SimpleLookup && files_touched);
         if !should_verify {
             // A clean lookup: nothing to verify.
-            return CandidateResult {
-                messages,
-                final_text,
-                aborted: None,
-                verdict: None,
-                score: CandidateScore::Unverified,
-                diff_lines,
-                revisions: 0,
-            };
+            return state.into_unverified();
         }
 
-        // Verify + bounded revise loop.
+        self.verify_candidate(goal, engine, budget, total, state)
+            .await
+    }
+
+    /// Execute stage: one turn for simple/single-task; one turn per plan step
+    /// for multi-step (each step guides a fresh engine turn). The last turn's
+    /// text lands in `state.final_text`; `Err` is the first aborted turn's
+    /// reason.
+    async fn execute_plan(
+        &self,
+        plan: Option<&[PlanStep]>,
+        engine: &Engine<'_>,
+        budget: &mut BudgetGuard,
+        total: &mut f64,
+        state: &mut CandidateState,
+    ) -> Result<(), String> {
+        self.emit(AgentEvent::Stage {
+            name: StageKind::Execute,
+        });
+        let steps: Vec<&PlanStep> = plan.map(|p| p.iter().collect()).unwrap_or_default();
+        if steps.is_empty() {
+            match self
+                .run_engine_turn(engine, &mut state.messages, budget, &mut state.file_changes)
+                .await
+            {
+                TurnOutcome::Completed { text, cost_usd } => {
+                    state.final_text = text;
+                    *total += cost_usd;
+                }
+                TurnOutcome::Aborted { reason } => return Err(reason),
+            }
+        } else {
+            let n = steps.len();
+            for (i, step) in steps.iter().enumerate() {
+                state.messages.push(CompletionMessage::user(format!(
+                    "Step {}/{}: {}",
+                    i + 1,
+                    n,
+                    step.description
+                )));
+                match self
+                    .run_engine_turn(engine, &mut state.messages, budget, &mut state.file_changes)
+                    .await
+                {
+                    TurnOutcome::Completed { text, cost_usd } => {
+                        state.final_text = text;
+                        *total += cost_usd;
+                    }
+                    TurnOutcome::Aborted { reason } => return Err(reason),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify + bounded revise loop over an executed candidate: observe the
+    /// tests, take the deterministic ladder decision (L-E11), and either
+    /// finish with a verdict, escalate to the model judge, or spend one of
+    /// `max_revisions` on a revise pass and re-observe. Owns `state` because
+    /// every exit moves it into the returned [`CandidateResult`].
+    async fn verify_candidate(
+        &self,
+        goal: &str,
+        engine: &Engine<'_>,
+        budget: &mut BudgetGuard,
+        total: &mut f64,
+        mut state: CandidateState,
+    ) -> CandidateResult {
         self.emit(AgentEvent::Stage {
             name: StageKind::Verify,
         });
-        let mut revisions = 0u32;
         loop {
-            // Post-execute test observation for the flip oracle + touched-tests
-            // signal.
-            let (touched_tests_passed, test_tail) = match &self.config.test_command {
-                Some(cmd) => {
-                    let post = self.commands.run(cmd).await;
-                    let passed = post.passed();
-                    oracle.observe(cmd, passed);
-                    (Some(passed), post.stderr_tail)
-                }
-                None => (None, String::new()),
-            };
+            let (touched_tests_passed, test_tail) =
+                self.observe_touched_tests(&mut state.oracle).await;
             let inputs = LadderInputs {
-                flip_achieved: oracle.is_flipped(),
+                flip_achieved: state.oracle.is_flipped(),
                 touched_tests_passed,
-                diff_lines,
+                diff_lines: state.diff_lines,
                 diff_budget: self.config.diff_budget_lines,
             };
 
             match ladder_decision(&inputs) {
                 LadderDecision::SubmitFast => {
                     // Deterministic pass — judge SKIPPED (L-E11).
-                    let evidence =
-                        deterministic_pass_evidence(oracle.tracked_command(), diff_lines);
+                    let evidence = deterministic_pass_evidence(
+                        state.oracle.tracked_command(),
+                        state.diff_lines,
+                    );
                     self.emit(AgentEvent::JudgeVerdict {
                         passed: true,
                         evidence: evidence.clone(),
                     });
-                    return CandidateResult {
-                        messages,
-                        final_text,
-                        aborted: None,
-                        verdict: Some(Verdict::from_evidence(true, &evidence)),
-                        score: score_from_verification(true, None),
-                        diff_lines,
-                        revisions,
-                    };
+                    return state.into_verified(
+                        true,
+                        &evidence,
+                        score_from_verification(true, None),
+                    );
                 }
                 LadderDecision::Revise => {
                     // Deterministic failure (touched tests red) — no judge.
@@ -778,37 +850,18 @@ impl<'a> Pipeline<'a> {
                         passed: false,
                         evidence: evidence.clone(),
                     });
-                    if revisions >= self.config.max_revisions {
-                        return CandidateResult {
-                            messages,
-                            final_text,
-                            aborted: None,
-                            verdict: Some(Verdict::from_evidence(false, &evidence)),
-                            score: score_from_verification(false, Some(false)),
-                            diff_lines,
-                            revisions,
-                        };
+                    if state.revisions >= self.config.max_revisions {
+                        return state.into_verified(
+                            false,
+                            &evidence,
+                            score_from_verification(false, Some(false)),
+                        );
                     }
-                    match self
-                        .revise_turn(
-                            engine,
-                            &mut messages,
-                            budget,
-                            &evidence.summary,
-                            &mut file_changes,
-                            &mut final_text,
-                            total,
-                            &untracked_before,
-                        )
+                    if let Err(reason) = self
+                        .revise_candidate(engine, budget, &evidence.summary, total, &mut state)
                         .await
                     {
-                        Ok((dl, dt)) => {
-                            diff_lines = dl;
-                            diff_text = dt;
-                            revisions += 1;
-                            continue;
-                        }
-                        Err(reason) => return CandidateResult::aborted(messages, reason),
+                        return CandidateResult::aborted(state.messages, reason);
                     }
                 }
                 LadderDecision::ModelJudge => {
@@ -818,11 +871,18 @@ impl<'a> Pipeline<'a> {
                         "flip_achieved={}; touched_tests={:?}; diff_lines={} (budget {})",
                         inputs.flip_achieved,
                         inputs.touched_tests_passed,
-                        diff_lines,
+                        state.diff_lines,
                         self.config.diff_budget_lines,
                     );
                     let verdict = self
-                        .judge(goal, &diff_text, &evidence_summary, &inputs, budget, total)
+                        .judge(
+                            goal,
+                            &state.diff_text,
+                            &evidence_summary,
+                            &inputs,
+                            budget,
+                            total,
+                        )
                         .await;
                     let evidence = model_verdict_evidence(&verdict);
                     self.emit(AgentEvent::JudgeVerdict {
@@ -830,51 +890,72 @@ impl<'a> Pipeline<'a> {
                         evidence: evidence.clone(),
                     });
                     if verdict.passed {
-                        return CandidateResult {
-                            messages,
-                            final_text,
-                            aborted: None,
-                            verdict: Some(Verdict::from_evidence(true, &evidence)),
-                            score: score_from_verification(false, Some(true)),
-                            diff_lines,
-                            revisions,
-                        };
+                        return state.into_verified(
+                            true,
+                            &evidence,
+                            score_from_verification(false, Some(true)),
+                        );
                     }
-                    if revisions >= self.config.max_revisions {
-                        return CandidateResult {
-                            messages,
-                            final_text,
-                            aborted: None,
-                            verdict: Some(Verdict::from_evidence(false, &evidence)),
-                            score: score_from_verification(false, Some(false)),
-                            diff_lines,
-                            revisions,
-                        };
+                    if state.revisions >= self.config.max_revisions {
+                        return state.into_verified(
+                            false,
+                            &evidence,
+                            score_from_verification(false, Some(false)),
+                        );
                     }
-                    match self
-                        .revise_turn(
-                            engine,
-                            &mut messages,
-                            budget,
-                            &verdict.reasoning,
-                            &mut file_changes,
-                            &mut final_text,
-                            total,
-                            &untracked_before,
-                        )
+                    if let Err(reason) = self
+                        .revise_candidate(engine, budget, &verdict.reasoning, total, &mut state)
                         .await
                     {
-                        Ok((dl, dt)) => {
-                            diff_lines = dl;
-                            diff_text = dt;
-                            revisions += 1;
-                            continue;
-                        }
-                        Err(reason) => return CandidateResult::aborted(messages, reason),
+                        return CandidateResult::aborted(state.messages, reason);
                     }
                 }
             }
         }
+    }
+
+    /// Post-execute test observation for the flip oracle + the touched-tests
+    /// signal: `(Some(passed), stderr tail)` when a test command is
+    /// configured, `(None, "")` when there is nothing to run.
+    async fn observe_touched_tests(&self, oracle: &mut FlipOracle) -> (Option<bool>, String) {
+        match &self.config.test_command {
+            Some(cmd) => {
+                let post = self.commands.run(cmd).await;
+                let passed = post.passed();
+                oracle.observe(cmd, passed);
+                (Some(passed), post.stderr_tail)
+            }
+            None => (None, String::new()),
+        }
+    }
+
+    /// Spend one revision: run [`Pipeline::revise_turn`] with the failure
+    /// evidence and fold the fresh diff back into `state`. `Err` is the abort
+    /// reason of a turn that died mid-revision (budget/loop).
+    async fn revise_candidate(
+        &self,
+        engine: &Engine<'_>,
+        budget: &mut BudgetGuard,
+        reason: &str,
+        total: &mut f64,
+        state: &mut CandidateState,
+    ) -> Result<(), String> {
+        let (diff_lines, diff_text) = self
+            .revise_turn(
+                engine,
+                &mut state.messages,
+                budget,
+                reason,
+                &mut state.file_changes,
+                &mut state.final_text,
+                total,
+                &state.untracked_before,
+            )
+            .await?;
+        state.diff_lines = diff_lines;
+        state.diff_text = diff_text;
+        state.revisions += 1;
+        Ok(())
     }
 
     /// Run one revision turn: append an evidence-carrying instruction, execute,

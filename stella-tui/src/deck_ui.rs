@@ -103,6 +103,10 @@ pub struct DeckUi {
     pub expanded: std::collections::HashMap<String, std::collections::HashSet<usize>>,
     /// Bumped on every expansion toggle so the fold cache invalidates.
     pub expanded_rev: u64,
+    /// Per-agent eviction count last reconciled by [`ingest_inbound`] —
+    /// front-eviction shifts every retained index, so when it advances that
+    /// agent's `expanded` set is stale and must drop.
+    pub evicted_seen: std::collections::HashMap<String, usize>,
     /// Armed by a `ctrl+o` pressed from the prompt (no selection); a second
     /// consecutive `ctrl+o` escalates to the all-thinking toggle. Any other
     /// key disarms.
@@ -140,6 +144,7 @@ impl Default for DeckUi {
             session_pending_scroll: None,
             expanded: std::collections::HashMap::new(),
             expanded_rev: 0,
+            evicted_seen: std::collections::HashMap::new(),
             ctrl_o_primed: false,
             session_fold: crate::views::session::SessionFold::default(),
         }
@@ -230,6 +235,29 @@ fn clamp(model: &WorkspaceModel, ui: &mut DeckUi) {
     } else {
         ui.queue_sel.min(queued - 1)
     };
+    // Front-eviction shifts every retained index: a ctrl+o flag would
+    // silently re-attach to whichever entry slid into its slot, so when an
+    // agent's cumulative eviction count advances its expansion set drops
+    // (bumping the rev invalidates the fold cache).
+    for agent in &model.agents {
+        let evicted = agent.model.evicted_entries();
+        if evicted > ui.evicted_seen.get(&agent.meta.id).copied().unwrap_or(0) {
+            ui.evicted_seen.insert(agent.meta.id.clone(), evicted);
+            if ui.expanded.remove(&agent.meta.id).is_some() {
+                ui.expanded_rev += 1;
+            }
+        }
+    }
+    // The ↑/↓ highlight must stay inside the retained window — eviction can
+    // shrink the transcript below a selection taken before the pass.
+    let entries = model
+        .agents
+        .get(ui.focused)
+        .map(|a| a.model.transcript.len())
+        .unwrap_or(0);
+    ui.session_selected = ui
+        .session_selected
+        .and_then(|sel| (entries > 0).then(|| sel.min(entries - 1)));
 }
 
 /// Map one key to a [`DeckAction`]. Pure over `(key, model)`, mutating `ui`.
@@ -1040,6 +1068,41 @@ mod tests {
         let mut ui = DeckUi::default();
         ui.splash.skip(); // past the splash for interaction tests
         ui
+    }
+
+    #[test]
+    fn eviction_clamps_the_selection_and_drops_stale_expansions() {
+        use crate::model::MAX_TRANSCRIPT_ENTRIES;
+        let mut model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        let retry = |i: usize| Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Retry {
+                attempt: i as u32,
+                reason: "r".into(),
+            },
+        };
+        // Grow to just under the cap, then highlight + expand near the tail.
+        for i in 0..(MAX_TRANSCRIPT_ENTRIES - 1) {
+            ingest_inbound(&retry(i), &mut model, &mut ui);
+        }
+        ui.session_selected = Some(MAX_TRANSCRIPT_ENTRIES - 2);
+        toggle_expanded(&mut ui, "lead", MAX_TRANSCRIPT_ENTRIES - 2);
+        let rev = ui.expanded_rev;
+
+        // One more event crosses the cap: a chunk of the front evicts.
+        ingest_inbound(&retry(MAX_TRANSCRIPT_ENTRIES), &mut model, &mut ui);
+        let len = model.agents[0].model.transcript.len();
+        assert!(len < MAX_TRANSCRIPT_ENTRIES, "a chunk was evicted");
+        assert!(
+            ui.session_selected.is_some_and(|sel| sel < len),
+            "selection clamped into the retained window"
+        );
+        assert!(
+            !ui.expanded.contains_key("lead"),
+            "index-keyed expansions are stale once the front moved"
+        );
+        assert!(ui.expanded_rev > rev, "fold cache invalidated");
     }
 
     #[test]

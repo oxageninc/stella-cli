@@ -34,6 +34,13 @@ impl Pricing {
     /// output rate. Never panics and never goes negative — a provider that
     /// reports more cached than total input (shouldn't happen, but is not
     /// worth aborting a turn over) saturates to zero non-cached input.
+    ///
+    /// `cache_write_tokens` is deliberately NOT priced: the catalog carries
+    /// no cache-write rate yet (providers bill writes at a premium over
+    /// input — e.g. Anthropic 1.25x), and those tokens are reported outside
+    /// `input_tokens`, so today they contribute $0 here. Adding a
+    /// `cache_write_usd_per_mtok` column is the staged follow-up to
+    /// issue #97.
     pub fn cost_usd(&self, usage: &CompletionUsage) -> f64 {
         let cached = usage.cached_input_tokens.min(usage.input_tokens);
         let uncached_input = usage.input_tokens - cached;
@@ -369,6 +376,7 @@ mod tests {
             input_tokens: 1_000_000,
             output_tokens: 200_000,
             cached_input_tokens: 400_000,
+            cache_write_tokens: 0,
         };
         assert!((pricing.cost_usd(&usage) - 4.92).abs() < 1e-9);
     }
@@ -386,6 +394,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 0,
             cached_input_tokens: 1_000,
+            cache_write_tokens: 0,
         };
         // All 100 input tokens billed as cached (clamped), never negative.
         let expected = (100.0 / 1_000_000.0) * 0.30;

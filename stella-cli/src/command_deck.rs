@@ -61,6 +61,7 @@ use crate::agent;
 use crate::config::Config;
 use crate::interactive::{AskUserIo, FREE_TEXT_LABEL, InteractiveToolSet, SkillRegistry};
 use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
+use crate::runtime::TokioSleeper;
 
 /// The lead agent's id — the one conversation this driver runs.
 const LEAD: &str = "lead";
@@ -113,15 +114,12 @@ enum TurnEnd {
 /// stream ends.
 pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result<(), String> {
     // ── Session assembly (still on the normal screen — prints are fine) ────
+    // MCP connect is NOT here: it can block up to 10s per server, so it runs
+    // after the deck task spawns, narrated as transcript events (#98).
     let provider = agent::build_provider(cfg)?;
     let registry: Arc<ToolRegistry> =
         Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     agent::populate_schema_index(&registry, &cfg.workspace_root);
-    let mcp = agent::connect_mcp(cfg, registry.clone(), true).await;
-    let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
-        None => &*registry,
-    };
     let custom_tools = agent::discover_custom_tools(cfg, true).await;
     let mut budget = agent::build_budget_guard(budget_limit);
     let store = agent::open_store(&cfg.workspace_root);
@@ -185,6 +183,57 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
     // The deck owns its channel ends and runs on its own task so rendering
     // never waits on the driver (and vice versa).
     let deck = tokio::spawn(run_deck(opts, in_rx, sub_tx));
+
+    // ── MCP connect, behind the live deck (#98) ─────────────────────────────
+    // This await used to run during assembly, before the deck spawned — a
+    // slow or unreachable server meant a blank terminal for up to the 10s
+    // per-server timeout. The deck is up now, so its splash absorbs the wait
+    // and the attempt is narrated in the transcript. Failure semantics are
+    // the plain REPL's: the session continues on native tools only. Prompts
+    // submitted while this await runs are never lost — the deck's input
+    // never blocks, and everything it sends buffers in `sub_rx` until the
+    // driver loop below starts reading.
+    let mcp = match agent::load_mcp_plan(cfg) {
+        agent::McpPlan::None => None,
+        agent::McpPlan::Invalid(reason) => {
+            let _ = in_tx.send(Inbound::Event {
+                agent: LEAD.to_string(),
+                event: AgentEvent::Text { delta: reason },
+            });
+            let _ = in_tx.send(Inbound::Status {
+                agent: LEAD.to_string(),
+                status: AgentStatus::WaitingInput,
+            });
+            None
+        }
+        agent::McpPlan::Servers(servers) => {
+            let _ = in_tx.send(Inbound::Event {
+                agent: LEAD.to_string(),
+                event: AgentEvent::Text {
+                    delta: format!("connecting {} MCP server(s)…", servers.len()),
+                },
+            });
+            let set = agent::connect_mcp_servers(&servers, registry.clone()).await;
+            let _ = in_tx.send(Inbound::Event {
+                agent: LEAD.to_string(),
+                event: AgentEvent::Text {
+                    delta: mcp_outcome_report(&set.connected_names(), set.failed_servers()),
+                },
+            });
+            // The Text events above fold the lead to `Running`, but no turn
+            // is in flight — restore the idle status or the dashboard would
+            // show a busy lead forever.
+            let _ = in_tx.send(Inbound::Status {
+                agent: LEAD.to_string(),
+                status: AgentStatus::WaitingInput,
+            });
+            Some(set)
+        }
+    };
+    let base_tools: &dyn ToolExecutor = match &mcp {
+        Some(set) => set,
+        None => &*registry,
+    };
 
     // ── The driver loop ─────────────────────────────────────────────────────
     let mut queue: VecDeque<String> = VecDeque::new();
@@ -420,6 +469,26 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
     }
 }
 
+/// The transcript report for a finished MCP connect attempt: the connected
+/// servers by name, then one row per failure with its reason — the deck-mode
+/// analogue of the diagnostics [`agent::connect_mcp`] prints in the plain
+/// REPL. Zero connections is stated outright: the degraded session must be
+/// visible in the transcript, never inferred from silence.
+fn mcp_outcome_report(connected: &[&str], failed: &[(String, String)]) -> String {
+    let mut lines = Vec::new();
+    match connected.len() {
+        0 => lines.push("no MCP servers connected — continuing with native tools only".to_string()),
+        n => lines.push(format!(
+            "{n} MCP server(s) connected: {}",
+            connected.join(", ")
+        )),
+    }
+    for (name, reason) in failed {
+        lines.push(format!("MCP server `{name}` unavailable: {reason}"));
+    }
+    lines.join("\n")
+}
+
 /// The disposition of a would-be slash command.
 enum DeckCommand {
     /// Not a command — run the model turn as usual.
@@ -616,8 +685,13 @@ async fn run_lead_turn(
             root: cfg.workspace_root.clone(),
         };
         let hook_runner = ShellHookRunner;
-        let mut engine = Engine::new(provider, &tapped, agent::engine_config_for(cfg))
-            .with_calibration(calibration);
+        let mut engine = Engine::with_sleeper(
+            provider,
+            &tapped,
+            agent::engine_config_for(cfg),
+            &TokioSleeper,
+        )
+        .with_calibration(calibration);
         if let Some(hooks) = &cfg.hooks {
             engine = engine.with_hooks(hooks, &hook_runner);
         }
@@ -1037,6 +1111,38 @@ mod tests {
             recv_file_change(&mut rx).is_none(),
             "read-only tools emit nothing"
         );
+    }
+
+    #[test]
+    fn mcp_outcome_report_lists_connected_servers_by_name() {
+        let report = mcp_outcome_report(&["files", "search"], &[]);
+        assert_eq!(report, "2 MCP server(s) connected: files, search");
+    }
+
+    #[test]
+    fn mcp_outcome_report_names_each_failure_with_its_reason() {
+        let failed = vec![(
+            "slow".to_string(),
+            "connect timed out after 10000ms".to_string(),
+        )];
+        let report = mcp_outcome_report(&["files"], &failed);
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(lines[0], "1 MCP server(s) connected: files");
+        assert_eq!(
+            lines[1],
+            "MCP server `slow` unavailable: connect timed out after 10000ms"
+        );
+    }
+
+    #[test]
+    fn mcp_outcome_report_states_total_failure_outright() {
+        let failed = vec![("a".to_string(), "spawn failed".to_string())];
+        let report = mcp_outcome_report(&[], &failed);
+        assert!(
+            report.starts_with("no MCP servers connected"),
+            "the degraded mode is stated, not implied: {report}"
+        );
+        assert!(report.contains("MCP server `a` unavailable: spawn failed"));
     }
 
     #[test]

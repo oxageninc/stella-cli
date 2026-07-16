@@ -63,60 +63,11 @@ impl ToolExecutor for ReadOnlyTools<'_> {
     }
 }
 
-/// Time source, injectable for deterministic tests.
+/// Time source, injectable for deterministic tests. Only the trait lives
+/// here — the production implementation belongs to the binary that wires
+/// the engine (the CLI's `runtime` module), so `stella-core` never carries
+/// a concrete time source of its own.
 pub trait Clock: Send + Sync {
     /// Monotonic milliseconds since an arbitrary epoch.
     fn now_ms(&self) -> u64;
-}
-
-/// The production clock.
-pub struct SystemClock {
-    origin: std::time::Instant,
-}
-
-impl SystemClock {
-    pub fn new() -> Self {
-        Self {
-            origin: std::time::Instant::now(),
-        }
-    }
-}
-
-impl Default for SystemClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Clock for SystemClock {
-    fn now_ms(&self) -> u64 {
-        self.origin.elapsed().as_millis() as u64
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn system_clock_starts_near_zero_and_advances_monotonically() {
-        let clock = SystemClock::new();
-        let first = clock.now_ms();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let second = clock.now_ms();
-        assert!(second >= first, "clock must never go backwards");
-        assert!(
-            second - first >= 4,
-            "clock must actually advance with wall time"
-        );
-    }
-
-    #[test]
-    fn default_constructs_a_fresh_clock() {
-        let clock = SystemClock::default();
-        assert!(
-            clock.now_ms() < 1000,
-            "a freshly constructed clock starts near zero"
-        );
-    }
 }

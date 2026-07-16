@@ -69,7 +69,7 @@ use crate::estimator::{CalibrationMap, estimate_conversation_tokens};
 use crate::hooks::{HookPayload, HookRunner, Hooks, run_hooks};
 use crate::loop_detect::{LoopDetectionConfig, detect_loop};
 use crate::ports::ToolExecutor;
-use crate::retry::{RetryOutcome, RetryPolicy, Sleeper, TokioSleeper, retry_with_backoff};
+use crate::retry::{RetryOutcome, RetryPolicy, Sleeper, retry_with_backoff};
 
 /// Everything about a turn's execution that isn't the provider/tools
 /// themselves: prompt shape, retry/compaction/loop tuning, and hard
@@ -151,7 +151,7 @@ pub struct Engine<'a> {
     pub(crate) sleeper: &'a dyn Sleeper,
     pub(crate) config: EngineConfig,
     /// Lifecycle hooks, off by default. Attached via [`Engine::with_hooks`]
-    /// so `new`/`with_sleeper` keep their existing signatures. When `None`,
+    /// so `with_sleeper` keeps its existing signature. When `None`,
     /// no hook is ever consulted and the turn path adds zero work.
     hooks: Option<HooksHandle<'a>>,
     /// Token-drift calibration (`crate::estimator::CalibrationMap`), off by
@@ -169,20 +169,27 @@ pub struct Engine<'a> {
 /// process pressure, not CPU.
 const MAX_CONCURRENT_TOOL_CALLS: usize = 8;
 
-impl<'a> Engine<'a> {
-    /// Construct an engine with the production [`TokioSleeper`]. Use
-    /// [`Engine::with_sleeper`] in tests to run retries with zero real
-    /// wall-clock delay.
-    pub fn new(
-        provider: &'a dyn Provider,
-        tools: &'a dyn ToolExecutor,
-        config: EngineConfig,
-    ) -> Self {
-        Self::with_sleeper(provider, tools, config, &TokioSleeper)
-    }
+/// One committed model call plus the step-scoped context the phases after
+/// it consume: the pre-call raw token estimate (drift feedback + telemetry
+/// — raw, never calibrated, see [`Engine::run_model_call`]), the read-only
+/// tool set for dispatch scheduling, and the retry/duration figures for
+/// the `StepUsage` metering record.
+struct CommittedStep {
+    result: CompletionResultAlias,
+    /// Names of tools whose schemas declare `read_only`, snapshotted from
+    /// the same `schemas()` call the request itself was built from.
+    read_only_tools: HashSet<String>,
+    estimated_input_tokens: u64,
+    retries: u32,
+    duration_ms: u64,
+}
 
-    /// Construct an engine with an injected [`Sleeper`] — the seam that
-    /// makes `run_turn`'s retry loop testable without real sleeping.
+impl<'a> Engine<'a> {
+    /// Construct an engine with an injected [`Sleeper`]. This is the only
+    /// constructor — `stella-core` exports the port, never a production
+    /// impl, so the caller wires a real sleeper (the CLI's tokio-backed
+    /// one) and tests wire a no-op to run retries with zero real
+    /// wall-clock delay.
     pub fn with_sleeper(
         provider: &'a dyn Provider,
         tools: &'a dyn ToolExecutor,
@@ -200,8 +207,8 @@ impl<'a> Engine<'a> {
     }
 
     /// Attach lifecycle hooks (`crate::hooks`) to an engine, opt-in. Kept a
-    /// builder so [`Engine::new`]/[`Engine::with_sleeper`] retain their
-    /// signatures and every existing call site is unchanged — an engine
+    /// builder so [`Engine::with_sleeper`] retains its signature and every
+    /// existing call site is unchanged — an engine
     /// built without this is exactly the pre-hooks engine. Takes both the
     /// parsed [`Hooks`] config and the [`HookRunner`] that executes the
     /// commands, because [`crate::hooks::run_hooks`] needs the port to run
@@ -255,6 +262,11 @@ impl<'a> Engine<'a> {
     /// accumulates across the turn (and, via `BudgetGuard::begin_turn`,
     /// across turns in the same session — the caller decides when to reset
     /// it, `run_turn` only reads and records).
+    ///
+    /// Every step is the same fixed phase sequence, one sub-method per
+    /// phase: compaction, loop detection, the between-steps budget check,
+    /// the model call (with retry+backoff), bookkeeping for the committed
+    /// call, then dispatch — complete the turn or execute its tool calls.
     pub async fn run_turn(
         &self,
         messages: &mut Vec<CompletionMessage>,
@@ -273,143 +285,35 @@ impl<'a> Engine<'a> {
         let mut calibration_model: Option<String> = None;
 
         for step in 0..self.config.max_steps {
-            // ---- Compaction (before every model call, per the running
-            // ---- estimate; L-E3 dedup+evict, stable system prefix — the
-            // ---- system message is index 0 and compact() never touches it).
-            //
-            // Drift correction enters here: `compact` compares the RAW
-            // estimate against the budget it is given, so dividing the
-            // configured budget by the correction factor is exactly
-            // comparing the CALIBRATED estimate (raw × factor) against the
-            // configured budget — including the eviction loop's stopping
-            // condition — without threading a factor through compaction's
-            // incremental bookkeeping. A factor > 1 (we under-estimate this
-            // model's tokenizer) shrinks the effective budget and compacts
-            // earlier; the factor's clamp (`crate::estimator`) bounds how
-            // far either way a noisy sample can move this.
-            let compaction_budget = match self.calibration {
-                Some(calibration) => {
-                    (self.config.compaction_budget_tokens as f64
-                        / calibration.factor(calibration_model.as_deref()))
-                        as u64
-                }
-                None => self.config.compaction_budget_tokens,
+            self.run_compaction_pass(messages, calibration_model.as_deref(), events);
+
+            if let Some(aborted) = self.check_loop_detection(messages, events) {
+                return aborted;
+            }
+            if let Some(aborted) = check_budget(budget, events) {
+                return aborted;
+            }
+
+            let committed = match self.run_model_call(messages, events).await {
+                Ok(committed) => committed,
+                Err(aborted) => return aborted,
             };
-            if let Some(report) = compact(messages, compaction_budget) {
-                let _ = events.send(AgentEvent::Compaction {
-                    before_tokens: report.before_tokens,
-                    after_tokens: report.after_tokens,
-                    evicted: report.evicted,
-                    deduped: report.deduped,
-                });
-            }
+            calibration_model = Some(committed.result.model.clone());
+            total_cost_usd += committed.result.cost_usd;
 
-            // ---- Loop detection (before spending a model call on a step
-            // ---- that's already stuck).
-            let recent_calls = recent_tool_calls(messages);
-            let verdict = detect_loop(&recent_calls, self.config.loop_detection);
-            if verdict.is_loop() {
-                let reason = verdict
-                    .evidence()
-                    .unwrap_or_else(|| "loop detected".to_string());
-                let _ = events.send(AgentEvent::Error {
-                    message: reason.clone(),
-                    retryable: false,
-                });
-                return TurnOutcome::Aborted {
-                    reason: format!("stuck-loop detected: {reason}"),
-                };
-            }
-
-            // ---- Budget (between steps, never mid-tool — see module docs).
-            if let BudgetOutcome::AbortTurn {
-                spent_usd,
-                limit_usd,
-                ..
-            } = budget.evaluate()
+            if let Some(aborted) =
+                self.handle_committed_result(step, &committed, budget, messages, events)
             {
-                let reason = format!(
-                    "budget exceeded: spent ${spent_usd:.4} against a ${limit_usd:.2} limit"
-                );
-                let _ = events.send(AgentEvent::Error {
-                    message: reason.clone(),
-                    retryable: false,
-                });
-                return TurnOutcome::Aborted { reason };
+                return aborted;
             }
 
-            // ---- The model call, with retry+backoff.
-            let tools_schema = self.tools.schemas();
-            let read_only_tools: HashSet<String> = tools_schema
-                .iter()
-                .filter(|s| s.read_only)
-                .map(|s| s.name.clone())
-                .collect();
-            // The raw (uncalibrated) estimate of exactly what this step
-            // sends — recorded against the provider's reported usage below.
-            // Raw, not calibrated: the drift ratio is actual/raw, and
-            // recording a corrected estimate would compound corrections on
-            // every feedback pass.
-            let estimated_input_tokens = estimate_conversation_tokens(messages);
-            let messages_snapshot = messages.clone();
-            let req_config = &self.config;
-            let attempt: RetryAttemptFn = Box::new(move || {
-                let req = CompletionRequest {
-                    messages: messages_snapshot.clone(),
-                    max_output_tokens: req_config.max_output_tokens,
-                    temperature: req_config.temperature,
-                    effort: req_config.effort,
-                    tools: tools_schema.clone(),
-                };
-                Box::pin(self.provider.complete(req))
-            });
-
-            let call_started = std::time::Instant::now();
-            let outcome =
-                retry_with_backoff(&self.config.retry_policy, self.sleeper, attempt).await;
-            let call_duration_ms = call_started.elapsed().as_millis() as u64;
-
-            let RetryOutcome {
-                value: result,
-                retries,
-                ..
-            } = match outcome {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    let message = error.to_string();
-                    let _ = events.send(AgentEvent::Error {
-                        message: message.clone(),
-                        retryable: error.is_retryable(),
-                    });
-                    return TurnOutcome::Aborted {
-                        reason: format!("model call failed: {message}"),
-                    };
-                }
-            };
-
-            // Deferred-flush: these `Retry` events only reach the wire now
-            // that the step has actually committed (see module docs).
-            for attempt in &retries {
-                let _ = events.send(AgentEvent::Retry {
-                    attempt: attempt.attempt,
-                    reason: attempt.reason.clone(),
-                });
+            if let Some(completed) = self
+                .dispatch_completion(committed, total_cost_usd, messages, events)
+                .await
+            {
+                return completed;
             }
-
-            // ---- Drift feedback for the call that just committed: the
-            // ---- provider's reported input tokens (total, cached included
-            // ---- — cached tokens were still real prompt tokens) against
-            // ---- the raw estimate, keyed by the model that actually
-            // ---- served the call. `record` ignores zero-sided pairs, so a
-            // ---- provider omitting usage never poisons the state.
-            if let Some(calibration) = self.calibration {
-                calibration.record(
-                    &result.model,
-                    estimated_input_tokens,
-                    result.usage.input_tokens,
-                );
-            }
-            calibration_model = Some(result.model.clone());
+        }
 
             // ---- Telemetry for the call that just committed: exactly one
             // ---- StepUsage per landed step — the metering record.
@@ -419,6 +323,7 @@ impl<'a> Engine<'a> {
                 input_tokens: result.usage.input_tokens,
                 output_tokens: result.usage.output_tokens,
                 cached_input_tokens: result.usage.cached_input_tokens,
+                cache_write_tokens: result.usage.cache_write_tokens,
                 estimated_input_tokens,
                 cost_usd: result.cost_usd,
                 duration_ms: call_duration_ms,
@@ -426,110 +331,236 @@ impl<'a> Engine<'a> {
                 tool_calls: result.tool_calls.len(),
             });
 
-            // ---- Budget accounting for the call that just committed.
-            let outcome = budget.record_spend(result.cost_usd);
-            total_cost_usd += result.cost_usd;
-            let _ = events.send(AgentEvent::BudgetTick {
-                spent_usd: budget.spent_usd(),
-                limit_usd: budget.turn_limit_usd(),
-                mode: budget.mode(),
+    /// Compaction, before every model call, per the running estimate
+    /// (L-E3 dedup+evict, stable system prefix — the system message is
+    /// index 0 and `compact()` never touches it).
+    ///
+    /// Drift correction enters here: `compact` compares the RAW estimate
+    /// against the budget it is given, so dividing the configured budget
+    /// by the correction factor is exactly comparing the CALIBRATED
+    /// estimate (raw × factor) against the configured budget — including
+    /// the eviction loop's stopping condition — without threading a factor
+    /// through compaction's incremental bookkeeping. A factor > 1 (we
+    /// under-estimate this model's tokenizer) shrinks the effective budget
+    /// and compacts earlier; the factor's clamp (`crate::estimator`)
+    /// bounds how far either way a noisy sample can move this.
+    fn run_compaction_pass(
+        &self,
+        messages: &mut [CompletionMessage],
+        calibration_model: Option<&str>,
+        events: &UnboundedSender<AgentEvent>,
+    ) {
+        let compaction_budget = match self.calibration {
+            Some(calibration) => {
+                (self.config.compaction_budget_tokens as f64
+                    / calibration.factor(calibration_model)) as u64
+            }
+            None => self.config.compaction_budget_tokens,
+        };
+        if let Some(report) = compact(messages, compaction_budget) {
+            let _ = events.send(AgentEvent::Compaction {
+                before_tokens: report.before_tokens,
+                after_tokens: report.after_tokens,
+                evicted: report.evicted,
+                deduped: report.deduped,
             });
-            if let BudgetOutcome::AbortTurn {
-                spent_usd,
-                limit_usd,
-                ..
-            } = outcome
-            {
-                // The call that just landed is the one that pushed spend
-                // over the limit — it already committed (its result is
-                // real, its cost already happened), so deliver what was
-                // paid for: emit its text and append it to history, THEN
-                // abort before dispatching anything further (its tool
-                // calls, if any, never run — recorded so the transcript
-                // shows what was cut). Still not a mid-tool kill.
-                if !result.text.is_empty() {
-                    let _ = events.send(AgentEvent::Text {
-                        delta: result.text.clone(),
-                    });
-                }
-                messages.push(CompletionMessage {
-                    role: MessageRole::Assistant,
-                    content: result.text.clone(),
-                    tool_calls: result.tool_calls.clone(),
-                    tool_results: Vec::new(),
-                });
-                // The assistant message above may carry `tool_calls` that never
-                // ran (we abort before dispatching them). A recorded `tool_use`
-                // with no matching `tool_result` is a broken history: when a
-                // REPL caller reuses this `messages` vec, the next turn's first
-                // provider call is hard-rejected ("tool_use must be followed by
-                // tool_result"). Close the pairing with a synthetic error
-                // result per un-run call so resumption stays valid.
-                if !result.tool_calls.is_empty() {
-                    let tool_results = result
-                        .tool_calls
-                        .iter()
-                        .map(|call| ToolResult {
-                            call_id: call.call_id.clone(),
-                            output: ToolOutput::Error {
-                                message: "not executed — turn aborted on budget".to_string(),
-                            },
-                        })
-                        .collect();
-                    messages.push(CompletionMessage {
-                        role: MessageRole::Tool,
-                        content: String::new(),
-                        tool_calls: Vec::new(),
-                        tool_results,
-                    });
-                }
-                let reason = format!(
-                    "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} limit"
-                );
+        }
+    }
+
+    /// Loop detection, before spending a model call on a step that's
+    /// already stuck. `Some` is the turn's clean abort.
+    fn check_loop_detection(
+        &self,
+        messages: &[CompletionMessage],
+        events: &UnboundedSender<AgentEvent>,
+    ) -> Option<TurnOutcome> {
+        let recent_calls = recent_tool_calls(messages);
+        let verdict = detect_loop(&recent_calls, self.config.loop_detection);
+        if !verdict.is_loop() {
+            return None;
+        }
+        let reason = verdict
+            .evidence()
+            .unwrap_or_else(|| "loop detected".to_string());
+        let _ = events.send(AgentEvent::Error {
+            message: reason.clone(),
+            retryable: false,
+        });
+        Some(TurnOutcome::Aborted {
+            reason: format!("stuck-loop detected: {reason}"),
+        })
+    }
+
+    /// One model call with retry+backoff (`crate::retry`). On commit,
+    /// flushes the step's deferred `Retry` events (module docs, L-E10) and
+    /// returns the result bundled with the request-time snapshots the
+    /// later phases consume; on exhausted retries, emits the terminal
+    /// error and returns the turn's clean abort.
+    ///
+    /// The estimate captured here is the raw (uncalibrated) estimate of
+    /// exactly what this step sends — recorded against the provider's
+    /// reported usage by [`Engine::handle_committed_result`]. Raw, not
+    /// calibrated: the drift ratio is actual/raw, and recording a
+    /// corrected estimate would compound corrections on every feedback
+    /// pass.
+    async fn run_model_call(
+        &self,
+        messages: &[CompletionMessage],
+        events: &UnboundedSender<AgentEvent>,
+    ) -> Result<CommittedStep, TurnOutcome> {
+        let tools_schema = self.tools.schemas();
+        let read_only_tools: HashSet<String> = tools_schema
+            .iter()
+            .filter(|s| s.read_only)
+            .map(|s| s.name.clone())
+            .collect();
+        let estimated_input_tokens = estimate_conversation_tokens(messages);
+        let messages_snapshot = messages.to_vec();
+        let req_config = &self.config;
+        let attempt: RetryAttemptFn = Box::new(move || {
+            let req = CompletionRequest {
+                messages: messages_snapshot.clone(),
+                max_output_tokens: req_config.max_output_tokens,
+                temperature: req_config.temperature,
+                effort: req_config.effort,
+                tools: tools_schema.clone(),
+            };
+            Box::pin(self.provider.complete(req))
+        });
+
+        let call_started = std::time::Instant::now();
+        let outcome = retry_with_backoff(&self.config.retry_policy, self.sleeper, attempt).await;
+        let call_duration_ms = call_started.elapsed().as_millis() as u64;
+
+        let RetryOutcome {
+            value: result,
+            retries,
+            ..
+        } = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let message = error.to_string();
                 let _ = events.send(AgentEvent::Error {
-                    message: reason.clone(),
-                    retryable: false,
+                    message: message.clone(),
+                    retryable: error.is_retryable(),
                 });
-                return TurnOutcome::Aborted { reason };
-            }
-
-            if !result.text.is_empty() {
-                let _ = events.send(AgentEvent::Text {
-                    delta: result.text.clone(),
+                return Err(TurnOutcome::Aborted {
+                    reason: format!("model call failed: {message}"),
                 });
             }
+        };
 
-            if result.tool_calls.is_empty() {
-                messages.push(CompletionMessage {
-                    role: MessageRole::Assistant,
-                    content: result.text.clone(),
-                    tool_calls: Vec::new(),
-                    tool_results: Vec::new(),
-                });
-                let _ = events.send(AgentEvent::Stage {
-                    name: StageKind::Complete,
-                });
-                let _ = events.send(AgentEvent::Complete {
-                    model: result.model.clone(),
-                    cost_usd: total_cost_usd,
-                });
-                return TurnOutcome::Completed {
-                    text: result.text,
-                    cost_usd: total_cost_usd,
-                };
-            }
-
-            messages.push(CompletionMessage {
-                role: MessageRole::Assistant,
-                content: result.text.clone(),
-                tool_calls: result.tool_calls.clone(),
-                tool_results: Vec::new(),
+        // Deferred-flush: these `Retry` events only reach the wire now
+        // that the step has actually committed (see module docs).
+        for attempt in &retries {
+            let _ = events.send(AgentEvent::Retry {
+                attempt: attempt.attempt,
+                reason: attempt.reason.clone(),
             });
+        }
 
-            let tool_results = self
-                .execute_tool_calls(&result.tool_calls, &read_only_tools, events)
-                .await;
+        Ok(CommittedStep {
+            result,
+            read_only_tools,
+            estimated_input_tokens,
+            retries: retries.len() as u32,
+            duration_ms: call_duration_ms,
+        })
+    }
 
+    /// Bookkeeping for the call that just committed: drift feedback into
+    /// the attached calibration, exactly one `StepUsage` metering record
+    /// per landed step, and budget accounting. `Some` is the turn's clean
+    /// abort — this call's spend pushed the turn over an enforced limit —
+    /// issued only after delivering what was already paid for (see body);
+    /// never a mid-tool kill.
+    fn handle_committed_result(
+        &self,
+        step: usize,
+        committed: &CommittedStep,
+        budget: &mut BudgetGuard,
+        messages: &mut Vec<CompletionMessage>,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> Option<TurnOutcome> {
+        let result = &committed.result;
+
+        // Drift feedback: the provider's reported input tokens (total,
+        // cached included — cached tokens were still real prompt tokens)
+        // against the raw estimate, keyed by the model that actually
+        // served the call. `record` ignores zero-sided pairs, so a
+        // provider omitting usage never poisons the state.
+        if let Some(calibration) = self.calibration {
+            calibration.record(
+                &result.model,
+                committed.estimated_input_tokens,
+                result.usage.input_tokens,
+            );
+        }
+
+        let _ = events.send(AgentEvent::StepUsage {
+            step,
+            model: result.model.clone(),
+            input_tokens: result.usage.input_tokens,
+            output_tokens: result.usage.output_tokens,
+            cached_input_tokens: result.usage.cached_input_tokens,
+            estimated_input_tokens: committed.estimated_input_tokens,
+            cost_usd: result.cost_usd,
+            duration_ms: committed.duration_ms,
+            retries: committed.retries,
+            tool_calls: result.tool_calls.len(),
+        });
+
+        let outcome = budget.record_spend(result.cost_usd);
+        let _ = events.send(AgentEvent::BudgetTick {
+            spent_usd: budget.spent_usd(),
+            limit_usd: budget.turn_limit_usd(),
+            mode: budget.mode(),
+        });
+        let BudgetOutcome::AbortTurn {
+            spent_usd,
+            limit_usd,
+            ..
+        } = outcome
+        else {
+            return None;
+        };
+
+        // The call that just landed is the one that pushed spend over the
+        // limit — it already committed (its result is real, its cost
+        // already happened), so deliver what was paid for: emit its text
+        // and append it to history, THEN abort before dispatching
+        // anything further (its tool calls, if any, never run — recorded
+        // so the transcript shows what was cut). Still not a mid-tool
+        // kill.
+        if !result.text.is_empty() {
+            let _ = events.send(AgentEvent::Text {
+                delta: result.text.clone(),
+            });
+        }
+        messages.push(CompletionMessage {
+            role: MessageRole::Assistant,
+            content: result.text.clone(),
+            tool_calls: result.tool_calls.clone(),
+            tool_results: Vec::new(),
+        });
+        // The assistant message above may carry `tool_calls` that never
+        // ran (we abort before dispatching them). A recorded `tool_use`
+        // with no matching `tool_result` is a broken history: when a
+        // REPL caller reuses this `messages` vec, the next turn's first
+        // provider call is hard-rejected ("tool_use must be followed by
+        // tool_result"). Close the pairing with a synthetic error
+        // result per un-run call so resumption stays valid.
+        if !result.tool_calls.is_empty() {
+            let tool_results = result
+                .tool_calls
+                .iter()
+                .map(|call| ToolResult {
+                    call_id: call.call_id.clone(),
+                    output: ToolOutput::Error {
+                        message: "not executed — turn aborted on budget".to_string(),
+                    },
+                })
+                .collect();
             messages.push(CompletionMessage {
                 role: MessageRole::Tool,
                 content: String::new(),
@@ -537,17 +568,79 @@ impl<'a> Engine<'a> {
                 tool_results,
             });
         }
-
         let reason = format!(
-            "reached the step cap ({}) without completing — this is the belt-and-suspenders \
-             backstop; loop detection should normally catch a stuck turn first",
-            self.config.max_steps
+            "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} limit"
         );
         let _ = events.send(AgentEvent::Error {
             message: reason.clone(),
             retryable: false,
         });
-        TurnOutcome::Aborted { reason }
+        Some(TurnOutcome::Aborted { reason })
+    }
+
+    /// Deliver a committed step's result: emit its text, then either
+    /// finish the turn (no tool calls — `Some(Completed)`) or record the
+    /// assistant message, execute its tool calls, record their results,
+    /// and return `None` so the loop takes another step. Consumes the
+    /// step: the result's text moves into the `Completed` outcome.
+    async fn dispatch_completion(
+        &self,
+        committed: CommittedStep,
+        total_cost_usd: f64,
+        messages: &mut Vec<CompletionMessage>,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> Option<TurnOutcome> {
+        let CommittedStep {
+            result,
+            read_only_tools,
+            ..
+        } = committed;
+
+        if !result.text.is_empty() {
+            let _ = events.send(AgentEvent::Text {
+                delta: result.text.clone(),
+            });
+        }
+
+        if result.tool_calls.is_empty() {
+            messages.push(CompletionMessage {
+                role: MessageRole::Assistant,
+                content: result.text.clone(),
+                tool_calls: Vec::new(),
+                tool_results: Vec::new(),
+            });
+            let _ = events.send(AgentEvent::Stage {
+                name: StageKind::Complete,
+            });
+            let _ = events.send(AgentEvent::Complete {
+                model: result.model.clone(),
+                cost_usd: total_cost_usd,
+            });
+            return Some(TurnOutcome::Completed {
+                text: result.text,
+                cost_usd: total_cost_usd,
+            });
+        }
+
+        messages.push(CompletionMessage {
+            role: MessageRole::Assistant,
+            content: result.text.clone(),
+            tool_calls: result.tool_calls.clone(),
+            tool_results: Vec::new(),
+        });
+
+        let tool_results = self
+            .execute_tool_calls(&result.tool_calls, &read_only_tools, events)
+            .await;
+
+        messages.push(CompletionMessage {
+            role: MessageRole::Tool,
+            content: String::new(),
+            tool_calls: Vec::new(),
+            tool_results,
+        });
+
+        None
     }
 
     /// Execute one step's tool calls, preserving sequential semantics for
@@ -713,6 +806,28 @@ type RetryAttemptFn<'a> = Box<
         + 'a,
 >;
 type CompletionResultAlias = stella_protocol::CompletionResult;
+
+/// The between-steps budget check (never mid-tool — see module docs).
+/// `Some` is the turn's clean abort. A free function like
+/// [`recent_tool_calls`] because it reads no engine state; the wording
+/// differs from the post-call abort in `Engine::handle_committed_result`
+/// because here nothing new was spent.
+fn check_budget(budget: &BudgetGuard, events: &UnboundedSender<AgentEvent>) -> Option<TurnOutcome> {
+    let BudgetOutcome::AbortTurn {
+        spent_usd,
+        limit_usd,
+        ..
+    } = budget.evaluate()
+    else {
+        return None;
+    };
+    let reason = format!("budget exceeded: spent ${spent_usd:.4} against a ${limit_usd:.2} limit");
+    let _ = events.send(AgentEvent::Error {
+        message: reason.clone(),
+        retryable: false,
+    });
+    Some(TurnOutcome::Aborted { reason })
+}
 
 /// Flatten the tool calls of the CURRENT turn — assistant messages after
 /// the last user message — in chronological order, for
@@ -1483,6 +1598,7 @@ mod tests {
                 input_tokens: 1000,
                 output_tokens: 50,
                 cached_input_tokens: 800,
+                cache_write_tokens: 120,
             };
             result
         };
@@ -1521,6 +1637,7 @@ mod tests {
                 step,
                 input_tokens,
                 cached_input_tokens,
+                cache_write_tokens,
                 retries,
                 tool_calls,
                 cost_usd,
@@ -1531,6 +1648,7 @@ mod tests {
                     step,
                     input_tokens,
                     cached_input_tokens,
+                    cache_write_tokens,
                     retries,
                     tool_calls,
                     cost_usd,
@@ -1539,14 +1657,15 @@ mod tests {
         }
         // Two committed model calls → exactly two metering records; the
         // 429'd attempt shows up as retries: 1 on step 0, never as its own
-        // record.
+        // record. Cache writes flow through from the provider's usage
+        // envelope — never re-derived, never dropped to 0.
         assert_eq!(
             usages.len(),
             2,
             "one StepUsage per committed step: {usages:?}"
         );
-        assert_eq!(usages[0], (0, 1000, 800, 1, 1, 0.0001));
-        assert_eq!(usages[1], (1, 1000, 800, 0, 0, 0.0001));
+        assert_eq!(usages[0], (0, 1000, 800, 120, 1, 1, 0.0001));
+        assert_eq!(usages[1], (1, 1000, 800, 120, 0, 0, 0.0001));
     }
 
     // ---- Token-drift calibration -------------------------------------------
@@ -1652,6 +1771,7 @@ mod tests {
                 input_tokens: 4_000,
                 output_tokens: 50,
                 cached_input_tokens: 0,
+                cache_write_tokens: 0,
             };
             // Vary each call's input: `tool_call_result` reuses one command,
             // and three byte-identical bash calls are exactly what

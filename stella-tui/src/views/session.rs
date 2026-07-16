@@ -30,12 +30,13 @@ use crate::theme;
 /// exactly once and are cached with their visual-row ranges; only the tail
 /// entry re-folds per frame. The cache invalidates whole when anything that
 /// changes how settled entries render changes: focused agent, the thinking
-/// toggle, a ctrl+o expansion, or the pane width. This turns the old
-/// O(whole-history) fold per frame into O(tail) — typing latency no longer
-/// grows with session length.
+/// toggle, a ctrl+o expansion, the pane width, or the retention cap evicting
+/// a chunk of the front (which shifts every retained index). This turns the
+/// old O(whole-history) fold per frame into O(tail) — typing latency no
+/// longer grows with session length.
 #[derive(Debug, Clone, Default)]
 pub struct SessionFold {
-    key: Option<(String, bool, u64, usize)>,
+    key: Option<(String, bool, u64, usize, usize)>,
     settled: usize,
     prefix: Vec<Line<'static>>,
     entry_rows: Vec<Range<usize>>,
@@ -53,7 +54,16 @@ impl SessionFold {
         expanded_rev: u64,
         width: usize,
     ) {
-        let key = (agent.to_string(), thinking, expanded_rev, width);
+        // Front-eviction shifts every retained index, so the settled prefix
+        // no longer describes the entries now occupying 0..settled. The
+        // marker's cumulative count grows on every pass, so keying on it
+        // invalidates exactly when the front moves — the shrink check alone
+        // misses an eviction whose survivors still outnumber `settled`.
+        let evicted = match transcript.first() {
+            Some(TranscriptEntry::Evicted { count }) => *count,
+            _ => 0,
+        };
+        let key = (agent.to_string(), thinking, expanded_rev, width, evicted);
         if self.key.as_ref() != Some(&key) || self.settled > transcript.len().saturating_sub(1) {
             self.key = Some(key);
             self.settled = 0;
@@ -256,6 +266,7 @@ fn empty_state(area: Rect, buf: &mut Buffer) {
 mod tests {
     use super::*;
     use crate::envelope::{AgentMeta, Inbound};
+    use crate::model::{MAX_TRANSCRIPT_ENTRIES, SessionModel};
     use stella_protocol::{AgentEvent, ScopeProposal};
 
     /// Flatten a `Buffer` to plain text (content, not ANSI — the crate-wide
@@ -312,6 +323,39 @@ mod tests {
         assert!(
             text.contains("Which database should the cache use?"),
             "ask-user card visible alongside the scope review:\n{text}"
+        );
+    }
+
+    #[test]
+    fn fold_cache_stays_line_exact_across_front_eviction() {
+        // The dangerous shape: the cache settles on a SHORT prefix, then the
+        // transcript grows past the cap so a chunk of the front evicts while
+        // the survivor count still exceeds `settled` — the shrink check alone
+        // cannot see it, only the eviction-count key can.
+        let mut model = SessionModel::new();
+        let expanded = HashSet::new();
+        let retry = |i: usize| AgentEvent::Retry {
+            attempt: i as u32,
+            reason: "r".into(),
+        };
+        for i in 0..1_000 {
+            model.apply(&retry(i));
+        }
+        let mut fold = SessionFold::default();
+        fold.refresh("lead", &model.transcript, false, &expanded, 0, 80);
+        for i in 1_000..(MAX_TRANSCRIPT_ENTRIES + 50) {
+            model.apply(&retry(i));
+        }
+        assert!(model.evicted_entries() > 0, "an eviction pass occurred");
+        fold.refresh("lead", &model.transcript, false, &expanded, 0, 80);
+
+        let mut fresh = SessionFold::default();
+        fresh.refresh("lead", &model.transcript, false, &expanded, 0, 80);
+        assert_eq!(fold.total(), fresh.total());
+        assert_eq!(
+            fold.window_lines(0..fold.total()),
+            fresh.window_lines(0..fresh.total()),
+            "the incrementally-maintained fold matches a from-scratch fold"
         );
     }
 

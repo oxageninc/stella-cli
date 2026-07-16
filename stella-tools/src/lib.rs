@@ -23,6 +23,7 @@ pub mod memory;
 pub mod project;
 pub mod read;
 pub mod registry;
+pub mod sandbox;
 pub mod schema_gate;
 pub mod screenshot;
 pub mod validate;

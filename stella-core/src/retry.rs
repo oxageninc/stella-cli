@@ -34,22 +34,13 @@ use stella_protocol::ProviderError;
 /// Injectable so retry-loop tests run instantly and deterministically
 /// instead of paying real wall-clock delays — the same seam
 /// [`crate::ports::Clock`] provides for reading time, but for the one place
-/// this crate needs to actually suspend a task.
+/// this crate needs to actually suspend a task. Only the trait lives here —
+/// the production tokio-backed impl belongs to the binary that constructs
+/// the engine (the CLI's `runtime` module).
 #[async_trait]
 pub trait Sleeper: Send + Sync {
     /// Suspend the current task for `duration_ms` milliseconds.
     async fn sleep(&self, duration_ms: u64);
-}
-
-/// The production [`Sleeper`]: a thin wrapper over `tokio::time::sleep`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TokioSleeper;
-
-#[async_trait]
-impl Sleeper for TokioSleeper {
-    async fn sleep(&self, duration_ms: u64) {
-        tokio::time::sleep(std::time::Duration::from_millis(duration_ms)).await;
-    }
 }
 
 /// Retry policy for one model or tool call: how many times to retry a

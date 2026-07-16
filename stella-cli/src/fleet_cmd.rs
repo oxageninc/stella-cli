@@ -19,7 +19,6 @@
 use std::path::Path;
 
 use colored::Colorize;
-use stella_core::ports::SystemClock;
 use stella_core::{Engine, TurnOutcome};
 use stella_fleet::{
     CommitRecord, Fleet, FleetConfig, FleetRunReport, FleetWorker, Ledger, Plan, SystemGitCli,
@@ -32,6 +31,7 @@ use tokio::sync::mpsc;
 
 use crate::agent;
 use crate::config::Config;
+use crate::runtime::{SystemClock, TokioSleeper};
 use crate::tui;
 
 /// Cap on the per-task summary line so the report table stays a table.
@@ -242,7 +242,12 @@ async fn run_task(
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let outcome = {
         let hook_runner = ShellHookRunner;
-        let mut engine = Engine::new(&*provider, &registry, agent::engine_config_for(&cfg));
+        let mut engine = Engine::with_sleeper(
+            &*provider,
+            &registry,
+            agent::engine_config_for(&cfg),
+            &TokioSleeper,
+        );
         if let Some(hooks) = &cfg.hooks {
             engine = engine.with_hooks(hooks, &hook_runner);
         }

@@ -33,6 +33,15 @@
 //! in-process parallel agents. Multi-PROCESS fleets need a lock-holder (or
 //! one store per worker + merge) — documented limitation, not a silent one.
 //!
+//! # Schema versioning
+//!
+//! `PRAGMA user_version` stamps every database with its schema version
+//! (version 0 is the legacy pre-versioning shape). A fresh file is created
+//! at [`SCHEMA_VERSION`] directly; an existing file is upgraded by the
+//! ordered [`MIGRATIONS`] list, one transaction per step, with the new
+//! version stamped inside that same transaction — a crash mid-migration
+//! rolls the file back to the old version and old shape, never a mix.
+//!
 //! # Graceful degradation
 //!
 //! Every method returns `Result`; the CLI treats a failed store as
@@ -192,6 +201,320 @@ fn harden_workspace_dir(dir: &Path, created: bool) -> Result<()> {
     Ok(())
 }
 
+/// One schema migration: upgrades an existing database exactly one
+/// `user_version` step, inside the transaction the runner opened for it.
+/// The runner stamps the new version and commits; the migration only
+/// reshapes.
+type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
+
+/// Ordered migration list for EXISTING databases: `MIGRATIONS[i]` upgrades
+/// a file at `user_version` i to i + 1. Fresh files never run these — they
+/// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
+/// directly.
+const MIGRATIONS: [Migration; 1] = [
+    // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
+    // their write paths have always assumed.
+    migrate_v0_to_v1,
+];
+
+/// The schema version this build writes — the `PRAGMA user_version` of
+/// every database it has opened. Version 0 is the legacy pre-versioning
+/// shape (and the default stamp of a fresh empty file, which is why fresh
+/// detection also probes for tables).
+const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+/// Every table the store owns — the allowlist for [`Store::count`] and the
+/// fresh-file probe in [`Store::migrate`].
+const TABLES: [&str; 7] = [
+    "executions",
+    "events",
+    "telemetry",
+    "files_touched",
+    "file_locks",
+    "graph_nodes",
+    "graph_edges",
+];
+
+/// Tables whose shape has not changed since v0. `IF NOT EXISTS` keeps one
+/// batch usable both for fresh files and for filling gaps in partial legacy
+/// files (a v0 file only holds what its era's code created).
+const UNCHANGED_TABLES: &str = "CREATE TABLE IF NOT EXISTS executions (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       kind TEXT NOT NULL,
+       prompt TEXT NOT NULL,
+       provider TEXT NOT NULL,
+       model TEXT NOT NULL,
+       started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       finished_at TEXT,
+       outcome TEXT,
+       cost_usd REAL NOT NULL DEFAULT 0
+     );
+     CREATE TABLE IF NOT EXISTS files_touched (
+       execution_id INTEGER NOT NULL,
+       path TEXT NOT NULL,
+       ops TEXT NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS file_locks (
+       path TEXT PRIMARY KEY,
+       holder TEXT NOT NULL,
+       acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+     );
+     CREATE TABLE IF NOT EXISTS graph_nodes (
+       id TEXT PRIMARY KEY,
+       label TEXT NOT NULL,
+       properties TEXT NOT NULL DEFAULT '{}'
+     );
+     CREATE TABLE IF NOT EXISTS graph_edges (
+       src TEXT NOT NULL,
+       dst TEXT NOT NULL,
+       edge_type TEXT NOT NULL,
+       properties TEXT NOT NULL DEFAULT '{}'
+     );";
+
+/// `events` DDL at [`SCHEMA_VERSION`], parameterized over the table name
+/// because the v0 → v1 rebuild first creates it under a scratch name.
+///
+/// UNIQUE (execution_id, seq): one row per position in an execution's event
+/// stream. The drain loop owns a monotonically increasing `seq` per
+/// execution and replay reads `(execution_id, seq)` back in order, so a
+/// duplicate position is a double-write, not data — the constraint turns it
+/// into an error instead of a silently corrupted replay. Its implicit index
+/// is exactly the replay access path (superseding the pre-v1 non-unique
+/// `events_by_execution` index, which is why no separate index exists).
+fn events_ddl(table: &str) -> String {
+    format!(
+        "CREATE TABLE {table} (
+           execution_id INTEGER NOT NULL,
+           seq INTEGER NOT NULL,
+           ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           event_type TEXT NOT NULL,
+           payload TEXT NOT NULL,
+           UNIQUE (execution_id, seq)
+         );"
+    )
+}
+
+/// `telemetry` DDL at [`SCHEMA_VERSION`] — see [`events_ddl`] for why it is
+/// name-parameterized.
+///
+/// UNIQUE (execution_id, step): one row per committed model call —
+/// `StepUsage` is emitted exactly once per step that lands. `drift_samples`
+/// treats `(execution_id, step)` as insertion order and `usage_stats` sums
+/// tokens/cost per execution, so a duplicate step double-counts money.
+fn telemetry_ddl(table: &str) -> String {
+    format!(
+        "CREATE TABLE {table} (
+           execution_id INTEGER NOT NULL,
+           step INTEGER NOT NULL,
+           ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           provider TEXT NOT NULL,
+           model TEXT NOT NULL,
+           input_tokens INTEGER NOT NULL,
+           estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
+           output_tokens INTEGER NOT NULL,
+           cache_read_tokens INTEGER NOT NULL,
+           cache_miss_tokens INTEGER NOT NULL,
+           cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+           cost_usd REAL NOT NULL,
+           duration_ms INTEGER NOT NULL,
+           retries INTEGER NOT NULL,
+           tool_calls INTEGER NOT NULL,
+           UNIQUE (execution_id, step)
+         );"
+    )
+}
+
+/// `drift_samples` filters (provider, model) and sorts (execution_id DESC,
+/// step DESC) at EVERY session start, over a table that grows one row per
+/// model call forever — without this index it full-scans. Non-unique on
+/// purpose: uniqueness lives on the (execution_id, step) key; this is the
+/// query's covering access path.
+const TELEMETRY_INDEX: &str = "CREATE INDEX IF NOT EXISTS telemetry_by_model
+       ON telemetry(provider, model, execution_id, step);";
+
+/// The full latest schema, applied in one shot to fresh databases only.
+/// Existing files never see this — [`MIGRATIONS`] upgrades them shape by
+/// shape, so this can always describe the CURRENT shape.
+fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(UNCHANGED_TABLES)?;
+    tx.execute_batch(&events_ddl("events"))?;
+    tx.execute_batch(&telemetry_ddl("telemetry"))?;
+    tx.execute_batch(TELEMETRY_INDEX)?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        params![table],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Whether any store-owned table exists — distinguishes a fresh empty file
+/// (create latest schema directly) from a legacy pre-versioning file (run
+/// the migration list), since both carry `user_version` 0.
+fn any_store_table_exists(conn: &Connection) -> Result<bool> {
+    let placeholders = TABLES.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let count: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ({placeholders})"
+        ),
+        rusqlite::params_from_iter(TABLES),
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info(?) WHERE name = ?",
+        params![table, column],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// v0 → v1: retrofit the UNIQUE constraints the write paths have always
+/// assumed (see [`events_ddl`]/[`telemetry_ddl`]), deduping first — a
+/// constraint cannot land on a table holding historic duplicates.
+///
+/// Keep-rule: the newest row per natural key — `max(rowid)`, which is
+/// insertion order. A duplicate key can only come from a double-write of
+/// the same logical record (the writers' counters are monotonic per
+/// execution), and readers want the writer's final word: replay renders one
+/// event per stream position, and analytics prices one row per committed
+/// call — exactly the row an upsert would have retained.
+///
+/// SQLite cannot ALTER a UNIQUE constraint in, so both tables are rebuilt
+/// per the documented procedure (lang_altertable §7): create-new →
+/// INSERT SELECT → DROP old → RENAME. The old tables' indexes drop with
+/// them; `telemetry_by_model` is recreated and `events_by_execution` is
+/// superseded by the UNIQUE constraint's implicit index on exactly its
+/// columns. No store table declares foreign keys in either direction, so
+/// the rebuild moves no FK edges — but the runner still follows the full §7
+/// procedure (`foreign_keys` OFF outside the transaction, `foreign_key_check`
+/// before commit) so a future FK-bearing schema cannot be corrupted by this
+/// path.
+///
+/// A v0 file is not guaranteed to hold every table (partial files exist —
+/// e.g. pre-drift fixtures with only `telemetry`), so missing tables are
+/// created fresh in the v1 shape: empty, nothing to dedupe.
+fn migrate_v0_to_v1(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(UNCHANGED_TABLES)?;
+    // New executions must never reuse an id that historic rows already
+    // reference: a reused id mis-attributes those orphaned rows to the new
+    // run, and — with the UNIQUE keys this migration retrofits — collides
+    // with their (execution_id, seq/step) positions. A partial v0 file can
+    // hold events/telemetry that outlive their executions table (whose
+    // AUTOINCREMENT counter then restarts at 1), so the counter is seeded
+    // past every execution id in sight. sqlite_sequence exists here:
+    // creating any AUTOINCREMENT table (executions, just ensured) creates
+    // it, and its content is plain-DML-writable by design.
+    let max_in_executions: Option<i64> =
+        tx.query_row("SELECT max(id) FROM executions", [], |row| row.get(0))?;
+    let mut max_execution_id = max_in_executions.unwrap_or(0);
+    // events and telemetry may still be missing here (they are ensured or
+    // rebuilt below), so each referencing table is probed individually.
+    for table in ["events", "telemetry", "files_touched"] {
+        if table_exists(tx, table)? {
+            let max_id: Option<i64> = tx.query_row(
+                &format!("SELECT max(execution_id) FROM {table}"),
+                [],
+                |row| row.get(0),
+            )?;
+            max_execution_id = max_execution_id.max(max_id.unwrap_or(0));
+        }
+    }
+    if max_execution_id > 0 {
+        let seeded = tx.execute(
+            "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'executions' AND seq < ?1",
+            params![max_execution_id],
+        )?;
+        if seeded == 0 {
+            // No row updated: either the counter is already past the ids
+            // (nothing to do) or the counter row does not exist yet.
+            let exists: i64 = tx.query_row(
+                "SELECT count(*) FROM sqlite_sequence WHERE name = 'executions'",
+                [],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                tx.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('executions', ?1)",
+                    params![max_execution_id],
+                )?;
+            }
+        }
+    }
+    if table_exists(tx, "events")? {
+        tx.execute_batch(&events_ddl("events_v1"))?;
+        tx.execute_batch(
+            "INSERT INTO events_v1 (execution_id, seq, ts, event_type, payload)
+             SELECT execution_id, seq, ts, event_type, payload FROM events
+             WHERE rowid IN (SELECT max(rowid) FROM events GROUP BY execution_id, seq);
+             DROP TABLE events;
+             ALTER TABLE events_v1 RENAME TO events;",
+        )?;
+    } else {
+        tx.execute_batch(&events_ddl("events"))?;
+    }
+    if table_exists(tx, "telemetry")? {
+        // Pre-drift files lack estimated_input_tokens; the rebuild
+        // backfills 0 = "no estimate was taken", which drift_samples
+        // excludes as signal-free — same semantics the old ALTER-based
+        // migration gave those rows.
+        let estimated = if column_exists(tx, "telemetry", "estimated_input_tokens")? {
+            "estimated_input_tokens"
+        } else {
+            "0"
+        };
+        tx.execute_batch(&telemetry_ddl("telemetry_v1"))?;
+        tx.execute_batch(&format!(
+            "INSERT INTO telemetry_v1 (execution_id, step, ts, provider, model, input_tokens,
+               estimated_input_tokens, output_tokens, cache_read_tokens, cache_miss_tokens,
+               cache_write_tokens, cost_usd, duration_ms, retries, tool_calls)
+             SELECT execution_id, step, ts, provider, model, input_tokens,
+               {estimated}, output_tokens, cache_read_tokens, cache_miss_tokens,
+               cache_write_tokens, cost_usd, duration_ms, retries, tool_calls
+             FROM telemetry
+             WHERE rowid IN (SELECT max(rowid) FROM telemetry GROUP BY execution_id, step);
+             DROP TABLE telemetry;
+             ALTER TABLE telemetry_v1 RENAME TO telemetry;",
+        ))?;
+    } else {
+        tx.execute_batch(&telemetry_ddl("telemetry"))?;
+    }
+    tx.execute_batch(TELEMETRY_INDEX)?;
+    Ok(())
+}
+
+/// Run one migration in its own transaction, stamping `user_version` before
+/// commit so version and shape can never disagree on disk. The caller has
+/// already suspended foreign-key enforcement (a no-op inside a
+/// transaction).
+fn apply_migration(conn: &mut Connection, migration: Migration, target: i64) -> Result<()> {
+    let tx = conn.transaction()?;
+    migration(&tx)?;
+    // lang_altertable §7 requires a full FK audit before committing work
+    // done with enforcement off. No store table declares foreign keys
+    // today, so this passes trivially — it is what keeps the runner safe
+    // for schemas that will.
+    let violations: i64 =
+        tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations > 0 {
+        return Err(StoreError(format!(
+            "migration to schema version {target} would leave {violations} \
+             foreign-key violation(s); rolling back"
+        )));
+    }
+    tx.pragma_update(None, "user_version", target)?;
+    tx.commit().map_err(StoreError::from)
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -235,98 +558,48 @@ impl Store {
         Ok(store)
     }
 
+    /// Bring the database to [`SCHEMA_VERSION`]. `PRAGMA user_version` 0 is
+    /// both "fresh empty file" and "legacy pre-versioning file",
+    /// disambiguated by probing for the store's tables: fresh files get the
+    /// latest schema in one transaction and are stamped directly; existing
+    /// files run each pending [`MIGRATIONS`] entry in its own transaction
+    /// (version stamped inside it — see [`apply_migration`]).
     fn migrate(&self) -> Result<()> {
-        let conn = self.lock();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS executions (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               kind TEXT NOT NULL,
-               prompt TEXT NOT NULL,
-               provider TEXT NOT NULL,
-               model TEXT NOT NULL,
-               started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-               finished_at TEXT,
-               outcome TEXT,
-               cost_usd REAL NOT NULL DEFAULT 0
-             );
-             CREATE TABLE IF NOT EXISTS events (
-               execution_id INTEGER NOT NULL,
-               seq INTEGER NOT NULL,
-               ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-               event_type TEXT NOT NULL,
-               payload TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS telemetry (
-               execution_id INTEGER NOT NULL,
-               step INTEGER NOT NULL,
-               ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-               provider TEXT NOT NULL,
-               model TEXT NOT NULL,
-               input_tokens INTEGER NOT NULL,
-               estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
-               output_tokens INTEGER NOT NULL,
-               cache_read_tokens INTEGER NOT NULL,
-               cache_miss_tokens INTEGER NOT NULL,
-               cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-               cost_usd REAL NOT NULL,
-               duration_ms INTEGER NOT NULL,
-               retries INTEGER NOT NULL,
-               tool_calls INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS files_touched (
-               execution_id INTEGER NOT NULL,
-               path TEXT NOT NULL,
-               ops TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS file_locks (
-               path TEXT PRIMARY KEY,
-               holder TEXT NOT NULL,
-               acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-             );
-             CREATE TABLE IF NOT EXISTS graph_nodes (
-               id TEXT PRIMARY KEY,
-               label TEXT NOT NULL,
-               properties TEXT NOT NULL DEFAULT '{}'
-             );
-             CREATE TABLE IF NOT EXISTS graph_edges (
-               src TEXT NOT NULL,
-               dst TEXT NOT NULL,
-               edge_type TEXT NOT NULL,
-               properties TEXT NOT NULL DEFAULT '{}'
-             );",
-        )?;
-        // Additive migration for databases created before drift correction
-        // landed: `CREATE TABLE IF NOT EXISTS` above is a no-op on them, so
-        // the column arrives via ALTER when it's missing. Old rows default to
-        // 0 = "no estimate was taken", which `drift_samples` excludes as
-        // signal-free. Unlike DuckDB, SQLite allows a NOT NULL column with a
-        // DEFAULT to be added to a non-empty table — the default backfills
-        // existing rows, so the constraint holds from the moment it lands.
-        let has_estimated_column: i64 = conn.query_row(
-            "SELECT count(*) FROM pragma_table_info('telemetry') \
-             WHERE name = 'estimated_input_tokens'",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_estimated_column == 0 {
-            conn.execute_batch(
-                "ALTER TABLE telemetry ADD COLUMN estimated_input_tokens \
-                 INTEGER NOT NULL DEFAULT 0;",
-            )?;
+        let mut conn = self.lock();
+        let mut version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > SCHEMA_VERSION {
+            // A downgrade guard, not a formality: older code writing into a
+            // newer shape would silently violate whatever invariants the
+            // newer schema added.
+            return Err(StoreError(format!(
+                "store.db is at schema version {version}, but this build only \
+                 knows {SCHEMA_VERSION} — refusing to open it with older code"
+            )));
         }
-        // Indexes are additive and safe on existing databases. Both tables
-        // grow one row per model call / event forever, and both hot queries
-        // otherwise full-scan: `drift_samples` filters (provider, model) and
-        // sorts (execution_id DESC, step DESC) at EVERY session start, and
-        // any event replay reads (execution_id, seq). Non-unique on purpose —
-        // retrofitting UNIQUE onto tables that may hold historic duplicates
-        // needs a dedupe migration first (expand → migrate → contract).
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS telemetry_by_model
-               ON telemetry(provider, model, execution_id, step);
-             CREATE INDEX IF NOT EXISTS events_by_execution
-               ON events(execution_id, seq);",
-        )?;
+        if version == 0 && !any_store_table_exists(&conn)? {
+            let tx = conn.transaction()?;
+            create_latest_schema(&tx)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            return Ok(());
+        }
+        while version < SCHEMA_VERSION {
+            let target = version + 1;
+            // PRAGMA foreign_keys is silently ignored inside a transaction
+            // (SQLite pragma docs), so enforcement is suspended out here and
+            // restored after commit/rollback — the lang_altertable §7
+            // procedure the table-rebuilding migrations rely on.
+            conn.pragma_update(None, "foreign_keys", false)?;
+            let applied = apply_migration(&mut conn, MIGRATIONS[version as usize], target);
+            // Restore enforcement even when the migration failed: this
+            // connection lives on serving the session.
+            let restored = conn
+                .pragma_update(None, "foreign_keys", true)
+                .map_err(StoreError::from);
+            applied?;
+            restored?;
+            version = target;
+        }
         Ok(())
     }
 
@@ -357,6 +630,8 @@ impl Store {
 
     /// Append one event to the execution's stream. `seq` is the caller's
     /// monotonically increasing counter (the event drain loop owns order).
+    /// `(execution_id, seq)` is UNIQUE — a double-write of the same stream
+    /// position errors instead of silently corrupting the replay.
     pub fn record_event(&self, execution_id: i64, seq: u64, event: &AgentEvent) -> Result<()> {
         let payload = serde_json::to_string(event).map_err(|e| StoreError(e.to_string()))?;
         // Read the internally-tagged `type` from the parsed value rather than
@@ -374,7 +649,9 @@ impl Store {
         Ok(())
     }
 
-    /// Record one model call's telemetry.
+    /// Record one model call's telemetry. `(execution_id, step)` is UNIQUE —
+    /// `StepUsage` lands exactly once per step, and a double-write would
+    /// double-count tokens and cost in `usage_stats`.
     pub fn record_telemetry(&self, execution_id: i64, row: &TelemetryRow) -> Result<()> {
         self.lock().execute(
             "INSERT INTO telemetry (execution_id, step, provider, model, input_tokens, \
@@ -547,15 +824,6 @@ impl Store {
     /// ad-hoc introspection.
     pub fn count(&self, table: &str) -> Result<i64> {
         // Table names can't be bound parameters; allowlist them.
-        const TABLES: [&str; 7] = [
-            "executions",
-            "events",
-            "telemetry",
-            "files_touched",
-            "file_locks",
-            "graph_nodes",
-            "graph_edges",
-        ];
         if !TABLES.contains(&table) {
             return Err(StoreError(format!("unknown table `{table}`")));
         }
@@ -861,6 +1129,330 @@ mod tests {
             vec![(1_000, 1_400)]
         );
         drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The COMPLETE pre-versioning (v0) schema, verbatim — what any
+    /// store.db written before `user_version` stamping looks like on disk:
+    /// no UNIQUE keys on events/telemetry, both non-unique indexes present.
+    /// Migration tests build their fixtures from this, never from the
+    /// current DDL.
+    const LEGACY_V0_SCHEMA: &str = "CREATE TABLE executions (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           kind TEXT NOT NULL,
+           prompt TEXT NOT NULL,
+           provider TEXT NOT NULL,
+           model TEXT NOT NULL,
+           started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           finished_at TEXT,
+           outcome TEXT,
+           cost_usd REAL NOT NULL DEFAULT 0
+         );
+         CREATE TABLE events (
+           execution_id INTEGER NOT NULL,
+           seq INTEGER NOT NULL,
+           ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           event_type TEXT NOT NULL,
+           payload TEXT NOT NULL
+         );
+         CREATE TABLE telemetry (
+           execution_id INTEGER NOT NULL,
+           step INTEGER NOT NULL,
+           ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           provider TEXT NOT NULL,
+           model TEXT NOT NULL,
+           input_tokens INTEGER NOT NULL,
+           estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
+           output_tokens INTEGER NOT NULL,
+           cache_read_tokens INTEGER NOT NULL,
+           cache_miss_tokens INTEGER NOT NULL,
+           cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+           cost_usd REAL NOT NULL,
+           duration_ms INTEGER NOT NULL,
+           retries INTEGER NOT NULL,
+           tool_calls INTEGER NOT NULL
+         );
+         CREATE TABLE files_touched (
+           execution_id INTEGER NOT NULL,
+           path TEXT NOT NULL,
+           ops TEXT NOT NULL
+         );
+         CREATE TABLE file_locks (
+           path TEXT PRIMARY KEY,
+           holder TEXT NOT NULL,
+           acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE TABLE graph_nodes (
+           id TEXT PRIMARY KEY,
+           label TEXT NOT NULL,
+           properties TEXT NOT NULL DEFAULT '{}'
+         );
+         CREATE TABLE graph_edges (
+           src TEXT NOT NULL,
+           dst TEXT NOT NULL,
+           edge_type TEXT NOT NULL,
+           properties TEXT NOT NULL DEFAULT '{}'
+         );
+         CREATE INDEX telemetry_by_model
+           ON telemetry(provider, model, execution_id, step);
+         CREATE INDEX events_by_execution
+           ON events(execution_id, seq);";
+
+    /// Unique-per-test workspace root with `.stella/` pre-created, cleaned
+    /// of any leftover from a previously crashed run.
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "stella_store_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join(".stella")).unwrap();
+        root
+    }
+
+    fn user_version(store: &Store) -> i64 {
+        store
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn fresh_database_is_created_at_the_latest_schema_version() {
+        let store = Store::in_memory().unwrap();
+        assert_eq!(
+            user_version(&store),
+            SCHEMA_VERSION,
+            "fresh files are stamped directly, no migration list"
+        );
+
+        // The fresh shape carries the UNIQUE keys the write paths assume:
+        // a double-write of the same stream position / step errors instead
+        // of silently corrupting replay and double-counting cost.
+        let id = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_event(id, 0, &AgentEvent::Text { delta: "a".into() })
+            .unwrap();
+        assert!(
+            store
+                .record_event(id, 0, &AgentEvent::Text { delta: "b".into() })
+                .is_err(),
+            "duplicate (execution_id, seq) must violate UNIQUE"
+        );
+        store
+            .record_telemetry(id, &drift_row(0, "zai", "glm-5.2", 1_000, 1_400))
+            .unwrap();
+        assert!(
+            store
+                .record_telemetry(id, &drift_row(0, "zai", "glm-5.2", 2_000, 2_900))
+                .is_err(),
+            "duplicate (execution_id, step) must violate UNIQUE"
+        );
+        // Distinct positions still insert freely.
+        store
+            .record_event(id, 1, &AgentEvent::Text { delta: "c".into() })
+            .unwrap();
+        store
+            .record_telemetry(id, &drift_row(1, "zai", "glm-5.2", 2_000, 2_900))
+            .unwrap();
+        assert_eq!(store.count("events").unwrap(), 2);
+        assert_eq!(store.count("telemetry").unwrap(), 2);
+    }
+
+    #[test]
+    fn v1_migration_dedupes_a_v0_database_and_retrofits_the_unique_keys() {
+        let root = temp_root("v0_dedupe");
+        {
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
+            conn.execute_batch(LEGACY_V0_SCHEMA).unwrap();
+            // Historic double-writes the v0 schema accepted: the same
+            // stream position / step recorded twice. Separate INSERTs pin
+            // rowid (insertion) order — the newer row must survive.
+            conn.execute_batch(
+                "INSERT INTO executions (kind, prompt, provider, model)
+                   VALUES ('run', 'p', 'zai', 'glm-5.2');
+                 INSERT INTO events (execution_id, seq, event_type, payload)
+                   VALUES (1, 0, 'text', '{\"delta\":\"stale\"}');
+                 INSERT INTO events (execution_id, seq, event_type, payload)
+                   VALUES (1, 0, 'text', '{\"delta\":\"final\"}');
+                 INSERT INTO events (execution_id, seq, event_type, payload)
+                   VALUES (1, 1, 'text', '{\"delta\":\"tail\"}');
+                 INSERT INTO telemetry (execution_id, step, provider, model, input_tokens,
+                   estimated_input_tokens, output_tokens, cache_read_tokens,
+                   cache_miss_tokens, cost_usd, duration_ms, retries, tool_calls)
+                   VALUES (1, 0, 'zai', 'glm-5.2', 111, 100, 10, 0, 111, 0.1, 500, 0, 1);
+                 INSERT INTO telemetry (execution_id, step, provider, model, input_tokens,
+                   estimated_input_tokens, output_tokens, cache_read_tokens,
+                   cache_miss_tokens, cost_usd, duration_ms, retries, tool_calls)
+                   VALUES (1, 0, 'zai', 'glm-5.2', 222, 200, 20, 0, 222, 0.2, 600, 0, 1);
+                 INSERT INTO telemetry (execution_id, step, provider, model, input_tokens,
+                   estimated_input_tokens, output_tokens, cache_read_tokens,
+                   cache_miss_tokens, cost_usd, duration_ms, retries, tool_calls)
+                   VALUES (1, 1, 'zai', 'glm-5.2', 333, 300, 30, 0, 333, 0.3, 700, 0, 1);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&root).unwrap();
+        assert_eq!(
+            user_version(&store),
+            SCHEMA_VERSION,
+            "the migration stamps the version it produced"
+        );
+
+        // Duplicates collapsed to the NEWEST row per natural key.
+        assert_eq!(store.count("events").unwrap(), 2);
+        assert_eq!(store.count("telemetry").unwrap(), 2);
+        {
+            let conn = store.lock();
+            let payload: String = conn
+                .query_row(
+                    "SELECT payload FROM events WHERE execution_id = 1 AND seq = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                payload, "{\"delta\":\"final\"}",
+                "replay position (1, 0) keeps the last write"
+            );
+            let input: i64 = conn
+                .query_row(
+                    "SELECT input_tokens FROM telemetry WHERE execution_id = 1 AND step = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(input, 222, "model call (1, 0) keeps the last write");
+            // The rebuild preserved drift_samples' hot-path index.
+            let index_count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master \
+                     WHERE type = 'index' AND name = 'telemetry_by_model'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(index_count, 1);
+        }
+
+        // The retrofitted constraints hold on the migrated tables…
+        assert!(
+            store
+                .record_event(
+                    1,
+                    0,
+                    &AgentEvent::Text {
+                        delta: "again".into()
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .record_telemetry(1, &drift_row(0, "zai", "glm-5.2", 1_000, 1_400))
+                .is_err()
+        );
+        // …while fresh positions and the normal readers keep working.
+        store
+            .record_event(
+                1,
+                2,
+                &AgentEvent::Text {
+                    delta: "new".into(),
+                },
+            )
+            .unwrap();
+        store
+            .record_telemetry(1, &drift_row(2, "zai", "glm-5.2", 400, 500))
+            .unwrap();
+        assert_eq!(
+            store.drift_samples("zai", "glm-5.2", 10).unwrap(),
+            vec![(200, 222), (300, 333), (400, 500)],
+            "deduped history reads back newest-per-key, oldest first"
+        );
+        // A post-migration execution gets a fresh id, never execution 1's.
+        assert_eq!(
+            store.begin_execution("run", "p", "zai", "glm-5.2").unwrap(),
+            2
+        );
+
+        // Reopening an already-migrated file is a no-op — nothing
+        // re-collapsed, version unchanged.
+        drop(store);
+        let store = Store::open(&root).unwrap();
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+        assert_eq!(store.count("events").unwrap(), 3);
+        assert_eq!(store.count("telemetry").unwrap(), 3);
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn v1_migration_seeds_the_execution_counter_past_orphaned_history() {
+        let root = temp_root("v0_orphans");
+        {
+            // A partial v0 file: telemetry references executions 1..=3 but
+            // the executions table never existed, so its fresh AUTOINCREMENT
+            // counter would restart at 1 and mis-attribute the orphans.
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE telemetry (
+                   execution_id INTEGER NOT NULL,
+                   step INTEGER NOT NULL,
+                   ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                   provider TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   input_tokens INTEGER NOT NULL,
+                   estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
+                   output_tokens INTEGER NOT NULL,
+                   cache_read_tokens INTEGER NOT NULL,
+                   cache_miss_tokens INTEGER NOT NULL,
+                   cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                   cost_usd REAL NOT NULL,
+                   duration_ms INTEGER NOT NULL,
+                   retries INTEGER NOT NULL,
+                   tool_calls INTEGER NOT NULL
+                 );
+                 INSERT INTO telemetry (execution_id, step, provider, model, input_tokens,
+                   output_tokens, cache_read_tokens, cache_miss_tokens, cost_usd,
+                   duration_ms, retries, tool_calls)
+                   VALUES (3, 0, 'zai', 'glm-5.2', 100, 10, 0, 100, 0.1, 500, 0, 1);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        assert_eq!(
+            store.begin_execution("run", "p", "zai", "glm-5.2").unwrap(),
+            4,
+            "new executions must never reuse a historically referenced id"
+        );
+        // In particular, step 0 of the new execution cannot collide with
+        // orphaned telemetry under the retrofitted UNIQUE key.
+        store
+            .record_telemetry(4, &drift_row(0, "zai", "glm-5.2", 1_000, 1_400))
+            .unwrap();
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn refuses_a_database_stamped_by_a_newer_build() {
+        let root = temp_root("newer_version");
+        {
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        let err = match Store::open(&root) {
+            Ok(_) => panic!("a newer-versioned file must refuse to open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("schema version"),
+            "downgrade must refuse, not silently write into a newer shape: {err}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

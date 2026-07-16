@@ -1058,6 +1058,7 @@ mod tests {
                 input_tokens: 1000,
                 output_tokens: 500,
                 cached_input_tokens: 0,
+                cache_write_tokens: 0,
             });
         assert!(result.cost_usd > 0.0, "cost must be non-zero");
         assert_eq!(result.cost_usd, expected);

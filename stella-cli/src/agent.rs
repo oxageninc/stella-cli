@@ -15,14 +15,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use colored::Colorize;
-use stella_core::ports::{SystemClock, ToolExecutor};
-use stella_core::retry::TokioSleeper;
+use stella_core::ports::ToolExecutor;
 use stella_core::router::{CircuitBreaker, ProviderProfile};
 use stella_core::{
     BudgetGuard, CalibrationMap, Engine, EngineConfig, GoalConfig, GoalOutcome, RoleTable, Router,
     TurnOutcome,
 };
-use stella_mcp::{McpConfig, McpToolSet};
+use stella_mcp::{McpConfig, McpServerConfig, McpToolSet};
 use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
 use stella_pipeline::{
@@ -44,6 +43,7 @@ use crate::config::Config;
 use crate::domains::{Domains, heuristic_domains, infer_domains};
 use crate::interactive::{InteractiveToolSet, SkillRegistry, default_ask_io};
 use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
+use crate::runtime::{SystemClock, TokioSleeper};
 use crate::tui;
 use stella_context::EpisodeOutcome;
 
@@ -1449,38 +1449,83 @@ pub async fn run_init(
     Ok(())
 }
 
+/// Cap on each MCP server's connect (and, until overridden, each later
+/// call) — the per-server bound `McpToolSet::connect` enforces.
+const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The parse of `.stella/mcp.toml`, split from the connect so a caller that
+/// owns a UI (the deck) can announce the slow part before awaiting it (#98).
+pub(crate) enum McpPlan {
+    /// No config file, or one naming zero servers — nothing to connect.
+    None,
+    /// The config exists but is unreadable/invalid: MCP is disabled this
+    /// session, and the reason must be surfaced exactly once.
+    Invalid(String),
+    /// Servers to connect via [`connect_mcp_servers`].
+    Servers(Vec<McpServerConfig>),
+}
+
+/// Stage 1 of MCP assembly: read and parse the workspace config. Local file
+/// I/O only — never touches the network.
+pub(crate) fn load_mcp_plan(cfg: &Config) -> McpPlan {
+    let path = cfg.workspace_root.join(".stella").join("mcp.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return McpPlan::None;
+    };
+    let parsed = match McpConfig::from_toml_str(&text) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return McpPlan::Invalid(format!(
+                "{} is invalid: {e} — MCP servers disabled this session",
+                path.display()
+            ));
+        }
+    };
+    let servers = parsed.into_servers();
+    if servers.is_empty() {
+        McpPlan::None
+    } else {
+        McpPlan::Servers(servers)
+    }
+}
+
+/// Stage 2 of MCP assembly: the slow part — up to [`MCP_CONNECT_TIMEOUT`]
+/// per server. Best-effort and isolated per server (stella-mcp records
+/// failures in the set instead of propagating them); the returned set wraps
+/// `native` so non-`mcp__` tool names fall through to it.
+pub(crate) async fn connect_mcp_servers(
+    servers: &[McpServerConfig],
+    native: std::sync::Arc<dyn ToolExecutor>,
+) -> McpToolSet {
+    McpToolSet::connect(servers, MCP_CONNECT_TIMEOUT)
+        .await
+        .wrapping(native)
+}
+
 /// Connect the workspace's MCP servers (.stella/mcp.toml), wrapping the
 /// native registry so their tools merge into the agent's set under
 /// mcp__<server>__<tool> names. Absent config -> None (zero overhead).
 /// Connection is best-effort per server (stella-mcp isolates failures);
-/// failed servers are reported once in text mode, never fatal.
+/// failed servers are reported once in text mode, never fatal. Deck mode
+/// stages [`load_mcp_plan`] / [`connect_mcp_servers`] itself instead: the
+/// connect must run behind the live TUI, with diagnostics as transcript
+/// events rather than prints (#98).
 pub(crate) async fn connect_mcp(
     cfg: &Config,
     native: std::sync::Arc<dyn ToolExecutor>,
     print_diagnostics: bool,
 ) -> Option<McpToolSet> {
-    let path = cfg.workspace_root.join(".stella").join("mcp.toml");
-    let text = std::fs::read_to_string(&path).ok()?;
-    let parsed = match McpConfig::from_toml_str(&text) {
-        Ok(parsed) => parsed,
-        Err(e) => {
+    let servers = match load_mcp_plan(cfg) {
+        McpPlan::None => return None,
+        McpPlan::Invalid(reason) => {
             if print_diagnostics {
-                eprintln!(
-                    "  {} {} is invalid: {e} — MCP servers disabled this session",
-                    "!".yellow(),
-                    path.display()
-                );
+                eprintln!("  {} {reason}", "!".yellow());
             }
             return None;
         }
+        McpPlan::Servers(servers) => servers,
     };
-    let servers = parsed.into_servers();
-    if servers.is_empty() {
-        return None;
-    }
-    let set = McpToolSet::connect(&servers, std::time::Duration::from_secs(10))
-        .await
-        .wrapping(native);
+    let set = connect_mcp_servers(&servers, native).await;
     if print_diagnostics {
         for (name, reason) in set.failed_servers() {
             eprintln!(
@@ -1816,7 +1861,8 @@ async fn run_turn(
         .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
         let hook_runner = ShellHookRunner;
         let mut engine =
-            Engine::new(provider, &tools, engine_config_for(cfg)).with_calibration(calibration);
+            Engine::with_sleeper(provider, &tools, engine_config_for(cfg), &TokioSleeper)
+                .with_calibration(calibration);
         if let Some(hooks) = &cfg.hooks {
             engine = engine.with_hooks(hooks, &hook_runner);
         }
@@ -2018,6 +2064,7 @@ pub(crate) fn persist_event(
         input_tokens,
         output_tokens,
         cached_input_tokens,
+        cache_write_tokens,
         estimated_input_tokens,
         cost_usd,
         duration_ms,
@@ -2037,9 +2084,11 @@ pub(crate) fn persist_event(
                     output_tokens: *output_tokens,
                     cache_read_tokens: *cached_input_tokens,
                     cache_miss_tokens: input_tokens.saturating_sub(*cached_input_tokens),
-                    // Populated once the usage envelope carries cache-write
-                    // counts (staged follow-up).
-                    cache_write_tokens: 0,
+                    // Straight from the provider's usage envelope (Anthropic
+                    // `cache_creation_input_tokens`, Bedrock
+                    // `cacheWriteInputTokens`); 0 for providers that never
+                    // report cache writes.
+                    cache_write_tokens: *cache_write_tokens,
                     cost_usd: *cost_usd,
                     duration_ms: *duration_ms,
                     retries: *retries,
@@ -2119,7 +2168,8 @@ async fn run_goal_turn(
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
         let hook_runner = ShellHookRunner;
         let mut engine =
-            Engine::new(provider, &tools, engine_config_for(cfg)).with_calibration(calibration);
+            Engine::with_sleeper(provider, &tools, engine_config_for(cfg), &TokioSleeper)
+                .with_calibration(calibration);
         if let Some(hooks) = &cfg.hooks {
             engine = engine.with_hooks(hooks, &hook_runner);
         }
@@ -2474,6 +2524,50 @@ mod tests {
     use super::*;
     use crate::config::{ConfiguredProvider, PROVIDERS, ProviderConfig};
     use stella_model::credential::ApiKey;
+
+    /// The store write path for `StepUsage`: every token field on the event
+    /// — cache writes included — lands in the telemetry row verbatim.
+    /// Regression for issue #97, where `cache_write_tokens` was hard-coded
+    /// to 0 at this exact seam while the schema and `stella stats` already
+    /// carried the column.
+    #[test]
+    fn persist_event_records_cache_write_tokens_from_step_usage() {
+        let store = Store::in_memory().expect("in-memory store");
+        let execution_id = store
+            .begin_execution("run", "prompt", "anthropic", "claude-fable-5")
+            .expect("begin execution");
+        let event = AgentEvent::StepUsage {
+            step: 0,
+            model: "claude-fable-5".into(),
+            input_tokens: 1_000,
+            output_tokens: 50,
+            cached_input_tokens: 900,
+            cache_write_tokens: 640,
+            estimated_input_tokens: 980,
+            cost_usd: 0.0042,
+            duration_ms: 1_830,
+            retries: 0,
+            tool_calls: 1,
+        };
+
+        assert!(persist_event(&store, execution_id, 0, &event, "anthropic"));
+        store
+            .finish_execution(execution_id, "completed", 0.0042)
+            .expect("finish execution");
+
+        let rows = store.usage_stats().expect("usage stats");
+        let row = rows
+            .iter()
+            .find(|r| r.provider == "anthropic")
+            .expect("anthropic row");
+        assert_eq!(row.input_tokens, 1_000);
+        assert_eq!(row.output_tokens, 50);
+        assert_eq!(row.cache_read_tokens, 900);
+        assert_eq!(
+            row.cache_write_tokens, 640,
+            "the event's cache-write count must reach the store, never a hard-coded 0"
+        );
+    }
 
     /// A `Config` selecting `provider_id` at its default model, with a dummy
     /// key. `build_provider` only constructs the adapter (no network call),

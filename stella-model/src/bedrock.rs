@@ -232,6 +232,12 @@ struct BedrockUsage {
     output_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: u64,
+    /// Tokens written to the prompt cache by this call (Converse
+    /// `cacheWriteInputTokens`) — reported separately from `inputTokens`,
+    /// surfaced as the normalized `cache_write_tokens` and never folded into
+    /// `input_tokens` (no cache-write rate in the catalog to price them).
+    #[serde(default)]
+    cache_write_input_tokens: u64,
 }
 
 /// Translate the engine's one message list into Converse `system` +
@@ -460,6 +466,7 @@ impl Provider for BedrockProvider {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cached_input_tokens: usage.cache_read_input_tokens,
+            cache_write_tokens: usage.cache_write_input_tokens,
         };
         let cost_usd = self.pricing.map(|p| p.cost_usd(&usage)).unwrap_or(0.0);
 
@@ -878,7 +885,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "output": {"message": {"role": "assistant", "content": [{"text": "Hello from Bedrock"}]}},
                 "stopReason": "end_turn",
-                "usage": {"inputTokens": 9, "outputTokens": 5, "cacheReadInputTokens": 3}
+                "usage": {"inputTokens": 9, "outputTokens": 5, "cacheReadInputTokens": 3, "cacheWriteInputTokens": 2}
             })))
             .mount(&server)
             .await;
@@ -900,6 +907,7 @@ mod tests {
         assert_eq!(result.usage.input_tokens, 9);
         assert_eq!(result.usage.output_tokens, 5);
         assert_eq!(result.usage.cached_input_tokens, 3);
+        assert_eq!(result.usage.cache_write_tokens, 2);
     }
 
     #[tokio::test]
