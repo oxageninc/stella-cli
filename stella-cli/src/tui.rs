@@ -30,8 +30,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use colored::{Color, Colorize};
-use stella_protocol::AgentEvent;
+use colored::{Color, ColoredString, Colorize};
+use stella_protocol::{AgentEvent, BudgetMode, StageKind};
+use stella_tui::textline::{self, EventLine, Tone, fmt_cost};
 
 /// Truncate `s` to at most `max` characters, appending `…` when it was
 /// shortened. Char-boundary-safe: operates on `char`s, never byte indices,
@@ -44,17 +45,6 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
         format!("{head}…")
     } else {
         s.to_string()
-    }
-}
-
-/// Render a token count compactly: `842`, `12.3k`, `1.2M`.
-fn fmt_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
     }
 }
 
@@ -276,9 +266,10 @@ pub fn assistant_response(text: &str) {
 /// turn-end.
 pub fn cost_summary(cost_usd: f64, model: &str, elapsed: Duration) {
     println!(
-        "\n  {} {} · ${cost_usd:.4} · {:.1}s",
+        "\n  {} {} · {} · {:.1}s",
         "◆".dimmed(),
         model.bright_blue(),
+        fmt_cost(cost_usd),
         elapsed.as_secs_f64(),
     );
 }
@@ -317,10 +308,15 @@ pub fn welcome_banner(provider: &str, model: &str, workspace: &str) {
 /// `agent.rs`'s event-draining task. Every other event kind (including
 /// `Text` — the engine emits one per step, not just at turn-end, since a
 /// step with tool calls can still carry commentary text) is rendered here.
+///
+/// Wording comes from `stella_tui::textline` — the one event→text table
+/// both this surface and the deck consume (issue #66); the arms below carry
+/// only this surface's *policy* (what to suppress, what goes to stderr) and
+/// styling. A new annotation variant needs a `textline` entry, nothing here.
 pub fn render_event(event: &AgentEvent) {
     match event {
         AgentEvent::Stage {
-            name: stella_protocol::StageKind::Execute,
+            name: StageKind::Execute,
         } => {
             println!("  {}", "thinking…".dimmed());
         }
@@ -330,192 +326,16 @@ pub fn render_event(event: &AgentEvent) {
         }
         AgentEvent::Text { delta } => assistant_response(delta),
         AgentEvent::Reasoning { .. } => {}
-        AgentEvent::Retry { attempt, reason } => {
-            println!("  {} retry #{attempt}: {}", "↻".yellow(), reason.dimmed());
-        }
-        AgentEvent::Compaction {
-            before_tokens,
-            after_tokens,
-            evicted,
-            deduped,
-        } => {
-            println!(
-                "  {} compacted context: {before_tokens} → {after_tokens} tokens ({evicted} evicted, {deduped} deduped)",
-                "⤵".cyan(),
-            );
-        }
         AgentEvent::BudgetTick {
-            spent_usd,
-            limit_usd,
-            mode,
-        } => {
-            if matches!(mode, stella_protocol::BudgetMode::Off) {
-                return;
-            }
-            match limit_usd {
-                Some(limit) => println!("  {} spend: ${spent_usd:.4} / ${limit:.2}", "$".dimmed()),
-                None => println!("  {} spend: ${spent_usd:.4}", "$".dimmed()),
-            }
-        }
-        AgentEvent::ProviderFallback { from, to, reason } => {
-            println!(
-                "  {} provider fallback {} → {}: {}",
-                "⚠".yellow().bold(),
-                from.bright_yellow(),
-                to.bright_green(),
-                reason.dimmed()
-            );
-        }
-        AgentEvent::StepUsage {
-            step,
-            model,
-            input_tokens,
-            output_tokens,
-            cached_input_tokens,
-            cost_usd,
-            duration_ms,
-            retries,
-            tool_calls,
-            // `estimated_input_tokens` is calibration feedback for the
-            // estimator (stella-core), not HUD material.
+            mode: BudgetMode::Off,
             ..
         } => {
-            // One dimmed telemetry line per committed model call: the live
-            // HUD a metering consumer would reconstruct from this event.
-            let cached = if *cached_input_tokens > 0 {
-                format!(" ({} cached)", fmt_tokens(*cached_input_tokens))
-            } else {
-                String::new()
-            };
-            let retried = if *retries > 0 {
-                format!(" · {retries} retry")
-            } else {
-                String::new()
-            };
-            let tools = if *tool_calls > 0 {
-                format!(
-                    " · {tool_calls} tool call{}",
-                    if *tool_calls == 1 { "" } else { "s" }
-                )
-            } else {
-                String::new()
-            };
-            println!(
-                "  {} step {} · {} · {}{} in → {} out · ${cost_usd:.4} · {:.1}s{}{}",
-                "·".dimmed(),
-                step + 1,
-                model.dimmed(),
-                fmt_tokens(*input_tokens),
-                cached.dimmed(),
-                fmt_tokens(*output_tokens),
-                (*duration_ms as f64) / 1000.0,
-                retried.dimmed(),
-                tools.dimmed(),
-            );
+            // Unmetered sessions stay quiet about spend.
         }
-        AgentEvent::GoalVerdict {
-            round,
-            met,
-            reasoning,
-            ..
-        } => {
-            if *met {
-                println!(
-                    "  {} judge verdict (round {round}): goal met — {}",
-                    "✓".green().bold(),
-                    reasoning
-                );
-            } else {
-                println!(
-                    "  {} judge verdict (round {round}): not yet met — {}",
-                    "○".yellow(),
-                    reasoning
-                );
-            }
-        }
-        AgentEvent::FileChange { path, kind, .. } => {
-            let verb = match kind {
-                stella_protocol::FileChangeKind::Created => "created",
-                stella_protocol::FileChangeKind::Modified => "modified",
-                stella_protocol::FileChangeKind::Deleted => "deleted",
-            };
-            println!("  {} {} {}", "±".cyan(), verb.dimmed(), path);
-        }
-        AgentEvent::ContextRecall {
-            frames,
-            provider_mix,
-            tokens,
-        } => {
-            let mix = provider_mix
-                .iter()
-                .map(|share| format!("{}×{}", share.frames, share.provider))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!(
-                "  {} recalled {} frames ({tokens} tokens: {mix})",
-                "◈".cyan(),
-                frames.len()
-            );
-        }
-        AgentEvent::ContextWrite {
-            provider,
-            upserts,
-            superseded,
-        } => {
-            println!(
-                "  {} context write-back via {provider}: {upserts} upserts, {superseded} superseded",
-                "◈".dimmed()
-            );
-        }
-        AgentEvent::MediaProgress {
-            artifact_id,
-            kind,
-            state,
-        } => {
-            let state_str = match state {
-                stella_protocol::MediaJobState::Queued => "queued".dimmed(),
-                stella_protocol::MediaJobState::Running => "running".cyan(),
-                stella_protocol::MediaJobState::Succeeded => "succeeded".green(),
-                stella_protocol::MediaJobState::Failed { reason } => {
-                    println!(
-                        "  {} {kind:?} job {artifact_id} failed: {reason}",
-                        "✗".red()
-                    );
-                    return;
-                }
-            };
-            println!("  {} {kind:?} job {artifact_id}: {state_str}", "▣".cyan());
-        }
-        AgentEvent::MediaComplete { artifact } => {
-            println!(
-                "  {} {} ready: {} ({})",
-                "▣".green(),
-                artifact.label,
-                artifact.path,
-                format!("{:?}", artifact.kind).to_lowercase()
-            );
-        }
-        AgentEvent::JudgeVerdict { passed, evidence } => {
-            let icon = if *passed { "✓".green() } else { "✗".red() };
-            let source = if evidence.deterministic {
-                "deterministic"
-            } else {
-                "model judge"
-            };
-            println!("  {icon} verify ({source}): {}", evidence.summary.dimmed());
-        }
-        AgentEvent::ScopeReview { proposal } => {
-            println!(
-                "  {} scope review: {} ({} steps, ~{} files{})",
-                "⌾".yellow().bold(),
-                proposal.summary,
-                proposal.steps.len(),
-                proposal.estimated_files,
-                proposal
-                    .estimated_cost_usd
-                    .map(|c| format!(", ~${c:.2}"))
-                    .unwrap_or_default()
-            );
+        AgentEvent::Complete { .. } => {
+            // The call site prints `cost_summary` from `TurnOutcome`
+            // directly (it has the same model/cost_usd this event carries,
+            // plus wall-clock elapsed time this event doesn't).
         }
         AgentEvent::AskUser {
             question, options, ..
@@ -526,31 +346,39 @@ pub fn render_event(event: &AgentEvent) {
             // consumers of the event log. The binding free-text contract
             // (every question always offers a type-your-own option) is
             // enforced at the prompt site, not here.
-            println!("  {} {}", "?".yellow().bold(), question.bold());
+            println!("  {}", styled_event_line(&textline::ask_user(question)));
             for (i, option) in options.iter().enumerate() {
                 println!("    {} {}", format!("{})", i + 1).dimmed(), option);
             }
         }
-        AgentEvent::Commit { sha, message } => {
-            let short = sha.get(..8).unwrap_or(sha.as_str());
-            println!("  {} committed {short} {}", "●".green(), message.dimmed());
+        AgentEvent::Error { .. } => {
+            // Errors belong on stderr — routing is policy, wording is shared.
+            if let Some(line) = textline::event_line(event) {
+                eprintln!("  {}", styled_event_line(&line));
+            }
         }
-        AgentEvent::Pr { url, status } => {
-            println!(
-                "  {} PR {}: {url}",
-                "⇡".cyan(),
-                format!("{status:?}").to_lowercase()
-            );
+        other => {
+            if let Some(line) = textline::event_line(other) {
+                println!("  {}", styled_event_line(&line));
+            }
         }
-        AgentEvent::Error { message, retryable } => {
-            let label = if *retryable { "warning" } else { "error" };
-            eprintln!("  {} {}: {}", "✗".red(), label.red().bold(), message);
-        }
-        AgentEvent::Complete { .. } => {
-            // The call site prints `cost_summary` from `TurnOutcome`
-            // directly (it has the same model/cost_usd this event carries,
-            // plus wall-clock elapsed time this event doesn't).
-        }
+    }
+}
+
+/// A shared [`EventLine`] in this surface's dress: the glyph carries the
+/// tone via `colored` (bold when `strong`), the detail tail is dimmed.
+fn styled_event_line(line: &EventLine) -> String {
+    let glyph = match line.tone {
+        Tone::Info => line.glyph.cyan(),
+        Tone::Success => line.glyph.green(),
+        Tone::Warn => line.glyph.yellow(),
+        Tone::Error => line.glyph.red(),
+        Tone::Muted => line.glyph.dimmed(),
+    };
+    let glyph: ColoredString = if line.strong { glyph.bold() } else { glyph };
+    match &line.detail {
+        Some(detail) => format!("{} {} {}", glyph, line.body, detail.dimmed()),
+        None => format!("{} {}", glyph, line.body),
     }
 }
 
@@ -850,6 +678,42 @@ impl PromptDuel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── shared event lines ─────────────────────────────────────────────────
+
+    /// Drop ANSI SGR sequences so assertions pin visible text regardless of
+    /// whether `colored` detects a tty in the test harness.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for e in chars.by_ref() {
+                    if e == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn styled_event_line_composes_glyph_body_detail_with_single_spaces() {
+        // Wording is pinned byte-exactly in `stella_tui::textline`'s own
+        // fixtures; this guards the composition this surface adds around it
+        // (the old renderers wrote `"  {glyph} {body} {detail}"`).
+        assert_eq!(
+            strip_ansi(&styled_event_line(&textline::retry(2, "rate limited"))),
+            "↻ retry #2: rate limited"
+        );
+        assert_eq!(
+            strip_ansi(&styled_event_line(&textline::budget_tick(0.42, None))),
+            "$ spend: $0.4200"
+        );
+    }
 
     // ── wordmark ───────────────────────────────────────────────────────────
 

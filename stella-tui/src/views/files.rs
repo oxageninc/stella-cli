@@ -223,13 +223,16 @@ fn record_line(rec: &FileRecord, width: usize, selected: bool) -> Line<'static> 
     Line::from(spans)
 }
 
-/// CRUD glyph + semantic color for one [`FileChangeKind`].
+/// CRUD badge for one [`FileChangeKind`]: the letter comes from the shared
+/// files-panel vocabulary (`textline::crud_letter`, one table for both
+/// rendering surfaces — issue #66); only the palette is this view's.
 fn op_style(kind: FileChangeKind) -> (&'static str, ratatui::style::Color) {
-    match kind {
-        FileChangeKind::Created => ("C", theme::OK),
-        FileChangeKind::Modified => ("U", theme::WARN),
-        FileChangeKind::Deleted => ("D", theme::BAD),
-    }
+    let color = match kind {
+        FileChangeKind::Created => theme::OK,
+        FileChangeKind::Modified => theme::WARN,
+        FileChangeKind::Deleted => theme::BAD,
+    };
+    (crate::textline::crud_letter(kind), color)
 }
 
 /// Left-elide `text` to at most `max` chars, keeping the tail (the

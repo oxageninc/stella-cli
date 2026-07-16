@@ -29,10 +29,11 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use unicode_width::UnicodeWidthChar;
 
-use stella_protocol::{BudgetMode, FileChangeKind, MediaKind, PrStatus, StageKind};
+use stella_protocol::FileChangeKind;
 
 use crate::composer::{ComposerLayout, SlashMenu, layout as composer_layout, split_row_at};
 use crate::model::{AskUserPrompt, FileState, Hud, SessionModel, TranscriptEntry};
+use crate::textline::{self, EventLine, Tone, budget_mode_label, stage_label};
 use crate::ui::{PanelFocus, UiState, ViewportMetrics};
 use crate::{diff, theme};
 
@@ -317,7 +318,10 @@ pub(crate) fn render_hud(hud: &Hud, area: Rect, buf: &mut Buffer) {
         Span::raw(hud.model.clone().unwrap_or_else(|| "—".to_string())),
         Span::raw("   "),
         Span::styled("spend: ", Style::new().fg(Color::DarkGray)),
-        Span::styled(spend_label(hud), Style::new().fg(spend_color(hud))),
+        Span::styled(
+            textline::spend_amount(hud.spent_usd, hud.limit_usd),
+            Style::new().fg(spend_color(hud)),
+        ),
     ];
     if let Some(mode) = hud.budget_mode {
         spans.push(Span::styled(
@@ -831,10 +835,7 @@ pub(crate) fn entry_lines(
                 .add_modifier(Modifier::ITALIC);
             if show_all {
                 for l in text.split('\n') {
-                    out.push(Line::from(Span::styled(
-                        format!("  {l}"),
-                        reasoning_style,
-                    )));
+                    out.push(Line::from(Span::styled(format!("  {l}"), reasoning_style)));
                 }
             } else {
                 let preview_count = 3;
@@ -844,10 +845,7 @@ pub(crate) fn entry_lines(
                         break;
                     }
                     if !l.trim().is_empty() {
-                        out.push(Line::from(Span::styled(
-                            format!("  {l}"),
-                            reasoning_style,
-                        )));
+                        out.push(Line::from(Span::styled(format!("  {l}"), reasoning_style)));
                         shown += 1;
                     }
                 }
@@ -949,126 +947,137 @@ pub(crate) fn entry_lines(
                 wrap_one_indent(line, width, LABEL_COL, out);
             }
         }
-        TranscriptEntry::Retry { attempt, reason } => out.push(Line::from(Span::styled(
-            format!("↻ retry #{attempt}: {reason}"),
-            Style::new().fg(Color::Yellow),
-        ))),
+        // Annotation rows: wording comes from the shared `textline` table
+        // (issue #66 — one lookup per `AgentEvent` variant, styled here).
+        TranscriptEntry::Retry { attempt, reason } => {
+            out.push(note_line(textline::retry(*attempt, reason)));
+        }
         TranscriptEntry::Compaction {
             before_tokens,
             after_tokens,
             evicted,
             deduped,
-        } => out.push(Line::from(Span::styled(
-            format!(
-                "⇣ compacted {before_tokens}→{after_tokens} tok (evicted {evicted}, deduped {deduped})"
-            ),
-            Style::new().fg(Color::Blue),
+        } => out.push(note_line(textline::compaction(
+            *before_tokens,
+            *after_tokens,
+            *evicted,
+            *deduped,
         ))),
         TranscriptEntry::BudgetTick {
             spent_usd,
             limit_usd,
             mode,
         } => {
-            let limit = limit_usd
-                .map(|l| format!("/${l:.2}"))
-                .unwrap_or_default();
-            out.push(Line::from(Span::styled(
-                format!("$ spend ${spent_usd:.4}{limit} ({})", budget_mode_label(*mode)),
-                Style::new().fg(Color::DarkGray),
-            )));
+            // The deck keeps the enforcement mode on the row (the plain
+            // surface suppresses `Off` ticks instead).
+            let mut line = textline::budget_tick(*spent_usd, *limit_usd);
+            line.detail = Some(format!("({})", budget_mode_label(*mode)));
+            out.push(note_line(line));
         }
-        TranscriptEntry::ProviderFallback { from, to, reason } => out.push(Line::from(Span::styled(
-            format!("⚡ provider fallback {from} → {to}: {reason}"),
-            Style::new().fg(Color::Magenta),
-        ))),
+        TranscriptEntry::ProviderFallback { from, to, reason } => {
+            out.push(note_line(textline::provider_fallback(from, to, reason)));
+        }
         TranscriptEntry::ContextRecall {
             frames,
             tokens,
             labels,
         } => {
-            let cited = labels.join(", ");
-            out.push(Line::from(Span::styled(
-                format!("◉ recalled {frames} frames ({tokens} tok): {cited}"),
-                Style::new().fg(Color::Blue),
+            // Cited by human label, never raw id (L-C4); the plain surface
+            // cites the provider mix on the same shared line instead.
+            out.push(note_line(textline::context_recall(
+                *frames,
+                *tokens,
+                &labels.join(", "),
             )));
         }
         TranscriptEntry::ContextWrite {
             provider,
             upserts,
             superseded,
-        } => out.push(Line::from(Span::styled(
-            format!("✎ wrote {upserts} facts ({superseded} superseded) → {provider}"),
-            Style::new().fg(Color::Blue),
+        } => out.push(note_line(textline::context_write(
+            provider,
+            *upserts,
+            *superseded,
         ))),
         TranscriptEntry::MediaProgress {
             artifact_id,
             kind,
             state,
-        } => out.push(Line::from(Span::styled(
-            format!("🎞 {} {artifact_id}: {state}", media_kind_label(*kind)),
-            Style::new().fg(Color::Magenta),
+        } => out.push(note_line(textline::media_progress(
+            *kind,
+            artifact_id,
+            state,
         ))),
-        TranscriptEntry::MediaComplete { label, path, kind } => out.push(Line::from(vec![
-            Span::styled(
-                format!("🎨 {} {label} ", media_kind_label(*kind)),
-                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(path.clone(), Style::new().fg(Color::DarkGray)),
-        ])),
+        TranscriptEntry::MediaComplete { label, path, kind } => {
+            out.push(note_line(textline::media_complete(label, path, *kind)));
+        }
         TranscriptEntry::JudgeVerdict {
             passed,
             summary,
             deterministic,
-        } => {
-            let (glyph, color) = if *passed {
-                ("✓", Color::Green)
-            } else {
-                ("✗", Color::Red)
-            };
-            let tag = if *deterministic { "deterministic" } else { "model-judge" };
-            out.push(Line::from(vec![
-                Span::styled(format!("{glyph} verdict "), Style::new().fg(color).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("[{tag}] "), Style::new().fg(Color::DarkGray)),
-                Span::raw(summary.clone()),
-            ]));
-        }
+        } => out.push(note_line(textline::judge_verdict(
+            *passed,
+            *deterministic,
+            summary,
+        ))),
         TranscriptEntry::ScopeReview {
             summary,
             steps,
             estimated_files,
-        } => out.push(Line::from(Span::styled(
-            format!("⏸ scope review: {summary} ({steps} steps, ~{estimated_files} files)"),
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        } => out.push(note_line(textline::scope_review(
+            summary,
+            *steps,
+            *estimated_files,
+            // The entry retains no cost estimate; the pending card carries it.
+            None,
         ))),
-        TranscriptEntry::AskUser { question, options } => out.push(Line::from(Span::styled(
-            format!("? {question} ({options} options + free text)"),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ))),
+        TranscriptEntry::AskUser { question, options } => {
+            // The shared line is the question; the option count + free-text
+            // affordance is this surface's card cue.
+            let mut line = textline::ask_user(question);
+            line.detail = Some(format!("({options} options + free text)"));
+            out.push(note_line(line));
+        }
         TranscriptEntry::Commit { sha, message } => {
-            let short = sha.chars().take(9).collect::<String>();
-            out.push(Line::from(vec![
-                Span::styled(format!("● {short} "), Style::new().fg(Color::Cyan)),
-                Span::raw(message.clone()),
-            ]));
+            out.push(note_line(textline::commit(sha, message)));
         }
-        TranscriptEntry::Pr { url, status } => out.push(Line::from(vec![
-            Span::styled(
-                format!("⇢ PR [{}] ", pr_status_label(*status)),
-                Style::new().fg(pr_status_color(*status)).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(url.clone(), Style::new().fg(Color::DarkGray)),
-        ])),
+        TranscriptEntry::Pr { url, status } => out.push(note_line(textline::pr(url, *status))),
         TranscriptEntry::Error { message, retryable } => {
-            let tag = if *retryable { " (retryable)" } else { "" };
-            out.push(Line::from(Span::styled(
-                format!("✗ error{tag}: {message}"),
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )));
+            out.push(note_line(textline::error(message, *retryable)));
         }
-        TranscriptEntry::Complete { model, cost_usd } => out.push(Line::from(Span::styled(
-            format!("✓ complete · {model} · ${cost_usd:.4}"),
-            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-        ))),
+        TranscriptEntry::Complete { model, cost_usd } => {
+            out.push(note_line(textline::complete(model, *cost_usd)));
+        }
+    }
+}
+
+/// One shared [`EventLine`] as a styled transcript row: glyph+body carry the
+/// tone's theme color (bold when `strong`), the detail tail reads muted —
+/// this fn and the palette map below are the *entire* deck-side presentation
+/// of an annotation.
+fn note_line(note: EventLine) -> Line<'static> {
+    let mut style = Style::new().fg(tone_color(note.tone));
+    if note.strong {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    let mut spans = vec![Span::styled(format!("{} {}", note.glyph, note.body), style)];
+    if let Some(detail) = note.detail {
+        spans.push(Span::styled(
+            format!(" {detail}"),
+            Style::new().fg(theme::MUTED),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Semantic tone → deck palette.
+fn tone_color(tone: Tone) -> Color {
+    match tone {
+        Tone::Info => theme::RUN,
+        Tone::Success => theme::OK,
+        Tone::Warn => theme::WARN,
+        Tone::Error => theme::BAD,
+        Tone::Muted => theme::MUTED,
     }
 }
 
@@ -1094,64 +1103,8 @@ fn file_line(file: &FileState, selected: bool) -> Line<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Labels
+// Labels — wording in `crate::textline`; only palette mapping lives here
 // ---------------------------------------------------------------------------
-
-pub(crate) fn stage_label(stage: StageKind) -> &'static str {
-    match stage {
-        StageKind::Triage => "triage",
-        StageKind::ContextRecall => "context recall",
-        StageKind::Plan => "plan",
-        StageKind::ScopeReview => "scope review",
-        StageKind::Execute => "execute",
-        StageKind::Verify => "verify",
-        StageKind::Judge => "judge",
-        StageKind::Reflect => "reflect",
-        StageKind::ContextWrite => "context write",
-        StageKind::Complete => "complete",
-    }
-}
-
-fn budget_mode_label(mode: BudgetMode) -> &'static str {
-    match mode {
-        BudgetMode::Off => "off",
-        BudgetMode::Observed => "observed",
-        BudgetMode::Enforced => "enforced",
-    }
-}
-
-fn media_kind_label(kind: MediaKind) -> &'static str {
-    match kind {
-        MediaKind::Image => "image",
-        MediaKind::Svg => "svg",
-        MediaKind::Video => "video",
-    }
-}
-
-fn pr_status_label(status: PrStatus) -> &'static str {
-    match status {
-        PrStatus::Draft => "draft",
-        PrStatus::Open => "open",
-        PrStatus::Merged => "merged",
-        PrStatus::Closed => "closed",
-    }
-}
-
-fn pr_status_color(status: PrStatus) -> Color {
-    match status {
-        PrStatus::Draft => Color::DarkGray,
-        PrStatus::Open => Color::Green,
-        PrStatus::Merged => Color::Magenta,
-        PrStatus::Closed => Color::Red,
-    }
-}
-
-fn spend_label(hud: &Hud) -> String {
-    match hud.limit_usd {
-        Some(limit) => format!("${:.4} / ${:.2}", hud.spent_usd, limit),
-        None => format!("${:.4}", hud.spent_usd),
-    }
-}
 
 fn spend_color(hud: &Hud) -> Color {
     match hud.limit_usd {
@@ -1172,7 +1125,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use stella_protocol::{
-        AgentEvent, FileChangeKind, ScopeProposal, StageKind, ToolCall, ToolOutput,
+        AgentEvent, BudgetMode, FileChangeKind, ScopeProposal, StageKind, ToolCall, ToolOutput,
     };
 
     /// Flatten a `TestBackend` buffer to one `String` per row (styling

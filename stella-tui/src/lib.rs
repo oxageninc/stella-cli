@@ -34,6 +34,7 @@ pub mod render;
 pub mod scroll;
 pub mod shell;
 pub(crate) mod term;
+pub mod textline;
 pub mod ui;
 
 // ── Command Deck: the multi-tab, multi-agent operations workspace ───────────
@@ -63,6 +64,7 @@ pub use model::{FileState, Hud, SessionModel, TranscriptEntry};
 pub use render::render;
 pub use scroll::ScrollState;
 pub use shell::{DebugLog, RunOptions, run};
+pub use textline::{EventLine, Tone, event_line};
 pub use ui::{PanelFocus, ShellAction, UiState, ViewportMetrics, handle_key, ingest};
 
 // Command Deck public surface.

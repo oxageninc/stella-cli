@@ -18,8 +18,8 @@
 //! backing cell buffer (the replay-determinism test in [`crate::render`]).
 
 use stella_protocol::{
-    AgentEvent, BudgetMode, FileChangeKind, MediaKind, PrStatus, ScopeProposal, StageKind,
-    ToolOutput,
+    AgentEvent, BudgetMode, FileChangeKind, MediaJobState, MediaKind, PrStatus, ScopeProposal,
+    StageKind, ToolOutput,
 };
 
 /// How many characters of a tool input / output summary we retain on a
@@ -155,11 +155,13 @@ pub enum TranscriptEntry {
         upserts: u32,
         superseded: u32,
     },
-    /// A media job changed state.
+    /// A media job changed state. The wire enum is retained (not a label)
+    /// so the renderer can distinguish failure — labeling is wording, and
+    /// wording lives in [`crate::textline`].
     MediaProgress {
         artifact_id: String,
         kind: MediaKind,
-        state: String,
+        state: MediaJobState,
     },
     /// A media artifact landed on disk.
     MediaComplete {
@@ -407,7 +409,7 @@ impl SessionModel {
                 self.transcript.push(TranscriptEntry::MediaProgress {
                     artifact_id: artifact_id.clone(),
                     kind: *kind,
-                    state: media_state_label(state),
+                    state: state.clone(),
                 });
             }
             AgentEvent::MediaComplete { artifact } => {
@@ -751,18 +753,6 @@ fn summarize(text: &str) -> String {
     let head_str: String = chars[..head].iter().collect();
     let tail_str: String = chars[chars.len() - tail..].iter().collect();
     format!("{head_str}...{tail_str}")
-}
-
-/// A short display label for a media job state (the wire enum is tagged; the
-/// TUI needs a flat human string).
-fn media_state_label(state: &stella_protocol::MediaJobState) -> String {
-    use stella_protocol::MediaJobState::*;
-    match state {
-        Queued => "queued".to_string(),
-        Running => "running".to_string(),
-        Succeeded => "succeeded".to_string(),
-        Failed { reason } => format!("failed: {reason}"),
-    }
 }
 
 #[cfg(test)]
