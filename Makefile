@@ -148,4 +148,4 @@ audit: ## Run full codebase audit (clippy, tests, supply-chain, dead-code scan)
 	cargo audit 2>/dev/null || printf '  \033[33mcargo-audit not installed — skipping\033[0m\n'
 	@printf '\n\033[1m=== Unused dependencies ===\033[0m\n'
 	cargo udeps --workspace 2>/dev/null || printf '  \033[33mcargo-udeps not installed — run: cargo install cargo-udeps\033[0m\n'
-	@printf '\n\033[32m✔ Audit complete. See AUDIT_REPORT.md for the full report.\033[0m\n'
+	@printf '\n\033[32m✔ Audit complete.\033[0m\n'

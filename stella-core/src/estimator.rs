@@ -19,7 +19,7 @@ use stella_protocol::CompletionMessage;
 /// estimate high — over-estimating triggers compaction *earlier*, which is
 /// the safe direction (silent truncation by the provider is the failure
 /// mode this exists to prevent).
-const CHARS_PER_TOKEN: f64 = 3.5;
+pub(crate) const CHARS_PER_TOKEN: f64 = 3.5;
 
 /// Fixed per-message framing overhead (role tags, separators) in tokens.
 const PER_MESSAGE_OVERHEAD: u64 = 4;

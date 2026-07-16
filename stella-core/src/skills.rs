@@ -53,16 +53,16 @@
 //! resolves anything relative to the binary's install path. This module
 //! operates purely on already-loaded content regardless of where it came from.
 //!
-//! # Reuse of `crate::rules`
+//! # Reuse of `crate::rules` and `crate::mining`
 //!
 //! Frontmatter splitting is shared: [`crate::rules::parse_frontmatter`] is
 //! already `pub` and does exactly the BOM-strip + `---` fence + single-line
 //! `key: value` parse this format needs (no YAML dependency), so it is reused
-//! rather than duplicated. The lexical helpers `rules` uses for mining
-//! (`terms`/`jaccard`/`slugify`/`hash8` and the stopword list) are *private*
-//! to that module; rather than widen its API (which would mean editing
-//! `rules.rs`), the ~40 lines are reimplemented locally here with identical
-//! behavior.
+//! rather than duplicated. The lexical mining helpers (`terms`/`jaccard`/
+//! `slugify`/`hash8`, clustering, representative selection) live once in
+//! [`crate::mining`], shared with the rules miner — they were briefly two
+//! identical private copies, which is exactly the divergence trap the shared
+//! module closes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -479,10 +479,13 @@ pub fn select_skills(
 // Rendering — the volatile context block injected after the stable prefix
 // ============================================================================
 
-/// Chars-per-token divisor, consistent with [`crate::estimator`]'s
-/// `CHARS_PER_TOKEN` (3.5 biases the estimate high — code/JSON run denser than
-/// prose, and over-estimating trims *earlier*, the safe direction).
-const CHARS_PER_TOKEN: f64 = 3.5;
+/// Chars-per-token divisor — [`crate::estimator`]'s constant, shared so the
+/// two heuristics can never drift on the divisor (3.5 biases the estimate
+/// high — code/JSON run denser than prose, and over-estimating trims
+/// *earlier*, the safe direction). Counting differs deliberately: this
+/// module counts chars to line up with its char-boundary truncation, the
+/// estimator counts bytes.
+const CHARS_PER_TOKEN: f64 = crate::estimator::CHARS_PER_TOKEN;
 /// Per-skill body budget before the body is truncated with a marker.
 const SKILL_BODY_TOKEN_BUDGET: u64 = 400;
 /// Total budget for the whole injected section — once exceeded, remaining
@@ -639,7 +642,8 @@ pub fn mine_skill_candidates(
     existing: &[Skill],
     config: &SkillMineConfig,
 ) -> Vec<SkillCandidate> {
-    let clusters = cluster_observations(observations, config.min_similarity);
+    let clusters =
+        crate::mining::cluster_observations(observations, config.min_similarity, |o| &o.text);
     let mut candidates: Vec<SkillCandidate> = Vec::new();
 
     for cluster in clusters {
@@ -647,10 +651,16 @@ pub fn mine_skill_candidates(
         if cluster.len() < config.min_occurrences && !salient {
             continue;
         }
-        let Some(text) = representative_text(&cluster) else {
+        let Some(text) = crate::mining::representative_text(&cluster, |o| &o.text) else {
             continue;
         };
-        if already_captured(&text, existing, config.min_similarity) {
+        if crate::mining::already_captured(
+            &text,
+            existing
+                .iter()
+                .map(|s| format!("{} {} {}", s.name, s.description, s.body)),
+            config.min_similarity,
+        ) {
             continue;
         }
 
@@ -673,7 +683,11 @@ pub fn mine_skill_candidates(
         } else {
             ""
         };
-        let name = format!("{}-{}", slugify(&text), hash8(&text));
+        let name = format!(
+            "{}-{}",
+            crate::mining::slugify(&text, "skill"),
+            crate::mining::hash8(&text)
+        );
 
         candidates.push(SkillCandidate {
             name,
@@ -816,118 +830,10 @@ pub enum InstallDecision {
 }
 
 // ============================================================================
-// Local lexical helpers (reimplemented from `crate::rules`'s private ones —
-// see the module doc: `rules.rs` must not be edited to widen their visibility)
+// Lexical helpers — shared with the rules miner via `crate::mining`
 // ============================================================================
 
-const STOPWORDS: &[&str] = &[
-    "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "is", "are", "be",
-    "this", "that", "it", "as", "at", "by", "from", "into", "we", "you", "i", "was", "were", "has",
-    "have", "had", "not", "but", "if", "so", "then", "than", "when", "where", "which", "will",
-    "would", "should", "did",
-];
-
-/// Split text into lowercased, de-stopped terms (>2 chars) for lexical
-/// scoring/clustering.
-fn terms(text: &str) -> Vec<String> {
-    let stopwords: HashSet<&str> = STOPWORDS.iter().copied().collect();
-    let mut out = Vec::new();
-    let mut current = String::new();
-    for ch in text.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            current.push(ch);
-        } else if !current.is_empty() {
-            if current.len() > 2 && !stopwords.contains(current.as_str()) {
-                out.push(std::mem::take(&mut current));
-            } else {
-                current.clear();
-            }
-        }
-    }
-    if current.len() > 2 && !stopwords.contains(current.as_str()) {
-        out.push(current);
-    }
-    out
-}
-
-/// Jaccard similarity of two term sets — 0 when either is empty.
-fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    let intersection = a.intersection(b).count();
-    let union = a.len() + b.len() - intersection;
-    if union == 0 {
-        0.0
-    } else {
-        intersection as f64 / union as f64
-    }
-}
-
-/// Filesystem/name-safe slug: lowercase, alnum + dashes, capped short.
-fn slugify(text: &str) -> String {
-    let mut collapsed = String::new();
-    let mut prev_dash = false;
-    for ch in text.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() {
-            collapsed.push(ch);
-            prev_dash = false;
-        } else if !prev_dash {
-            collapsed.push('-');
-            prev_dash = true;
-        }
-    }
-    let trimmed = collapsed.trim_matches('-');
-    let truncated: String = trimmed.chars().take(40).collect();
-    let truncated = truncated.trim_end_matches('-');
-    if truncated.is_empty() {
-        "skill".to_string()
-    } else {
-        truncated.to_string()
-    }
-}
-
-/// Short deterministic content hash (FNV-1a 64-bit, lower 32 bits as 8 hex
-/// chars) so re-mining identical data yields the same candidate name. Not
-/// cryptographic — purely a stable id, and dependency-free (no hash crate is
-/// a workspace dependency).
-fn hash8(text: &str) -> String {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    format!("{:08x}", (hash & 0xffff_ffff) as u32)
-}
-
-/// The cluster's most representative wording: the most-repeated exact text,
-/// longest wins ties. `None` only for an empty cluster (never constructed by
-/// [`mine_skill_candidates`]).
-fn representative_text(cluster: &[SkillObservation]) -> Option<String> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for o in cluster {
-        *counts.entry(o.text.as_str()).or_insert(0) += 1;
-    }
-    let mut best = cluster.first()?.text.as_str();
-    let mut best_count = 0usize;
-    for (text, count) in &counts {
-        // Most-frequent, then longest, then lexically smallest. The final
-        // lexical tiebreak is load-bearing: without it, two equal-count,
-        // equal-length texts resolve in HashMap iteration order (randomized
-        // per process), so re-mining the same observations could pick a
-        // different representative and mint a duplicate `<slug>-<hash>` file.
-        let better = *count > best_count
-            || (*count == best_count && text.len() > best.len())
-            || (*count == best_count && text.len() == best.len() && *text < best);
-        if better {
-            best = text;
-            best_count = *count;
-        }
-    }
-    Some(best.to_string())
-}
+use crate::mining::{jaccard, terms};
 
 /// Union of every domain across a cluster, dedup'd case-insensitively,
 /// first-seen casing preserved, order stable.
@@ -941,42 +847,6 @@ fn union_domains(cluster: &[SkillObservation]) -> Vec<String> {
         }
     }
     out
-}
-
-/// `true` when an existing skill already says essentially the same thing —
-/// its name+description+body terms overlap the candidate text past
-/// `min_similarity`. Compared against the whole existing skill (not just its
-/// name+description) so a differently-titled but same-content skill still
-/// suppresses the duplicate.
-fn already_captured(text: &str, existing: &[Skill], min_similarity: f64) -> bool {
-    let t: HashSet<String> = terms(text).into_iter().collect();
-    existing.iter().any(|s| {
-        let haystack = format!("{} {} {}", s.name, s.description, s.body);
-        let st: HashSet<String> = terms(&haystack).into_iter().collect();
-        jaccard(&t, &st) >= min_similarity
-    })
-}
-
-/// Greedy single-pass clustering: each observation joins the first cluster
-/// whose *first* member's term set overlaps it enough, else starts a new one.
-/// `O(n × clusters)` — fine at CLI-local data volumes.
-fn cluster_observations(
-    observations: Vec<SkillObservation>,
-    min_similarity: f64,
-) -> Vec<Vec<SkillObservation>> {
-    let mut clusters: Vec<Vec<SkillObservation>> = Vec::new();
-    for obs in observations {
-        let obs_terms: HashSet<String> = terms(&obs.text).into_iter().collect();
-        let home = clusters.iter().position(|c| {
-            let head_terms: HashSet<String> = terms(&c[0].text).into_iter().collect();
-            jaccard(&obs_terms, &head_terms) >= min_similarity
-        });
-        match home {
-            Some(idx) => clusters[idx].push(obs),
-            None => clusters.push(vec![obs]),
-        }
-    }
-    clusters
 }
 
 // ============================================================================

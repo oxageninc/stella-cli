@@ -21,7 +21,6 @@ reqwest.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 wiremock.workspace = true
 
 # A tiny, self-contained MCP server used only by the integration tests. It

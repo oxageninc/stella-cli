@@ -544,19 +544,16 @@ fn handle_agents_key(
             Some(DeckAction::Handled)
         }
         // Agent controls — only when the composer is empty (else they type).
-        KeyCode::Char('p') | KeyCode::Char('s') | KeyCode::Char('r') if composer_empty => {
-            let control = match key.code {
-                KeyCode::Char('p') => AgentControl::Pause,
-                KeyCode::Char('s') => AgentControl::Stop,
-                _ => AgentControl::Restart,
-            };
-            model.agents.get(ui.focused).map(|entry| {
-                DeckAction::Send(WorkspaceInput::Control {
-                    agent: entry.meta.id.clone(),
-                    control,
-                })
+        // Only `s` (stop) is bound: the driver drops Pause/Restart as no-ops
+        // (they need the fleet supervisor), and a key that visibly does
+        // nothing erodes trust in the ones that work. Re-add `p`/`r` here
+        // and in the help overlay when the driver honors them.
+        KeyCode::Char('s') if composer_empty => model.agents.get(ui.focused).map(|entry| {
+            DeckAction::Send(WorkspaceInput::Control {
+                agent: entry.meta.id.clone(),
+                control: AgentControl::Stop,
             })
-        }
+        }),
         _ => None,
     }
 }

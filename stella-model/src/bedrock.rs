@@ -407,21 +407,11 @@ impl Provider for BedrockProvider {
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(ProviderError::Auth(format!(
-                "Bedrock rejected the AWS credentials (HTTP {status})"
-            )));
-        }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            // Surface the server's own message and any Retry-After hint rather
-            // than a fixed string (matches `zai.rs`), so the driver can honor
-            // the provider's stated backoff.
-            let retry_after_ms = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .map(|s| s.saturating_mul(1000));
+            // Vendor pre-check ahead of the shared ladder: surface the
+            // server's own throttle message plus any Retry-After hint, so
+            // the driver can honor the provider's stated backoff.
+            let retry_after_ms = http::parse_retry_after_ms(response.headers());
             let text = response.text().await.unwrap_or_default();
             let message = if text.trim().is_empty() {
                 "Bedrock throttled the request".to_string()
@@ -433,21 +423,15 @@ impl Provider for BedrockProvider {
                 retry_after_ms,
             });
         }
-        // 5xx (500 InternalServerException, 503 ServiceUnavailableException,
-        // 529) are transient — retryable Transport, not a permanent Terminal,
-        // matching every sibling adapter. Without this a momentary blip aborts
-        // the whole turn (Terminal.is_retryable() == false).
-        if status.is_server_error() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Transport(format!(
-                "Bedrock HTTP {status}: {text}"
-            )));
-        }
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Terminal(format!(
-                "Bedrock HTTP {status}: {text}"
-            )));
+            let retry_after_ms = http::parse_retry_after_ms(response.headers());
+            let body = response.text().await.unwrap_or_default();
+            return Err(http::classify_http_status(
+                "Bedrock",
+                status,
+                retry_after_ms,
+                &body,
+            ));
         }
 
         let parsed: ConverseResponse = response

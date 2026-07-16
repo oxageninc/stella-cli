@@ -98,13 +98,13 @@ impl ProviderProfile {
 // Role table (explicit pins)
 // ---------------------------------------------------------------------
 
-/// Explicit per-role pins — the data structure the future `stella-cli`
-/// layer populates from `--worker-model`/`--triage-model`/`--judge-model`
-/// flags and `/worker-model`/`/triage-model`/`/judge-model` slash commands
-/// (L-M6: per-function model overrides are the core abstraction, not an
-/// afterthought). Absence of a pin for a role is `None`, never a magic
-/// sentinel (L-M3) — the router falls through to scenario defaults
-/// (`07-model-matrix.md` §5) when a role isn't in this table.
+/// Explicit per-role pins (L-M6: per-function model overrides are the core
+/// abstraction, not an afterthought). No CLI surface populates pins yet —
+/// production only ever builds `RoleTable::new()`; flags/slash commands for
+/// pinning are planned but not implemented. Absence of a pin for a role is
+/// `None`, never a magic sentinel (L-M3) — the router falls through to
+/// scenario defaults (`07-model-matrix.md` §5) when a role isn't in this
+/// table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleTable {
     pins: HashMap<Role, ModelRef>,
@@ -114,12 +114,6 @@ impl RoleTable {
     /// An empty table — every role is auto (no pins).
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Build a table directly from a pre-populated pin map (e.g. loaded
-    /// from `config.toml`).
-    pub fn from_pins(pins: HashMap<Role, ModelRef>) -> Self {
-        Self { pins }
     }
 
     /// Set (or replace) an explicit pin for `role`. Returns `&mut Self` for
@@ -345,12 +339,13 @@ pub enum RouterError {
     )]
     AllProvidersUnavailable { role: Role },
 
-    /// `Embed`/`Vision`/`Image`/`Video` have no default resolution yet —
-    /// their real backends (`stella-context`, `stella-media`) land in later
-    /// phases (`03-plan.md` Phases 3/5). Never invent a fake default; pin
-    /// explicitly via `RoleTable::pin` if you need one before then.
+    /// `Embed`/`Vision`/`Image`/`Video` have no default resolution in this
+    /// router — those roles are served by their own crates (`stella-context`
+    /// embeds locally, `stella-media` routes by media kind), not by the
+    /// chat-model scenario defaults. Never invent a fake default; pin
+    /// explicitly via `RoleTable::pin` if you need one.
     #[error(
-        "no default model available yet for role `{role:?}` — its backend hasn't landed (docs/specs/stella-rust-cli/03-plan.md Phases 3/5); pin one explicitly with RoleTable::pin"
+        "no default model available for role `{role:?}` — pin one explicitly with RoleTable::pin"
     )]
     NoDefaultForRole { role: Role },
 }
@@ -397,21 +392,9 @@ impl Router {
         &self.role_table
     }
 
-    /// Mutable access so the future `stella-cli` slash-command layer
-    /// (`/worker-model`, `/triage-model`, `/judge-model`, …) can pin/unpin
-    /// roles at runtime without rebuilding the whole `Router`.
-    pub fn role_table_mut(&mut self) -> &mut RoleTable {
-        &mut self.role_table
-    }
-
     /// The configured providers, in preference order.
     pub fn providers(&self) -> &[ProviderProfile] {
         &self.profiles
-    }
-
-    /// `provider_id`'s current breaker disposition.
-    pub fn breaker_status(&self, provider_id: &str) -> BreakerStatus {
-        self.breaker.status(provider_id)
     }
 
     /// Feed a successful call outcome into the breaker for `provider_id`.

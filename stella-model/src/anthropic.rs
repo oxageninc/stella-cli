@@ -184,22 +184,6 @@ fn classify_anthropic_stream_error(err: &AnthropicStreamError) -> ProviderError 
     }
 }
 
-/// Parse a `Retry-After` response header into milliseconds. Anthropic (like
-/// the OpenAI-compatible gateways) sends it as an integer number of seconds
-/// on a 429; the alternative HTTP-date form is tolerated by being ignored —
-/// the caller falls back to computed backoff. `None` when the header is
-/// absent or not a bare integer. Mirrors `zai.rs::parse_retry_after_ms`.
-fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|secs| secs.saturating_mul(1_000))
-}
-
 #[derive(Deserialize, Debug, Default)]
 struct AnthropicMessageStart {
     #[serde(default)]
@@ -354,31 +338,16 @@ impl Provider for AnthropicProvider {
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(ProviderError::Auth("Anthropic rejected the API key".into()));
-        }
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after_ms = parse_retry_after_ms(response.headers());
-            return Err(ProviderError::RateLimited {
-                message: "Anthropic rate limit".into(),
-                retry_after_ms,
-            });
-        }
-        // 5xx (incl. 529 overloaded, which Anthropic uses for load shedding)
-        // is transient — map to a retryable Transport error.
-        if response.status().is_server_error() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Transport(format!(
-                "Anthropic HTTP {status}: {text}"
-            )));
-        }
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Terminal(format!(
-                "Anthropic HTTP {status}: {text}"
-            )));
+            let retry_after_ms = http::parse_retry_after_ms(response.headers());
+            let body = response.text().await.unwrap_or_default();
+            return Err(http::classify_http_status(
+                "Anthropic",
+                status,
+                retry_after_ms,
+                &body,
+            ));
         }
 
         let (text, tool_calls, usage) = aggregate_anthropic_stream(response).await?;
@@ -976,6 +945,41 @@ mod tests {
             .await;
 
         let provider = AnthropicProvider::new(ApiKey::new("bad-key"), "claude-fable-5")
+            .with_base_url(server.uri());
+
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage {
+                role: MessageRole::User,
+                content: "hi".into(),
+                tool_calls: vec![],
+                tool_results: vec![],
+            }],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+        };
+
+        let err = provider.complete(req).await.unwrap_err();
+        assert!(matches!(err, ProviderError::Auth(_)));
+        assert!(!err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn complete_maps_403_to_auth_error() {
+        // A permission-denied key (403 permission_error — e.g. a key without
+        // access to the requested model) is a credential failure the user
+        // must fix, not a generic terminal error. Regression for the drift
+        // where only 401 was mapped to Auth here while sibling adapters
+        // mapped 401|403.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("permission_error"))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(ApiKey::new("limited-key"), "claude-fable-5")
             .with_base_url(server.uri());
 
         let req = CompletionRequest {

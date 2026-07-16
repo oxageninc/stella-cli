@@ -144,6 +144,54 @@ impl UsageStatsRow {
     }
 }
 
+/// Hardening of the workspace `.stella/` directory. The store holds full
+/// session transcripts (prompts, tool outputs — which can carry file
+/// contents), so:
+/// - a directory this call just created gets owner-only permissions on unix,
+///   matching the credentials file's 0600-from-birth discipline; a
+///   pre-existing directory keeps whatever permissions the user chose. If
+///   that chmod FAILS, the error propagates and the store refuses to open:
+///   proceeding would write transcripts into a world-readable directory.
+///   (The CLI treats a failed open as observability loss — it warns once
+///   and the session runs on without persistence.)
+/// - a `.gitignore` covering the *generated* artifacts (databases, their WAL
+///   siblings, the reflections mining log) is dropped once if absent, so
+///   transcripts are never committed and pushed by accident. Deliberately
+///   NOT `*`: settings.json, mcp.toml, tools/, skills/ and memories/ are
+///   user-authored and meant to be committable. Created with `create_new`
+///   so a file that appears concurrently is never truncated (no
+///   check-then-write TOCTOU): `AlreadyExists` — pre-existing or racing —
+///   means "leave it alone", and any other failure stays best-effort
+///   ignored (the DB open right after surfaces a genuinely unusable
+///   directory).
+fn harden_workspace_dir(dir: &Path, created: bool) -> Result<()> {
+    #[cfg(unix)]
+    if created {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            StoreError(format!(
+                "could not restrict permissions on freshly created {} (chmod 0700 failed: {e}); \
+                 refusing transcript persistence rather than writing sensitive session data \
+                 into a world-readable directory",
+                dir.display()
+            ))
+        })?;
+    }
+    let gitignore = dir.join(".gitignore");
+    // create_new: AlreadyExists (pre-existing or created by a concurrent
+    // session between any check and this open) leaves the file untouched —
+    // success; other errors are best-effort ignored, like the write itself.
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&gitignore)
+    {
+        use std::io::Write;
+        let _ = file.write_all(b"*.db\n*.db-wal\n*.db-shm\nreflections.jsonl\n");
+    }
+    Ok(())
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -153,7 +201,9 @@ impl Store {
     /// and apply the schema.
     pub fn open(workspace_root: &Path) -> Result<Self> {
         let dir = workspace_root.join(".stella");
+        let created = !dir.exists();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError(e.to_string()))?;
+        harden_workspace_dir(&dir, created)?;
         Self::init(Connection::open(dir.join("store.db"))?)
     }
 
@@ -166,7 +216,18 @@ impl Store {
         // execute_batch tolerates the row PRAGMA journal_mode returns (a
         // plain pragma_update errors on it). WAL means a read-only caller
         // (`stella stats`) is never blocked by a live session's writes.
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        // busy_timeout matches the sibling stores (context.db, codegraph.db):
+        // without it a second same-workspace session gets an immediate
+        // SQLITE_BUSY and its best-effort telemetry writes vanish silently.
+        // synchronous=NORMAL is the standard WAL pairing — durability to the
+        // last checkpoint rather than one fsync per event insert on the hot
+        // render path (matching stella-graph's store).
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;
+             PRAGMA foreign_keys=ON;",
+        )?;
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -253,6 +314,19 @@ impl Store {
                  INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
+        // Indexes are additive and safe on existing databases. Both tables
+        // grow one row per model call / event forever, and both hot queries
+        // otherwise full-scan: `drift_samples` filters (provider, model) and
+        // sorts (execution_id DESC, step DESC) at EVERY session start, and
+        // any event replay reads (execution_id, seq). Non-unique on purpose —
+        // retrofitting UNIQUE onto tables that may hold historic duplicates
+        // needs a dedupe migration first (expand → migrate → contract).
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS telemetry_by_model
+               ON telemetry(provider, model, execution_id, step);
+             CREATE INDEX IF NOT EXISTS events_by_execution
+               ON events(execution_id, seq);",
+        )?;
         Ok(())
     }
 
@@ -469,7 +543,8 @@ impl Store {
         Ok(())
     }
 
-    /// Count helper used by tests and `stella config`-style introspection.
+    /// Count helper — currently exercised only by tests; kept `pub` for
+    /// ad-hoc introspection.
     pub fn count(&self, table: &str) -> Result<i64> {
         // Table names can't be bound parameters; allowlist them.
         const TABLES: [&str; 7] = [
@@ -1097,6 +1172,42 @@ mod tests {
             let store = Store::open(&root).unwrap();
             assert_eq!(store.count("executions").unwrap(), 1);
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn open_hardens_a_fresh_dot_stella_dir() {
+        let root = std::env::temp_dir().join(format!("stella_harden_{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let _store = Store::open(&root).unwrap();
+        let dir = root.join(".stella");
+
+        // Generated artifacts (transcript DBs, WAL siblings, reflections log)
+        // must be gitignored so session transcripts can't be committed by
+        // accident; user-authored files must NOT be (no bare `*`).
+        let gitignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(gitignore.contains("*.db"));
+        assert!(gitignore.contains("reflections.jsonl"));
+        assert!(!gitignore.lines().any(|l| l.trim() == "*"));
+
+        // A pre-existing .gitignore is left alone (user may have customized).
+        // Under create_new this same path also covers the race where another
+        // session drops the file between open's checks — never truncated.
+        std::fs::write(dir.join(".gitignore"), "custom\n").unwrap();
+        drop(Store::open(&root).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".gitignore")).unwrap(),
+            "custom\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "fresh .stella must be owner-only");
+        }
+
         std::fs::remove_dir_all(&root).ok();
     }
 }

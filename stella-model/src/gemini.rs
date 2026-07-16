@@ -440,38 +440,18 @@ pub(crate) async fn classify_google_error(
     response: reqwest::Response,
 ) -> ProviderError {
     let status = response.status();
-    let retry_after_ms = response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|s| s.saturating_mul(1000));
+    let retry_after_ms = crate::http::parse_retry_after_ms(response.headers());
     let body = response.text().await.unwrap_or_default();
 
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return ProviderError::Auth(format!("{label} rejected the credential (HTTP {status})"));
-    }
-    // Google reports an invalid API key as HTTP 400 with reason
-    // API_KEY_INVALID, not a 401 — surface it as the auth failure it is so
-    // the user is told to fix the key rather than shown a generic terminal
-    // error (and so the step-driver never retries it).
+    // Vendor pre-check ahead of the shared ladder: Google reports an invalid
+    // API key as HTTP 400 with reason API_KEY_INVALID, not a 401 — surface
+    // it as the auth failure it is so the user is told to fix the key rather
+    // than shown a generic terminal error (and so the step-driver never
+    // retries it).
     if status == reqwest::StatusCode::BAD_REQUEST && body.contains("API_KEY_INVALID") {
         return ProviderError::Auth(format!("{label} rejected the API key: {body}"));
     }
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return ProviderError::RateLimited {
-            message: format!("{label} rate limit"),
-            retry_after_ms,
-        };
-    }
-    // 5xx (500 INTERNAL, 503 UNAVAILABLE, …) are transient load-shedding on
-    // Google's side — retryable Transport, not a permanent Terminal, matching
-    // `openai.rs`/`anthropic.rs`/`zai.rs`. Without this a momentary 503 aborts
-    // the whole turn (Terminal.is_retryable() == false).
-    if status.is_server_error() {
-        return ProviderError::Transport(format!("{label} HTTP {status}: {body}"));
-    }
-    ProviderError::Terminal(format!("{label} HTTP {status}: {body}"))
+    crate::http::classify_http_status(label, status, retry_after_ms, &body)
 }
 
 #[async_trait]

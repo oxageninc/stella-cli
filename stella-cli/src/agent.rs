@@ -388,7 +388,6 @@ async fn run_pipeline_one_shot(
 
     let files = registry.files_touched();
     if let Some((store, id)) = &execution {
-        let _ = store.record_files_touched(*id, &files);
         let (outcome_label, cost) = match &result {
             Ok(outcome) => {
                 let label = match outcome.status {
@@ -399,7 +398,9 @@ async fn run_pipeline_one_shot(
             }
             Err(_) => ("error", 0.0),
         };
-        let _ = store.finish_execution(*id, outcome_label, cost);
+        if !record_execution_end(store, *id, &files, outcome_label, cost) {
+            warn_store_write_failed("the audit record (files touched / outcome)");
+        }
     }
 
     // Episodic memory: a run that did work (tools or file changes) becomes a
@@ -1153,7 +1154,7 @@ pub(crate) async fn record_turn_episode(
 /// succeeds, offline included) — the graph can always be rebuilt on a later
 /// `init` once a toolchain/parser is available. Progress goes to `emit`
 /// (plain text, no ANSI) so both the CLI and the deck transcript can show it.
-fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut(String)) {
+async fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut(String)) {
     let dot_stella = workspace_root.join(".stella");
     if let Err(e) = std::fs::create_dir_all(&dot_stella) {
         emit(format!(
@@ -1163,34 +1164,51 @@ fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut(Strin
     }
     let db_path = dot_stella.join("codegraph.db");
     emit("◈ indexing code graph…".to_string());
-    match stella_graph::CodeGraph::open(workspace_root, &db_path) {
-        Ok(graph) => match graph.index_all() {
-            Ok(stats) => {
-                emit(format!(
-                    "✓ code graph: {} symbols, {} imports across {} file{} \
-                     ({} parsed, {} unchanged)",
-                    stats.symbols,
-                    stats.imports,
-                    stats.files_parsed + stats.files_skipped_unchanged,
-                    if stats.files_parsed + stats.files_skipped_unchanged == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                    stats.files_parsed,
-                    stats.files_skipped_unchanged,
-                ));
-                graph.shutdown();
-            }
-            Err(e) => {
-                emit(format!(
-                    "! code-graph indexing failed: {e} — run `stella init` again to retry"
-                ));
-            }
-        },
-        Err(e) => {
-            emit(format!("! code-graph store unavailable: {e} — skipped"));
+    // A full-tree tree-sitter index is seconds-to-minutes of blocking file
+    // reads + parsing + SQLite on a large repo. Run it on the blocking pool
+    // so it never pins a runtime worker — the deck driver awaits `/init`
+    // inline and must stay responsive to queue edits and cancels meanwhile
+    // (the incremental watcher path already does this, stella-graph
+    // watch.rs). `emit` stays on this side of the boundary: the only
+    // pre-completion line is the one above.
+    let root = workspace_root.to_path_buf();
+    let outcome =
+        tokio::task::spawn_blocking(
+            move || match stella_graph::CodeGraph::open(&root, &db_path) {
+                Ok(graph) => match graph.index_all() {
+                    Ok(stats) => {
+                        graph.shutdown();
+                        Ok(stats)
+                    }
+                    Err(e) => Err(format!(
+                        "! code-graph indexing failed: {e} — run `stella init` again to retry"
+                    )),
+                },
+                Err(e) => Err(format!("! code-graph store unavailable: {e} — skipped")),
+            },
+        )
+        .await;
+    match outcome {
+        Ok(Ok(stats)) => {
+            emit(format!(
+                "✓ code graph: {} symbols, {} imports across {} file{} \
+                 ({} parsed, {} unchanged)",
+                stats.symbols,
+                stats.imports,
+                stats.files_parsed + stats.files_skipped_unchanged,
+                if stats.files_parsed + stats.files_skipped_unchanged == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                stats.files_parsed,
+                stats.files_skipped_unchanged,
+            ));
         }
+        Ok(Err(warning)) => emit(warning),
+        Err(e) => emit(format!(
+            "! code-graph indexing task failed: {e} — run `stella init` again to retry"
+        )),
     }
 }
 
@@ -1212,7 +1230,7 @@ pub(crate) async fn init_workspace(
 
     // The code graph needs no provider — build it regardless of how the
     // domains were inferred, so the index exists even fully offline.
-    build_code_graph(workspace_root, emit);
+    build_code_graph(workspace_root, emit).await;
 
     let path = domains.save(workspace_root)?;
 
@@ -1762,12 +1780,13 @@ async fn run_turn(
     // executor the engine held.
     let files = registry.files_touched();
     if let Some((store, id)) = &execution {
-        let _ = store.record_files_touched(*id, &files);
         let (outcome_label, cost) = match &outcome {
             TurnOutcome::Completed { cost_usd, .. } => ("completed", *cost_usd),
             TurnOutcome::Aborted { .. } => ("aborted", 0.0),
         };
-        let _ = store.finish_execution(*id, outcome_label, cost);
+        if !record_execution_end(store, *id, &files, outcome_label, cost) {
+            warn_store_write_failed("the audit record (files touched / outcome)");
+        }
     }
 
     if format == OutputFormat::Json {
@@ -1892,13 +1911,42 @@ fn spawn_renderer(
     })
 }
 
+/// Best-effort end-of-execution records: which files the agent touched and
+/// how the run ended. A failure must not abort the turn, but it must not
+/// vanish either — the store is the durable audit record of what the agent
+/// did. Returns `false` when either write failed so the caller can surface
+/// a warning on its own channel (stderr for the CLI surfaces, a deck event
+/// for the TUI, where stderr belongs to the alternate screen).
+pub(crate) fn record_execution_end(
+    store: &Store,
+    execution_id: i64,
+    files: &[(String, String)],
+    outcome_label: &str,
+    cost_usd: f64,
+) -> bool {
+    let files_ok = store.record_files_touched(execution_id, files).is_ok();
+    let finish_ok = store
+        .finish_execution(execution_id, outcome_label, cost_usd)
+        .is_ok();
+    files_ok && finish_ok
+}
+
+/// The stderr form of the store-write warning, for the non-deck surfaces.
+pub(crate) fn warn_store_write_failed(what: &str) {
+    eprintln!(
+        "  {} store write failed — {what} for this execution is incomplete",
+        "⚠".yellow()
+    );
+}
+
 /// Persist one drained event to an open execution record: append it to the
 /// event stream and, for `StepUsage`, add a telemetry row. Shared by
 /// [`spawn_renderer`] (one-shot/REPL rendering) and the command deck's event
 /// forwarder (`crate::command_deck`), so the store's write path lives in
-/// exactly one place. Returns `false` when the event-stream append failed so
-/// the caller can surface its once-only warning; the telemetry row stays
-/// silently best-effort, exactly as before this was extracted.
+/// exactly one place. Returns `false` when the event-stream append failed OR
+/// (for `StepUsage`) the telemetry insert failed, so the caller's once-only
+/// "telemetry for this execution is incomplete" warning actually covers the
+/// telemetry row too — a telemetry-only failure must not stay silent.
 pub(crate) fn persist_event(
     store: &Store,
     execution_id: i64,
@@ -1907,6 +1955,8 @@ pub(crate) fn persist_event(
     provider_id: &str,
 ) -> bool {
     let recorded = store.record_event(execution_id, seq, event).is_ok();
+    // True when the event carried no StepUsage or the insert succeeded.
+    let mut telemetry_ok = true;
     if let AgentEvent::StepUsage {
         step,
         model,
@@ -1920,28 +1970,30 @@ pub(crate) fn persist_event(
         tool_calls,
     } = event
     {
-        let _ = store.record_telemetry(
-            execution_id,
-            &TelemetryRow {
-                step: *step as u64,
-                provider: provider_id.to_string(),
-                model: model.clone(),
-                input_tokens: *input_tokens,
-                estimated_input_tokens: *estimated_input_tokens,
-                output_tokens: *output_tokens,
-                cache_read_tokens: *cached_input_tokens,
-                cache_miss_tokens: input_tokens.saturating_sub(*cached_input_tokens),
-                // Populated once the usage envelope carries cache-write
-                // counts (staged follow-up).
-                cache_write_tokens: 0,
-                cost_usd: *cost_usd,
-                duration_ms: *duration_ms,
-                retries: *retries,
-                tool_calls: *tool_calls as u64,
-            },
-        );
+        telemetry_ok = store
+            .record_telemetry(
+                execution_id,
+                &TelemetryRow {
+                    step: *step as u64,
+                    provider: provider_id.to_string(),
+                    model: model.clone(),
+                    input_tokens: *input_tokens,
+                    estimated_input_tokens: *estimated_input_tokens,
+                    output_tokens: *output_tokens,
+                    cache_read_tokens: *cached_input_tokens,
+                    cache_miss_tokens: input_tokens.saturating_sub(*cached_input_tokens),
+                    // Populated once the usage envelope carries cache-write
+                    // counts (staged follow-up).
+                    cache_write_tokens: 0,
+                    cost_usd: *cost_usd,
+                    duration_ms: *duration_ms,
+                    retries: *retries,
+                    tool_calls: *tool_calls as u64,
+                },
+            )
+            .is_ok();
     }
-    recorded
+    recorded && telemetry_ok
 }
 
 /// Run one goal loop through `stella_core::Engine::run_goal`: working turns
@@ -2025,12 +2077,13 @@ async fn run_goal_turn(
 
     let files = registry.files_touched();
     if let Some((store, id)) = &execution {
-        let _ = store.record_files_touched(*id, &files);
         let (outcome_label, cost) = match &outcome {
             GoalOutcome::Met { cost_usd, .. } => ("goal_met", *cost_usd),
             GoalOutcome::Unmet { cost_usd, .. } => ("goal_unmet", *cost_usd),
         };
-        let _ = store.finish_execution(*id, outcome_label, cost);
+        if !record_execution_end(store, *id, &files, outcome_label, cost) {
+            warn_store_write_failed("the audit record (files touched / outcome)");
+        }
     }
     tui::files_touched_panel(&files);
 
@@ -2418,9 +2471,11 @@ mod tests {
         // shared ZaiProvider shim, id "zai", nor the anthropic branch). Both
         // arms read extra addressing/credentials from the environment; set
         // the minimum each requires. build_provider only constructs — no
-        // network call. These env vars are read by no other test, so setting
-        // them here is race-free within the test binary; the missing-project
-        // error case shares this test so the set/remove stays serialized.
+        // network call. Env mutation is UB against concurrent getenv on
+        // POSIX, so hold the binary-wide env lock for the whole
+        // mutate-read-cleanup window; the missing-project error case shares
+        // this test so the set/remove stays serialized.
+        let _env = crate::test_env::lock();
         unsafe {
             std::env::set_var("VERTEX_PROJECT_ID", "test-project");
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");

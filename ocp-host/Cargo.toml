@@ -38,5 +38,4 @@ reqwest.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 wiremock = "0.6"

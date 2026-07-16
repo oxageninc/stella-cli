@@ -111,6 +111,12 @@ pub const RESERVED_NAMES: &[&str] = &[
     // CI & evidence
     "ci_status",
     "screenshot",
+    // Conditionally registered tools: code_graph only when a code-graph index
+    // exists, generate_image only when a media key is configured. The
+    // registry-driven drift test can't see these (a bare registry never
+    // advertises them), so they must be listed here by hand.
+    "code_graph",
+    "generate_image",
     // Issue tracking (registered only when a backend is configured)
     "create_issue",
     "update_issue",

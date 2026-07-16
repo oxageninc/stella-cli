@@ -177,7 +177,22 @@ fn issue_ref_description(backend: &IssueBackend) -> &'static str {
 
 fn require_issue_ref(input: &Value) -> Result<String, ToolOutput> {
     match input.get("issue") {
-        Some(Value::String(s)) if !s.is_empty() => Ok(s.clone()),
+        Some(Value::String(s)) if !s.is_empty() => {
+            // The ref is used POSITIONALLY in gh commands. `quote()` stops
+            // shell injection but not argument injection: a flag-shaped
+            // value like `--web` or `-R other/repo` would reach gh as an
+            // option. Real refs (123, #123, TEAM-123, full issue URLs)
+            // never start with `-`.
+            if s.starts_with('-') {
+                return Err(ToolOutput::Error {
+                    message: format!(
+                        "invalid issue ref `{s}` — expected an issue number, #number, \
+                         key, or URL"
+                    ),
+                });
+            }
+            Ok(s.clone())
+        }
         Some(Value::Number(n)) => Ok(n.to_string()),
         _ => Err(ToolOutput::Error {
             message: "missing required field `issue`".into(),
@@ -678,5 +693,29 @@ mod tests {
     #[test]
     fn quote_neutralizes_single_quotes() {
         assert_eq!(quote("a'b"), r"'a'\''b'");
+    }
+
+    #[test]
+    fn issue_refs_reject_flag_shaped_values_and_accept_real_refs() {
+        // The ref is passed positionally to gh, so a flag-shaped value is
+        // argument injection — this pins the `-` guard in require_issue_ref.
+        for injected in ["--web", "-R other/repo"] {
+            match require_issue_ref(&json!({ "issue": injected })) {
+                Err(ToolOutput::Error { message }) => {
+                    assert!(message.contains("invalid issue ref"), "{message}");
+                }
+                other => panic!("expected error for `{injected}`, got {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            require_issue_ref(&json!({ "issue": "123" })).unwrap(),
+            "123"
+        );
+        assert_eq!(
+            require_issue_ref(&json!({ "issue": "#123" })).unwrap(),
+            "#123"
+        );
+        assert_eq!(require_issue_ref(&json!({ "issue": 123 })).unwrap(), "123");
     }
 }

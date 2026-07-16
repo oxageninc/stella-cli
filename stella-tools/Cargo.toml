@@ -15,7 +15,6 @@ stella-graph = { path = "../stella-graph" }
 stella-media = { path = "../stella-media" }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 libc.workspace = true

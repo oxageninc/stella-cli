@@ -25,11 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use stella_protocol::AgentEvent;
@@ -39,6 +35,7 @@ use crate::composer::{Composer, SlashCommand};
 use crate::input::UserInput;
 use crate::model::SessionModel;
 use crate::render::render;
+use crate::term::{PanicHookGuard, TerminalGuard};
 use crate::ui::{ShellAction, UiState, handle_key, ingest};
 
 /// Configuration for one interactive session.
@@ -114,8 +111,13 @@ impl DebugLog {
     }
 }
 
-/// Append one structured JSON line to `path` (best-effort).
-fn append_json_line(path: &PathBuf, kind: &str, payload: serde_json::Value) -> io::Result<()> {
+/// Append one structured JSON line to `path` (best-effort). Also used by the
+/// panic hook in [`crate::term`] to record panics into the same log.
+pub(crate) fn append_json_line(
+    path: &PathBuf,
+    kind: &str,
+    payload: serde_json::Value,
+) -> io::Result<()> {
     use std::io::Write;
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -127,73 +129,6 @@ fn append_json_line(path: &PathBuf, kind: &str, payload: serde_json::Value) -> i
         .open(path)?;
     let line = serde_json::json!({ "ts_ms": ts_ms, "kind": kind, "payload": payload });
     writeln!(file, "{line}")
-}
-
-/// Restores the terminal (raw mode + alternate screen, and mouse capture if it
-/// was enabled) on drop — including during a panic unwind.
-struct TerminalGuard {
-    mouse: bool,
-}
-
-impl TerminalGuard {
-    fn enter(mouse: bool) -> io::Result<Self> {
-        enable_raw_mode()?;
-        let mut out = io::stdout();
-        execute!(out, EnterAlternateScreen)?;
-        if mouse {
-            execute!(out, EnableMouseCapture)?;
-        }
-        Ok(Self { mouse })
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let mut out = io::stdout();
-        if self.mouse {
-            let _ = execute!(out, DisableMouseCapture);
-        }
-        let _ = execute!(out, LeaveAlternateScreen);
-        let _ = disable_raw_mode();
-    }
-}
-
-/// The boxed panic-hook type `std::panic::take_hook` hands back — aliased so
-/// the guard's field stays readable.
-type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
-
-/// Installs a panic hook that routes panic info to the debug log instead of
-/// splattering the alternate screen, and restores the previous hook on drop.
-struct PanicHookGuard {
-    prev: Option<PanicHook>,
-}
-
-impl PanicHookGuard {
-    fn install(path: Option<PathBuf>) -> Self {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if let Some(path) = &path {
-                let _ = append_json_line(
-                    path,
-                    "panic",
-                    serde_json::json!({ "info": info.to_string() }),
-                );
-            }
-            // Intentionally silent on stderr: we are on an alternate screen.
-            // Panel panics are already caught by `guarded_panel`; anything
-            // reaching this hook unwinds `run` and `TerminalGuard` restores
-            // the screen on the way out.
-        }));
-        Self { prev: Some(prev) }
-    }
-}
-
-impl Drop for PanicHookGuard {
-    fn drop(&mut self) {
-        if let Some(prev) = self.prev.take() {
-            std::panic::set_hook(prev);
-        }
-    }
 }
 
 /// Run the interactive TUI to completion.
@@ -211,10 +146,10 @@ pub async fn run(
     let debug = DebugLog::new(opts.debug_log_path.clone());
     debug.note("tui session start");
 
-    // Order matters: declare the hook guard first so it drops *last* — the
-    // terminal is restored before the panic hook is put back.
-    let _hook_guard = PanicHookGuard::install(opts.debug_log_path.clone());
+    // The hook shares the guard's state so a panic restores the terminal even
+    // in abort builds, where Drop never runs (see `crate::term`).
     let _term_guard = TerminalGuard::enter(opts.mouse_capture)?;
+    let _hook_guard = PanicHookGuard::install(opts.debug_log_path.clone(), &_term_guard);
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
@@ -276,7 +211,18 @@ pub async fn run(
                             ShellAction::Handled | ShellAction::Ignored => {}
                         }
                     }
-                    // Resize/paste/other events: the next draw picks them up.
+                    // Bracketed paste: the whole paste arrives as one event
+                    // (the guard enabled it), so the composer can fold it
+                    // into a chip instead of replaying N raw Enter keys.
+                    Some(Event::Paste(text)) => {
+                        // Modal gates swallow paste like any other non-gate
+                        // input — never queue text into the hidden composer.
+                        if model.pending_scope_review.is_none() && model.pending_ask_user.is_none()
+                        {
+                            ui.composer.paste(&text);
+                        }
+                    }
+                    // Resize/other events: the next draw picks them up.
                     Some(_) => {}
                     // Reader thread ended (stdin closed).
                     None => break,

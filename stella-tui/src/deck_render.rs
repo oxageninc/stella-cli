@@ -375,7 +375,7 @@ fn render_help(area: Rect, buf: &mut Buffer) {
             theme::body(),
         )),
         Line::from(Span::styled(
-            "  Agents: p/s/r  pause / stop / restart",
+            "  Agents: s      stop the focused agent",
             theme::body(),
         )),
         Line::from(Span::styled(

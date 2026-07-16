@@ -125,16 +125,35 @@ impl Settings {
         all.push(project.clone());
         let mut merged = Self::load_from(&all)?;
 
+        let project_only = Self::load_from(std::slice::from_ref(&project))?;
+
         let project_hooks_trusted =
             std::env::var_os("STELLA_PROJECT_HOOKS").is_some_and(|v| !v.is_empty() && v != "0");
-        if !project_hooks_trusted {
-            let project_only = Self::load_from(std::slice::from_ref(&project))?;
-            if project_only.hooks.is_some() {
-                // Rebuild hooks from the trusted scopes alone.
-                merged.hooks = Self::load_from(&trusted)?.hooks;
+        if !project_hooks_trusted && project_only.hooks.is_some() {
+            // Rebuild hooks from the trusted scopes alone.
+            merged.hooks = Self::load_from(&trusted)?.hooks;
+            eprintln!(
+                "  ! project hooks in {} were NOT loaded — set STELLA_PROJECT_HOOKS=1 \
+                 to trust this repo's hooks",
+                project.display()
+            );
+        }
+
+        // An inline `api_key` in the PROJECT scope is the foot-gun the
+        // field's own docs warn about: .stella/settings.json is commonly
+        // committed, so a literal key there tends to end up pushed. The key
+        // still loads (it may be deliberate in a private repo), but the risk
+        // is named instead of silent — matching the hooks gate above in
+        // spirit.
+        for (id, entry) in &project_only.providers {
+            if entry.api_key.is_some() {
+                // The provider id is attacker-controlled text from a repo
+                // file; escape it so a malicious key can't smuggle terminal
+                // control sequences into stderr.
                 eprintln!(
-                    "  ! project hooks in {} were NOT loaded — set STELLA_PROJECT_HOOKS=1 \
-                     to trust this repo's hooks",
+                    "  ! providers.{} in {} sets an inline api_key — prefer api_key_env \
+                     (project settings files are often committed)",
+                    id.escape_debug(),
                     project.display()
                 );
             }

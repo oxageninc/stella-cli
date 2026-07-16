@@ -1660,8 +1660,6 @@ dependencies = [
  "ocp-types",
  "serde",
  "serde_json",
- "tempfile",
- "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -1676,7 +1674,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "wiremock",
@@ -2660,7 +2657,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "stella-protocol",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2702,7 +2698,6 @@ dependencies = [
 name = "stella-graph"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "notify",
  "ocp-types",
  "rusqlite",
@@ -2731,7 +2726,6 @@ dependencies = [
  "serde_json",
  "stella-core",
  "stella-protocol",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "toml",
@@ -2744,7 +2738,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
- "futures-util",
  "reqwest",
  "roxmltree",
  "serde",
@@ -2786,7 +2779,6 @@ dependencies = [
  "serde_json",
  "stella-core",
  "stella-protocol",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -2825,7 +2817,6 @@ dependencies = [
  "stella-media",
  "stella-protocol",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "toml",
 ]
@@ -2844,7 +2835,6 @@ dependencies = [
  "sysinfo",
  "tachyonfx",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tui-big-text",
  "unicode-width",

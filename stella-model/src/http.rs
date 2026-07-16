@@ -1,6 +1,6 @@
 //! Shared HTTP plumbing for every provider adapter: a `reqwest` client with a
 //! bounded connect timeout, and an idle-timeout wrapper around per-chunk
-//! stream reads. Centralized so all three adapters get identical
+//! stream reads. Centralized so every provider adapter gets identical
 //! timeout-and-retry-classification behavior — a hung TCP connect or a
 //! provider that opens a stream and then goes silent must surface as a
 //! *retryable* `Transport` error, not an unbounded hang.
@@ -21,15 +21,68 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// the turn forever.
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// A `reqwest::Client` with [`CONNECT_TIMEOUT`] applied. Falls back to the
-/// default client if the builder fails (only possible on a broken TLS
-/// backend, which is catastrophic and unrelated to any single request) —
-/// never panics on the construction path.
+/// A `reqwest::Client` with [`CONNECT_TIMEOUT`] applied, plus a per-read
+/// stall bound of [`STREAM_IDLE_TIMEOUT`]. The read timeout closes the gap
+/// [`next_with_timeout`] cannot see: the wait between a successful connect
+/// and the first response byte (headers). Without it, a provider LB that
+/// accepts the connection and then black-holes hangs `.send()` forever and
+/// the retry engine never fires. The bound matches the stream-idle policy,
+/// so it can never kill a stream the idle timeout would have allowed.
+/// Falls back to the default client if the builder fails (only possible on
+/// a broken TLS backend, which is catastrophic and unrelated to any single
+/// request) — never panics on the construction path.
 pub(crate) fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(STREAM_IDLE_TIMEOUT)
         .build()
         .unwrap_or_default()
+}
+
+/// Parse a `Retry-After` header (delta-seconds form, RFC 9110 §10.2.3) into
+/// a millisecond hint for the retry policy — `stella-core/src/retry.rs`
+/// honors `RateLimited.retry_after_ms` when present. The HTTP-date form is
+/// not handled (providers send seconds on 429s); an absent or unparseable
+/// value yields `None` rather than an error.
+pub(crate) fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?;
+    let seconds: u64 = value.to_str().ok()?.trim().parse().ok()?;
+    Some(seconds.saturating_mul(1000))
+}
+
+/// The mechanical non-success ladder shared by every adapter, applied AFTER
+/// any vendor-specific pre-check (Z.ai's billing-encoded 429s, Google's
+/// API_KEY_INVALID-on-400):
+///
+/// - 401/403 → non-retryable `Auth`. A 403 (permission-denied key, model
+///   not enabled for the account) is a credential problem the user must fix
+///   — pointing them at their key beats a generic terminal error, and the
+///   step driver must not retry it.
+/// - 429 → retryable `RateLimited` carrying the Retry-After hint.
+/// - 5xx → retryable `Transport` (includes 529, which Anthropic and Z.ai
+///   use for load shedding). Without this a momentary blip aborts the whole
+///   turn (`Terminal.is_retryable() == false`).
+/// - anything else → `Terminal`, with the body for diagnosis.
+pub(crate) fn classify_http_status(
+    label: &str,
+    status: reqwest::StatusCode,
+    retry_after_ms: Option<u64>,
+    body: &str,
+) -> ProviderError {
+    use reqwest::StatusCode;
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            ProviderError::Auth(format!("{label} rejected the credential (HTTP {status})"))
+        }
+        StatusCode::TOO_MANY_REQUESTS => ProviderError::RateLimited {
+            message: format!("{label} rate limit"),
+            retry_after_ms,
+        },
+        s if s.is_server_error() => {
+            ProviderError::Transport(format!("{label} HTTP {status}: {body}"))
+        }
+        _ => ProviderError::Terminal(format!("{label} HTTP {status}: {body}")),
+    }
 }
 
 /// Await the next stream item, bounded by `idle`. Maps a stalled stream (no

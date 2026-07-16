@@ -20,7 +20,7 @@ use ocp_types::{ContextFrame, ContextQuery, Provenance};
 
 use crate::error::ContextError;
 use crate::store::{
-    ContextStore, NodeRow, domains_for_node, live_nodes, neighbors, node_ids_excluded_by_scope,
+    ContextStore, NodeRow, domains_by_node, live_nodes, neighbors, node_ids_excluded_by_scope,
     node_ids_for_uris, vectors_for_fingerprint,
 };
 
@@ -134,8 +134,10 @@ impl ContextStore {
             }
         };
 
-        // 2. Gather candidates under one lock — no await is held here. The
-        //    domain filter (if any) is applied here so every downstream signal
+        // 2. Gather candidates under one lock acquisition — no await is
+        //    held here (the graph-neighbor expansion in 4b briefly
+        //    re-acquires the connection for its 1-hop lookup). The domain
+        //    filter (if any) is applied here so every downstream signal
         //    sees only the in-scope nodes.
         let fp_id = self.fingerprint().id();
         let (nodes, vectors, anchor_ids, domains_by_id) = {
@@ -154,10 +156,10 @@ impl ContextStore {
                 nodes.retain(|n| !excluded.contains(&n.id));
                 vectors.retain(|(id, _)| !excluded.contains(id));
             }
-            let mut domains_by_id: HashMap<i64, Vec<String>> = HashMap::new();
-            for n in &nodes {
-                domains_by_id.insert(n.id, domains_for_node(&conn, n.id)?);
-            }
+            // One grouped scan (live nodes only) instead of one statement
+            // per node — entries for scope-filtered nodes are harmless
+            // (lookups below are keyed by candidate id only).
+            let domains_by_id: HashMap<i64, Vec<String>> = domains_by_node(&conn)?;
             (nodes, vectors, anchor_ids, domains_by_id)
         };
 
