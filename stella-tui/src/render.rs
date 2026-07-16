@@ -101,7 +101,9 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
     let (diff_total, diff_inner_h) = if ui.diff_open {
         let file = model.files.get(ui.selected_file);
         let diff_text = file.and_then(|f| f.latest_diff.as_deref());
-        let d_lines = diff_text.map(diff::body_lines).unwrap_or_default();
+        let d_lines = diff_text
+            .map(|d| diff::body_lines(d, file.map(|f| f.path.as_str())))
+            .unwrap_or_default();
         let (added, removed) = diff_text.map(diff::count_diff_lines).unwrap_or((0, 0));
         let d_total = d_lines.len();
         let d_inner_h = inner_height(right_area);
@@ -552,14 +554,18 @@ fn render_composer(line: &str, focused: bool, area: Rect, buf: &mut Buffer) {
 pub(crate) fn transcript_lines(model: &SessionModel, expand_thinking: bool) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for entry in &model.transcript {
-        entry_lines(entry, expand_thinking, &mut out);
+        entry_lines(entry, expand_thinking, &model.files, &mut out);
     }
     out
 }
 
+/// Render one transcript entry into styled lines. `files` is the session's
+/// files-touched state, read only to inline a mutating tool result's diff
+/// (sourced from `files[].latest_diff`, the single event-borne path — L-T5).
 pub(crate) fn entry_lines(
     entry: &TranscriptEntry,
     expand_thinking: bool,
+    files: &[FileState],
     out: &mut Vec<Line<'static>>,
 ) {
     match entry {
@@ -596,6 +602,7 @@ pub(crate) fn entry_lines(
             ok,
             summary,
             duration_ms,
+            diff,
             ..
         } => {
             let (glyph, color) = if *ok {
@@ -608,6 +615,19 @@ pub(crate) fn entry_lines(
                 Span::raw(summary.clone()),
                 Span::styled(format!("  ({duration_ms}ms)"), Style::new().fg(Color::DarkGray)),
             ]));
+            // A file-mutating tool shows its diff inline, Crush-style, sourced
+            // from the same `files[].latest_diff` the Files tab reads (L-T5)
+            // and collapsed so a huge diff can't flood the scrollback. The
+            // `seq` check keeps history honest: once a later call mutates the
+            // same path, `changes` moves past this entry's tag and the stale
+            // entry shows nothing rather than someone else's diff.
+            if let Some(dref) = diff
+                && let Some(file) = files.iter().find(|f| f.path == dref.path)
+                && file.changes == dref.seq
+                && let Some(diff) = file.latest_diff.as_deref()
+            {
+                push_inline_diff(&dref.path, diff, out);
+            }
         }
         TranscriptEntry::Retry { attempt, reason } => out.push(Line::from(Span::styled(
             format!("↻ retry #{attempt}: {reason}"),
@@ -729,6 +749,35 @@ pub(crate) fn entry_lines(
             format!("✓ complete · {model} · ${cost_usd:.4}"),
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
         ))),
+    }
+}
+
+/// The most diff lines shown inline under a tool result before collapsing;
+/// the full diff always remains in the Files tab.
+const INLINE_DIFF_CAP: usize = 12;
+
+/// Append a mutating tool's diff inline under its result line: the same PR-styled,
+/// syntax-highlighted body the Files tab renders (`crate::diff`), capped to
+/// [`INLINE_DIFF_CAP`] lines with a "… (+N more lines)" footer when it runs
+/// longer. The cap is applied *before* styling (`body_lines_capped`), so a
+/// transcript full of large diffs never pays per-frame tokenizing cost for
+/// lines it drops.
+fn push_inline_diff(path: &str, diff: &str, out: &mut Vec<Line<'static>>) {
+    let (lines, total) = diff::body_lines_capped(diff, Some(path), INLINE_DIFF_CAP);
+    if total == 0 {
+        return;
+    }
+    let shown = lines.len();
+    out.extend(lines);
+    if total > shown {
+        let more = total - shown;
+        // Indent past the 5-wide gutter so the footer sits under the diff body.
+        out.push(Line::from(Span::styled(
+            format!("     … (+{more} more lines, open Files tab for full diff)"),
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
     }
 }
 
@@ -1173,6 +1222,197 @@ mod tests {
         assert!(joined.contains("read_file"));
         assert!(joined.contains("not found"));
         assert!(joined.contains("12ms"));
+    }
+
+    #[test]
+    fn edit_tool_result_inlines_a_collapsed_diff_but_a_read_does_not() {
+        let mut model = SessionModel::new();
+        // An edit tool touches a file whose FileChange carries a long diff.
+        model.apply(&AgentEvent::ToolStart {
+            call: ToolCall {
+                call_id: "edit1".into(),
+                name: "edit_file".into(),
+                input: serde_json::json!({"path": "src/x.rs"}),
+            },
+        });
+        let mut big = String::from("@@ -1,20 +1,20 @@\n");
+        for i in 0..20 {
+            big.push_str(&format!("+let v{i} = {i};\n"));
+        }
+        model.apply(&AgentEvent::FileChange {
+            path: "src/x.rs".into(),
+            kind: FileChangeKind::Modified,
+            diff: Some(big),
+        });
+        model.apply(&AgentEvent::ToolResult {
+            call_id: "edit1".into(),
+            output: ToolOutput::Ok {
+                content: "ok".into(),
+            },
+            duration_ms: 3,
+        });
+        // A *read* of the very same (diff-carrying) file must inline nothing —
+        // the gate is the tool kind, not whether a diff exists.
+        model.apply(&AgentEvent::ToolStart {
+            call: ToolCall {
+                call_id: "read1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "src/x.rs"}),
+            },
+        });
+        model.apply(&AgentEvent::ToolResult {
+            call_id: "read1".into(),
+            output: ToolOutput::Ok {
+                content: "contents".into(),
+            },
+            duration_ms: 1,
+        });
+
+        let lines = transcript_lines(&model, false);
+        let all: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The edit's diff body is inlined...
+        assert!(
+            all.contains("let v0 = 0;"),
+            "inline diff body present:\n{all}"
+        );
+        // ...collapsed, with exactly one "more lines" footer (only the edit,
+        // never the read).
+        assert_eq!(
+            all.matches("more lines, open Files tab").count(),
+            1,
+            "exactly one collapsed inline diff — the edit, not the read:\n{all}"
+        );
+        // And the cap holds: no more than INLINE_DIFF_CAP diff-body lines.
+        let inlined = lines
+            .iter()
+            .filter(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+                    .contains("let v")
+            })
+            .count();
+        assert!(
+            (1..=INLINE_DIFF_CAP).contains(&inlined),
+            "inlined={inlined}"
+        );
+    }
+
+    /// When the same file is mutated twice, the earlier result's inline diff
+    /// must disappear (its freshness tag is stale) rather than retroactively
+    /// display the later edit's diff — scrollback never attributes a change
+    /// to a call that didn't make it.
+    #[test]
+    fn a_later_edit_hides_the_earlier_results_inline_diff() {
+        let mut model = SessionModel::new();
+        for (call, body) in [("edit1", "+let first = 1;"), ("edit2", "+let second = 2;")] {
+            model.apply(&AgentEvent::ToolStart {
+                call: ToolCall {
+                    call_id: call.into(),
+                    name: "edit_file".into(),
+                    input: serde_json::json!({"path": "src/x.rs"}),
+                },
+            });
+            model.apply(&AgentEvent::FileChange {
+                path: "src/x.rs".into(),
+                kind: FileChangeKind::Modified,
+                diff: Some(format!("@@ -1,1 +1,1 @@\n{body}")),
+            });
+            model.apply(&AgentEvent::ToolResult {
+                call_id: call.into(),
+                output: ToolOutput::Ok {
+                    content: "ok".into(),
+                },
+                duration_ms: 1,
+            });
+        }
+
+        let all: String = transcript_lines(&model, false)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("let second = 2;"),
+            "the latest edit inlines its diff:\n{all}"
+        );
+        assert!(
+            !all.contains("let first = 1;"),
+            "the stale entry shows nothing, not the newer diff:\n{all}"
+        );
+    }
+
+    /// A FAILED mutating call made no change (no `FileChange` fired), so its
+    /// ✗ entry must not inline the path's previous successful diff.
+    #[test]
+    fn a_failed_mutation_inlines_no_diff() {
+        let mut model = SessionModel::new();
+        model.apply(&AgentEvent::ToolStart {
+            call: ToolCall {
+                call_id: "w1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/y.rs"}),
+            },
+        });
+        model.apply(&AgentEvent::FileChange {
+            path: "src/y.rs".into(),
+            kind: FileChangeKind::Created,
+            diff: Some("@@ -0,0 +1,1 @@\n+let y = 0;".into()),
+        });
+        model.apply(&AgentEvent::ToolResult {
+            call_id: "w1".into(),
+            output: ToolOutput::Ok {
+                content: "ok".into(),
+            },
+            duration_ms: 1,
+        });
+        // A second mutation of the same path fails: no FileChange.
+        model.apply(&AgentEvent::ToolStart {
+            call: ToolCall {
+                call_id: "e1".into(),
+                name: "edit_file".into(),
+                input: serde_json::json!({"path": "src/y.rs"}),
+            },
+        });
+        model.apply(&AgentEvent::ToolResult {
+            call_id: "e1".into(),
+            output: ToolOutput::Error {
+                message: "old_string not found".into(),
+            },
+            duration_ms: 1,
+        });
+
+        let all: String = transcript_lines(&model, false)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all.matches("let y = 0;").count(),
+            1,
+            "the diff appears only under the ✓ that produced it, never the ✗:\n{all}"
+        );
     }
 
     // ---- Replay determinism (L-T1) ------------------------------------

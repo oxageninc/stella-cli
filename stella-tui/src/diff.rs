@@ -7,7 +7,7 @@
 //! only — the add/remove/hunk semantics stay consistent with the rest of the
 //! deck (and with any future light variant of the theme) by construction.
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::theme;
@@ -94,19 +94,53 @@ pub fn footer_line(added: u32, removed: u32, width: usize) -> Line<'static> {
 /// PR view. Lines outside any hunk (`diff --git`, `index`, `+++`/`---`
 /// headers, or a diff with no hunk header at all) simply get no number —
 /// malformed input degrades to unnumbered styled text, never a panic.
-pub fn body_lines(diff: &str) -> Vec<Line<'static>> {
+///
+/// `path` is the file the diff belongs to (the diffs on stella's event path
+/// are bare hunks with no `diff --git` header, so the caller supplies it);
+/// when it names a language we recognize, the code tokens inside each body
+/// line get syntax colors *layered under* the add/remove semantics (the
+/// `+`/`-` background is preserved). A supplied path *alone* decides the
+/// language — an unknown extension disables highlighting rather than falling
+/// back to header sniffing, because on the event path the "diff" is a
+/// headerless pseudo-diff whose own content (`--- an SQL comment`) can spoof
+/// a header. Only with no path at all is the diff's real `diff --git` /
+/// `+++` header consulted. An unknown language renders plain, byte-for-byte.
+pub fn body_lines(diff: &str, path: Option<&str>) -> Vec<Line<'static>> {
+    body_lines_capped(diff, path, usize::MAX).0
+}
+
+/// Like [`body_lines`], but styles at most `cap` lines, returning the styled
+/// prefix plus the total line count the full render would produce — so a
+/// caller that collapses long diffs (the inline transcript view) never pays
+/// tokenizing cost for lines it drops.
+pub fn body_lines_capped(
+    diff: &str,
+    path: Option<&str>,
+    cap: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let lang = match path {
+        Some(p) => lang_from_path(p),
+        None => lang_from_diff_header(diff),
+    };
     let mut old_no: Option<u32> = None;
     let mut new_no: Option<u32> = None;
     let mut in_hunk = false;
+    let mut lines = Vec::new();
+    let mut total = 0usize;
     // `.lines()`, not `.split('\n')`: a diff ending in a trailing newline
     // must not render (and count against hunk state) a spurious empty row.
-    diff.lines()
-        .map(|raw| body_line(raw, &mut old_no, &mut new_no, &mut in_hunk))
-        .collect()
+    for raw in diff.lines() {
+        total += 1;
+        if lines.len() < cap {
+            lines.push(body_line(raw, lang, &mut old_no, &mut new_no, &mut in_hunk));
+        }
+    }
+    (lines, total)
 }
 
 fn body_line(
     raw: &str,
+    lang: Option<Lang>,
     old_no: &mut Option<u32>,
     new_no: &mut Option<u32>,
     in_hunk: &mut bool,
@@ -156,37 +190,104 @@ fn body_line(
         ]);
     }
     match raw.as_bytes().first() {
+        // `+`/`-`/` ` are ASCII (one byte), so `raw[1..]` splits the diff
+        // marker off the code safely for tokenizing.
         Some(b'+') => {
             let n = *new_no;
             *new_no = new_no.map(|n| n + 1);
-            Line::from(vec![
-                gutter(n),
-                Span::styled(
-                    raw.to_string(),
-                    Style::default().fg(theme::OK).bg(theme::DIFF_ADD_BG),
-                ),
-            ])
+            let mut spans = vec![gutter(n)];
+            spans.extend(code_spans(
+                "+",
+                &raw[1..],
+                theme::OK,
+                Some(theme::DIFF_ADD_BG),
+                lang,
+            ));
+            Line::from(spans)
         }
         Some(b'-') => {
             let n = *old_no;
             *old_no = old_no.map(|n| n + 1);
-            Line::from(vec![
-                gutter(n),
-                Span::styled(
-                    raw.to_string(),
-                    Style::default().fg(theme::BAD).bg(theme::DIFF_DEL_BG),
-                ),
-            ])
+            let mut spans = vec![gutter(n)];
+            spans.extend(code_spans(
+                "-",
+                &raw[1..],
+                theme::BAD,
+                Some(theme::DIFF_DEL_BG),
+                lang,
+            ));
+            Line::from(spans)
         }
         _ => {
             let n = *new_no;
             *old_no = old_no.map(|n| n + 1);
             *new_no = new_no.map(|n| n + 1);
-            Line::from(vec![
-                gutter(n),
-                Span::styled(raw.to_string(), theme::muted()),
-            ])
+            // Real unified-diff context lines carry a leading-space marker;
+            // headerless pseudo-diffs may not — keep whatever prefix exists in
+            // the (uncolored) marker span so the code column stays aligned.
+            let (marker, code) = match raw.strip_prefix(' ') {
+                Some(rest) => (" ", rest),
+                None => ("", raw),
+            };
+            let mut spans = vec![gutter(n)];
+            // Context lines stay fully muted (no syntax colors — `lang` is
+            // deliberately not passed): de-emphasis is what separates the
+            // unchanged surroundings from the change itself, and a keyword
+            // glowing brand-amber on both would erase that distinction.
+            spans.extend(code_spans(marker, code, theme::MUTED, None, None));
+            Line::from(spans)
         }
+    }
+}
+
+/// Build the styled spans for one diff body line's content: the uncolored
+/// `marker` (`+`/`-`/` `) followed by the `code`. With no known language the
+/// code is one span in `base`/`bg` — byte-identical to the plain rendering.
+/// With a language, the code is tokenized and each recognized token overrides
+/// the foreground with its syntax color while keeping the same `bg`, so the
+/// add/remove tint is never lost.
+fn code_spans(
+    marker: &str,
+    code: &str,
+    base: Color,
+    bg: Option<Color>,
+    lang: Option<Lang>,
+) -> Vec<Span<'static>> {
+    let base_style = with_bg(Style::default().fg(base), bg);
+    let Some(lang) = lang else {
+        return vec![Span::styled(format!("{marker}{code}"), base_style)];
+    };
+    let mut spans = Vec::new();
+    if !marker.is_empty() {
+        spans.push(Span::styled(marker.to_string(), base_style));
+    }
+    for (text, tok) in tokenize(code, lang) {
+        let style = match tok {
+            Some(t) => with_bg(tok_style(t), bg),
+            None => base_style,
+        };
+        spans.push(Span::styled(text, style));
+    }
+    spans
+}
+
+/// Apply an optional background to a style (identity when `bg` is `None`).
+fn with_bg(style: Style, bg: Option<Color>) -> Style {
+    match bg {
+        Some(c) => style.bg(c),
+        None => style,
+    }
+}
+
+/// The foreground style for a token class (comments also italicize).
+fn tok_style(t: Tok) -> Style {
+    match t {
+        Tok::Keyword => Style::default().fg(theme::SYNTAX_KEYWORD),
+        Tok::Str => Style::default().fg(theme::SYNTAX_STRING),
+        Tok::Number => Style::default().fg(theme::SYNTAX_NUMBER),
+        Tok::Comment => Style::default()
+            .fg(theme::SYNTAX_COMMENT)
+            .add_modifier(Modifier::ITALIC),
     }
 }
 
@@ -243,6 +344,320 @@ fn elide_left(text: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
+// ── Lightweight syntax highlighting ─────────────────────────────────────────
+//
+// A compact, dependency-free lexer (no `syntect`, no tree-sitter — stella-tui
+// stays decoupled) that colors keywords, string/char literals, line comments,
+// and numbers for the languages the deck edits most. It is intentionally *not*
+// a parser: one left-to-right scan per line, no cross-line state, so a diff
+// hunk that slices a block comment or a multi-line string in half degrades to
+// slightly-off coloring, never a wrong add/remove or a panic. Unknown
+// extensions never reach here (the caller passes `None`).
+
+/// A language we can syntax-highlight.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lang {
+    Rust,
+    /// TypeScript / JavaScript (and their `x`/module variants).
+    TsJs,
+    Python,
+}
+
+/// A token class we give a syntax color; `None` runs stay the base color.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tok {
+    Keyword,
+    Str,
+    Number,
+    Comment,
+}
+
+/// Map a file extension to a language, or `None` if we don't highlight it.
+fn lang_from_ext(ext: &str) -> Option<Lang> {
+    match ext {
+        "rs" => Some(Lang::Rust),
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" => Some(Lang::TsJs),
+        "py" | "pyi" => Some(Lang::Python),
+        _ => None,
+    }
+}
+
+/// The language for a file path via its extension (the segment after the last
+/// `.`), guarding against a dot that lives in a parent directory rather than
+/// the filename.
+fn lang_from_path(path: &str) -> Option<Lang> {
+    let (_, ext) = path.rsplit_once('.')?;
+    if ext.contains('/') {
+        return None;
+    }
+    lang_from_ext(ext)
+}
+
+/// Infer the language from a diff's own header lines (`diff --git a/f.rs …`,
+/// `+++ b/f.rs`, `--- a/f.rs`), scanning only up to the first hunk.
+fn lang_from_diff_header(diff: &str) -> Option<Lang> {
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            break; // headers only ever precede the first hunk
+        }
+        if let Some(rest) = line.strip_prefix("diff --git ")
+            && let Some(lang) = rest.split_whitespace().find_map(header_path_lang)
+        {
+            return Some(lang);
+        } else if let Some(rest) = line
+            .strip_prefix("+++ ")
+            .or_else(|| line.strip_prefix("--- "))
+            && let Some(lang) = header_path_lang(rest)
+        {
+            return Some(lang);
+        }
+    }
+    None
+}
+
+/// Language of a single diff-header path token, stripping the `a/`/`b/` prefix
+/// and any trailing `\t`-separated metadata; `/dev/null` yields `None`.
+fn header_path_lang(token: &str) -> Option<Lang> {
+    let token = token.split('\t').next().unwrap_or(token).trim();
+    if token == "/dev/null" {
+        return None;
+    }
+    let token = token
+        .strip_prefix("a/")
+        .or_else(|| token.strip_prefix("b/"))
+        .unwrap_or(token);
+    lang_from_path(token)
+}
+
+/// Split one line of source `code` into consecutive runs, each tagged with an
+/// optional token class (`None` = punctuation/whitespace/plain identifier).
+/// Lossless — concatenating the run texts reproduces `code` exactly — and
+/// panic-free.
+fn tokenize(code: &str, lang: Lang) -> Vec<(String, Option<Tok>)> {
+    let chars: Vec<char> = code.chars().collect();
+    let n = chars.len();
+    let mut runs: Vec<(String, Option<Tok>)> = Vec::new();
+    let mut plain = String::new();
+    let mut i = 0;
+
+    while i < n {
+        let c = chars[i];
+
+        // Line comment: `//` (Rust/TS/JS) or `#` (Python) runs to end of line.
+        if is_comment_start(&chars, i, lang) {
+            flush(&mut plain, &mut runs);
+            runs.push((chars[i..].iter().collect(), Some(Tok::Comment)));
+            return runs;
+        }
+
+        // String / char literal.
+        if is_string_start(&chars, i, lang) {
+            let (end, closed) = scan_string(&chars, i);
+            // An unterminated single quote is far more often a contraction in
+            // prose ("Don't" in JSX text or a docstring) than a string the
+            // hunk cut in half — leave it plain instead of swallowing the
+            // rest of the line. Double quotes and backticks keep the
+            // string-to-end-of-line reading (a cut hunk is the likely cause).
+            if closed || c != '\'' {
+                flush(&mut plain, &mut runs);
+                runs.push((chars[i..end].iter().collect(), Some(Tok::Str)));
+                i = end;
+                continue;
+            }
+            plain.push(c);
+            i += 1;
+            continue;
+        }
+
+        // Number literal (only at a run boundary — identifiers below consume
+        // their own trailing digits, so a leading digit here starts a number).
+        if c.is_ascii_digit() {
+            flush(&mut plain, &mut runs);
+            let end = scan_number(&chars, i);
+            runs.push((chars[i..end].iter().collect(), Some(Tok::Number)));
+            i = end;
+            continue;
+        }
+
+        // Identifier / keyword.
+        if is_ident_start(c) {
+            let mut j = i + 1;
+            while j < n && is_ident_continue(chars[j]) {
+                j += 1;
+            }
+            let word: String = chars[i..j].iter().collect();
+            if is_keyword(&word, lang) {
+                flush(&mut plain, &mut runs);
+                runs.push((word, Some(Tok::Keyword)));
+            } else {
+                plain.push_str(&word);
+            }
+            i = j;
+            continue;
+        }
+
+        // Anything else accumulates into the current plain run.
+        plain.push(c);
+        i += 1;
+    }
+    flush(&mut plain, &mut runs);
+    runs
+}
+
+/// Push the accumulated plain run (if any) and clear the buffer.
+fn flush(plain: &mut String, runs: &mut Vec<(String, Option<Tok>)>) {
+    if !plain.is_empty() {
+        runs.push((std::mem::take(plain), None));
+    }
+}
+
+fn is_comment_start(chars: &[char], i: usize, lang: Lang) -> bool {
+    match lang {
+        Lang::Python => chars[i] == '#',
+        Lang::Rust | Lang::TsJs => chars[i] == '/' && chars.get(i + 1) == Some(&'/'),
+    }
+}
+
+/// Whether position `i` opens a string/char literal. Double quotes (and TS/JS
+/// template backticks) always do; the single quote is ambiguous in Rust
+/// (lifetimes like `&'a T`, `derive('...')`), so there it only counts when it
+/// matches a char-literal shape — otherwise the whole line would mis-color.
+fn is_string_start(chars: &[char], i: usize, lang: Lang) -> bool {
+    match chars[i] {
+        '"' => true,
+        '`' => lang == Lang::TsJs,
+        '\'' => lang != Lang::Rust || is_rust_char_literal(chars, i),
+        _ => false,
+    }
+}
+
+/// A Rust char literal at `i`: `'x'` or an escaped `'\n'` / `'\''` / `'\\'`.
+fn is_rust_char_literal(chars: &[char], i: usize) -> bool {
+    if chars.get(i + 1) == Some(&'\\') {
+        chars.get(i + 3) == Some(&'\'')
+    } else {
+        matches!(chars.get(i + 1), Some(c) if *c != '\'') && chars.get(i + 2) == Some(&'\'')
+    }
+}
+
+/// Scan a string opened at `i`, honoring backslash escapes. Returns the end
+/// index (just past the closing quote, or end of line when unterminated) and
+/// whether the closing quote was actually found — the caller uses that to
+/// tell a real string from a lone apostrophe in prose.
+fn scan_string(chars: &[char], i: usize) -> (usize, bool) {
+    let quote = chars[i];
+    let n = chars.len();
+    let mut j = i + 1;
+    while j < n {
+        match chars[j] {
+            '\\' => j = (j + 2).min(n),
+            c if c == quote => return (j + 1, true),
+            _ => j += 1,
+        }
+    }
+    (n, false)
+}
+
+/// Scan a number opened at `i`: a run of alphanumerics/underscores (covering
+/// hex `0xFF`, suffixes `10u64`, separators `1_000`), plus one embedded
+/// decimal point followed by more digits (`1.5`), so a `1..2` range keeps its
+/// `..` intact. Returns the end index.
+fn scan_number(chars: &[char], i: usize) -> usize {
+    let n = chars.len();
+    let mut j = i;
+    while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+        j += 1;
+    }
+    if j < n && chars[j] == '.' && chars.get(j + 1).is_some_and(|c| c.is_ascii_digit()) {
+        j += 1;
+        while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+    }
+    j
+}
+
+fn is_ident_start(c: char) -> bool {
+    c.is_alphabetic() || c == '_'
+}
+
+fn is_ident_continue(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `word` is a keyword in `lang`. Linear scans over small, fixed
+/// slices — cheap enough for the handful of identifiers on a diff line.
+fn is_keyword(word: &str, lang: Lang) -> bool {
+    let table: &[&str] = match lang {
+        Lang::Rust => &RUST_KEYWORDS,
+        Lang::TsJs => &TSJS_KEYWORDS,
+        Lang::Python => &PYTHON_KEYWORDS,
+    };
+    table.contains(&word)
+}
+
+const RUST_KEYWORDS: [&str; 39] = [
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while", "yield",
+];
+
+const TSJS_KEYWORDS: [&str; 45] = [
+    "as",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "instanceof",
+    "interface",
+    "let",
+    "new",
+    "null",
+    "of",
+    "readonly",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+];
+
+const PYTHON_KEYWORDS: [&str; 35] = [
+    "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
+    "else", "except", "False", "finally", "for", "from", "global", "if", "import", "in", "is",
+    "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return", "True", "try", "while",
+    "with", "yield",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,7 +695,7 @@ mod tests {
 
     #[test]
     fn body_numbers_added_lines_on_the_new_side_and_removed_on_the_old() {
-        let lines = body_lines(SAMPLE);
+        let lines = body_lines(SAMPLE, None);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         // "@@ -1,3 +1,4 @@" starts old=1/new=1; context takes new 1.
         assert!(texts[3].starts_with("   1  context"), "{:?}", texts[3]);
@@ -293,7 +708,7 @@ mod tests {
 
     #[test]
     fn file_headers_and_hunks_get_no_number() {
-        let lines = body_lines(SAMPLE);
+        let lines = body_lines(SAMPLE, None);
         for (i, line) in lines.iter().take(3).enumerate() {
             assert!(
                 line_text(line).starts_with("     "),
@@ -305,14 +720,14 @@ mod tests {
 
     #[test]
     fn a_diff_without_hunk_headers_degrades_to_unnumbered_lines() {
-        let lines = body_lines("+first\n-gone");
+        let lines = body_lines("+first\n-gone", None);
         assert!(line_text(&lines[0]).starts_with("     +first"));
         assert!(line_text(&lines[1]).starts_with("     -gone"));
     }
 
     #[test]
     fn malformed_hunk_header_resets_numbering_without_panic() {
-        let lines = body_lines("@@ nonsense @@\n+x");
+        let lines = body_lines("@@ nonsense @@\n+x", None);
         assert!(line_text(&lines[1]).starts_with("     +x"));
     }
 
@@ -336,7 +751,7 @@ mod tests {
     #[test]
     fn body_lines_number_hunk_text_matching_header_syntax_instead_of_hiding_it() {
         let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n--- was a rule\n+++ is a rule\n";
-        let lines = body_lines(diff);
+        let lines = body_lines(diff, None);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(
             !texts[3].starts_with("     "),
@@ -356,8 +771,8 @@ mod tests {
     fn body_lines_ignores_a_trailing_newline() {
         let with_trailing_newline = format!("{SAMPLE}\n");
         assert_eq!(
-            body_lines(SAMPLE).len(),
-            body_lines(&with_trailing_newline).len(),
+            body_lines(SAMPLE, None).len(),
+            body_lines(&with_trailing_newline, None).len(),
             "a trailing newline must not render a spurious extra row"
         );
     }
@@ -366,7 +781,7 @@ mod tests {
     fn no_newline_marker_gets_no_number_and_does_not_shift_later_numbering() {
         let diff =
             "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-old\n\\ No newline at end of file\n+new\n";
-        let lines = body_lines(diff);
+        let lines = body_lines(diff, None);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(
             texts[4].starts_with("     "),
@@ -411,5 +826,195 @@ mod tests {
         let path = "a".repeat(70);
         let text = line_text(&header_line(&path, 80));
         assert!(!text.contains('…'), "path elided too early: {text}");
+    }
+
+    // ── Syntax highlighting ─────────────────────────────────────────────
+
+    /// Find the span whose exact content is `text`, if any.
+    fn span_with<'a>(line: &'a Line<'a>, text: &str) -> Option<&'a Span<'a>> {
+        line.spans.iter().find(|s| s.content == text)
+    }
+
+    #[test]
+    fn highlighted_added_line_keeps_add_background_and_colors_tokens() {
+        // A Rust `+` line: the add background must survive on the code (never
+        // lost) AND `fn`/`let` get the keyword color, `42` the number color —
+        // syntax layered *under* the diff semantics.
+        let diff = "@@ -1,1 +1,1 @@\n+    fn f() { let x = 42; }";
+        let line = body_lines(diff, Some("src/x.rs")).pop().unwrap();
+
+        // The add background is present somewhere on the code spans.
+        assert!(
+            line.spans
+                .iter()
+                .any(|s| s.style.bg == Some(theme::DIFF_ADD_BG)),
+            "add background preserved: {:?}",
+            line.spans
+        );
+        let kw = span_with(&line, "fn").expect("`fn` is its own span");
+        assert_eq!(kw.style.fg, Some(theme::SYNTAX_KEYWORD), "keyword colored");
+        assert_eq!(
+            kw.style.bg,
+            Some(theme::DIFF_ADD_BG),
+            "keyword still on the add background"
+        );
+        assert!(span_with(&line, "let").is_some(), "second keyword present");
+        let num = span_with(&line, "42").expect("`42` is its own span");
+        assert_eq!(num.style.fg, Some(theme::SYNTAX_NUMBER), "number colored");
+        // Lossless: the text still reads back intact, marker included.
+        assert!(line_text(&line).contains("+    fn f() { let x = 42; }"));
+    }
+
+    #[test]
+    fn highlighted_removed_line_keeps_del_background_and_colors_keywords() {
+        let diff = "@@ -1,1 +1,1 @@\n-def go():";
+        let line = body_lines(diff, Some("app.py")).pop().unwrap();
+        let kw = span_with(&line, "def").expect("`def` is its own span");
+        assert_eq!(kw.style.fg, Some(theme::SYNTAX_KEYWORD));
+        assert_eq!(
+            kw.style.bg,
+            Some(theme::DIFF_DEL_BG),
+            "keyword on the del background, so removal is never lost"
+        );
+    }
+
+    #[test]
+    fn strings_and_comments_get_their_syntax_colors() {
+        let diff = "@@ -1,1 +1,1 @@\n+let s = \"hi\"; // note";
+        let line = body_lines(diff, Some("x.ts")).pop().unwrap();
+        let s = span_with(&line, "\"hi\"").expect("string is its own span");
+        assert_eq!(s.style.fg, Some(theme::SYNTAX_STRING));
+        let c = span_with(&line, "// note").expect("comment runs to end of line");
+        assert_eq!(c.style.fg, Some(theme::SYNTAX_COMMENT));
+        assert!(c.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn unknown_language_falls_back_to_a_single_plain_code_span() {
+        // No path and no inferable header → one code span per line, exactly
+        // like the pre-highlighting rendering (gutter + one styled span).
+        let line = body_lines("@@ -1 +1 @@\n+fn x", None).pop().unwrap();
+        assert_eq!(
+            line.spans.len(),
+            2,
+            "gutter + one plain span: {:?}",
+            line.spans
+        );
+        assert_eq!(line.spans[1].content, "+fn x");
+        assert_eq!(line.spans[1].style.fg, Some(theme::OK));
+        assert_eq!(line.spans[1].style.bg, Some(theme::DIFF_ADD_BG));
+    }
+
+    #[test]
+    fn language_is_inferred_from_the_diff_header_when_no_path_is_given() {
+        let diff = "diff --git a/m.rs b/m.rs\n@@ -1 +1 @@\n+fn q() {}";
+        let line = body_lines(diff, None).pop().unwrap();
+        assert_eq!(
+            span_with(&line, "fn").map(|s| s.style.fg),
+            Some(Some(theme::SYNTAX_KEYWORD)),
+            "header-inferred Rust highlights `fn`: {:?}",
+            line.spans
+        );
+    }
+
+    #[test]
+    fn rust_lifetimes_do_not_swallow_the_line_as_a_string() {
+        // `'a` is a lifetime, not a char literal — it must not open a string
+        // run that eats the rest of the line.
+        let diff = "@@ -1 +1 @@\n+fn f<'a>(x: &'a str) {}";
+        let line = body_lines(diff, Some("x.rs")).pop().unwrap();
+        assert!(
+            !line
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(theme::SYNTAX_STRING)),
+            "no string span from a lifetime: {:?}",
+            line.spans
+        );
+        assert!(line_text(&line).contains("&'a str"), "text intact");
+    }
+
+    #[test]
+    fn tokenizer_is_lossless_across_languages() {
+        for (code, lang) in [
+            ("let x = \"a\\\"b\"; // c", Lang::TsJs),
+            ("fn main() { 0xFF_u8; 'z' }", Lang::Rust),
+            ("def f(): return 1.5 # x", Lang::Python),
+            ("<p>Don't have an account?</p>", Lang::TsJs),
+            ("", Lang::Rust),
+        ] {
+            let rebuilt: String = tokenize(code, lang).into_iter().map(|(t, _)| t).collect();
+            assert_eq!(rebuilt, code, "tokenizer dropped/added chars for {code:?}");
+        }
+    }
+
+    #[test]
+    fn a_contraction_apostrophe_does_not_swallow_the_line_as_a_string() {
+        // An unpaired apostrophe in JSX prose must not open a string run —
+        // the old behavior painted everything after "Don" in string sand.
+        let runs = tokenize("<p>Don't have an account?</p>", Lang::TsJs);
+        assert!(
+            runs.iter().all(|(_, tok)| *tok != Some(Tok::Str)),
+            "no string run in prose: {runs:?}"
+        );
+        // A real single-quoted string on the same language still highlights.
+        let runs = tokenize("const x = 'ok';", Lang::TsJs);
+        assert!(
+            runs.iter()
+                .any(|(t, tok)| t == "'ok'" && *tok == Some(Tok::Str)),
+            "terminated strings keep their color: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_path_alone_decides_the_language_never_the_diff_content() {
+        // Event-path pseudo-diffs have no headers, so their *content* must
+        // never be sniffed as one: a removed SQL comment `-- see load.py`
+        // renders as `--- see load.py`, which looks exactly like a header
+        // naming a Python file. With a path supplied (unknown extension),
+        // highlighting must simply stay off.
+        let diff = "--- see scripts/load.py\n+import x";
+        let line = body_lines(diff, Some("q.sql")).pop().unwrap();
+        assert_eq!(
+            line.spans.len(),
+            2,
+            "gutter + one plain span, no Python keywords: {:?}",
+            line.spans
+        );
+    }
+
+    #[test]
+    fn context_lines_stay_fully_muted_without_syntax_colors() {
+        // De-emphasis is the whole point of a context line: even with a
+        // recognized language its keywords keep the muted foreground.
+        let diff = "@@ -1,2 +1,2 @@\n fn unchanged() {}\n+fn added() {}";
+        let lines = body_lines(diff, Some("m.rs"));
+        let context = &lines[1];
+        assert_eq!(
+            context.spans.len(),
+            2,
+            "gutter + one muted span: {:?}",
+            context.spans
+        );
+        assert_eq!(context.spans[1].style.fg, Some(theme::MUTED));
+        let added = &lines[2];
+        assert_eq!(
+            span_with(added, "fn").map(|s| s.style.fg),
+            Some(Some(theme::SYNTAX_KEYWORD)),
+            "added lines still highlight: {:?}",
+            added.spans
+        );
+    }
+
+    #[test]
+    fn capped_rendering_styles_only_the_cap_but_counts_every_line() {
+        let diff = "+one\n+two\n+three\n+four\n+five";
+        let (lines, total) = body_lines_capped(diff, Some("x.rs"), 2);
+        assert_eq!(lines.len(), 2, "styles stop at the cap");
+        assert_eq!(total, 5, "the footer math sees the full length");
+        // An uncapped call is byte-identical to `body_lines`.
+        let (all, n) = body_lines_capped(diff, Some("x.rs"), usize::MAX);
+        assert_eq!(n, 5);
+        assert_eq!(all, body_lines(diff, Some("x.rs")));
     }
 }
