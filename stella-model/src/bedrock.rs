@@ -110,7 +110,7 @@ impl BedrockProvider {
 #[serde(rename_all = "camelCase")]
 struct ConverseRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    system: Vec<BedrockTextBlock>,
+    system: Vec<BedrockSystemBlock>,
     messages: Vec<BedrockMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inference_config: Option<BedrockInferenceConfig>,
@@ -121,6 +121,30 @@ struct ConverseRequest {
 #[derive(Serialize, Debug)]
 struct BedrockTextBlock {
     text: String,
+}
+
+/// Converse's opt-in prompt-cache marker (`{"cachePoint": {"type": "default"}}`).
+/// Same role as the Anthropic adapter's `cache_control` breakpoints: without
+/// one, Bedrock caches nothing and every turn re-pays the replayed prefix at
+/// the full input rate. Placed after the system blocks (tools+system tier)
+/// and at the tail of the last message (conversation-incremental tier).
+#[derive(Serialize, Debug, Clone, Copy)]
+struct BedrockCachePoint {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+const CACHE_POINT: BedrockCachePoint = BedrockCachePoint { kind: "default" };
+
+/// One `system` array entry — a union of a text block or a cache point,
+/// same one-field-set convention as [`BedrockContentBlock`].
+#[derive(Serialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct BedrockSystemBlock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_point: Option<BedrockCachePoint>,
 }
 
 #[derive(Serialize, Debug)]
@@ -140,6 +164,8 @@ struct BedrockContentBlock {
     tool_use: Option<BedrockToolUse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_result: Option<BedrockToolResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_point: Option<BedrockCachePoint>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -344,6 +370,17 @@ fn to_bedrock_tool_config(
     })
 }
 
+/// Whether the target model family supports Converse `cachePoint` blocks.
+/// Bedrock rejects cache points on models without prompt-caching support
+/// (ValidationException), so the markers are added only for families with
+/// documented support — Anthropic Claude and Amazon Nova. The catalog's
+/// bedrock entries are all Claude inference profiles today; the gate keeps
+/// a custom-routed model id from breaking every request.
+fn supports_cache_points(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("claude") || model.contains("nova")
+}
+
 #[async_trait]
 impl Provider for BedrockProvider {
     fn id(&self) -> &str {
@@ -351,7 +388,33 @@ impl Provider for BedrockProvider {
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResult, ProviderError> {
-        let (system, messages) = to_bedrock_messages(&req.messages);
+        let (system_text, mut messages) = to_bedrock_messages(&req.messages);
+        let cache = supports_cache_points(&self.model);
+        let mut system: Vec<BedrockSystemBlock> = system_text
+            .into_iter()
+            .map(|block| BedrockSystemBlock {
+                text: Some(block.text),
+                ..Default::default()
+            })
+            .collect();
+        if cache && !system.is_empty() {
+            // Tools+system cache tier — mirrors the Anthropic adapter's
+            // system-block `cache_control` breakpoint.
+            system.push(BedrockSystemBlock {
+                cache_point: Some(CACHE_POINT),
+                ..Default::default()
+            });
+        }
+        if cache {
+            // Conversation-tail cache tier: each turn reads the prefix the
+            // previous turn wrote instead of re-paying the replayed history.
+            if let Some(last) = messages.last_mut() {
+                last.content.push(BedrockContentBlock {
+                    cache_point: Some(CACHE_POINT),
+                    ..Default::default()
+                });
+            }
+        }
         let inference_config = if req.max_output_tokens.is_none() && req.temperature.is_none() {
             None
         } else {
@@ -463,7 +526,12 @@ impl Provider for BedrockProvider {
         }
         let usage = parsed.usage.unwrap_or_default();
         let usage = CompletionUsage {
-            input_tokens: usage.input_tokens,
+            // Converse's `inputTokens` EXCLUDES cache reads (same meter split
+            // as Anthropic's native API), so reads are folded back in to keep
+            // the normalized subset invariant (cached ⊆ input) that
+            // `Pricing::cost_usd` relies on — otherwise cached tokens would
+            // be double-subtracted and the turn under-billed.
+            input_tokens: usage.input_tokens + usage.cache_read_input_tokens,
             output_tokens: usage.output_tokens,
             cached_input_tokens: usage.cache_read_input_tokens,
             cache_write_tokens: usage.cache_write_input_tokens,
@@ -796,8 +864,17 @@ mod tests {
     use super::*;
     use stella_protocol::tool::ToolSchema;
     use stella_protocol::{ToolOutput, ToolResult};
-    use wiremock::matchers::{header_regex, method, path};
+    use wiremock::matchers::{body_string_contains, header_regex, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn cache_points_are_gated_to_supporting_model_families() {
+        assert!(supports_cache_points(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        ));
+        assert!(supports_cache_points("us.amazon.nova-pro-v1:0"));
+        assert!(!supports_cache_points("meta.llama4-maverick-17b-v1:0"));
+    }
 
     fn test_provider(server_uri: &str) -> BedrockProvider {
         BedrockProvider::new(
@@ -904,10 +981,48 @@ mod tests {
             .await
             .expect("completion should succeed");
         assert_eq!(result.text, "Hello from Bedrock");
-        assert_eq!(result.usage.input_tokens, 9);
+        // Converse reports cache reads OUTSIDE `inputTokens`; the adapter
+        // folds them back in so cached stays a subset of input (9 + 3).
+        assert_eq!(result.usage.input_tokens, 12);
         assert_eq!(result.usage.output_tokens, 5);
         assert_eq!(result.usage.cached_input_tokens, 3);
         assert_eq!(result.usage.cache_write_tokens, 2);
+    }
+
+    /// Prompt caching on Converse is opt-in via `cachePoint` blocks: one
+    /// after the system blocks (tools+system tier) and one at the tail of
+    /// the last message (conversation-incremental tier). Without them
+    /// Bedrock caches nothing.
+    #[tokio::test]
+    async fn complete_sends_cache_points_for_claude_models() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("\"cachePoint\":{\"type\":\"default\"}"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 4, "outputTokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = test_provider(&server.uri());
+        let req = CompletionRequest {
+            messages: vec![
+                CompletionMessage::system("You are a coding agent."),
+                CompletionMessage::user("hi"),
+            ],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+        };
+        let result = provider
+            .complete(req)
+            .await
+            .expect("completion should succeed");
+        assert_eq!(result.text, "ok");
     }
 
     #[tokio::test]

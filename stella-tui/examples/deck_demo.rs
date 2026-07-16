@@ -147,6 +147,7 @@ async fn main() -> std::io::Result<()> {
                         edges: vec![],
                         files: demo_graph().files,
                     }));
+                }
                 // The installed-agents manager needs the real driver (disk +
                 // provider); the demo answers with an empty list so the pane
                 // renders its empty state instead of loading forever.

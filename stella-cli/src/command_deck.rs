@@ -638,6 +638,7 @@ pub async fn run_deck_session(
                                     let _ = tx.send(Inbound::GraphSnapshot(snapshot));
                                 }
                             });
+                        }
                         // The INSTALLED AGENTS pane stays live while a turn
                         // runs — refresh / save / pin are pure filesystem
                         // ops, the same shared helper as the idle recv site.

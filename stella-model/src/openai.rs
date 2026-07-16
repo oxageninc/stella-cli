@@ -39,6 +39,14 @@ pub struct OpenAiProvider {
     /// List pricing for `model`, resolved from the catalog at construction so
     /// `cost_usd` is computed on the real request path (see `zai.rs`).
     pricing: Option<Pricing>,
+    /// OpenAI's prompt caching is implicit (no `cache_control` equivalent to
+    /// opt into), but `prompt_cache_key` steers cache *routing*: requests
+    /// sharing a key land on the same cache shard, so an agent loop's turns
+    /// — which all replay the same growing prefix — reliably find the writes
+    /// their earlier turns made. One key per provider instance = one key per
+    /// session. The value is volatile by design; it rides as a request
+    /// parameter and never enters the cached prompt bytes.
+    prompt_cache_key: String,
 }
 
 impl OpenAiProvider {
@@ -47,12 +55,17 @@ impl OpenAiProvider {
     pub fn new(api_key: ApiKey, model: impl Into<String>) -> Self {
         let model = model.into();
         let pricing = Catalog::seed().resolve(&model).ok().map(|e| e.pricing);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         Self {
             client: http::client(),
             api_key,
             base_url: DEFAULT_BASE_URL.to_string(),
             model,
             pricing,
+            prompt_cache_key: format!("stella-{}-{nanos:x}", std::process::id()),
         }
     }
 
@@ -89,6 +102,9 @@ struct OpenAiRequest<'a> {
     tools: Vec<OpenAiToolSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<OpenAiReasoning>,
+    /// Session-stable cache-routing key — see the field on
+    /// [`OpenAiProvider`] for why this maximizes implicit-cache hit rate.
+    prompt_cache_key: &'a str,
 }
 
 #[derive(Serialize)]
@@ -380,6 +396,7 @@ impl Provider for OpenAiProvider {
             reasoning: req.effort.map(|effort| OpenAiReasoning {
                 effort: map_reasoning_effort(effort),
             }),
+            prompt_cache_key: &self.prompt_cache_key,
         };
 
         let response = self
@@ -527,8 +544,43 @@ async fn aggregate_openai_stream(
 mod tests {
     use super::*;
     use stella_protocol::tool::ToolSchema;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Every request carries the session-stable `prompt_cache_key` so
+    /// OpenAI's implicit cache routes all of a session's prefix-sharing
+    /// turns to the same shard.
+    #[tokio::test]
+    async fn complete_sends_a_session_stable_prompt_cache_key() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_string_contains("\"prompt_cache_key\":\"stella-"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(ApiKey::new("sk-test-openai"), "gpt-5.5")
+            .with_base_url(server.uri());
+        let req = || CompletionRequest {
+            messages: vec![CompletionMessage::user("hi")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+        };
+        provider.complete(req()).await.expect("first turn");
+        provider.complete(req()).await.expect("second turn");
+        // The same provider instance keys both turns identically — routing
+        // them to the same cache shard is the whole point.
+    }
 
     #[test]
     fn to_openai_input_hoists_system_into_instructions_and_maps_user() {
