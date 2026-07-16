@@ -1329,11 +1329,14 @@ mod tests {
         assert!(matches!(outcome, TurnOutcome::Completed { .. }));
     }
 
-    /// Tools that log start/end order. Read-only `read_file` sleeps per its
-    /// input so completion order can invert; mutating `edit_file` records
-    /// that it saw a quiet world (no read in flight).
+    /// Tools that log start/end order. The first read-only `read_file` ends
+    /// only after the second has ended (a Notify handshake, not a wall-clock
+    /// sleep — a loaded CI runner can stall the "fast" path past any sleep
+    /// and flip the asserted order); mutating `edit_file` records that it
+    /// saw a quiet world (no read in flight).
     struct RecordingTools {
         log: Arc<TokioMutex<Vec<String>>>,
+        read2_done: tokio::sync::Notify,
     }
     #[async_trait]
     impl ToolExecutor for RecordingTools {
@@ -1352,11 +1355,16 @@ mod tests {
             let which = input.get("which").and_then(|v| v.as_str()).unwrap_or("?");
             self.log.lock().await.push(format!("start:{name}:{which}"));
             if name == "read_file" && which == "call_1" {
-                // The FIRST read is slow, so with real concurrency the
-                // second read finishes first.
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // Deterministic ordering: with real concurrency call_2 runs,
+                // ends, and releases this wait (Notify stores the permit if
+                // it fires first). A sequential executor deadlocks here —
+                // caught by the test's outer timeout instead of hanging.
+                self.read2_done.notified().await;
             }
             self.log.lock().await.push(format!("end:{name}:{which}"));
+            if name == "read_file" && which == "call_2" {
+                self.read2_done.notify_one();
+            }
             ToolOutput::Ok {
                 content: "done".into(),
             }
@@ -1379,7 +1387,10 @@ mod tests {
             calls: Arc::new(AtomicU32::new(0)),
         };
         let log = Arc::new(TokioMutex::new(Vec::new()));
-        let tools = RecordingTools { log: log.clone() };
+        let tools = RecordingTools {
+            log: log.clone(),
+            read2_done: tokio::sync::Notify::new(),
+        };
         let sleeper = NoopSleeper;
         let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
         let mut messages = vec![
@@ -1389,7 +1400,12 @@ mod tests {
         let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.run_turn(&mut messages, &mut budget, &tx),
+        )
+        .await
+        .expect("reads must overlap — a sequential executor deadlocks on the handshake");
         assert!(matches!(outcome, TurnOutcome::Completed { .. }));
 
         // Sequencing: the mutating call is a barrier — it must start only
