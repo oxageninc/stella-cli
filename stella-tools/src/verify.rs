@@ -40,58 +40,15 @@ const TAIL_BYTES: usize = 4_000;
 pub struct VerifyDone;
 
 /// Run `command` via `bash -c` in `dir` with a process-group kill on
-/// timeout. Returns (exit_code, combined_output) or a spawn/timeout error.
+/// timeout — the shared runner in [`crate::exec`]. Its 30k middle-out cap is
+/// invisible here: `tail()` keeps only the last [`TAIL_BYTES`], which the
+/// cap's preserved tail half always contains.
 async fn run(
     command: &str,
     dir: &std::path::Path,
     timeout_secs: u64,
 ) -> Result<(i32, String), String> {
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(command);
-    cmd.current_dir(dir);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    #[cfg(unix)]
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
-    #[cfg(unix)]
-    let pid = child.id().unwrap_or(0) as i32;
-
-    let output =
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-            .await
-        {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(format!("command failed: {e}")),
-            Err(_) => {
-                #[cfg(unix)]
-                unsafe {
-                    // Guard on a real pid: kill(-0, …) would SIGKILL Stella's
-                    // OWN process group.
-                    if pid > 0 {
-                        libc::kill(-pid, libc::SIGKILL);
-                    }
-                }
-                return Err(format!("`{command}` timed out after {timeout_secs}s"));
-            }
-        };
-
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.is_empty() {
-        if !combined.is_empty() {
-            combined.push('\n');
-        }
-        combined.push_str(&stderr);
-    }
-    Ok((output.status.code().unwrap_or(-1), combined))
+    crate::exec::run(command, dir, timeout_secs).await
 }
 
 fn tail(s: &str) -> &str {
