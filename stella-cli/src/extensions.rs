@@ -156,6 +156,9 @@ pub struct SyncOutcome {
     /// Created links as `(kind, name)`.
     pub linked: Vec<(ExtensionKind, String)>,
     /// Entries skipped by the plan (symlink sources, existing names).
+    /// Silent skips are the idempotent-rerun norm, so the init progress
+    /// line reports only links and errors — today only tests read this.
+    #[allow(dead_code)]
     pub skipped: usize,
     pub errors: Vec<String>,
 }
