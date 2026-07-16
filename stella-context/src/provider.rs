@@ -1,19 +1,20 @@
 //! The provider registry seam (`02-architecture.md` §7, `06-context-protocol.md`
-//! §2). One interface — [`ContextProvider`] — behind which context sources are
-//! intended to register: the built-in [`ContextStore`] implements it today (so
-//! the store is both the primary backend and a first-class provider). Wiring
-//! additional sources through this seam — a `stella-graph` code-graph provider,
-//! a git-history provider, and external OCP providers adapted from `ocp-host` —
-//! is designed here but not yet built; this crate does not depend on `ocp-host`,
-//! and the shipping CLI queries the store directly rather than via this
-//! registry.
+//! §2). One interface — [`ContextProvider`] — behind which context sources
+//! register: the built-in [`ContextStore`] implements it (so the store is both
+//! the primary backend and a first-class provider), and the shipping CLI's
+//! session recall flows through this registry (`stella-cli/src/ocp.rs` wraps
+//! it as the `workspace-memory` OCP provider, registering the store domain-
+//! scoped). Wiring further sources through this seam — a `stella-graph`
+//! code-graph provider at this layer, a git-history provider, and external OCP
+//! providers adapted from `ocp-host` — is designed here but not yet built;
+//! this crate does not depend on `ocp-host`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ocp_types::capability::QueryCapability;
-use ocp_types::{Capabilities, ContextFrame, ContextQuery, DataFlow, ProviderInfo};
+use ocp_types::{Capabilities, ContextQuery, ContextQueryResult, DataFlow, ProviderInfo};
 
 use crate::error::ContextError;
 use crate::store::{ContextStore, NodeKind};
@@ -30,9 +31,11 @@ pub trait ContextProvider: Send + Sync {
     /// What this provider can answer, for query routing.
     fn capabilities(&self) -> Capabilities;
 
-    /// Return frames relevant to the query. Providers return `Vec<ContextFrame>`;
-    /// budgeting/fusion across providers is the host's job.
-    async fn query(&self, q: &ContextQuery) -> Result<Vec<ContextFrame>, ContextError>;
+    /// Return frames relevant to the query, as the OCP wire result so a
+    /// provider's budget drops stay visible across the seam (`L-C5` — a bare
+    /// frame list would erase the truncation report). Budgeting/fusion across
+    /// providers is the host's job.
+    async fn query(&self, q: &ContextQuery) -> Result<ContextQueryResult, ContextError>;
 }
 
 /// Every frame kind the built-in store can serve.
@@ -93,9 +96,9 @@ impl ContextProvider for ContextStore {
         }
     }
 
-    async fn query(&self, q: &ContextQuery) -> Result<Vec<ContextFrame>, ContextError> {
+    async fn query(&self, q: &ContextQuery) -> Result<ContextQueryResult, ContextError> {
         // The OCP-shaped adapter over the rich `recall` pipeline.
-        Ok(self.recall(q).await?.frames)
+        Ok(self.recall(q).await?.into())
     }
 }
 
@@ -153,21 +156,35 @@ impl ProviderRegistry {
     }
 
     /// Fan the query to capability-matching providers and concatenate their
-    /// frames, deduping by frame id (first writer wins).
-    pub async fn query_all(&self, q: &ContextQuery) -> Result<Vec<ContextFrame>, ContextError> {
+    /// frames, deduping by frame id (first writer wins). The truncation report
+    /// aggregates across providers — `truncated` if any provider truncated,
+    /// `dropped_estimate` summed over the providers that reported one — so the
+    /// fan-out never erases a provider's honest drop report (`L-C5`).
+    pub async fn query_all(&self, q: &ContextQuery) -> Result<ContextQueryResult, ContextError> {
         let mut seen: HashSet<String> = HashSet::new();
-        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        let mut truncated = false;
+        let mut dropped_estimate: Option<u32> = None;
         for provider in &self.providers {
             if !Self::matches(&provider.capabilities(), q) {
                 continue;
             }
-            for frame in provider.query(q).await? {
+            let result = provider.query(q).await?;
+            truncated |= result.truncated;
+            if let Some(d) = result.dropped_estimate {
+                dropped_estimate = Some(dropped_estimate.unwrap_or(0).saturating_add(d));
+            }
+            for frame in result.frames {
                 if seen.insert(frame.id.clone()) {
-                    out.push(frame);
+                    frames.push(frame);
                 }
             }
         }
-        Ok(out)
+        Ok(ContextQueryResult {
+            frames,
+            truncated,
+            dropped_estimate,
+        })
     }
 }
 
@@ -176,7 +193,7 @@ mod tests {
     use super::*;
     use crate::store::{ContextStore, NodeInput};
     use crate::writeback::ContextDelta;
-    use ocp_types::FrameKind;
+    use ocp_types::{ContextFrame, FrameKind};
     use tempfile::TempDir;
 
     async fn seeded_store() -> (TempDir, Arc<ContextStore>) {
@@ -240,14 +257,14 @@ mod tests {
         registry.register(store.clone());
         registry.register(store.clone());
         assert_eq!(registry.len(), 2);
-        let frames = registry
+        let result = registry
             .query_all(&query("open the sqlite connection"))
             .await
             .unwrap();
-        let ids: HashSet<_> = frames.iter().map(|f| f.id.clone()).collect();
+        let ids: HashSet<_> = result.frames.iter().map(|f| f.id.clone()).collect();
         assert_eq!(
             ids.len(),
-            frames.len(),
+            result.frames.len(),
             "no duplicate frame ids across providers"
         );
     }
@@ -261,10 +278,78 @@ mod tests {
         // (which the store's node kinds never map to) skips it.
         let mut q = query("anything");
         q.kinds = vec![FrameKind::Graph];
-        let frames = registry.query_all(&q).await.unwrap();
+        let result = registry.query_all(&q).await.unwrap();
         assert!(
-            frames.is_empty(),
+            result.frames.is_empty(),
             "provider is routed away when kinds don't intersect"
+        );
+        assert!(!result.truncated, "a routed-away provider reports no drops");
+    }
+
+    /// A scripted provider for aggregation tests.
+    struct Scripted {
+        frames: Vec<ContextFrame>,
+        truncated: bool,
+        dropped_estimate: Option<u32>,
+    }
+
+    #[async_trait]
+    impl ContextProvider for Scripted {
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo {
+                name: "scripted".to_string(),
+                version: "0".to_string(),
+                data_flow: DataFlow {
+                    reads: true,
+                    writes: false,
+                    egress: false,
+                },
+            }
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                query: QueryCapability {
+                    kinds: store_kinds(),
+                    filters: vec![],
+                },
+                ..Capabilities::default()
+            }
+        }
+
+        async fn query(&self, _q: &ContextQuery) -> Result<ContextQueryResult, ContextError> {
+            Ok(ContextQueryResult {
+                frames: self.frames.clone(),
+                truncated: self.truncated,
+                dropped_estimate: self.dropped_estimate,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fan_out_aggregates_the_truncation_report_instead_of_erasing_it() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(Scripted {
+            frames: vec![],
+            truncated: false,
+            dropped_estimate: None,
+        }));
+        registry.register(Arc::new(Scripted {
+            frames: vec![],
+            truncated: true,
+            dropped_estimate: Some(2),
+        }));
+        registry.register(Arc::new(Scripted {
+            frames: vec![],
+            truncated: true,
+            dropped_estimate: Some(3),
+        }));
+        let result = registry.query_all(&query("anything")).await.unwrap();
+        assert!(result.truncated, "one truncating provider taints the merge");
+        assert_eq!(
+            result.dropped_estimate,
+            Some(5),
+            "estimates sum over the providers that reported one (L-C5)"
         );
     }
 }

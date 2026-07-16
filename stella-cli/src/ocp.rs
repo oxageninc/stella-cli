@@ -11,9 +11,11 @@
 //! gets. "Code is a graph, not text" is now the runtime path, not just a
 //! wire spec.
 //!
-//! - **`workspace-memory`** — the bi-temporal store (`stella-context`):
-//!   reflections, episodes, facts, fused by its own recall pipeline and
-//!   scoped to the workspace's domain taxonomy.
+//! - **`workspace-memory`** — the context plane: a
+//!   [`stella_context::ProviderRegistry`] fan-out with the bi-temporal store
+//!   registered domain-scoped (issue #103's wire decision — the store is
+//!   queried through the plane's own provider seam, never directly).
+//!   Reflections, episodes, facts, fused by the store's recall pipeline.
 //! - **`code-graph`** — the tree-sitter index (`stella-graph`), opened
 //!   read-only per query (the schema-gate discipline) on the blocking pool.
 //!
@@ -28,7 +30,9 @@ use ocp_host::{ContextProvider, Host, HostError, ProviderResult};
 use ocp_types::{
     Capabilities, ContextFrame, ContextQuery, ContextQueryResult, DataFlow, ProviderInfo,
 };
-use stella_context::ContextStore;
+use stella_context::{
+    ContextError, ContextProvider as PlaneProvider, ContextStore, ProviderRegistry,
+};
 
 /// Per-provider recall timeout. Recall runs before every turn, so a wedged
 /// source must cost bounded latency — the host isolates it and the other
@@ -47,13 +51,46 @@ fn local_info(name: &str) -> ProviderInfo {
     }
 }
 
-/// The workspace memory store behind the OCP provider trait. Domain scoping
-/// is provider-internal: OCP's `ContextQuery` is workspace-agnostic, and
-/// which taxonomy applies is exactly the kind of local knowledge a provider
-/// owns.
-struct MemoryProvider {
+/// The built-in store registered at the context-plane seam, with the
+/// session's domain scope applied. Domain scoping is provider-internal:
+/// OCP's `ContextQuery` is workspace-agnostic, and which taxonomy applies is
+/// exactly the kind of local knowledge a provider owns. Identity and
+/// capabilities are the store's own provider declarations.
+struct ScopedStore {
     store: Arc<ContextStore>,
     domains: Vec<String>,
+}
+
+#[async_trait]
+impl PlaneProvider for ScopedStore {
+    fn info(&self) -> ProviderInfo {
+        PlaneProvider::info(self.store.as_ref())
+    }
+    fn capabilities(&self) -> Capabilities {
+        PlaneProvider::capabilities(self.store.as_ref())
+    }
+    async fn query(&self, query: &ContextQuery) -> Result<ContextQueryResult, ContextError> {
+        Ok(self.store.recall_scoped(query, &self.domains).await?.into())
+    }
+}
+
+/// The context-plane registry behind `workspace-memory`: the seam every
+/// in-plane source registers through (issue #103's wire decision). Today
+/// that is the built-in store, domain-scoped; a further plane source (a
+/// git-history provider, an adapted external OCP provider) lands by
+/// registering here, not by editing the host adapter.
+fn memory_plane(store: Arc<ContextStore>, domains: Vec<String>) -> ProviderRegistry {
+    let mut plane = ProviderRegistry::new();
+    plane.register(Arc::new(ScopedStore { store, domains }));
+    plane
+}
+
+/// The workspace context plane behind the OCP provider trait: recall fans
+/// through the plane's [`ProviderRegistry`] instead of hitting the store
+/// directly, so the registry's capability routing, id-dedup, and aggregated
+/// truncation report are the production path.
+struct MemoryProvider {
+    plane: ProviderRegistry,
     info: ProviderInfo,
     caps: Capabilities,
 }
@@ -71,28 +108,29 @@ impl ContextProvider for MemoryProvider {
     }
     async fn query(&self, query: &ContextQuery) -> Result<ContextQueryResult, HostError> {
         let result = self
-            .store
-            .recall_scoped(query, &self.domains)
+            .plane
+            .query_all(query)
             .await
             .map_err(|e| HostError::Transport {
                 id: "workspace-memory".to_string(),
                 message: e.to_string(),
             })?;
-        // The store's recall does not honor `query.kinds`, so a kind-filtered
-        // query (now routed here because we advertise those kinds) must be
+        // The registry routes `query.kinds` at provider granularity, but the
+        // store's recall does not honor it per-frame, so a kind-filtered
+        // query (routed here because we advertise those kinds) must still be
         // filtered before returning — otherwise a `kinds: [Symbol]` request
         // could surface memory/fact frames. This filtering is NOT truncation:
         // `ContextQueryResult.truncated`/`dropped_estimate` describe candidates
         // that matched the request but were cut for budget, so they reflect
-        // only the store's own drops — a non-matching kind was never a
+        // only the plane's own drops — a non-matching kind was never a
         // candidate for this query in the first place.
         let mut frames = result.frames;
         if !query.kinds.is_empty() {
             frames.retain(|f| query.kinds.contains(&f.kind));
         }
         Ok(ContextQueryResult {
-            truncated: !result.dropped.is_empty(),
-            dropped_estimate: u32::try_from(result.dropped.len()).ok(),
+            truncated: result.truncated,
+            dropped_estimate: result.dropped_estimate,
             frames,
         })
     }
@@ -169,8 +207,7 @@ pub fn session_host(
     // memory store serves every kind it mints; the graph serves symbols,
     // snippets, and graph frames).
     host.register(Box::new(MemoryProvider {
-        store,
-        domains,
+        plane: memory_plane(store, domains),
         info: local_info("workspace-memory"),
         caps: Capabilities {
             query: ocp_types::capability::QueryCapability {
@@ -356,5 +393,106 @@ mod tests {
         let mut ids = host.provider_ids();
         ids.sort();
         assert_eq!(ids, vec!["code-graph", "workspace-memory"]);
+    }
+
+    use stella_context::{ContextDelta, NodeInput, NodeKind};
+
+    /// A store with one strongly-matching node, for plane-routing tests.
+    async fn seeded_store(dir: &tempfile::TempDir) -> Arc<ContextStore> {
+        let store = Arc::new(ContextStore::open(dir.path().join("context.db")).expect("store"));
+        store
+            .upsert(
+                ContextDelta::new().with_node(
+                    NodeInput::new(NodeKind::File, "src/store.rs")
+                        .with_uri("file:///repo/src/store.rs")
+                        .with_content("open the sqlite connection in wal mode"),
+                ),
+            )
+            .await
+            .expect("seed");
+        store
+    }
+
+    #[tokio::test]
+    async fn recall_routes_through_the_plane_registry_to_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = seeded_store(&dir).await;
+        let host = session_host(store, vec![], dir.path().to_path_buf());
+        let mut q = query(5, 4_000);
+        q.query_text = Some("open the sqlite connection in wal mode".to_string());
+        // Host → workspace-memory → plane registry → store: the full
+        // production path, end to end.
+        let kept = recall_via_host(&host, &q).await;
+        assert!(
+            kept.iter().any(|f| f.content.contains("sqlite")),
+            "the seeded node surfaces through the registry-routed path"
+        );
+    }
+
+    /// A scripted context-plane provider (the `stella-context` seam, not the
+    /// host trait) for plane fan-out tests.
+    struct PlaneScripted {
+        kinds: Vec<String>,
+        frames: Vec<ContextFrame>,
+        truncated: bool,
+    }
+
+    #[async_trait]
+    impl PlaneProvider for PlaneScripted {
+        fn info(&self) -> ProviderInfo {
+            local_info("plane-scripted")
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                query: ocp_types::capability::QueryCapability {
+                    kinds: self.kinds.clone(),
+                    filters: Vec::new(),
+                },
+                ..Capabilities::default()
+            }
+        }
+        async fn query(&self, _q: &ContextQuery) -> Result<ContextQueryResult, ContextError> {
+            Ok(ContextQueryResult {
+                frames: self.frames.clone(),
+                truncated: self.truncated,
+                dropped_estimate: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_plane_fans_out_and_kind_routes_across_registered_providers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut plane = memory_plane(seeded_store(&dir).await, vec![]);
+        let mut graph_frame = frame("plane-graph", 0.9, 10);
+        graph_frame.kind = ocp_types::FrameKind::Graph;
+        plane.register(Arc::new(PlaneScripted {
+            kinds: vec!["graph".to_string()],
+            frames: vec![graph_frame],
+            truncated: true,
+        }));
+        let provider = MemoryProvider {
+            plane,
+            info: local_info("workspace-memory"),
+            caps: Capabilities::default(),
+        };
+
+        // Unfiltered: both plane providers answer — the store's frame and the
+        // second provider's graph frame merge, and the second provider's
+        // truncation survives the fan-out instead of being erased (L-C5).
+        let mut q = query(10, 4_000);
+        q.query_text = Some("open the sqlite connection in wal mode".to_string());
+        let result = provider.query(&q).await.expect("fan-out");
+        assert!(result.frames.iter().any(|f| f.id == "plane-graph"));
+        assert!(result.frames.iter().any(|f| f.content.contains("sqlite")));
+        assert!(result.truncated, "a plane provider's drop report survives");
+
+        // Kind-filtered to `graph`: the registry routes the store away (it
+        // never serves graph frames) and only the second provider answers.
+        let mut q = query(10, 4_000);
+        q.kinds = vec![ocp_types::FrameKind::Graph];
+        let result = provider.query(&q).await.expect("kind routing");
+        let ids: Vec<&str> = result.frames.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["plane-graph"]);
     }
 }

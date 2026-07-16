@@ -63,4 +63,6 @@ pub use writeback::{
 
 // Re-export the OCP wire types callers pass in/out, so a consumer needs only
 // this crate for the common path (they remain `ocp-types`' definitions).
-pub use ocp_types::{Capabilities, ContextFrame, ContextQuery, DataFlow, ProviderInfo};
+pub use ocp_types::{
+    Capabilities, ContextFrame, ContextQuery, ContextQueryResult, DataFlow, ProviderInfo,
+};
