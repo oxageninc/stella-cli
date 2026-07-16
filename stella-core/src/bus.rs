@@ -623,13 +623,24 @@ impl HookBus {
     /// in registration order, folding `Modify` into the payload, stopping
     /// at the first `Deny`/`RequireApproval`. Records the final decision in
     /// a `policy.evaluated` event plus one of `policy.allowed` /
-    /// `policy.blocked` / `approval.requested`. The chain sees the **raw**
-    /// payload (interception needs it); the recorded policy events carry
-    /// only the decision, never the payload.
+    /// `policy.blocked` / `approval.requested`.
+    ///
+    /// The blocking event itself is delivered **only to blocking handlers**
+    /// ([`HookBus::on_blocking`]) — never to observers ([`HookBus::on`]).
+    /// That is the payload-hygiene boundary: the raw payload (which may carry
+    /// full file contents or a shell command) reaches only the explicitly
+    /// privileged interception point. Observers see the *outcome* — the
+    /// `policy.*` records (decision only, no payload) — plus whatever
+    /// sanitized observable events the emitter chooses to also send (e.g. the
+    /// registry's `tool.call.started`).
     pub fn emit_blocking(&self, draft: HookEventDraft) -> PolicyOutcome {
         let mut event = self.seal(draft);
         let chain: Vec<(String, Arc<BlockingFn>)> = {
-            let blockers = self.inner.blockers.lock().unwrap_or_else(|p| p.into_inner());
+            let blockers = self
+                .inner
+                .blockers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             blockers
                 .iter()
                 .filter(|r| pattern_matches(&r.pattern, &event.name))
@@ -654,7 +665,11 @@ impl HookBus {
                 }
                 Err(panic) => {
                     let message = panic_message(panic);
-                    self.report_failure(&pattern, &event, format!("policy handler panicked: {message}"));
+                    self.report_failure(
+                        &pattern,
+                        &event,
+                        format!("policy handler panicked: {message}"),
+                    );
                     decision = HookDecision::Deny {
                         reason: format!("policy handler for `{pattern}` failed: {message}"),
                     };
@@ -734,7 +749,11 @@ impl HookBus {
     /// in-flight event.
     fn dispatch(&self, event: &HookEvent) {
         let matching: Vec<(String, Arc<ObserverFn>)> = {
-            let observers = self.inner.observers.lock().unwrap_or_else(|p| p.into_inner());
+            let observers = self
+                .inner
+                .observers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             observers
                 .iter()
                 .filter(|r| pattern_matches(&r.pattern, &event.name))
@@ -879,7 +898,9 @@ pub fn scan_for_secrets(text: &str) -> Vec<SecretKind> {
     if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
         push(SecretKind::PrivateKeyPem);
     }
-    if has_prefixed_run(text, "AKIA", 16, |c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+    if has_prefixed_run(text, "AKIA", 16, |c| {
+        c.is_ascii_uppercase() || c.is_ascii_digit()
+    }) {
         push(SecretKind::AwsAccessKeyId);
     }
     for prefix in ["ghp_", "gho_", "ghs_", "ghr_", "github_pat_"] {
@@ -991,9 +1012,7 @@ pub fn iso8601_utc_millis(unix_millis: i64) -> String {
     let hour = secs_of_day / 3_600;
     let minute = (secs_of_day % 3_600) / 60;
     let second = secs_of_day % 60;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
 /// Days since 1970-01-01 → `(year, month, day)` (Howard Hinnant's civil
@@ -1035,7 +1054,11 @@ mod tests {
     }
 
     fn names_of(seen: &Arc<Mutex<Vec<HookEvent>>>) -> Vec<String> {
-        seen.lock().unwrap().iter().map(|e| e.name.clone()).collect()
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect()
     }
 
     // ---- catalog -------------------------------------------------------
@@ -1140,7 +1163,10 @@ mod tests {
         assert_eq!(json["id"], "evt_sess-1_1");
         assert_eq!(json["name"], "file.read");
         assert_eq!(json["session_id"], "sess-1");
-        assert_eq!(json["turn_id"], "turn-9", "ambient turn context stamps events");
+        assert_eq!(
+            json["turn_id"], "turn-9",
+            "ambient turn context stamps events"
+        );
         assert_eq!(json["agent_id"], "agent-2", "draft override wins");
         assert_eq!(json["sequence"], 1);
         assert_eq!(json["payload"]["path"], "src/a.rs");
@@ -1164,7 +1190,10 @@ mod tests {
     #[test]
     fn iso8601_formats_known_instants() {
         assert_eq!(iso8601_utc_millis(0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(iso8601_utc_millis(1_600_000_000_123), "2020-09-13T12:26:40.123Z");
+        assert_eq!(
+            iso8601_utc_millis(1_600_000_000_123),
+            "2020-09-13T12:26:40.123Z"
+        );
     }
 
     #[test]
@@ -1305,7 +1334,8 @@ mod tests {
     #[test]
     fn failure_log_is_bounded() {
         let bus = HookBus::new("s");
-        bus.on(names::FILE_READ, |_| Err("broken".to_string())).detach();
+        bus.on(names::FILE_READ, |_| Err("broken".to_string()))
+            .detach();
         for _ in 0..(MAX_RECENT_FAILURES + 20) {
             bus.emit_named(names::FILE_READ, Value::Null);
         }
@@ -1361,13 +1391,19 @@ mod tests {
             0,
             "handlers after a deny never run"
         );
-        let evaluated = &seen.lock().unwrap()[0];
-        assert_eq!(evaluated.name, "policy.evaluated");
-        assert_eq!(evaluated.payload["decision"]["action"], "deny");
-        assert_eq!(
-            evaluated.payload["decision"]["reason"],
-            "workspace is read-only"
-        );
+        // Scope the guard: binding `&seen.lock()...[0]` would hold the lock
+        // across the `names_of(&seen)` re-lock below and deadlock (std Mutex
+        // is not reentrant).
+        {
+            let events = seen.lock().unwrap();
+            let evaluated = &events[0];
+            assert_eq!(evaluated.name, "policy.evaluated");
+            assert_eq!(evaluated.payload["decision"]["action"], "deny");
+            assert_eq!(
+                evaluated.payload["decision"]["reason"],
+                "workspace is read-only"
+            );
+        }
         assert_eq!(names_of(&seen)[1], "policy.blocked");
     }
 
@@ -1387,7 +1423,10 @@ mod tests {
                 reason: "production deploys need a human".into()
             }
         );
-        assert_eq!(names_of(&seen), vec!["policy.evaluated", "approval.requested"]);
+        assert_eq!(
+            names_of(&seen),
+            vec!["policy.evaluated", "approval.requested"]
+        );
     }
 
     #[test]

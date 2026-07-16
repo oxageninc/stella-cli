@@ -640,7 +640,11 @@ impl ToolRegistry {
                     lines_removed,
                 },
             );
-            (touched.revision(), touched.get(&path).cloned(), touched.len())
+            (
+                touched.revision(),
+                touched.get(&path).cloned(),
+                touched.len(),
+            )
         };
         if let Some(bus) = bus {
             let fact = match pending.op {
@@ -1398,5 +1402,175 @@ mod tests {
             vec![FileOp::Update, FileOp::Read],
             "payload keeps first-occurrence order"
         );
+    }
+
+    // ---- extension hook bus integration -------------------------------
+
+    use std::sync::Arc as StdArc;
+    use std::sync::Mutex as StdMutex;
+    use stella_core::bus::{HookBus, HookDecision, HookEvent, names as hook_names};
+
+    /// Capture every event a `"*"` observer sees on `bus`.
+    fn record_bus_events(bus: &HookBus) -> StdArc<StdMutex<Vec<HookEvent>>> {
+        let seen = StdArc::new(StdMutex::new(Vec::new()));
+        let sink = seen.clone();
+        bus.on("*", move |event| {
+            sink.lock().unwrap().push(event.clone());
+            Ok(())
+        })
+        .detach();
+        seen
+    }
+
+    fn event_names(seen: &StdArc<StdMutex<Vec<HookEvent>>>) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_deny_policy_blocks_the_tool_and_leaves_no_touch() {
+        let (dir, reg) = telemetry_fixture();
+        std::fs::write(dir.path().join("f.rs"), "keep me\n").unwrap();
+        let bus = HookBus::new("sess");
+        bus.on_blocking(hook_names::TOOL_CALL_REQUESTED, |_| HookDecision::Deny {
+            reason: "workspace is read-only".into(),
+        })
+        .detach();
+        reg.attach_bus(bus);
+
+        // The delete is refused by the policy; the file survives and the
+        // ledger records nothing.
+        let out = reg
+            .execute("delete_file", &serde_json::json!({"path": "f.rs"}))
+            .await;
+        assert!(out.is_error(), "deny must surface as a tool error");
+        match out {
+            ToolOutput::Error { message } => assert!(message.contains("read-only"), "{message}"),
+            _ => unreachable!(),
+        }
+        assert!(
+            dir.path().join("f.rs").exists(),
+            "denied delete must not run"
+        );
+        assert!(
+            reg.file_touch_telemetry().files_touched.is_empty(),
+            "a blocked op records no file touch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_write_emits_the_file_and_files_touched_events() {
+        let (_dir, reg) = telemetry_fixture();
+        let bus = HookBus::new("sess");
+        let seen = record_bus_events(&bus);
+        reg.attach_bus(bus);
+
+        exec_ok(
+            &reg,
+            "write_file",
+            serde_json::json!({"path": "src/new.rs", "content": "a\nb\nc\n", "reason": "scaffold"}),
+        )
+        .await;
+
+        let names = event_names(&seen);
+        // The OBSERVABLE lifecycle for a create. The raw `tool.call.requested`
+        // / `file.created` blocking events are delivered only to blocking
+        // (privileged) handlers, never to observers — observers see their
+        // safe outcomes (`policy.*`), the sanitized `tool.call.started`, the
+        // completion, and the `file.created` FACT + aggregate update.
+        for expected in [
+            hook_names::POLICY_ALLOWED,
+            hook_names::TOOL_CALL_STARTED,
+            hook_names::TOOL_CALL_COMPLETED,
+            hook_names::FILE_CREATED,
+            hook_names::FILES_TOUCHED_UPDATED,
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing {expected} in {names:?}"
+            );
+        }
+        // The raw blocking event never reaches an observer.
+        assert!(
+            !names.iter().any(|n| n == hook_names::TOOL_CALL_REQUESTED),
+            "raw tool.call.requested must not reach observers: {names:?}"
+        );
+        // The file.created fact carries the line delta but never the content.
+        let events = seen.lock().unwrap();
+        let created = events
+            .iter()
+            .find(|e| e.name == hook_names::FILE_CREATED)
+            .unwrap();
+        assert_eq!(created.payload["path"], "src/new.rs");
+        assert_eq!(created.payload["lines_added"], 3);
+        let started = events
+            .iter()
+            .find(|e| e.name == hook_names::TOOL_CALL_STARTED)
+            .unwrap();
+        assert!(
+            started.payload["input"]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("<omitted:"),
+            "tool.call.started must not leak file content"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_modify_policy_rewrites_the_input_the_tool_runs() {
+        let (dir, reg) = telemetry_fixture();
+        let bus = HookBus::new("sess");
+        bus.on_blocking(hook_names::TOOL_CALL_REQUESTED, |event| {
+            // Redirect any write to a quarantine path.
+            let mut input = event.payload["input"].clone();
+            input["path"] = serde_json::Value::String("quarantine.txt".into());
+            let mut payload = event.payload.clone();
+            payload["input"] = input;
+            HookDecision::Modify { payload }
+        })
+        .detach();
+        reg.attach_bus(bus);
+
+        exec_ok(
+            &reg,
+            "write_file",
+            serde_json::json!({"path": "original.txt", "content": "x\n"}),
+        )
+        .await;
+
+        assert!(
+            dir.path().join("quarantine.txt").exists(),
+            "the modified path is what actually got written"
+        );
+        assert!(!dir.path().join("original.txt").exists());
+        assert_eq!(
+            reg.file_touch_telemetry().files_touched[0].path,
+            "quarantine.txt",
+            "the ledger records the path the tool actually touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_command_never_runs_and_a_bus_less_registry_is_unchanged() {
+        let (_dir, reg) = telemetry_fixture();
+        let bus = HookBus::new("sess");
+        bus.on_blocking(hook_names::COMMAND_STARTED, |_| HookDecision::Deny {
+            reason: "no shell".into(),
+        })
+        .detach();
+        reg.attach_bus(bus);
+        let out = reg
+            .execute("bash", &serde_json::json!({"command": "echo hi"}))
+            .await;
+        assert!(out.is_error());
+
+        // A registry with no bus attached behaves exactly as before hooks.
+        let (dir2, plain) = telemetry_fixture();
+        std::fs::write(dir2.path().join("f.txt"), "hi\n").unwrap();
+        exec_ok(&plain, "read_file", serde_json::json!({"path": "f.txt"})).await;
+        assert_eq!(plain.file_touch_telemetry().files_touched.len(), 1);
     }
 }

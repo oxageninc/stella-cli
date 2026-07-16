@@ -29,7 +29,9 @@ pub use budget::{BudgetGuard, BudgetOutcome};
 // `bus::HookEvent` (the extension-bus envelope) stays module-qualified: the
 // crate root already exports `hooks::HookEvent` (the shell-hook lifecycle
 // enum) and the two must never be confused at a glance.
-pub use bus::{ExtensionFailure, HookBus, HookDecision, HookEventDraft, HookSubscription, PolicyOutcome};
+pub use bus::{
+    ExtensionFailure, HookBus, HookDecision, HookEventDraft, HookSubscription, PolicyOutcome,
+};
 pub use driver::{Engine, EngineConfig, TurnOutcome};
 pub use estimator::{Calibration, CalibrationMap};
 pub use extensions::{
