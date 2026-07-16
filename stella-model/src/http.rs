@@ -1,6 +1,6 @@
 //! Shared HTTP plumbing for every provider adapter: a `reqwest` client with a
 //! bounded connect timeout, and an idle-timeout wrapper around per-chunk
-//! stream reads. Centralized so all three adapters get identical
+//! stream reads. Centralized so every provider adapter gets identical
 //! timeout-and-retry-classification behavior — a hung TCP connect or a
 //! provider that opens a stream and then goes silent must surface as a
 //! *retryable* `Transport` error, not an unbounded hang.

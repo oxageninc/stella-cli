@@ -521,7 +521,8 @@ impl Store {
         Ok(())
     }
 
-    /// Count helper used by tests and `stella config`-style introspection.
+    /// Count helper — currently exercised only by tests; kept `pub` for
+    /// ad-hoc introspection.
     pub fn count(&self, table: &str) -> Result<i64> {
         // Table names can't be bound parameters; allowlist them.
         const TABLES: [&str; 7] = [

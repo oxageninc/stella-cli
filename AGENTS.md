@@ -47,7 +47,8 @@ make watch-lint          # re-run clippy on every save
 
 ### The gate — run before every push
 
-CI (`/.github/workflows/ci.yml`) runs exactly these three, and a red gate is an
+CI (`/.github/workflows/ci.yml`) runs exactly these three plus a release
+smoke build (thin LTO) in the same required job, and a red gate is an
 automatic "not yet":
 
 ```bash

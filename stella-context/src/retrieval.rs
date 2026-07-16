@@ -134,7 +134,8 @@ impl ContextStore {
             }
         };
 
-        // 2. Gather candidates under one lock — no await is held here. The
+        // 2. Gather candidates under one lock acquisition — no await is
+        //    held here (packing below briefly re-acquires for neighbors). The
         //    domain filter (if any) is applied here so every downstream signal
         //    sees only the in-scope nodes.
         let fp_id = self.fingerprint().id();
