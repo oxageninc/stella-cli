@@ -211,7 +211,13 @@ pub async fn run(
                             ShellAction::Handled | ShellAction::Ignored => {}
                         }
                     }
-                    // Resize/paste/other events: the next draw picks them up.
+                    // Bracketed paste: the whole paste arrives as one event
+                    // (the guard enabled it), so the composer can fold it
+                    // into a chip instead of replaying N raw Enter keys.
+                    Some(Event::Paste(text)) => {
+                        ui.composer.paste(&text);
+                    }
+                    // Resize/other events: the next draw picks them up.
                     Some(_) => {}
                     // Reader thread ended (stdin closed).
                     None => break,

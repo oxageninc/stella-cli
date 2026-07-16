@@ -21,7 +21,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -35,6 +37,7 @@ struct TermState {
     raw: AtomicBool,
     alt: AtomicBool,
     mouse: AtomicBool,
+    paste: AtomicBool,
 }
 
 impl TermState {
@@ -43,6 +46,9 @@ impl TermState {
     /// Drop-time restore to redo.
     fn restore(&self) {
         let mut out = io::stdout();
+        if self.paste.swap(false, Ordering::SeqCst) {
+            let _ = execute!(out, DisableBracketedPaste);
+        }
         if self.mouse.swap(false, Ordering::SeqCst) {
             let _ = execute!(out, DisableMouseCapture);
         }
@@ -78,6 +84,12 @@ impl TerminalGuard {
         guard.state.raw.store(true, Ordering::SeqCst);
         execute!(out, EnterAlternateScreen)?;
         guard.state.alt.store(true, Ordering::SeqCst);
+        // Always on: without bracketed paste a multi-line paste arrives as
+        // raw key events, so every newline acts as Enter — one paste becomes
+        // N separate prompt submissions. With it, the whole paste arrives as
+        // one `Event::Paste` the composer folds into a chip.
+        execute!(out, EnableBracketedPaste)?;
+        guard.state.paste.store(true, Ordering::SeqCst);
         if mouse {
             execute!(out, EnableMouseCapture)?;
             guard.state.mouse.store(true, Ordering::SeqCst);

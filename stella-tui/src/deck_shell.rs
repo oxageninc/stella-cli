@@ -358,7 +358,14 @@ pub async fn run_deck(
                             DeckAction::Handled | DeckAction::Ignored => {}
                         }
                     }
-                    // Resize / mouse / paste: the next draw picks them up.
+                    // Bracketed paste: the whole paste arrives as one event
+                    // (the guard enabled it), so the composer can fold it
+                    // into a chip instead of replaying N raw Enter keys —
+                    // each of which would have submitted a separate prompt.
+                    Some(Event::Paste(text)) => {
+                        ui.composer.paste(&text);
+                    }
+                    // Resize / mouse: the next draw picks them up.
                     Some(_) => {}
                     // Reader thread ended (stdin closed).
                     None => break 'run,
