@@ -267,6 +267,16 @@ impl CodeGraph {
         store::busiest_file(&self.inner.read_guard())
     }
 
+    /// Every indexed file path (root-relative, forward-slash), sorted. The
+    /// deck's Graph tab lists these in its file picker so a user can re-root
+    /// the neighborhood on any file, not only the [`busiest_file`] default.
+    /// Empty on an empty index.
+    ///
+    /// [`busiest_file`]: CodeGraph::busiest_file
+    pub fn all_files(&self) -> Result<Vec<String>, GraphError> {
+        store::all_files(&self.inner.read_guard())
+    }
+
     /// The structured neighborhood of `file` — its symbols and import edges
     /// in both directions — for UI consumers (the deck's Graph tab). The
     /// frame methods above render prose for the model; this keeps the shape.
@@ -427,5 +437,29 @@ mod tests {
             !watcher_is_installed(&graph),
             "shutdown must clear an already-installed watcher"
         );
+    }
+
+    /// `all_files` surfaces every indexed file (root-relative, sorted) so the
+    /// deck's Graph tab can list them — the file picker's data source.
+    #[test]
+    fn all_files_lists_every_indexed_file_sorted() {
+        let ws = TempDir::new().unwrap();
+        let dbdir = TempDir::new().unwrap();
+        std::fs::write(ws.path().join("zeta.rs"), "pub fn z() {}\n").unwrap();
+        std::fs::write(ws.path().join("alpha.rs"), "pub fn a() {}\n").unwrap();
+        let graph = CodeGraph::open(ws.path(), &dbdir.path().join("context.db")).unwrap();
+        graph.index_all().unwrap();
+
+        assert_eq!(
+            graph.all_files().unwrap(),
+            vec!["alpha.rs".to_string(), "zeta.rs".to_string()],
+            "every indexed file, root-relative and sorted"
+        );
+    }
+
+    #[test]
+    fn all_files_is_empty_on_an_empty_index() {
+        let (graph, _ws, _dbdir) = open_graph();
+        assert!(graph.all_files().unwrap().is_empty());
     }
 }

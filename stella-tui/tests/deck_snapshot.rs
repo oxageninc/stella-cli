@@ -59,8 +59,9 @@ fn deck_renders_every_tab_with_real_content() {
             text.contains(needle),
             "the {tab:?} tab should show {needle:?}, got:\n{text}"
         );
-        // The comfy-tabs bar labels are always present.
-        assert!(text.contains("Agents"), "tab bar should render on {tab:?}");
+        // The comfy-tabs bar labels are always present — UPPERCASE by the
+        // deck's tab-label convention.
+        assert!(text.contains("AGENTS"), "tab bar should render on {tab:?}");
     }
 
     // Write all five tabs to a human-readable artifact at the repo root.

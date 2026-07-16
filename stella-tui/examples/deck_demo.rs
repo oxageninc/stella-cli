@@ -22,8 +22,8 @@ use tokio::sync::mpsc;
 
 use stella_tui::scenario::{demo_graph, demo_inbound};
 use stella_tui::{
-    AgentControl, AgentMeta, AgentStatus, DeckOptions, Inbound, ScopeDecision, SlashCommand,
-    UserInput, WorkspaceInput, run_deck,
+    AgentControl, AgentMeta, AgentStatus, DeckOptions, GraphNode, GraphSnapshot, Inbound,
+    ScopeDecision, SlashCommand, UserInput, WorkspaceInput, run_deck,
 };
 
 fn now_ms() -> u64 {
@@ -132,6 +132,33 @@ async fn main() -> std::io::Result<()> {
                 // (the shell's out-of-band echo); a real engine would also
                 // drop the prompt from its own backlog here.
                 WorkspaceInput::QueueRemove { .. } | WorkspaceInput::QueueClear => {}
+                // The Graph tab's file picker re-roots on a file. The demo has
+                // no code-graph store, so it synthesizes a minimal neighborhood
+                // centered on the pick — enough to show the pick → re-root
+                // round-trip the real CLI does against `codegraph.db`.
+                WorkspaceInput::FocusGraphFile { file } => {
+                    let _ = react_tx.send(Inbound::GraphSnapshot(GraphSnapshot {
+                        focus: file.clone(),
+                        nodes: vec![GraphNode {
+                            label: file.clone(),
+                            kind: "file".into(),
+                            location: Some(file),
+                        }],
+                        edges: vec![],
+                        files: demo_graph().files,
+                    }));
+                // The installed-agents manager needs the real driver (disk +
+                // provider); the demo answers with an empty list so the pane
+                // renders its empty state instead of loading forever.
+                WorkspaceInput::AgentsRefresh
+                | WorkspaceInput::AgentSave { .. }
+                | WorkspaceInput::AgentPin { .. }
+                | WorkspaceInput::AgentCreate { .. } => {
+                    let _ = react_tx.send(Inbound::AgentsList {
+                        entries: vec![],
+                        status: Some("the demo has no agents on disk".to_string()),
+                    });
+                }
                 WorkspaceInput::Quit => break,
             }
         }

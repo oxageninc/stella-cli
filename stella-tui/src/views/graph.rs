@@ -85,7 +85,14 @@ fn render_empty(area: Rect, buf: &mut Buffer) {
 // ---------------------------------------------------------------------------
 
 fn render_node_list(snapshot: &GraphSnapshot, cursor: usize, area: Rect, buf: &mut Buffer) {
-    let title = format!(" nodes · {} ", snapshot.nodes.len());
+    // Advertise the file picker in the title (the "/ files" affordance) when a
+    // file list is available — the whole point of the tab is being able to
+    // re-root, so the way to do it must be visible, not hidden behind a key.
+    let title = if snapshot.files.is_empty() {
+        format!(" nodes · {} ", snapshot.nodes.len())
+    } else {
+        format!(" nodes · {} · / files ", snapshot.nodes.len())
+    };
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     block.render(area, buf);
@@ -381,6 +388,7 @@ mod tests {
                     kind: "imports".into(),
                 },
             ],
+            files: vec!["driver.rs".into(), "src/lib.rs".into()],
         }
     }
 
@@ -472,6 +480,7 @@ mod tests {
                 location: None,
             }],
             edges: vec![],
+            files: vec![],
         });
         let text = draw(&mut ui, 100, 24);
         assert!(
@@ -495,6 +504,7 @@ mod tests {
                 })
                 .collect(),
             edges: vec![],
+            files: vec![],
         };
         let mut ui = DeckUi::default();
         ui.graph = Some(snapshot);

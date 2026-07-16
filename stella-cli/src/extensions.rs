@@ -278,7 +278,7 @@ fn create_symlink(_target: &Path, _dest: &Path) -> std::io::Result<()> {
 
 /// The user-global stella config root (`~/.config/stella`), or `None`
 /// without a home directory.
-fn user_config_root() -> Option<PathBuf> {
+pub(crate) fn user_config_root() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("stella"))
 }
 
@@ -449,6 +449,10 @@ pub struct CustomExtensions {
 pub enum Invocation<'a> {
     Command(&'a CommandDef),
     Skill(&'a Skill),
+    /// An installed agent persona: `/agent-name task…` runs the task under
+    /// the agent's system-prompt-shaped body (and its toolbelt note). This
+    /// is the invocation seam the agent-usage telemetry records.
+    Agent(&'a AgentDef),
 }
 
 impl CustomExtensions {
@@ -495,11 +499,11 @@ impl CustomExtensions {
         Some(out)
     }
 
-    /// The ⚡ slash-menu rows: commands first, then skills, names prefixed
-    /// with `/`. A custom name shadowed by a productized command in
-    /// `reserved` is dropped (builtins always win), and a skill sharing a
-    /// command's name is dropped (the command wins — it was authored as an
-    /// invocation).
+    /// The ⚡ slash-menu rows: commands first, then skills, then agents,
+    /// names prefixed with `/`. A custom name shadowed by a productized
+    /// command in `reserved` is dropped (builtins always win), and later
+    /// kinds sharing an earlier kind's name are dropped (a command was
+    /// authored as an invocation; it wins).
     pub fn slash_entries(&self, reserved: &[SlashCommand]) -> Vec<SlashCommand> {
         let mut taken: HashSet<String> = reserved.iter().map(|c| c.name.clone()).collect();
         let mut rows = Vec::new();
@@ -511,7 +515,11 @@ impl CustomExtensions {
             .skills
             .iter()
             .map(|s| (format!("/{}", s.name), s.description.clone()));
-        for (name, description) in commands.chain(skills) {
+        let agents = self
+            .agents
+            .iter()
+            .map(|a| (format!("/{}", a.name), a.description.clone()));
+        for (name, description) in commands.chain(skills).chain(agents) {
             if taken.insert(name.clone()) {
                 rows.push(SlashCommand::custom(name, description));
             }
@@ -520,17 +528,20 @@ impl CustomExtensions {
     }
 
     /// Resolve a custom invocation: `head` is the leading `/word` of the
-    /// input (slash included). Commands shadow skills, matching
-    /// [`Self::slash_entries`].
+    /// input (slash included). Commands shadow skills shadow agents,
+    /// matching [`Self::slash_entries`].
     pub fn lookup(&self, head: &str) -> Option<Invocation<'_>> {
         let name = head.strip_prefix('/')?;
         if let Some(cmd) = self.commands.iter().find(|c| c.name == name) {
             return Some(Invocation::Command(cmd));
         }
-        self.skills
+        if let Some(skill) = self.skills.iter().find(|s| s.name == name) {
+            return Some(Invocation::Skill(skill));
+        }
+        self.agents
             .iter()
-            .find(|s| s.name == name)
-            .map(Invocation::Skill)
+            .find(|a| a.name == name)
+            .map(Invocation::Agent)
     }
 
     /// Expand `input` (`/name args…`) into the prompt the model runs, or
@@ -551,6 +562,7 @@ impl CustomExtensions {
         match self.lookup(head)? {
             Invocation::Command(cmd) => Some(expand_command(&cmd.body, args)),
             Invocation::Skill(skill) => Some(skill_invocation_prompt(skill, args)),
+            Invocation::Agent(agent) => Some(agent_invocation_prompt(agent, args)),
         }
     }
 
@@ -571,6 +583,28 @@ impl CustomExtensions {
         }
         out
     }
+}
+
+/// The prompt a `/agent-name` invocation runs: the agent's persona body as
+/// explicit instructions (with its toolbelt grant stated when the
+/// definition restricts tools — prompt-level today; hard enforcement is the
+/// fleet-spawn seam's concern), and any trailing text as the task.
+fn agent_invocation_prompt(agent: &AgentDef, args: &str) -> String {
+    let mut out = format!(
+        "Adopt the following agent persona for this task.\n\n# Agent: {}\n{}\n\n{}",
+        agent.name, agent.description, agent.body
+    );
+    if let Some(tools) = &agent.tools {
+        out.push_str(&format!(
+            "\n\nThis agent's toolbelt is restricted to: {}.",
+            tools.join(", ")
+        ));
+    }
+    let args = args.trim();
+    if !args.is_empty() {
+        out.push_str(&format!("\n\n## Task\n{args}"));
+    }
+    out
 }
 
 /// The prompt a `/skill-name` invocation runs: the skill body as explicit
@@ -864,6 +898,7 @@ mod tests {
             agents: vec![AgentDef {
                 name: "reviewer".to_string(),
                 description: "reviews diffs".to_string(),
+                tools: None,
                 body: "You review.".to_string(),
                 source_path: "x/reviewer.md".to_string(),
             }],
@@ -883,8 +918,26 @@ mod tests {
         let reserved = vec![SlashCommand::new("/help", "show commands")];
         let rows = custom.slash_entries(&reserved);
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["/fix-bug", "/sql-style"]);
+        // Commands, then skills, then agents — the fixture's `reviewer`
+        // agent is offered as an invocable ⚡ row too.
+        assert_eq!(names, vec!["/fix-bug", "/sql-style", "/reviewer"]);
         assert!(rows.iter().all(|r| r.kind == stella_tui::SlashKind::Custom));
+    }
+
+    #[test]
+    fn agent_invocations_expand_to_the_persona_prompt() {
+        let custom = custom_fixture();
+        let prompt = custom
+            .expand("/reviewer check the diff", &[])
+            .expect("the agent is invocable");
+        assert!(prompt.contains("# Agent: reviewer"), "{prompt}");
+        assert!(prompt.contains("You review."), "{prompt}");
+        assert!(prompt.contains("## Task\ncheck the diff"), "{prompt}");
+        // Commands and skills still shadow agents by name.
+        match custom.lookup("/reviewer") {
+            Some(Invocation::Agent(agent)) => assert_eq!(agent.name, "reviewer"),
+            _ => panic!("expected the agent invocation"),
+        }
     }
 
     #[test]

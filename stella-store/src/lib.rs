@@ -209,6 +209,18 @@ pub struct RuleRow {
     pub source: String,
 }
 
+/// One agent-invocation row for the `agent_uses` log: which installed agent
+/// definition (by name), at which pinned version, was invoked under an
+/// execution — with a short free-text reason when one was available. The
+/// timestamp column defaults to the insert time; the ledger drains per
+/// execution, so insert time is invocation-accurate to within the turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentUseRow {
+    pub agent: String,
+    pub version: u32,
+    pub reason: String,
+}
+
 /// One aggregated analytics row per (provider, model): the numbers behind
 /// "$-per-resolved-task" receipts, straight from local telemetry.
 ///
@@ -312,7 +324,7 @@ type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// a file at `user_version` i to i + 1. Fresh files never run these — they
 /// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
 /// directly.
-const MIGRATIONS: [Migration; 3] = [
+const MIGRATIONS: [Migration; 4] = [
     // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
     // their write paths have always assumed.
     migrate_v0_to_v1,
@@ -324,6 +336,10 @@ const MIGRATIONS: [Migration; 3] = [
     // v2 → v3: the additive `rules` table (extension-authored workspace
     // rules for the stella-core rules engine).
     migrate_v2_to_v3,
+    // v3 → v4: the agent_uses invocation log (purely additive).
+    // NOTE: several in-flight branches each add a store.db migration — the
+    // slot number is taken naively here and reconciled at merge time.
+    migrate_v3_to_v4,
 ];
 
 /// The schema version this build writes — the `PRAGMA user_version` of
@@ -334,7 +350,7 @@ const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// Every table the store owns — the allowlist for [`Store::count`] and the
 /// fresh-file probe in [`Store::migrate`].
-const TABLES: [&str; 9] = [
+const TABLES: [&str; 10] = [
     "executions",
     "events",
     "telemetry",
@@ -344,6 +360,7 @@ const TABLES: [&str; 9] = [
     "file_locks",
     "graph_nodes",
     "graph_edges",
+    "agent_uses",
 ];
 
 /// Tables whose shape has not changed since v0. `IF NOT EXISTS` keeps one
@@ -497,6 +514,24 @@ const MEMORY_CITATIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS memory_citations 
      CREATE INDEX IF NOT EXISTS memory_citations_by_memory
        ON memory_citations(memory_id, execution_id);";
 
+/// `agent_uses` DDL at [`SCHEMA_VERSION`] — the agent-invocation log
+/// ([`AgentUseRow`]): one row per invocation of an installed agent
+/// definition, attributed to the execution it ran under and to the
+/// definition's pinned `version` at invocation time. Deliberately **not**
+/// UNIQUE on any key: invoking the same agent-version twice in one execution
+/// is two real events, and the drain-per-execution write path never
+/// double-writes a drained event. `IF NOT EXISTS` keeps the one DDL usable
+/// for both the fresh-file path and the additive v3 → v4 migration.
+const AGENT_USES_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_uses (
+       execution_id INTEGER NOT NULL,
+       agent TEXT NOT NULL,
+       version INTEGER NOT NULL,
+       reason TEXT NOT NULL DEFAULT '',
+       ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+     );
+     CREATE INDEX IF NOT EXISTS agent_uses_by_agent
+       ON agent_uses(agent, version, execution_id);";
+
 /// The full latest schema, applied in one shot to fresh databases only.
 /// Existing files never see this — [`MIGRATIONS`] upgrades them shape by
 /// shape, so this can always describe the CURRENT shape.
@@ -508,6 +543,7 @@ fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(RULES_TABLE)?;
     tx.execute_batch(TELEMETRY_INDEX)?;
     tx.execute_batch(MEMORY_CITATIONS_DDL)?;
+    tx.execute_batch(AGENT_USES_DDL)?;
     Ok(())
 }
 
@@ -699,6 +735,15 @@ fn migrate_v1_to_v2(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 fn migrate_v2_to_v3(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(MEMORY_CITATIONS_DDL)?;
     tx.execute_batch(RULES_TABLE)?;
+    Ok(())
+}
+
+/// v3 → v4: the `agent_uses` invocation log (agent-version usage telemetry,
+/// drained per execution like `files_touched`). Purely additive — no
+/// existing table changes shape, so no §7 rebuild is needed; `IF NOT
+/// EXISTS` also covers a partial file that somehow already grew the table.
+fn migrate_v3_to_v4(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(AGENT_USES_DDL)?;
     Ok(())
 }
 
@@ -977,6 +1022,20 @@ impl Store {
                     row.truthful,
                     row.remark,
                 ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record the agent invocations drained from one execution's ledger —
+    /// one row per invocation, never aggregated (see [`AgentUseRow`]).
+    pub fn record_agent_uses(&self, execution_id: i64, uses: &[AgentUseRow]) -> Result<()> {
+        let conn = self.lock();
+        for row in uses {
+            conn.execute(
+                "INSERT INTO agent_uses (execution_id, agent, version, reason) \
+                 VALUES (?, ?, ?, ?)",
+                params![execution_id, row.agent, row.version as i64, row.reason],
             )?;
         }
         Ok(())
@@ -1627,6 +1686,79 @@ mod tests {
         assert_eq!(user_version(&store), SCHEMA_VERSION);
         store.upsert_rule("r", "rule text", "ext").unwrap();
         assert_eq!(store.count("rules").unwrap(), 1);
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn agent_uses_log_one_row_per_invocation_never_aggregated() {
+        let store = Store::in_memory().unwrap();
+        let id = store
+            .begin_execution("deck", "p", "zai", "glm-5.2")
+            .unwrap();
+        store
+            .record_agent_uses(
+                id,
+                &[
+                    AgentUseRow {
+                        agent: "reviewer".into(),
+                        version: 2,
+                        reason: "review the diff".into(),
+                    },
+                    // The SAME agent-version again in the same execution: a
+                    // second real invocation, a second row — the log carries
+                    // no UNIQUE key by design.
+                    AgentUseRow {
+                        agent: "reviewer".into(),
+                        version: 2,
+                        reason: "second pass".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.count("agent_uses").unwrap(), 2);
+        let conn = store.lock();
+        let (agent, version, reason, ts): (String, i64, String, String) = conn
+            .query_row(
+                "SELECT agent, version, reason, ts FROM agent_uses \
+                 WHERE execution_id = ? ORDER BY rowid LIMIT 1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((agent.as_str(), version), ("reviewer", 2));
+        assert_eq!(reason, "review the diff");
+        assert!(!ts.is_empty(), "the insert stamps a timestamp");
+    }
+
+    #[test]
+    fn v4_migration_adds_agent_uses_to_a_pre_v4_file() {
+        let root = temp_root("v4_agent_uses");
+        {
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
+            conn.execute_batch(LEGACY_V0_SCHEMA).unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+        assert_eq!(
+            store.count("agent_uses").unwrap(),
+            0,
+            "the migrated file grew an empty agent_uses log"
+        );
+        let id = store
+            .begin_execution("deck", "p", "zai", "glm-5.2")
+            .unwrap();
+        store
+            .record_agent_uses(
+                id,
+                &[AgentUseRow {
+                    agent: "planner".into(),
+                    version: 1,
+                    reason: String::new(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(store.count("agent_uses").unwrap(), 1);
         drop(store);
         std::fs::remove_dir_all(&root).ok();
     }

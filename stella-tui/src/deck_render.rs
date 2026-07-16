@@ -16,7 +16,7 @@ use ratatui_comfy_tabs::{TabNav, TabNavState};
 use crate::composer::{ComposerLayout, layout as composer_layout, split_row_at};
 use crate::deck::{DeckTab, WorkspaceModel};
 use crate::deck_ui::DeckUi;
-use crate::render::{render_slash_popup, slash_popup_area};
+use crate::render::{render_slash_popup, scroll_window_start, slash_popup_area};
 use crate::textline::stage_label;
 use crate::{fx, splash, theme, views};
 
@@ -55,12 +55,12 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
     let c_layout = composer_layout(&ui.composer, text_w.max(1));
     let composer_h = c_layout.rows.len().clamp(1, DECK_COMPOSER_MAX_ROWS) as u16;
     let bands = Layout::vertical([
-        Constraint::Length(3),        // tab bar
-        Constraint::Min(1),           // active view
-        Constraint::Length(1),        // run progress bar
+        Constraint::Length(3),          // tab bar
+        Constraint::Min(1),             // active view
+        Constraint::Length(1),          // run progress bar
         Constraint::Length(composer_h), // composer
-        Constraint::Length(1),        // composer footer (keys + line counter)
-        Constraint::Length(2),        // statline (label over value)
+        Constraint::Length(1),          // composer footer (keys + line counter)
+        Constraint::Length(2),          // statline (label over value)
     ])
     .split(area);
 
@@ -91,6 +91,9 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
     }
     if ui.queue_open {
         render_queue_popup(model, ui, area, buf);
+    }
+    if ui.graph_picker_open {
+        render_graph_picker(ui, area, buf);
     }
 
     // Deck motion (crate::fx), scrubbed like the splash: each frame builds a
@@ -199,6 +202,87 @@ fn render_queue_popup(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut
     Paragraph::new(lines).block(block).render(popup, buf);
 }
 
+/// The Graph tab's file picker: a centered overlay listing every indexed file,
+/// narrowed by a filter-as-you-type query, with the selection highlighted and
+/// windowed so it stays in view on long lists (the shared
+/// [`scroll_window_start`] the slash popup uses). Selecting a row re-roots the
+/// neighborhood on that file; the current focus opens pre-selected as the
+/// sensible default.
+fn render_graph_picker(ui: &DeckUi, area: Rect, buf: &mut Buffer) {
+    let Some(graph) = ui.graph.as_ref() else {
+        return;
+    };
+    let matches = graph.matching_files(&ui.graph_picker_query);
+
+    let w = area.width.min(64);
+    let h = area.height.min(18);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    Clear.render(popup, buf);
+
+    // Query line (top) + legend line (bottom) + two borders bracket the rows.
+    let inner_h = (h as usize).saturating_sub(2);
+    let visible_rows = inner_h.saturating_sub(2).max(1);
+    let selected = ui.graph_picker_sel.min(matches.len().saturating_sub(1));
+    let first = scroll_window_start(matches.len(), selected, visible_rows);
+    let last = (first + visible_rows).min(matches.len());
+
+    // The filter query, with a violet caret so the keybind/edit accent reads.
+    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
+        Span::styled("filter ", theme::muted()),
+        Span::styled(ui.graph_picker_query.clone(), theme::body()),
+        Span::styled("▏", Style::new().fg(theme::VIOLET)),
+    ])];
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no files match — Backspace to widen",
+            theme::muted(),
+        )));
+    }
+    for (i, file) in matches.iter().enumerate().take(last).skip(first) {
+        let is_sel = i == selected;
+        let is_focus = *file == graph.focus;
+        let marker = if is_sel { "▸ " } else { "  " };
+        let mut style = theme::body();
+        if is_sel {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        let name = (*file)
+            .chars()
+            .take((w as usize).saturating_sub(6))
+            .collect::<String>();
+        let mut spans = vec![
+            Span::styled(marker.to_string(), style.fg(theme::AMBER)),
+            Span::styled(name, style),
+        ];
+        // Mark the file the neighborhood is currently rooted on (the default).
+        if is_focus {
+            spans.push(Span::styled("  · current", theme::muted()));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Pad so the legend sits on the last interior row regardless of match count.
+    while lines.len() < inner_h.saturating_sub(1).max(1) {
+        lines.push(Line::default());
+    }
+    lines.push(Line::from(Span::styled(
+        " type to filter · ↑/↓ select · enter open · esc close",
+        theme::muted(),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::accent())
+        .title(format!(" files · {} indexed ", graph.files.len()));
+    Paragraph::new(lines).block(block).render(popup, buf);
+}
+
 /// Cap on the deck composer's visible rows — it grows with the prompt up to
 /// this, then scrolls (with a gutter indicator) to keep the cursor row in view.
 const DECK_COMPOSER_MAX_ROWS: usize = 4;
@@ -242,7 +326,11 @@ fn render_composer(
             spans.push(Span::styled(before, theme::body()));
             spans.push(Span::styled(
                 under_ch,
-                if caret_on { cursor_style } else { theme::body() },
+                if caret_on {
+                    cursor_style
+                } else {
+                    theme::body()
+                },
             ));
             spans.push(Span::styled(after, theme::body()));
         } else {
@@ -454,7 +542,9 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
         (
             "AGENT",
             vec![Span::styled(
-                focused.map(|a| a.meta.id.clone()).unwrap_or_else(|| "—".into()),
+                focused
+                    .map(|a| a.meta.id.clone())
+                    .unwrap_or_else(|| "—".into()),
                 val,
             )],
             5,
@@ -478,7 +568,10 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
         (
             "CPU",
             vec![
-                Span::styled(meter_bar(cpu / 100.0), Style::default().fg(theme::gauge_color(cpu / 100.0))),
+                Span::styled(
+                    meter_bar(cpu / 100.0),
+                    Style::default().fg(theme::gauge_color(cpu / 100.0)),
+                ),
                 Span::styled(format!(" {cpu:>3.0}%"), val),
             ],
             5,
@@ -486,7 +579,10 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
         (
             "CONTEXT",
             vec![
-                Span::styled(meter_bar(ctx_frac), Style::default().fg(theme::gauge_color(ctx_frac))),
+                Span::styled(
+                    meter_bar(ctx_frac),
+                    Style::default().fg(theme::gauge_color(ctx_frac)),
+                ),
                 Span::styled(format!(" {}/{}", fmt_k(ctx_tokens), fmt_k(CTX_WINDOW)), val),
             ],
             MUST_KEEP,
@@ -502,7 +598,10 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
         ("CACHE", cache_spans, 4),
         (
             "AGENTS",
-            vec![Span::styled(format!("{} active", model.active_count()), val)],
+            vec![Span::styled(
+                format!("{} active", model.active_count()),
+                val,
+            )],
             4,
         ),
         (
@@ -716,6 +815,10 @@ fn render_help(area: Rect, buf: &mut Buffer) {
             theme::body(),
         )),
         Line::from(Span::styled(
+            "  Graph:  / or Enter  browse & filter indexed files",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
             "  Esc          stop the turn (next queued runs)",
             theme::body(),
         )),
@@ -789,12 +892,13 @@ mod tests {
                 "new line", // composer footer affordance (§4)
                 "queue",    // footer / queue status
                 "plan",     // progress stage labels (§3)
-                "execute",
-                "verify",
-                "stella",   // statline brand (§5)
-                "CONTEXT",  // load-bearing token meter, kept at every width (§5)
+                "execute", "verify", "stella",  // statline brand (§5)
+                "CONTEXT", // load-bearing token meter, kept at every width (§5)
             ] {
-                assert!(text.contains(needle), "deck @{w}×{h} missing {needle:?}:\n{text}");
+                assert!(
+                    text.contains(needle),
+                    "deck @{w}×{h} missing {needle:?}:\n{text}"
+                );
             }
             // The ethos chip is chrome — it only needs to appear once the row is
             // wide enough (it is the first thing dropped on a narrow statline).
@@ -805,7 +909,10 @@ mod tests {
                 );
             }
             // The killed rocket/garble leave no trace (§2).
-            assert!(!text.contains("}=>"), "rocket sprite still rendered:\n{text}");
+            assert!(
+                !text.contains("}=>"),
+                "rocket sprite still rendered:\n{text}"
+            );
             assert!(!text.contains("<●>"), "UFO sprite still rendered:\n{text}");
         }
     }
@@ -846,7 +953,11 @@ mod tests {
         render_composer(&ui, &layout, 0, area, &mut buf);
         let text = buffer_text(&buf);
         let rows: Vec<&str> = text.lines().collect();
-        assert!(rows[0].starts_with(">>> "), "row 0 is the gold prompt: {:?}", rows[0]);
+        assert!(
+            rows[0].starts_with(">>> "),
+            "row 0 is the gold prompt: {:?}",
+            rows[0]
+        );
         // Exactly one prompt line — the rest of the box is empty.
         assert!(
             rows[1..].iter().all(|r| !r.contains(">>>")),
@@ -868,7 +979,10 @@ mod tests {
         let mut ui = DeckUi::default();
         let paste: String = (1..=8).map(|n| format!("line{n}\n")).collect();
         ui.composer.paste(&paste);
-        assert!(ui.composer.chips().is_empty(), "no chip — rendered per line");
+        assert!(
+            ui.composer.chips().is_empty(),
+            "no chip — rendered per line"
+        );
 
         let layout = crate::composer::layout(&ui.composer, 40);
         let area = Rect::new(0, 0, 40, 4); // capped at DECK_COMPOSER_MAX_ROWS
@@ -881,7 +995,9 @@ mod tests {
         }
         // Beyond 4 rows the box scrolls — the gutter shows a violet thumb.
         assert!(
-            (0..area.height).any(|yy| buf.cell((area.width - 1, yy)).is_some_and(|c| c.symbol() == "▐")),
+            (0..area.height).any(|yy| buf
+                .cell((area.width - 1, yy))
+                .is_some_and(|c| c.symbol() == "▐")),
             "scroll indicator present:\n{text}"
         );
     }
@@ -901,7 +1017,10 @@ mod tests {
             "queue affordance:\n{text}"
         );
         assert!(text.contains("1 line"), "live line counter:\n{text}");
-        assert!(text.contains("2 queued"), "queue status on the right:\n{text}");
+        assert!(
+            text.contains("2 queued"),
+            "queue status on the right:\n{text}"
+        );
     }
 
     #[test]
@@ -941,7 +1060,10 @@ mod tests {
             "PIPELINE",
             "deterministic-first",
         ] {
-            assert!(text.contains(needle), "statline missing {needle:?}:\n{text}");
+            assert!(
+                text.contains(needle),
+                "statline missing {needle:?}:\n{text}"
+            );
         }
     }
 
@@ -1124,6 +1246,81 @@ mod tests {
         assert!(
             warned.contains("press ctrl+d again"),
             "confirm warning:\n{warned}"
+        );
+    }
+
+    /// A `DeckUi` on the Graph tab with an `n`-file snapshot rooted on the
+    /// middle file, its picker open.
+    fn ui_with_graph_picker(n: usize) -> DeckUi {
+        use crate::graph::{GraphNode, GraphSnapshot};
+        let files: Vec<String> = (0..n).map(|i| format!("crate/mod_{i:02}.rs")).collect();
+        let focus = files[n / 2].clone();
+        let mut ui = DeckUi::default();
+        ui.tab = DeckTab::Graph;
+        ui.graph = Some(GraphSnapshot {
+            focus: focus.clone(),
+            nodes: vec![GraphNode {
+                label: focus,
+                kind: "file".into(),
+                location: None,
+            }],
+            edges: vec![],
+            files,
+        });
+        ui.graph_picker_open = true;
+        ui
+    }
+
+    #[test]
+    fn graph_picker_lists_files_marks_the_current_and_shows_the_legend() {
+        let mut ui = ui_with_graph_picker(4);
+        ui.graph_picker_sel = 2; // the focus file (crate/mod_02.rs)
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        render_graph_picker(&ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("files · 4 indexed"), "title:\n{text}");
+        assert!(text.contains("filter"), "filter query line:\n{text}");
+        assert!(text.contains("crate/mod_00.rs"), "lists files:\n{text}");
+        assert!(text.contains("· current"), "marks the rooted file:\n{text}");
+        assert!(text.contains("type to filter"), "legend:\n{text}");
+    }
+
+    #[test]
+    fn graph_picker_windows_the_list_to_keep_the_selection_visible() {
+        // Far more files than the popup's rows, selection at the end: the
+        // window must slide (via the shared `scroll_window_start`) so the last
+        // file shows and the first scrolls out.
+        let mut ui = ui_with_graph_picker(60);
+        ui.graph_picker_sel = 59;
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        render_graph_picker(&ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("crate/mod_59.rs"),
+            "selection scrolled in:\n{text}"
+        );
+        assert!(
+            !text.contains("crate/mod_00.rs"),
+            "head scrolled out:\n{text}"
+        );
+    }
+
+    #[test]
+    fn graph_picker_narrows_to_the_filter_query() {
+        let mut ui = ui_with_graph_picker(20);
+        ui.graph_picker_query = "mod_1".to_string();
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        render_graph_picker(&ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        // mod_10..mod_19 match; mod_00..mod_09 (except none contain "mod_1")
+        // do not.
+        assert!(text.contains("crate/mod_10.rs"), "matches shown:\n{text}");
+        assert!(
+            !text.contains("crate/mod_02.rs"),
+            "non-matches hidden:\n{text}"
         );
     }
 }

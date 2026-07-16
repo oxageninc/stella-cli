@@ -28,7 +28,9 @@ use crate::composer::{
     handle_slash_popup_key, slash_popup_matches,
 };
 use crate::deck::{DeckTab, WorkspaceModel};
-use crate::envelope::{AgentControl, AgentId, AgentStatus, Inbound, WorkspaceInput};
+use crate::envelope::{
+    AgentControl, AgentId, AgentScope, AgentStatus, Inbound, InstalledAgentEntry, WorkspaceInput,
+};
 use crate::graph::GraphSnapshot;
 use crate::input::{ScopeDecision, UserInput};
 use crate::scroll::ScrollState;
@@ -52,10 +54,116 @@ pub struct DeckMetrics {
     pub files_diff_total: usize,
 }
 
+/// Which pane the AGENTS tab shows — its secondary nav, switched with ←/→
+/// (from a blank composer, exactly like the other blank-gated tab keys).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentsPane {
+    /// The `htop`-style dashboard of currently ACTIVE agents (the
+    /// pre-existing Agents view).
+    #[default]
+    Executions,
+    /// The agents INSTALLED at the user / project level: inspect
+    /// name/description/toolbelt, edit (a save is a NEW pinned version),
+    /// re-pin an older version, create one from a prompt.
+    Installed,
+}
+
+/// The INSTALLED AGENTS pane's interaction mode. `Browse` is plain tab
+/// state (the composer stays live, like every other tab); every other mode
+/// is modal — it owns the keyboard while open, exactly like the queue
+/// editor, so its typing never leaks into the composer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstalledMode {
+    #[default]
+    Browse,
+    /// The definition editor (⏎ on a row opens it): ctrl+s saves — always a
+    /// NEW version, immediately pinned; Esc discards the draft.
+    Edit,
+    /// Create-from-prompt, step 1: type the short description.
+    CreateDescribe,
+    /// Create-from-prompt, step 2: pick the install scope (project / user).
+    CreateScope,
+    /// The version picker (`v` on a row): ⏎ re-pins the highlighted version
+    /// WITHOUT creating a new one — pin changes never increment the version.
+    PickVersion,
+}
+
+/// The INSTALLED AGENTS pane's view state. The list itself is driven
+/// entirely by [`Inbound::AgentsList`] snapshots the driver sends — the
+/// panel owns only selection, the modal sub-states, and their input
+/// buffers, exactly like the queue editor owns only `queue_sel`.
+#[derive(Debug, Clone)]
+pub struct InstalledPanel {
+    /// Newest driver snapshot of the installed agents.
+    pub entries: Vec<InstalledAgentEntry>,
+    /// Selected row in the browse list.
+    pub sel: usize,
+    /// True once the first [`Inbound::AgentsList`] arrived.
+    pub loaded: bool,
+    /// An op is in flight driver-side (refresh / save / pin / create) —
+    /// cleared when the next list snapshot folds back.
+    pub busy: bool,
+    /// A transient one-line status/hint (op outcomes, errors).
+    pub status: Option<String>,
+    pub mode: InstalledMode,
+    /// The definition editor's buffer — a full [`Composer`] textarea, the
+    /// deck's one editing surface, reused rather than inventing a novel
+    /// editor. Paste inserts verbatim (`usize::MAX` chip threshold): an
+    /// agent file is exactly the kind of multi-line paste the chip folding
+    /// exists to intercept elsewhere.
+    pub editor: Composer,
+    /// Which agent the editor holds, as `(name, scope)`.
+    pub editing: Option<(String, AgentScope)>,
+    /// The create-from-prompt description buffer.
+    pub create_desc: String,
+    /// Scope choice in the create flow: 0 = project, 1 = user.
+    pub scope_sel: usize,
+    /// Selected row in the version picker.
+    pub version_sel: usize,
+}
+
+impl Default for InstalledPanel {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            sel: 0,
+            loaded: false,
+            busy: false,
+            status: None,
+            mode: InstalledMode::default(),
+            editor: Composer::with_paste_threshold(usize::MAX),
+            editing: None,
+            create_desc: String::new(),
+            scope_sel: 0,
+            version_sel: 0,
+        }
+    }
+}
+
+impl InstalledPanel {
+    /// The browse list's selected entry, if any.
+    pub fn selected(&self) -> Option<&InstalledAgentEntry> {
+        self.entries.get(self.sel)
+    }
+
+    /// The scope the create flow's picker currently points at.
+    pub fn create_scope(&self) -> AgentScope {
+        if self.scope_sel == 0 {
+            AgentScope::Project
+        } else {
+            AgentScope::User
+        }
+    }
+}
+
 /// All ephemeral view state for the deck.
 #[derive(Debug, Clone)]
 pub struct DeckUi {
     pub tab: DeckTab,
+    /// The AGENTS tab's secondary nav: EXECUTIONS | INSTALLED AGENTS.
+    pub agents_pane: AgentsPane,
+    /// The INSTALLED AGENTS pane's state.
+    pub installed: InstalledPanel,
     /// The one global composer — typing works from any tab.
     pub composer: Composer,
     pub splash: SplashState,
@@ -69,6 +177,17 @@ pub struct DeckUi {
     pub graph_cursor: usize,
     /// The out-of-band code-graph snapshot (set by the caller/scenario).
     pub graph: Option<GraphSnapshot>,
+    /// Whether the Graph tab's file picker is open. While open it is modal
+    /// (like the queue editor): printable keys type into its filter, ↑/↓ move
+    /// the selection, Enter re-roots the neighborhood on the chosen file, Esc
+    /// closes. Opened with `/` (or `Enter`) on the Graph tab.
+    pub graph_picker_open: bool,
+    /// The picker's filter-as-you-type query — kept separate from the global
+    /// composer so opening the picker never disturbs a half-typed prompt.
+    pub graph_picker_query: String,
+    /// Selected row in the picker, indexing the *filtered* match list
+    /// ([`GraphSnapshot::matching_files`]). Reset to 0 on every query edit.
+    pub graph_picker_sel: usize,
     pub files_sel: usize,
     pub files_diff_open: bool,
     pub files_diff_scroll: ScrollState,
@@ -144,6 +263,8 @@ impl Default for DeckUi {
     fn default() -> Self {
         Self {
             tab: DeckTab::Session,
+            agents_pane: AgentsPane::default(),
+            installed: InstalledPanel::default(),
             composer: Composer::with_paste_threshold(crate::composer::DECK_PASTE_LINE_THRESHOLD),
             splash: SplashState::new(),
             help_open: false,
@@ -153,6 +274,9 @@ impl Default for DeckUi {
             trace_filter: None,
             graph_cursor: 0,
             graph: None,
+            graph_picker_open: false,
+            graph_picker_query: String::new(),
+            graph_picker_sel: 0,
             files_sel: 0,
             files_diff_open: false,
             files_diff_scroll: ScrollState::default(),
@@ -198,6 +322,17 @@ impl DeckUi {
         }
     }
 
+    /// Route a bracketed paste to whichever editing surface owns the
+    /// keyboard: the agent-definition editor while it is open, the global
+    /// composer otherwise. Keeps [`crate::deck_shell`] a dumb wire.
+    pub fn paste(&mut self, text: &str) {
+        if self.installed.mode == InstalledMode::Edit {
+            self.installed.editor.paste(text);
+        } else {
+            self.composer.paste(text);
+        }
+    }
+
     /// Point the deck at agent `idx`. A session-message selection indexes the
     /// *previously* focused agent's transcript, so it must not carry across;
     /// dropping it also re-arms tail-follow (the selection is what pinned the
@@ -234,11 +369,33 @@ pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut De
     // folds into the model, then selections are re-clamped.
     if let Inbound::GraphSnapshot(snapshot) = inbound {
         ui.graph = Some(snapshot.clone());
+        // A refreshed snapshot re-roots the neighborhood (a file pick, or an
+        // `/init` rebuild): the node list is now a different file's, so land
+        // the cursor on the new focus (index 0) rather than leaving it on a
+        // stale row that render would merely clamp into range.
+        ui.graph_cursor = 0;
         return;
     }
     if let Inbound::SlashCommands(commands) = inbound {
         ui.slash_commands = commands.clone();
         ui.slash_selected = 0;
+        return;
+    }
+    // The installed-agents list is out-of-band view state too — the driver
+    // owns the definitions on disk and pushes fresh snapshots here; the
+    // model fold ignores them.
+    if let Inbound::AgentsList { entries, status } = inbound {
+        ui.installed.entries = entries.clone();
+        ui.installed.loaded = true;
+        // A fresh list is the completion signal for a refresh / save / pin /
+        // create op — clear the working flag.
+        ui.installed.busy = false;
+        ui.installed.sel = ui.installed.sel.min(entries.len().saturating_sub(1));
+        // A driver-supplied status (op outcome, error) replaces the hint; a
+        // plain refresh sends none, leaving any client-side line standing.
+        if let Some(status) = status {
+            ui.installed.status = Some(status.clone());
+        }
         return;
     }
     model.apply_inbound(inbound);
@@ -353,6 +510,14 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         return DeckAction::Handled;
     }
 
+    // The INSTALLED AGENTS sub-modes (editor / create flow / version picker)
+    // are modal while open — they own the keyboard (only ctrl+c quit and the
+    // splash/help, handled above, precede them), so their typing and their
+    // Esc never leak to the composer, the tab views, or the turn-stop rules.
+    if ui.installed.mode != InstalledMode::Browse {
+        return handle_installed_modal_key(key, ui);
+    }
+
     // Ctrl-R toggles the collapsed-thinking view from anywhere.
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('r')) {
         ui.thinking_expanded = !ui.thinking_expanded;
@@ -400,6 +565,14 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
     // delete · ctrl+d twice clear all · Esc close).
     if ui.queue_open {
         return handle_queue_key(key, model, ui);
+    }
+
+    // The Graph tab's file picker is modal exactly like the queue editor: while
+    // it is open every key drives the picker (type to filter, ↑/↓ select, Enter
+    // re-root, Esc close) — before the composer or any tab handler sees it, so a
+    // filter keystroke can never leak into a half-typed prompt.
+    if ui.graph_picker_open {
+        return handle_graph_picker_key(key, ui);
     }
 
     let composer_empty = ui.composer.buffer().is_empty();
@@ -565,6 +738,16 @@ fn handle_slash_key(key: KeyEvent, matches: &[String], ui: &mut DeckUi) -> Optio
                 ui.set_tab(DeckTab::Graph);
                 DeckAction::Handled
             }
+            // `/agents` opens the AGENTS tab directly, on the INSTALLED
+            // AGENTS pane (the configured-on-disk view the command has
+            // always been about) — and asks the driver, which owns the
+            // definitions on disk, for a fresh list.
+            "/agents" => {
+                ui.set_tab(DeckTab::Agents);
+                ui.agents_pane = AgentsPane::Installed;
+                ui.installed.busy = true;
+                DeckAction::Send(WorkspaceInput::AgentsRefresh)
+            }
             // Everything else — including `/help` — is enqueued for the
             // driver, which owns the session vocabulary and answers into the
             // transcript (a transient overlay would leave no record).
@@ -625,6 +808,190 @@ fn handle_queue_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -> D
             DeckAction::Handled
         }
         _ => DeckAction::Ignored,
+    }
+}
+
+/// The INSTALLED AGENTS sub-modes' keys, dispatched by the modal gate in
+/// [`handle_deck_key`]. Every key is consumed — nothing leaks to the
+/// composer or the tab views while a sub-mode is open.
+fn handle_installed_modal_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    match ui.installed.mode {
+        InstalledMode::Edit => handle_agent_editor_key(key, ui),
+        InstalledMode::CreateDescribe => handle_create_describe_key(key, ui),
+        InstalledMode::CreateScope => handle_create_scope_key(key, ui),
+        InstalledMode::PickVersion => handle_pick_version_key(key, ui),
+        // Unreachable — the gate only fires for non-Browse modes.
+        InstalledMode::Browse => DeckAction::Ignored,
+    }
+}
+
+/// The definition editor: a full textarea over the agent's file content.
+/// Every ⏎ is a line break (a file editor's Enter is never "submit");
+/// `ctrl+s` saves — always a NEW version, immediately pinned; Esc discards
+/// the draft without writing anything.
+fn handle_agent_editor_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            ui.installed.mode = InstalledMode::Browse;
+            ui.installed.editing = None;
+            ui.installed.status = Some("edit discarded — no version written".into());
+            DeckAction::Handled
+        }
+        KeyCode::Char('s') if ctrl => {
+            let Some((name, scope)) = ui.installed.editing.take() else {
+                ui.installed.mode = InstalledMode::Browse;
+                return DeckAction::Handled;
+            };
+            let content = ui.installed.editor.buffer().to_string();
+            if content.trim().is_empty() {
+                // Refuse to save an empty definition — the loader would
+                // reject it as EmptyBody and the agent would vanish.
+                ui.installed.editing = Some((name, scope));
+                ui.installed.status =
+                    Some("the definition is empty — Esc to discard instead".into());
+                return DeckAction::Handled;
+            }
+            ui.installed.mode = InstalledMode::Browse;
+            ui.installed.busy = true;
+            ui.installed.status = Some(format!("saving {name} as a new pinned version…"));
+            DeckAction::Send(WorkspaceInput::AgentSave {
+                name,
+                scope,
+                content,
+            })
+        }
+        KeyCode::Enter => {
+            ui.installed.editor.insert_newline();
+            DeckAction::Handled
+        }
+        KeyCode::Backspace => {
+            ui.installed.editor.backspace();
+            DeckAction::Handled
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META) =>
+        {
+            ui.installed.editor.insert_char(c);
+            DeckAction::Handled
+        }
+        _ => {
+            // Cursor motion (arrows, home/end, the ⌥[ / ⌥] jumps) — then
+            // swallow whatever remains: the editor is modal.
+            let _ = handle_edit_key(key, &mut ui.installed.editor);
+            DeckAction::Handled
+        }
+    }
+}
+
+/// Create-from-prompt, step 1: a one-line description buffer. ⏎ advances to
+/// the scope picker; Esc cancels the flow.
+fn handle_create_describe_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    match key.code {
+        KeyCode::Esc => {
+            ui.installed.mode = InstalledMode::Browse;
+            ui.installed.status = None;
+            DeckAction::Handled
+        }
+        KeyCode::Enter => {
+            if ui.installed.create_desc.trim().is_empty() {
+                ui.installed.status = Some("describe the agent first".into());
+            } else {
+                ui.installed.mode = InstalledMode::CreateScope;
+                ui.installed.status = None;
+            }
+            DeckAction::Handled
+        }
+        KeyCode::Backspace => {
+            ui.installed.create_desc.pop();
+            DeckAction::Handled
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META) =>
+        {
+            ui.installed.create_desc.push(c);
+            DeckAction::Handled
+        }
+        _ => DeckAction::Handled,
+    }
+}
+
+/// Create-from-prompt, step 2: the install-scope picker (project / user,
+/// mirroring the skills install flow's scope question). ⏎ dispatches the
+/// LLM-assisted creation; Esc steps back to the description.
+fn handle_create_scope_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    match key.code {
+        KeyCode::Esc => {
+            ui.installed.mode = InstalledMode::CreateDescribe;
+            DeckAction::Handled
+        }
+        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+            ui.installed.scope_sel = 1 - ui.installed.scope_sel.min(1);
+            DeckAction::Handled
+        }
+        KeyCode::Enter => {
+            let description = ui.installed.create_desc.trim().to_string();
+            let scope = ui.installed.create_scope();
+            ui.installed.mode = InstalledMode::Browse;
+            ui.installed.busy = true;
+            ui.installed.status = Some(format!(
+                "drafting the agent with the session model ({} scope)…",
+                scope.label()
+            ));
+            DeckAction::Send(WorkspaceInput::AgentCreate { description, scope })
+        }
+        _ => DeckAction::Handled,
+    }
+}
+
+/// The version picker: ↑/↓ choose, ⏎ re-pins the highlighted version
+/// (pin-only — no new version is ever written here), Esc closes.
+fn handle_pick_version_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    let Some(entry) = ui.installed.selected().cloned() else {
+        ui.installed.mode = InstalledMode::Browse;
+        return DeckAction::Handled;
+    };
+    let count = entry.versions.len();
+    match key.code {
+        KeyCode::Esc => {
+            ui.installed.mode = InstalledMode::Browse;
+            DeckAction::Handled
+        }
+        KeyCode::Up => {
+            ui.installed.version_sel = ui.installed.version_sel.saturating_sub(1);
+            DeckAction::Handled
+        }
+        KeyCode::Down => {
+            if count > 0 {
+                ui.installed.version_sel = (ui.installed.version_sel + 1).min(count - 1);
+            }
+            DeckAction::Handled
+        }
+        KeyCode::Enter => {
+            let Some(picked) = entry.versions.get(ui.installed.version_sel) else {
+                return DeckAction::Handled;
+            };
+            ui.installed.mode = InstalledMode::Browse;
+            if picked.version == entry.version {
+                ui.installed.status = Some(format!(
+                    "v{} is already the pinned version of {}",
+                    picked.version, entry.name
+                ));
+                return DeckAction::Handled;
+            }
+            ui.installed.busy = true;
+            ui.installed.status = Some(format!("pinning {} to v{}…", entry.name, picked.version));
+            DeckAction::Send(WorkspaceInput::AgentPin {
+                name: entry.name,
+                scope: entry.scope,
+                version: picked.version,
+            })
+        }
+        _ => DeckAction::Handled,
     }
 }
 
@@ -707,6 +1074,30 @@ fn handle_agents_key(
     ui: &mut DeckUi,
     composer_empty: bool,
 ) -> Option<DeckAction> {
+    // The secondary nav: ←/→ switch EXECUTIONS ↔ INSTALLED AGENTS. These
+    // only arrive here with a blank composer (a composer holding text claims
+    // ←/→ for cursor motion first), same gate as every other tab key.
+    match key.code {
+        KeyCode::Left if ui.agents_pane == AgentsPane::Installed => {
+            ui.agents_pane = AgentsPane::Executions;
+            return Some(DeckAction::Handled);
+        }
+        KeyCode::Right if ui.agents_pane == AgentsPane::Executions => {
+            ui.agents_pane = AgentsPane::Installed;
+            // First visit loads the list; after that the driver keeps it
+            // fresh after every op, so no re-fetch on every switch.
+            if !ui.installed.loaded && !ui.installed.busy {
+                ui.installed.busy = true;
+                return Some(DeckAction::Send(WorkspaceInput::AgentsRefresh));
+            }
+            return Some(DeckAction::Handled);
+        }
+        _ => {}
+    }
+    if ui.agents_pane == AgentsPane::Installed {
+        return handle_installed_browse_key(key, ui, composer_empty);
+    }
+
     let count = model.agents.len();
     match key.code {
         KeyCode::Up => {
@@ -734,6 +1125,71 @@ fn handle_agents_key(
                 control: AgentControl::Stop,
             })
         }),
+        _ => None,
+    }
+}
+
+/// The INSTALLED AGENTS pane's browse keys (non-modal — the composer stays
+/// live, so every letter verb is gated on a blank composer exactly like the
+/// executions pane's `s`): ↑/↓ select · ⏎ edit · `v` versions · `n` new ·
+/// `r` reload.
+fn handle_installed_browse_key(
+    key: KeyEvent,
+    ui: &mut DeckUi,
+    composer_empty: bool,
+) -> Option<DeckAction> {
+    let count = ui.installed.entries.len();
+    match key.code {
+        KeyCode::Up => {
+            ui.installed.sel = ui.installed.sel.saturating_sub(1);
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Down => {
+            if count > 0 {
+                ui.installed.sel = (ui.installed.sel + 1).min(count - 1);
+            }
+            Some(DeckAction::Handled)
+        }
+        // ⏎ opens the editor on the selected agent — the queue editor's
+        // "pull it out to edit" idiom, over the pinned version's content.
+        KeyCode::Enter if composer_empty && key.modifiers.is_empty() => {
+            if let Some(entry) = ui.installed.selected().cloned() {
+                ui.installed.editor = Composer::with_paste_threshold(usize::MAX);
+                ui.installed.editor.load(entry.content.clone());
+                ui.installed.editing = Some((entry.name.clone(), entry.scope));
+                ui.installed.mode = InstalledMode::Edit;
+                ui.installed.status = None;
+            }
+            Some(DeckAction::Handled)
+        }
+        // `v` opens the version picker on the selected agent, preselecting
+        // the pinned version.
+        KeyCode::Char('v') if composer_empty => {
+            if let Some(entry) = ui.installed.selected() {
+                ui.installed.version_sel = entry
+                    .versions
+                    .iter()
+                    .position(|v| v.version == entry.version)
+                    .unwrap_or(0);
+                ui.installed.mode = InstalledMode::PickVersion;
+                ui.installed.status = None;
+            }
+            Some(DeckAction::Handled)
+        }
+        // `n` starts the create-from-prompt flow.
+        KeyCode::Char('n') if composer_empty => {
+            ui.installed.mode = InstalledMode::CreateDescribe;
+            ui.installed.create_desc.clear();
+            ui.installed.scope_sel = 0;
+            ui.installed.status = None;
+            Some(DeckAction::Handled)
+        }
+        // `r` reloads the list from disk.
+        KeyCode::Char('r') if composer_empty => {
+            ui.installed.busy = true;
+            ui.installed.status = Some("reloading installed agents…".into());
+            Some(DeckAction::Send(WorkspaceInput::AgentsRefresh))
+        }
         _ => None,
     }
 }
@@ -784,9 +1240,98 @@ fn handle_graph_key(key: KeyEvent, ui: &mut DeckUi, composer_empty: bool) -> Opt
             }
             Some(DeckAction::Handled)
         }
-        // `/` search reserved (only when composer empty) — no-op stub for now.
-        KeyCode::Char('/') if composer_empty => Some(DeckAction::Handled),
+        // `/` (filter-as-you-type) or Enter opens the file picker so a user can
+        // re-root the neighborhood on any indexed file, not just the busiest
+        // one the tab seeds. Gated on an empty composer so both keys stay
+        // typeable as the first character of a prompt. Only meaningful once a
+        // graph with a file list has loaded.
+        KeyCode::Char('/') | KeyCode::Enter if composer_empty && graph_has_files(ui) => {
+            open_graph_picker(ui);
+            Some(DeckAction::Handled)
+        }
         _ => None,
+    }
+}
+
+/// Whether a graph snapshot with at least one listed file is loaded — the
+/// precondition for opening the file picker.
+fn graph_has_files(ui: &DeckUi) -> bool {
+    ui.graph.as_ref().is_some_and(|g| !g.files.is_empty())
+}
+
+/// Open the file picker, defaulting the selection to the file the neighborhood
+/// is currently rooted on (`focus`) — the busiest file on first load. That
+/// keeps the sensible default while making every other file reachable: the
+/// selection starts on "where you already are", not forced there.
+fn open_graph_picker(ui: &mut DeckUi) {
+    ui.graph_picker_query.clear();
+    ui.graph_picker_open = true;
+    ui.graph_picker_sel = ui
+        .graph
+        .as_ref()
+        .and_then(|g| g.files.iter().position(|f| *f == g.focus))
+        .unwrap_or(0);
+}
+
+/// The modal file picker's key map. Printable keys narrow the filter, ↑/↓ walk
+/// the filtered matches, Enter re-roots the neighborhood on the selected file
+/// (a [`WorkspaceInput::FocusGraphFile`] round-trip — see the envelope docs),
+/// and Esc / a cleared-then-Backspace closes it. Selection bounds and the
+/// selected path both come from [`GraphSnapshot::matching_files`] so they can
+/// never disagree with the rendered list.
+fn handle_graph_picker_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    // Snapshot the current match count/selection off the shared filter helper.
+    let match_count = ui
+        .graph
+        .as_ref()
+        .map(|g| g.matching_files(&ui.graph_picker_query).len())
+        .unwrap_or(0);
+
+    match key.code {
+        KeyCode::Esc => {
+            ui.graph_picker_open = false;
+            DeckAction::Handled
+        }
+        KeyCode::Up => {
+            ui.graph_picker_sel = ui.graph_picker_sel.saturating_sub(1);
+            DeckAction::Handled
+        }
+        KeyCode::Down => {
+            if match_count > 0 {
+                ui.graph_picker_sel = (ui.graph_picker_sel + 1).min(match_count - 1);
+            }
+            DeckAction::Handled
+        }
+        KeyCode::Enter => {
+            let picked = ui.graph.as_ref().and_then(|g| {
+                g.matching_files(&ui.graph_picker_query)
+                    .get(ui.graph_picker_sel)
+                    .map(|f| f.to_string())
+            });
+            ui.graph_picker_open = false;
+            match picked {
+                Some(file) => DeckAction::Send(WorkspaceInput::FocusGraphFile { file }),
+                None => DeckAction::Handled, // filter matched nothing — just close
+            }
+        }
+        KeyCode::Backspace => {
+            ui.graph_picker_query.pop();
+            ui.graph_picker_sel = 0; // the match set changed — re-anchor
+            DeckAction::Handled
+        }
+        // Printable characters extend the filter. Modified chords (Ctrl/Cmd)
+        // are not filter input — let them fall through as Ignored so global
+        // shortcuts still resolve.
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META) =>
+        {
+            ui.graph_picker_query.push(c);
+            ui.graph_picker_sel = 0; // the match set changed — re-anchor
+            DeckAction::Handled
+        }
+        _ => DeckAction::Ignored,
     }
 }
 
@@ -2000,6 +2545,7 @@ mod tests {
                 location: Some("src/lib.rs".into()),
             }],
             edges: vec![],
+            files: vec!["src/lib.rs".into()],
         };
         ingest_inbound(
             &Inbound::GraphSnapshot(snapshot.clone()),
@@ -2007,5 +2553,399 @@ mod tests {
             &mut ui,
         );
         assert_eq!(ui.graph.as_ref(), Some(&snapshot));
+    }
+
+    // ── Graph file picker ────────────────────────────────────────────────────
+
+    /// A three-file graph rooted on the busiest (`src/b.rs`), on the Graph tab.
+    fn ui_with_graph() -> DeckUi {
+        use crate::graph::{GraphNode, GraphSnapshot};
+        let mut ui = ready_ui();
+        ui.tab = DeckTab::Graph;
+        ui.graph = Some(GraphSnapshot {
+            focus: "src/b.rs".into(),
+            nodes: vec![GraphNode {
+                label: "src/b.rs".into(),
+                kind: "file".into(),
+                location: Some("src/b.rs".into()),
+            }],
+            edges: vec![],
+            files: vec!["src/a.rs".into(), "src/b.rs".into(), "src/c.rs".into()],
+        });
+    // ---- AGENTS tab: INSTALLED AGENTS pane -------------------------------
+
+    fn installed_entry(name: &str, version: u32) -> InstalledAgentEntry {
+        InstalledAgentEntry {
+            name: name.into(),
+            description: format!("about {name}"),
+            tools: Some(vec!["Read".into()]),
+            scope: AgentScope::Project,
+            source_path: format!("/ws/.stella/agents/{name}.md"),
+            version,
+            versions: (1..=version)
+                .map(|v| crate::envelope::AgentVersionInfo {
+                    version: v,
+                    label: String::new(),
+                })
+                .collect(),
+            content: format!("---\nname: {name}\n---\nbody of {name}"),
+        }
+    }
+
+    /// A ready deck on the AGENTS tab's INSTALLED pane with `entries` loaded.
+    fn installed_ui(entries: Vec<InstalledAgentEntry>) -> DeckUi {
+        let mut ui = ready_ui();
+        ui.tab = DeckTab::Agents;
+        ui.agents_pane = AgentsPane::Installed;
+        ui.installed.entries = entries;
+        ui.installed.loaded = true;
+        ui
+    }
+
+    #[test]
+    fn slash_opens_the_picker_defaulting_to_the_current_focus() {
+        let model = model_with(&["lead"]);
+        let mut ui = ui_with_graph();
+        let action = handle_deck_key(ch('/'), &model, &mut ui);
+        assert_eq!(action, DeckAction::Handled);
+        assert!(ui.graph_picker_open, "/ opens the picker on the Graph tab");
+        // Default selection is the busiest/focused file (index 1 = src/b.rs),
+        // the sensible default — not forced there, just pre-selected.
+        assert_eq!(ui.graph_picker_sel, 1);
+        assert!(
+            ui.composer.buffer().is_empty(),
+            "/ did not leak into the prompt"
+    fn agents_pane_arrows_switch_and_first_visit_asks_for_the_list() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.tab = DeckTab::Agents;
+        assert_eq!(ui.agents_pane, AgentsPane::Executions, "executions first");
+        // → switches to INSTALLED AGENTS; the unloaded list triggers one
+        // refresh request.
+        let action = handle_deck_key(key(KeyCode::Right), &model, &mut ui);
+        assert_eq!(ui.agents_pane, AgentsPane::Installed);
+        assert_eq!(action, DeckAction::Send(WorkspaceInput::AgentsRefresh));
+        // ← switches back; → again does NOT re-fetch (busy flag pending).
+        handle_deck_key(key(KeyCode::Left), &model, &mut ui);
+        assert_eq!(ui.agents_pane, AgentsPane::Executions);
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Right), &model, &mut ui),
+            DeckAction::Handled,
+            "no duplicate refresh while one is in flight"
+        );
+    }
+
+    #[test]
+    fn enter_also_opens_the_picker() {
+        let model = model_with(&["lead"]);
+        let mut ui = ui_with_graph();
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert!(ui.graph_picker_open);
+    }
+
+    #[test]
+    fn typing_filters_and_re_anchors_the_selection() {
+        let model = model_with(&["lead"]);
+        let mut ui = ui_with_graph();
+        open_graph_picker(&mut ui);
+        // Filter to just "a.rs" — one match, selection re-anchors to 0.
+        handle_deck_key(ch('a'), &model, &mut ui);
+        assert_eq!(ui.graph_picker_query, "a");
+        assert_eq!(ui.graph_picker_sel, 0);
+        let matches = ui
+            .graph
+            .as_ref()
+            .unwrap()
+            .matching_files(&ui.graph_picker_query);
+        assert_eq!(matches, vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn enter_in_the_picker_re_roots_on_the_selected_file() {
+        let model = model_with(&["lead"]);
+        let mut ui = ui_with_graph();
+        open_graph_picker(&mut ui);
+        // A multi-char needle (`c.rs`) narrows to exactly src/c.rs — a bare
+        // `c` would also match the shared `src/` prefix of every file.
+        for c in "c.rs".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::FocusGraphFile {
+                file: "src/c.rs".into()
+            }),
+            "Enter sends the re-root request for the filtered selection"
+        );
+        assert!(!ui.graph_picker_open, "the picker closes on selection");
+    }
+
+    #[test]
+    fn down_arrow_walks_the_filtered_matches_and_clamps() {
+        let model = model_with(&["lead"]);
+        let mut ui = ui_with_graph();
+        open_graph_picker(&mut ui);
+        ui.graph_picker_sel = 0;
+        handle_deck_key(key(KeyCode::Down), &model, &mut ui);
+        handle_deck_key(key(KeyCode::Down), &model, &mut ui);
+        handle_deck_key(key(KeyCode::Down), &model, &mut ui); // past the end
+        assert_eq!(ui.graph_picker_sel, 2, "clamps to the last of three files");
+    }
+
+    #[test]
+    fn esc_closes_the_picker_without_re_rooting() {
+        let model = model_with(&["lead"]);
+        let mut ui = ui_with_graph();
+        open_graph_picker(&mut ui);
+        let action = handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
+        assert_eq!(action, DeckAction::Handled);
+        assert!(!ui.graph_picker_open);
+    }
+
+    #[test]
+    fn the_picker_is_modal_over_the_composer() {
+        // A printable key while the picker is open filters — it must NOT type
+        // into the global composer (the queue-editor modality contract).
+        let model = model_with(&["lead"]);
+        let mut ui = ui_with_graph();
+        open_graph_picker(&mut ui);
+        handle_deck_key(ch('b'), &model, &mut ui);
+        assert_eq!(ui.graph_picker_query, "b");
+        assert!(
+            ui.composer.buffer().is_empty(),
+            "filter keys never reach the composer"
+        );
+    }
+
+    #[test]
+    fn a_re_rooted_snapshot_resets_the_node_cursor() {
+        let mut model = model_with(&["lead"]);
+        let mut ui = ui_with_graph();
+        ui.graph_cursor = 5; // stale cursor from the previous neighborhood
+        use crate::graph::{GraphNode, GraphSnapshot};
+        let rerooted = GraphSnapshot {
+            focus: "src/a.rs".into(),
+            nodes: vec![GraphNode {
+                label: "src/a.rs".into(),
+                kind: "file".into(),
+                location: Some("src/a.rs".into()),
+            }],
+            edges: vec![],
+            files: vec!["src/a.rs".into(), "src/b.rs".into(), "src/c.rs".into()],
+        };
+        ingest_inbound(&Inbound::GraphSnapshot(rerooted), &mut model, &mut ui);
+        assert_eq!(ui.graph_cursor, 0, "the cursor lands on the new focus");
+    }
+
+    #[test]
+    fn the_picker_does_not_open_without_a_loaded_graph() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.tab = DeckTab::Graph; // no snapshot loaded
+        handle_deck_key(ch('/'), &model, &mut ui);
+        assert!(!ui.graph_picker_open, "nothing to pick from — stays closed");
+    fn slash_agents_opens_the_tab_on_the_installed_pane() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.slash_commands = vec![SlashCommand::new("/agents", "agents")];
+        for c in "/agents".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(ui.tab, DeckTab::Agents, "/agents opens the Agents tab");
+        assert_eq!(ui.agents_pane, AgentsPane::Installed);
+        assert_eq!(action, DeckAction::Send(WorkspaceInput::AgentsRefresh));
+        assert!(ui.composer.buffer().is_empty(), "the composer cleared");
+    }
+
+    #[test]
+    fn agents_list_ingest_updates_the_panel_out_of_band_and_clamps() {
+        let mut model = model_with(&["lead"]);
+        let mut ui = installed_ui(vec![]);
+        ui.installed.sel = 5;
+        ui.installed.busy = true;
+        ingest_inbound(
+            &Inbound::AgentsList {
+                entries: vec![installed_entry("reviewer", 1)],
+                status: Some("saved".into()),
+            },
+            &mut model,
+            &mut ui,
+        );
+        assert_eq!(ui.installed.entries.len(), 1);
+        assert_eq!(ui.installed.sel, 0, "selection clamped to the new list");
+        assert!(!ui.installed.busy, "a fresh list completes the op");
+        assert_eq!(ui.installed.status.as_deref(), Some("saved"));
+        assert_eq!(
+            model.agents.len(),
+            1,
+            "the model fold ignores the out-of-band list"
+        );
+    }
+
+    #[test]
+    fn installed_enter_opens_the_editor_and_ctrl_s_saves_a_new_version() {
+        let model = model_with(&["lead"]);
+        let mut ui = installed_ui(vec![installed_entry("reviewer", 2)]);
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(ui.installed.mode, InstalledMode::Edit);
+        assert_eq!(
+            ui.installed.editor.buffer(),
+            "---\nname: reviewer\n---\nbody of reviewer",
+            "the editor holds the pinned version's content"
+        );
+        // Type at the end (the cursor loads at the end of the buffer), with
+        // a plain Enter inserting a newline — never submitting.
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        for c in "x".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_deck_key(ctrl('s'), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::AgentSave {
+                name: "reviewer".into(),
+                scope: AgentScope::Project,
+                content: "---\nname: reviewer\n---\nbody of reviewer\nx".into(),
+            }),
+            "ctrl+s sends the edited content — the driver writes a NEW pinned version"
+        );
+        assert_eq!(ui.installed.mode, InstalledMode::Browse);
+        assert!(ui.installed.busy, "save shows the working state");
+    }
+
+    #[test]
+    fn editor_esc_discards_without_sending_and_typing_never_leaks() {
+        let model = model_with(&["lead"]);
+        let mut ui = installed_ui(vec![installed_entry("reviewer", 1)]);
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        for c in "abc".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        assert!(
+            ui.composer.buffer().is_empty(),
+            "editor typing never reaches the global composer"
+        );
+        let action = handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
+        assert_eq!(action, DeckAction::Handled, "no save is sent");
+        assert_eq!(ui.installed.mode, InstalledMode::Browse);
+        assert!(
+            ui.installed
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("discarded")),
+            "{:?}",
+            ui.installed.status
+        );
+    }
+
+    #[test]
+    fn create_flow_describes_picks_scope_and_dispatches_the_llm_draft() {
+        let model = model_with(&["lead"]);
+        let mut ui = installed_ui(vec![]);
+        handle_deck_key(ch('n'), &model, &mut ui);
+        assert_eq!(ui.installed.mode, InstalledMode::CreateDescribe);
+        for c in "reviews diffs".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        assert_eq!(ui.installed.create_desc, "reviews diffs");
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            ui.installed.mode,
+            InstalledMode::CreateScope,
+            "⏎ advances to the scope picker (mirrors the skills install flow)"
+        );
+        // Default scope is project; ↓ flips to user, ↑ flips back.
+        assert_eq!(ui.installed.create_scope(), AgentScope::Project);
+        handle_deck_key(key(KeyCode::Down), &model, &mut ui);
+        assert_eq!(ui.installed.create_scope(), AgentScope::User);
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::AgentCreate {
+                description: "reviews diffs".into(),
+                scope: AgentScope::Project,
+            })
+        );
+        assert_eq!(ui.installed.mode, InstalledMode::Browse);
+        assert!(ui.installed.busy);
+    }
+
+    #[test]
+    fn create_flow_requires_a_description_and_esc_steps_back() {
+        let model = model_with(&["lead"]);
+        let mut ui = installed_ui(vec![]);
+        handle_deck_key(ch('n'), &model, &mut ui);
+        // Empty description: ⏎ refuses to advance.
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(ui.installed.mode, InstalledMode::CreateDescribe);
+        for c in "x".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(ui.installed.mode, InstalledMode::CreateScope);
+        // Esc from the scope picker returns to the description, not Browse.
+        handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
+        assert_eq!(ui.installed.mode, InstalledMode::CreateDescribe);
+        handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
+        assert_eq!(ui.installed.mode, InstalledMode::Browse);
+    }
+
+    #[test]
+    fn version_picker_pins_an_older_version_without_editing() {
+        let model = model_with(&["lead"]);
+        let mut ui = installed_ui(vec![installed_entry("reviewer", 3)]);
+        handle_deck_key(ch('v'), &model, &mut ui);
+        assert_eq!(ui.installed.mode, InstalledMode::PickVersion);
+        assert_eq!(
+            ui.installed.version_sel, 2,
+            "the picker opens on the pinned version"
+        );
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::AgentPin {
+                name: "reviewer".into(),
+                scope: AgentScope::Project,
+                version: 1,
+            }),
+            "⏎ re-pins — an AgentPin, never an AgentSave"
+        );
+        assert_eq!(ui.installed.mode, InstalledMode::Browse);
+    }
+
+    #[test]
+    fn version_picker_on_the_already_pinned_version_sends_nothing() {
+        let model = model_with(&["lead"]);
+        let mut ui = installed_ui(vec![installed_entry("reviewer", 2)]);
+        handle_deck_key(ch('v'), &model, &mut ui);
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(action, DeckAction::Handled, "re-pinning the pin is a no-op");
+        assert!(
+            ui.installed
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("already")),
+            "{:?}",
+            ui.installed.status
+        );
+    }
+
+    #[test]
+    fn installed_browse_letter_verbs_type_when_the_composer_has_text() {
+        let model = model_with(&["lead"]);
+        let mut ui = installed_ui(vec![installed_entry("reviewer", 1)]);
+        handle_deck_key(ch('h'), &model, &mut ui);
+        handle_deck_key(ch('n'), &model, &mut ui);
+        assert_eq!(
+            ui.installed.mode,
+            InstalledMode::Browse,
+            "a typed `n` is prompt text, not the create verb"
+        );
+        assert_eq!(ui.composer.buffer(), "hn");
     }
 }

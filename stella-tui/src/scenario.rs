@@ -80,6 +80,15 @@ pub fn demo_graph() -> GraphSnapshot {
         focus: "run_turn — engine step driver".into(),
         nodes,
         edges,
+        // The picker's file list — the demo's source files, so `/` in the
+        // Graph tab opens a browsable, filterable list during playback.
+        files: vec![
+            "stella-core/src/driver.rs".into(),
+            "stella-core/src/engine.rs".into(),
+            "stella-core/src/router.rs".into(),
+            "stella-fleet/src/ledger.rs".into(),
+            "stella-protocol/src/event.rs".into(),
+        ],
     }
 }
 
