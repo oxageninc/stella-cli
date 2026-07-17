@@ -71,8 +71,8 @@ use stella_tools::ToolRegistry;
 use stella_tools::custom::{CustomTool, CustomToolSet};
 use stella_tools::hook_runner::ShellHookRunner;
 use stella_tui::{
-    AgentMeta, AgentScope, AgentStatus, DeckOptions, Inbound, SlashCommand, UserInput,
-    WorkspaceInput, run_deck,
+    AgentMeta, AgentScope, AgentStatus, DeckOptions, Inbound, SkillOp, SkillScope, SkillSearchHit,
+    SkillsView, SlashCommand, UserInput, WorkspaceInput, run_deck,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -248,6 +248,9 @@ pub async fn run_deck_session(
     // Custom extensions: ⚡ commands/skills in the slash menu, custom agents
     // behind `/agents`. Reloaded after `/init`, which may adopt new ones.
     let mut custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
+    // The npx skills registry (search/install), constructed once for the whole
+    // session — the SKILLS tab's ops route through it (see `handle_skills_input`).
+    let skill_registry = SkillRegistry::from_env(cfg.workspace_root.clone());
 
     // ── Channels: engine → deck (Inbound) and deck → driver (WorkspaceInput)
     let (in_tx, in_rx) = mpsc::unbounded_channel::<Inbound>();
@@ -280,6 +283,9 @@ pub async fn run_deck_session(
         agent: LEAD.to_string(),
         status: AgentStatus::WaitingInput,
     });
+    // Seed the SKILLS tab so it has data the instant it is opened (both scopes),
+    // without waiting on a `/skills` round-trip.
+    let _ = in_tx.send(skills_snapshot(&cfg.workspace_root, None));
 
     let ask_io = DeckAskUserIo {
         agent: LEAD.to_string(),
@@ -431,6 +437,12 @@ pub async fn run_deck_session(
                     }
                     continue 'session;
                 }
+                // SKILLS-tab ops work whether or not a turn is running — handled
+                // at both recv sites so the manager is live mid-turn too.
+                Some(WorkspaceInput::Skill(op)) => {
+                    handle_skills_input(&op, cfg, &in_tx, &skill_registry);
+                    continue 'session;
+                }
                 // LLM-assisted agent creation needs the provider, which is
                 // free here (no turn in flight) — draft, install, refresh.
                 Some(WorkspaceInput::AgentCreate { description, scope }) => {
@@ -544,6 +556,27 @@ pub async fn run_deck_session(
         );
         let files_before = registry.files_touched().len();
         let started_unix = crate::memory::unix_now_secs();
+
+        // Skill-version usage telemetry: record which skills recall selected for
+        // this turn, at their pinned version, keyed to this execution. Recorded
+        // at turn start (the skills are injected regardless of how the turn
+        // ends); best-effort, and only for the deck path for now — the other
+        // `record_execution_end` sites can adopt it later.
+        if let (Some((store, id)), Some(m)) = (&execution, &memory) {
+            let selected = m.selected_skills(&prompt);
+            if !selected.is_empty() {
+                let versions = crate::skill_manager::pinned_versions(&cfg.workspace_root);
+                let rows: Vec<stella_store::SkillUsageRow> = selected
+                    .into_iter()
+                    .map(|(skill, reason)| stella_store::SkillUsageRow {
+                        version: versions.get(&skill).copied().unwrap_or(1),
+                        skill,
+                        reason,
+                    })
+                    .collect();
+                let _ = store.record_skill_usage(*id, &rows);
+            }
+        }
 
         let end = {
             // Both arms return `Result<(), String>`, so one pinned future
@@ -659,6 +692,13 @@ pub async fn run_deck_session(
                                         .to_string(),
                                 ),
                             ));
+                        }
+                        // SKILLS-tab ops run alongside the in-flight turn (disk
+                        // ops inline, npx/model ops spawned) — the manager stays
+                        // usable while an agent is working. Create spawns its own
+                        // provider, so unlike AgentCreate it needs no parking.
+                        Some(WorkspaceInput::Skill(op)) => {
+                            handle_skills_input(&op, cfg, &in_tx, &skill_registry);
                         }
                         // Scope review is not engine-driven yet, and deep
                         // pause/resume/restart need the fleet supervisor —
@@ -816,7 +856,6 @@ const DECK_BUILTINS: &[(&str, &str)] = &[
     ("/clear", "reset the conversation"),
     ("/models", "list providers & models"),
     ("/init", "index the workspace: domains + code graph"),
-
     (
         "/agents",
         "open the Agents tab: executions & installed agents",
@@ -828,6 +867,7 @@ const DECK_BUILTINS: &[(&str, &str)] = &[
     ("/files", "open the Files tab"),
     ("/diff", "open the diff viewer"),
     ("/graph", "open the code-graph tab"),
+    ("/skills", "open the SKILLS tab: manage · search · create"),
 ];
 
 /// The deck's reserved command names — see [`DECK_BUILTINS`].
@@ -1009,6 +1049,289 @@ fn deck_slash_commands(custom: &crate::extensions::CustomExtensions) -> Vec<Slas
     commands
 }
 
+// ── SKILLS tab: driver-side ops (the deck routes `WorkspaceInput::Skill`) ────
+
+/// Snapshot the installed skills across BOTH scopes into an [`Inbound::Skills`].
+fn skills_snapshot(workspace_root: &std::path::Path, status: Option<String>) -> Inbound {
+    Inbound::Skills(SkillsView {
+        rows: crate::skill_manager::enumerate(workspace_root),
+        status,
+        busy: false,
+    })
+}
+
+/// Parse `npx skills find` stdout into hit rows: one per non-empty line (cap
+/// 50); `id` = the leading token (skipping a list marker), `label` = the whole
+/// line kept verbatim for display.
+fn parse_skill_hits(out: &str) -> Vec<SkillSearchHit> {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(50)
+        .map(|line| {
+            let mut toks = line.split_whitespace();
+            let first = toks.next().unwrap_or("");
+            let id = if matches!(first, "-" | "*" | "•" | "▸") {
+                toks.next().unwrap_or(first)
+            } else {
+                first
+            };
+            SkillSearchHit {
+                id: id.to_string(),
+                label: line.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Run `npx skills add <id>` in an isolated temp dir, then adopt the produced
+/// skill into `scope`. Running in a temp cwd (not the workspace) makes the
+/// destination ours to control — that is how "install for me →
+/// ~/.config/stella/skills" lands there despite the registry CLI's fixed cwd.
+async fn install_skill(
+    registry: &SkillRegistry,
+    scope: SkillScope,
+    id: &str,
+    workspace_root: &std::path::Path,
+) -> String {
+    let tmp = match tempfile::Builder::new().prefix("stella-skill-").tempdir() {
+        Ok(t) => t,
+        Err(e) => return format!("install failed: {e}"),
+    };
+    let mut reg = registry.clone();
+    reg.workspace_root = tmp.path().to_path_buf();
+    let argv = SkillRegistry::render(&reg.install_cmd, "{id}", id);
+    if let Err(e) = reg.run(argv, 300).await {
+        return format!("install failed: {e}");
+    }
+    match crate::skill_manager::adopt_tree(scope, workspace_root, tmp.path(), id) {
+        Ok(name) => format!("installed {name} ({})", scope.label()),
+        Err(e) => format!("install produced nothing usable: {e}"),
+    }
+}
+
+/// A crude popularity signal: the largest integer on a registry result line
+/// (stars/downloads if the CLI prints them), else 0.
+fn hit_popularity(label: &str) -> u64 {
+    label
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|t| t.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Rank registry hits for LLM-assisted creation by (a) relevance — how many of
+/// the request's words appear in the hit's line — then (b) popularity as a
+/// usefulness signal. Returns the top few labels, most useful first.
+fn rank_hits(hits: &[SkillSearchHit], request: &str) -> Vec<String> {
+    let want: Vec<String> = request
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 2)
+        .map(|w| w.to_ascii_lowercase())
+        .collect();
+    let mut scored: Vec<(usize, u64, &SkillSearchHit)> = hits
+        .iter()
+        .map(|h| {
+            let lower = h.label.to_ascii_lowercase();
+            let relevance = want.iter().filter(|w| lower.contains(w.as_str())).count();
+            (relevance, hit_popularity(&h.label), h)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    scored
+        .into_iter()
+        .take(6)
+        .map(|(_, _, h)| h.label.clone())
+        .collect()
+}
+
+/// The system prompt for one-shot skill authoring.
+const SKILL_AUTHOR_SYSTEM: &str = "You author `SKILL.md` files for a coding agent. A skill is reusable \
+know-how (a convention, procedure, or preference) the agent applies when relevant. Output ONLY the \
+file content: YAML frontmatter delimited by `---` with `name:` (a short kebab-case slug), \
+`description:` (one line — the primary selection signal), and optional `domains:` (comma-separated \
+tags), followed by a concise markdown body. No commentary before or after.";
+
+/// Assemble the user prompt for LLM-assisted creation: the request plus the
+/// ranked registry candidates the model may borrow from (whole or in part,
+/// across several) to deliver ONE coherent skill. Pure — unit-tested.
+fn build_skill_creation_prompt(request: &str, ranked_candidates: &[String]) -> String {
+    let mut p = String::new();
+    p.push_str("Create ONE new skill for this request:\n\n");
+    p.push_str(request.trim());
+    p.push_str("\n\n");
+    if ranked_candidates.is_empty() {
+        p.push_str(
+            "No existing skills were found in the registry. Author the skill from scratch.\n",
+        );
+    } else {
+        p.push_str(
+            "Existing registry skills, ranked by usefulness (relevance, then popularity). You may \
+             borrow whole or in part from any of them, and assemble bits from several into one \
+             coherent skill — but deliver a SINGLE skill:\n",
+        );
+        for (i, c) in ranked_candidates.iter().enumerate() {
+            p.push_str(&format!("{}. {}\n", i + 1, c));
+        }
+    }
+    p.push_str(
+        "\nWrite the SKILL.md now. Keep the body focused and actionable; the description must make \
+         it easy to select for the right task.",
+    );
+    p
+}
+
+/// Extract the `SKILL.md` content from a model reply: prefer the first fenced
+/// code block; otherwise, from the first `---` (frontmatter) onward; otherwise
+/// the trimmed whole reply.
+fn extract_skill_md(text: &str) -> String {
+    if let Some(start) = text.find("```") {
+        let after = &text[start + 3..];
+        let after = after
+            .split_once('\n')
+            .map(|(_, rest)| rest)
+            .unwrap_or(after);
+        if let Some(end) = after.find("```") {
+            return after[..end].trim().to_string();
+        }
+    }
+    if let Some(fm) = text.find("---") {
+        return text[fm..].trim().to_string();
+    }
+    text.trim().to_string()
+}
+
+/// LLM-assisted creation: search the registry for the request, rank the hits,
+/// have the model assemble ONE `SKILL.md` (reusing the existing provider path),
+/// and write it into `scope` as version 1. Returns a status string.
+async fn create_skill_llm(
+    cfg: &Config,
+    registry: &SkillRegistry,
+    scope: SkillScope,
+    description: &str,
+    workspace_root: &std::path::Path,
+) -> String {
+    // 1. Search existing skills for inspiration (best-effort — a registry
+    //    failure just means authoring from scratch).
+    let argv = SkillRegistry::render(&registry.search_cmd, "{query}", description);
+    let search_out = registry.run(argv, 90).await.unwrap_or_default();
+    let ranked = rank_hits(&parse_skill_hits(&search_out), description);
+    // 2. Assemble the prompt and run a one-shot model call (the same provider
+    //    path the rest of the session uses — never hand-rolled HTTP).
+    let provider = match agent::build_provider(cfg) {
+        Ok(p) => p,
+        Err(e) => return format!("create failed: {e}"),
+    };
+    let req = CompletionRequest {
+        messages: vec![
+            CompletionMessage::system(SKILL_AUTHOR_SYSTEM),
+            CompletionMessage::user(build_skill_creation_prompt(description, &ranked)),
+        ],
+        max_output_tokens: Some(1200),
+        temperature: Some(0.2),
+        effort: None,
+        tools: vec![],
+    };
+    let content = match provider.complete(req).await {
+        Ok(r) => extract_skill_md(&r.text),
+        Err(e) => return format!("model call failed: {e}"),
+    };
+    // 3. Validate it parses as a real skill, then write it as v1.
+    let name = match stella_core::skills::skill_from_file("SKILL.md", &content) {
+        Ok(s) => s.name,
+        Err(_) => return "the model did not return a valid SKILL.md — try again".to_string(),
+    };
+    match crate::skill_manager::create(scope, &name, &content, workspace_root) {
+        Ok(n) => format!("created {n} ({}) — v1", scope.label()),
+        Err(e) => format!("create failed: {e}"),
+    }
+}
+
+/// Route one SKILLS-tab op. Disk ops run inline and answer immediately with a
+/// refreshed [`Inbound::Skills`]; npx/model ops spawn a task (like `!` shell
+/// commands) so a slow child never stalls the driver, then answer on
+/// completion. Called at both driver recv sites so the tab works mid-turn.
+fn handle_skills_input(
+    op: &SkillOp,
+    cfg: &Config,
+    in_tx: &UnboundedSender<Inbound>,
+    registry: &SkillRegistry,
+) {
+    let root = cfg.workspace_root.clone();
+    match op {
+        SkillOp::List => {
+            let _ = in_tx.send(skills_snapshot(&root, None));
+        }
+        SkillOp::SetEnabled {
+            scope,
+            name,
+            enabled,
+        } => {
+            let status = crate::skill_manager::set_enabled(*scope, name, *enabled, &root)
+                .unwrap_or_else(|e| e);
+            let _ = in_tx.send(skills_snapshot(&root, Some(status)));
+        }
+        SkillOp::Uninstall { scope, name } => {
+            let status = crate::skill_manager::uninstall(*scope, name, &root).unwrap_or_else(|e| e);
+            let _ = in_tx.send(skills_snapshot(&root, Some(status)));
+        }
+        SkillOp::Edit { scope, name, body } => {
+            let status =
+                crate::skill_manager::save_edit(*scope, name, body, &root).unwrap_or_else(|e| e);
+            let _ = in_tx.send(skills_snapshot(&root, Some(status)));
+        }
+        SkillOp::Pin {
+            scope,
+            name,
+            version,
+        } => {
+            let status =
+                crate::skill_manager::set_pin(*scope, name, *version, &root).unwrap_or_else(|e| e);
+            let _ = in_tx.send(skills_snapshot(&root, Some(status)));
+        }
+        SkillOp::Search { query } => {
+            let registry = registry.clone();
+            let in_tx = in_tx.clone();
+            let query = query.clone();
+            tokio::spawn(async move {
+                let argv = SkillRegistry::render(&registry.search_cmd, "{query}", &query);
+                let (hits, status) = match registry.run(argv, 90).await {
+                    Ok(out) => (parse_skill_hits(&out), None),
+                    Err(e) => (Vec::new(), Some(format!("search failed: {e}"))),
+                };
+                let _ = in_tx.send(Inbound::SkillSearch {
+                    query,
+                    hits,
+                    status,
+                });
+            });
+        }
+        SkillOp::Install { scope, id } => {
+            let registry = registry.clone();
+            let in_tx = in_tx.clone();
+            let id = id.clone();
+            let scope = *scope;
+            let root = root.clone();
+            tokio::spawn(async move {
+                let status = install_skill(&registry, scope, &id, &root).await;
+                let _ = in_tx.send(skills_snapshot(&root, Some(status)));
+            });
+        }
+        SkillOp::Create { scope, description } => {
+            let registry = registry.clone();
+            let in_tx = in_tx.clone();
+            let cfg = cfg.clone();
+            let scope = *scope;
+            let description = description.clone();
+            let root = root.clone();
+            tokio::spawn(async move {
+                let status = create_skill_llm(&cfg, &registry, scope, &description, &root).await;
+                let _ = in_tx.send(skills_snapshot(&root, Some(status)));
+            });
+        }
+    }
+}
+
 /// Handle a session-level slash command. Output goes into the lead agent's
 /// transcript as `Text` events — the deck renders exclusively from events, so
 /// printing to stdout (which the alternate screen owns) is never an option.
@@ -1102,7 +1425,7 @@ async fn run_deck_command(
         // tab) are normally consumed TUI-side, but a queued one reaches
         // here — accept it as handled (a no-op) rather than calling it
         // "unknown".
-        "/files" | "/diff" | "/graph" | "/agents" => {}
+        "/files" | "/diff" | "/graph" | "/agents" | "/skills" => {}
         _ => {
             // A custom command/skill/agent (⚡): expand its template —
             // arguments and all — into the prompt the model turn runs.
@@ -1622,6 +1945,74 @@ fn pseudo_diff(old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_skill_hits_takes_id_first_and_keeps_the_label() {
+        let out = "acme/auth  OAuth helper\n- foo/bar  another one\n\n";
+        let hits = parse_skill_hits(out);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "acme/auth");
+        assert_eq!(hits[0].label, "acme/auth  OAuth helper");
+        assert_eq!(hits[1].id, "foo/bar", "leading list marker skipped");
+    }
+
+    #[test]
+    fn parse_skill_hits_caps_at_fifty() {
+        let out = (0..100)
+            .map(|i| format!("pkg/skill-{i}  desc"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(parse_skill_hits(&out).len(), 50);
+    }
+
+    #[test]
+    fn rank_hits_orders_by_relevance_then_popularity() {
+        let hits = vec![
+            SkillSearchHit {
+                id: "a/pdf".into(),
+                label: "a/pdf extract pdf tables  120".into(),
+            },
+            SkillSearchHit {
+                id: "b/img".into(),
+                label: "b/img resize images  9000".into(),
+            },
+            SkillSearchHit {
+                id: "c/pdf".into(),
+                label: "c/pdf pdf reader  5".into(),
+            },
+        ];
+        let ranked = rank_hits(&hits, "extract tables from pdf");
+        assert!(ranked[0].contains("a/pdf"), "{ranked:?}");
+        assert!(
+            ranked.iter().position(|l| l.contains("a/pdf"))
+                < ranked.iter().position(|l| l.contains("b/img")),
+            "relevance beats popularity: {ranked:?}"
+        );
+    }
+
+    #[test]
+    fn build_skill_creation_prompt_includes_request_and_ranked_candidates() {
+        let p = build_skill_creation_prompt(
+            "format sql nicely",
+            &["a/sql-fmt  sql formatter".to_string()],
+        );
+        assert!(p.contains("format sql nicely"));
+        assert!(p.contains("a/sql-fmt"));
+        assert!(p.contains("SINGLE skill"));
+        let empty = build_skill_creation_prompt("do a thing", &[]);
+        assert!(empty.contains("from scratch"));
+    }
+
+    #[test]
+    fn extract_skill_md_unwraps_a_fenced_block_or_frontmatter() {
+        let fenced =
+            "Here you go:\n```markdown\n---\nname: x\ndescription: d\n---\nbody\n```\ndone";
+        let got = extract_skill_md(fenced);
+        assert!(got.starts_with("---"), "{got}");
+        assert!(got.ends_with("body"), "{got}");
+        let bare = "prose\n---\nname: y\ndescription: d\n---\nbody";
+        assert!(extract_skill_md(bare).starts_with("---\nname: y"));
+    }
 
     /// A minimal inner executor that always succeeds (or always errors).
     struct FakeInner {

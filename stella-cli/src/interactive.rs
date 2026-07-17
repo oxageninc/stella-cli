@@ -144,7 +144,7 @@ impl SkillRegistry {
             .collect()
     }
 
-    async fn run(&self, argv: Vec<String>, timeout_secs: u64) -> Result<String, String> {
+    pub(crate) async fn run(&self, argv: Vec<String>, timeout_secs: u64) -> Result<String, String> {
         let Some((program, args)) = argv.split_first() else {
             return Err("empty registry command".into());
         };

@@ -34,15 +34,17 @@ pub enum DeckTab {
     Traces,
     Graph,
     Files,
+    Skills,
 }
 
 impl DeckTab {
-    pub const ALL: [DeckTab; 5] = [
+    pub const ALL: [DeckTab; 6] = [
         DeckTab::Session,
         DeckTab::Agents,
         DeckTab::Traces,
         DeckTab::Graph,
         DeckTab::Files,
+        DeckTab::Skills,
     ];
 
     /// The tab-bar label. Deck tab labels are UPPERCASE by convention —
@@ -54,6 +56,7 @@ impl DeckTab {
             DeckTab::Traces => "TRACES",
             DeckTab::Graph => "GRAPH",
             DeckTab::Files => "FILES",
+            DeckTab::Skills => "SKILLS",
         }
     }
 
@@ -334,7 +337,11 @@ impl WorkspaceModel {
             // agents list are out-of-band read-models, not part of the
             // event-log fold — the view state owns them, applied in
             // `ingest_inbound`, so the model deliberately ignores them here.
-            Inbound::GraphSnapshot(_) | Inbound::SlashCommands(_) | Inbound::AgentsList { .. } => {}
+            Inbound::GraphSnapshot(_)
+            | Inbound::SlashCommands(_)
+            | Inbound::AgentsList { .. }
+            | Inbound::Skills(_)
+            | Inbound::SkillSearch { .. } => {}
         }
     }
 
@@ -1301,8 +1308,9 @@ mod tests {
     #[test]
     fn deck_tab_cycles_both_ways() {
         assert_eq!(DeckTab::Session.next(), DeckTab::Agents);
-        assert_eq!(DeckTab::Session.prev(), DeckTab::Files);
-        assert_eq!(DeckTab::Files.next(), DeckTab::Session);
+        assert_eq!(DeckTab::Session.prev(), DeckTab::Skills);
+        assert_eq!(DeckTab::Files.next(), DeckTab::Skills);
+        assert_eq!(DeckTab::Skills.next(), DeckTab::Session);
     }
 
     #[test]

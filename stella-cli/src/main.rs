@@ -31,6 +31,7 @@ mod ocp;
 mod rules;
 mod runtime;
 mod settings;
+mod skill_manager;
 mod stats;
 mod tui;
 

@@ -74,6 +74,7 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
         DeckTab::Traces => views::traces::render(model, ui, content, buf),
         DeckTab::Graph => views::graph::render(model, ui, content, buf),
         DeckTab::Files => views::files::render(model, ui, content, buf),
+        DeckTab::Skills => views::skills::render(model, ui, content, buf),
     }
 
     crate::progress::render(model, ui, bands[2], buf);
@@ -746,7 +747,7 @@ fn fmt_tokens(n: u64) -> String {
 /// A centered help overlay listing the deck's keys.
 fn render_help(area: Rect, buf: &mut Buffer) {
     let w = area.width.min(62);
-    let h = area.height.min(23);
+    let h = area.height.min(27);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -816,6 +817,14 @@ fn render_help(area: Rect, buf: &mut Buffer) {
         )),
         Line::from(Span::styled(
             "  Graph:  / or Enter  browse & filter indexed files",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  SKILLS: space on/off · ctrl+x×2 delete · ←/→ pane",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "          e edit · p pin · n new (LLM) · /skills opens",
             theme::body(),
         )),
         Line::from(Span::styled(
