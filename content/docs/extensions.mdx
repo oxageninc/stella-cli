@@ -1,0 +1,164 @@
+---
+title: Extension hooks
+description: A typed, in-process event bus that lets extensions observe Stella's activity and gate policy-sensitive actions — tool calls, file writes, shell commands, and delivery — with allow / modify / deny / require-approval decisions.
+---
+
+Stella's engine (`stella-core`) exposes a typed **event bus** that extensions and embedders
+use to *observe* everything the agent does and, on an explicit allowlist of
+policy-sensitive actions, to *intercept* it. Every event flows through one uniform
+envelope, and every subscription is disposable and cleanup-safe.
+
+<Callout type="info">
+  Two different things are both called "hooks" in Stella. **[Lifecycle hooks](/docs/tools/hooks)**
+  are shell commands you declare in `settings.json` — no code required. **Extension hooks**
+  (this page) are the *programmatic* in-process bus you register handlers against when you
+  embed Stella's engine as a library. They share the event vocabulary but not the wiring.
+</Callout>
+
+## The event envelope
+
+Every event — whether an observer notification or a policy decision point — is delivered as
+a `HookEvent`:
+
+```ts
+type HookEvent<TPayload = unknown> = {
+  id: string;          // "evt_<session_id>_<sequence>"
+  name: string;        // dotted, e.g. "file.updated"
+  timestamp: string;   // ISO 8601 UTC, millisecond precision
+  session_id: string;
+  turn_id?: string;
+  agent_id?: string;
+  sequence: number;    // monotonic within a session, from 1
+  payload: unknown;
+};
+```
+
+`sequence` is monotonic per session, so a consumer that needs a total order across threads
+sorts by it. The timestamp is fixed-width, so lexicographic order equals time order.
+
+## Two kinds of handler
+
+### Observers — watch everything, change nothing
+
+Observers subscribe with `on` and are notified via `emit`. They **cannot** block, delay, or
+corrupt the primary operation — an observer that returns an error (or panics) is logged,
+surfaced as an `extension.error` event, and skipped; the operation continues regardless.
+
+```rust
+// exact name, namespace wildcard, or "*" for everything
+let sub = bus.on("file.*", |event| {
+    println!("{} touched {}", event.name, event.payload["path"]);
+    Ok(())               // Err(msg) reports a handled failure — isolated, never fatal
+});
+```
+
+Matching:
+
+| Pattern | Matches |
+| --- | --- |
+| `file.read` | exactly that event |
+| `file.*` | `file.read`, `file.created`, `file.diff.computed`, … |
+| `tool.*` | `tool.call.requested`, `tool.call.completed`, … |
+| `*` | every event |
+
+### Policy hooks — gate the sensitive actions
+
+Policy hooks subscribe with `on_blocking` and run **sequentially, in registration order**,
+*before* a policy-sensitive action proceeds. Each returns a decision:
+
+```ts
+type HookDecision =
+  | { action: "allow" }
+  | { action: "deny"; reason: string }
+  | { action: "require_approval"; reason: string }
+  | { action: "modify"; payload: unknown };
+```
+
+The chain folds every `modify` into the payload (the next handler sees the modified version)
+and **stops at the first `deny` or `require_approval`**. A chain that only ever allows or
+modifies ends in `allow`. A policy handler that panics **fails closed** — it denies.
+
+```rust
+// Require a human for production deploys.
+bus.on_blocking("deployment.*", |_event| HookDecision::RequireApproval {
+    reason: "production deploys need a human".into(),
+});
+
+// Redirect any write under /etc to a quarantine path.
+bus.on_blocking("file.updated", |event| {
+    if event.payload["path"].as_str().unwrap_or("").starts_with("etc/") {
+        let mut payload = event.payload.clone();
+        payload["path"] = "quarantine/blocked.txt".into();
+        return HookDecision::Modify { payload };
+    }
+    HookDecision::Allow
+});
+```
+
+Only these events are interceptable — the explicit allowlist of policy-sensitive actions:
+
+```text
+tool.call.requested   file.created   file.updated   file.deleted
+command.started       git.commit.requested          git.push.requested
+pull_request.requested                               deployment.requested
+```
+
+Every gated action records its outcome as a `policy.evaluated` event plus one of
+`policy.allowed` / `policy.blocked` / `approval.requested`.
+
+## Payload hygiene
+
+The bus never exposes secrets or full file contents to observers by default:
+
+- The **raw** payload of a blocking event (which may hold a whole file or a shell command)
+  reaches only **blocking handlers** — the explicitly privileged interception point. Never
+  an observer.
+- Observable tool events carry a **sanitized** input: content-bearing fields (`content`,
+  `new_string`, `old_string`) are replaced with `"<omitted: N bytes, M lines>"`.
+- Writes are scanned for high-precision secret shapes (PEM keys, AWS / GitHub / Slack /
+  Google / `sk-` tokens) → a `secret.detected` event that names only the *kind*, never the
+  match. Touches to credential-shaped paths (`.env*`, `*.pem`, `id_rsa`, …) →
+  `sensitive_operation.detected` with the path only.
+
+## Disposal
+
+`on` / `on_blocking` return a subscription. **Dropping it unsubscribes** — cleanup is
+automatic. Call `.detach()` to keep a handler for the session's lifetime, or
+`.unsubscribe()` to remove it explicitly. Removal is idempotent and safe even after the bus
+is gone.
+
+```rust
+let sub = bus.on("*", audit);
+// ... later
+sub.unsubscribe();          // or: drop(sub);  — same effect
+```
+
+## The event catalog
+
+The host emits events across these namespaces. Extensions may also emit their own names —
+the catalog is the contract for what the *host* emits.
+
+| Namespace | Events |
+| --- | --- |
+| `session.*` | `created`, `started`, `paused`, `resumed`, `cancel_requested`, `cancelled`, `completed`, `failed` |
+| `agent.*` / `transcript.*` | `agent.turn.started/completed`, `agent.thinking.*`, `agent.message.*`, `agent.error`, `transcript.entry.created/updated` |
+| `model.*` | `request.started/completed/failed`, `response.started/delta/completed`, `rate_limited`, `context.compacted` |
+| `tool.*` | `registered`, `call.requested`, `call.validated`, `call.started`, `call.progress`, `call.completed`, `call.failed`, `call.cancelled` |
+| `policy.*` / `approval.*` | `policy.evaluated/allowed/blocked`, `approval.requested/granted/denied/expired`, `secret.detected`, `sensitive_operation.detected` |
+| `file.*` / `workspace.*` / `search.*` | `file.read/created/updated/deleted/renamed/diff.computed`, `files_touched.updated`, `workspace.opened`, `workspace.index.started/completed`, `search.started/completed/failed` |
+| `command.*` / `build.*` / `test.*` | `command.started/stdout/stderr/completed/failed`, `build.*`, `test.*`, `diagnostic.detected/resolved` |
+| `git.*` / delivery | `git.status.changed`, `git.diff.created`, `git.commit.requested/created`, `git.push.requested/completed`, `pull_request.requested/created`, `deployment.requested/completed/failed` |
+| `extension.*` / `telemetry.*` | `extension.loaded/unloaded/error`, `telemetry.event.queued/flushed/failed` |
+
+## Relationship to file-touch telemetry
+
+The bus is how you react to file changes *as they happen*: the same
+[file-touch telemetry](/docs/files-touched) that Stella records also drives `file.created`,
+`file.updated`, `file.deleted`, and `files_touched.updated` events, each carrying the path,
+reason, and line deltas of the touch (never the file contents).
+
+<Callout type="warn">
+  The extension hook bus is the in-process API surfaced by `stella-core` for embedders. If
+  you only need to run a shell command on a tool call, reach for the config-driven
+  [lifecycle hooks](/docs/tools/hooks) instead — no code, no build.
+</Callout>

@@ -48,6 +48,69 @@ Two separate concerns:
 
 Both feed the [credential chain](/docs/providers#the-credential-chain).
 
+## Everything you can configure
+
+Stella is configured through three kinds of surface — **files**, **environment variables**,
+and **command-line flags** — with flags winning over env vars winning over files. This table
+is the complete map; each row links to its detail page.
+
+| What you want to set | Surface | Example |
+| --- | --- | --- |
+| Which provider/model runs | `--model` flag · `STELLA_MODEL` · `providers.<id>.default_model` | `stella --model anthropic/claude-fable-5 run "…"` |
+| A provider's API key | `--api-key` flag · provider env var · `settings.json` `api_key` · `credentials.toml` | `export ANTHROPIC_API_KEY=…` |
+| A provider's base URL | `--base-url` flag · `STELLA_BASE_URL` · `providers.<id>.base_url` | `providers.zai.base_url` → coding endpoint |
+| A provider's display name | `settings.json` `providers.<id>.name` | see [settings.json](/docs/configuration/settings) |
+| Output format (text/json/stream-json) | `--output-format` flag · `STELLA_OUTPUT_FORMAT` | `stella run --output-format json "…"` |
+| A hard USD spend cap | `--budget` flag · `STELLA_BUDGET` | `stella --budget 2.00 goal "…"` |
+| Shell commands on lifecycle events | `settings.json` `hooks` key | [Hooks](/docs/tools/hooks) |
+| Org-managed defaults for a fleet | `STELLA_MANAGED_SETTINGS` → a `settings.json` | [settings hierarchy](#the-settings-hierarchy) |
+| MCP servers to connect | `<workspace>/.stella/mcp.toml` | [MCP](/docs/tools/mcp) |
+| Custom script tools | `<workspace>/.stella/tools/*.toml` | [Custom tools](/docs/tools/custom-tools) |
+| Per-tool permission gates | `settings.json` permission model | [Permissions](/docs/tools/permissions) |
+| Force the plain REPL (no TUI) | `--plain` flag · `STELLA_PLAIN=1` | `stella --plain chat` |
+| Freeze TUI animation (CI/recordings) | `--no-anim` flag · `STELLA_NO_ANIM` · `NO_COLOR` | `stella --no-anim chat` |
+
+<Callout type="info">
+  Stella **auto-detects** the provider from whichever API keys are present in your
+  environment — the minimum viable configuration is a single `*_API_KEY` env var and nothing
+  else. Everything above is for when you want to override that default behavior.
+</Callout>
+
+### Common tasks
+
+**Point a Z.ai coding-plan subscription at its endpoint** (project scope):
+
+```json title=".stella/settings.json"
+{ "providers": { "zai": { "base_url": "https://api.z.ai/api/coding/paas/v4" } } }
+```
+
+**Pin a model and a hard budget for an unattended CI run:**
+
+```bash
+STELLA_MODEL=anthropic/claude-fable-5 STELLA_BUDGET=5 \
+  stella run --output-format json "port the utils module to the new API"
+```
+
+**Ship org-wide defaults every project inherits** (a gateway URL + team key), leaving
+projects free to override per field:
+
+```bash
+export STELLA_MANAGED_SETTINGS=/etc/stella/managed-settings.json
+```
+
+**Run against a local OpenAI-compatible server** (Ollama, vLLM, LM Studio):
+
+```bash
+stella --model local/llama3.1 --base-url http://localhost:11434/v1 run "…"
+```
+
+**Gate every `bash` call through a guard script** (`settings.json`):
+
+```json
+{ "hooks": { "PreToolUse": [ { "matcher": "bash",
+  "hooks": [ { "command": "./scripts/guard.sh", "timeoutMs": 5000 } ] } ] } }
+```
+
 ## Inspecting the resolved configuration
 
 ```bash

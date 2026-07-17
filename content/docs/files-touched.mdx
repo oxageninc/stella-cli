@@ -1,0 +1,141 @@
+---
+title: Files touched
+description: Stella records every file it reads, creates, updates, or deletes — as a per-session CRUD ledger with reasons and line-delta counts, surfaced live in the TUI, in JSON output, and in the local store.
+---
+
+Every time Stella touches a file through one of its file tools, it records the touch in a
+per-session **file-touch ledger**: which file, what happened (**C**reate / **R**ead /
+**U**pdate / **D**elete), *why*, and how many lines it added and removed. The ledger is
+surfaced live in the TUI, included in `--output-format json` output, and persisted to the
+local store — so you always have an auditable record of exactly what a run changed.
+
+## What gets recorded
+
+Only Stella's dedicated file tools are attributable. Shell commands are opaque — Stella
+cannot see what a `bash` command did to the filesystem, which is one reason the file tools
+exist and the agent is steered toward them.
+
+| Tool | CRUD event | Line counts |
+| --- | --- | --- |
+| `read_file` | **R** | always `0` added, `0` removed |
+| `write_file` (new path) | **C** | `lines_added` = the full new file's line count |
+| `write_file` (existing path) | **U** | the line diff of pre- vs post-write content |
+| `edit_file` | **U** | the line diff of the replaced region |
+| `delete_file` | **D** | `lines_removed` = the full pre-deletion line count |
+
+A **failed** operation records nothing — a blocked write, a missing file, or an
+out-of-workspace path never produces a ledger entry.
+
+### The `reason` field
+
+Each of `read_file`, `write_file`, `edit_file`, and `delete_file` accepts an optional
+`reason` string. It is stored verbatim in the audit log so the ledger reads like a
+changelog rather than a list of paths. When omitted, Stella fills in a per-operation
+default (`"file updated (no reason given)"`, etc.).
+
+```jsonc
+// the model calls edit_file like this
+{
+  "path": "src/router.rs",
+  "old_string": "…",
+  "new_string": "…",
+  "reason": "route /health to the new readiness probe"
+}
+```
+
+## The record shape
+
+Touches aggregate by **normalized, workspace-relative POSIX path**, so equivalent
+spellings (`src/main.rs`, `src/./main.rs`, `./src/main.rs`) collapse into one record. Each
+record keeps:
+
+- `crud_events` — the **unique** CRUD letters in first-seen order (e.g. `["R","U"]`).
+- `lines_added` / `lines_removed` — the aggregate totals across every touch.
+- `events` — the **complete, ordered** audit log, one entry per touch, never deduplicated.
+
+```json
+{
+  "files_touched": [
+    {
+      "path": "src/router.rs",
+      "crud_events": ["R", "U"],
+      "lines_added": 18,
+      "lines_removed": 4,
+      "events": [
+        { "event": "R", "reason": "inspect before editing", "lines_added": 0, "lines_removed": 0 },
+        { "event": "U", "reason": "route /health to the readiness probe", "lines_added": 18, "lines_removed": 4 }
+      ]
+    }
+  ]
+}
+```
+
+<Callout type="info">
+  `crud_events` is deduplicated (three reads show one `R`); `events` is not (three reads
+  show three entries). The first is the compact "what kinds of change happened here"; the
+  second is the full receipt.
+</Callout>
+
+### How the line counts are defined
+
+- A **line** is a `str::lines()` item: `""` is 0 lines, and a trailing newline does not add
+  one.
+- **Update** deltas come from a minimal line diff (longest-common-subsequence) of the
+  pre-write versus post-write content — a moved line counts as one removal plus one
+  addition, not zero.
+- All counts are non-negative integers, and a record's totals always equal the sum of its
+  events' deltas.
+
+## Where you see it
+
+### Live in the TUI
+
+Interactive sessions render a **Files touched** panel that updates as the agent works,
+showing each path with its compact CRUD string (e.g. `src/router.rs  RU`).
+
+### In JSON output
+
+`stella run --output-format json` includes the full telemetry payload under `files_touched`, so a
+script can assert on exactly what a run changed:
+
+```bash
+stella run --output-format json "add a --health flag and wire the readiness probe" \
+  | jq '.files_touched[] | {path, crud_events, lines_added, lines_removed}'
+```
+
+```json
+{ "path": "src/router.rs", "crud_events": ["R","U"], "lines_added": 18, "lines_removed": 4 }
+{ "path": "src/health.rs",  "crud_events": ["C"],     "lines_added": 22, "lines_removed": 0 }
+```
+
+### Persisted to the local store
+
+Every execution's file-touch ledger is written to Stella's local session store at
+`<workspace>/.stella/store.db` (one row per touched path, with the CRUD letters, line-delta
+totals, and the JSON audit log). Like the rest of [Stella's telemetry](/docs/telemetry),
+it stays entirely on your machine.
+
+## Common tasks
+
+**Fail CI when a run edits files outside a directory.**
+
+```bash
+touched=$(stella run --output-format json "$TASK" | jq -r '.files_touched[].path')
+echo "$touched" | grep -qv '^src/' && { echo "run touched files outside src/"; exit 1; }
+```
+
+**Get a one-line change summary of a run.**
+
+```bash
+stella run --output-format json "$TASK" \
+  | jq -r '.files_touched[] | "\(.crud_events|join("")) \(.path) (+\(.lines_added) -\(.lines_removed))"'
+# CU src/router.rs (+18 -4)
+# C  src/health.rs (+22 -0)
+```
+
+<Callout type="info">
+  Want a program to react to touches *as they happen* rather than reading the summary at the
+  end? The [extension hooks](/docs/extensions) event bus emits `file.created`,
+  `file.updated`, `file.deleted`, and `files_touched.updated` events with the same
+  per-touch data.
+</Callout>

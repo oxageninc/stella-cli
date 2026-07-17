@@ -7,6 +7,13 @@ Hooks are shell commands that fire on agent lifecycle events. They are configure
 
 Each hook receives the event payload as **JSON on stdin**, so your command can read the event details and react to them.
 
+<Callout type="info">
+  This page covers the **config-driven shell hooks** — the `hooks` key in `settings.json`,
+  no code required. For the *programmatic* in-process event bus (observe every event, gate
+  actions with allow / modify / deny / require-approval, in code when you embed Stella's
+  engine), see [Extension hooks](/docs/extensions).
+</Callout>
+
 ## Events
 
 Stella fires hooks on three lifecycle events. Each behaves differently, and each has its own rules for matching and blocking.
