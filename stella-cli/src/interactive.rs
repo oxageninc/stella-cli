@@ -133,7 +133,12 @@ impl SkillRegistry {
             ),
             install_cmd: parse(
                 "STELLA_SKILLS_INSTALL_CMD",
-                &["npx", "skills", "add", "{id}"],
+                // `--yes` skips the interactive "which agents do you want to install
+                // to?" multi-select that the registry CLI otherwise shows — it would
+                // hang forever when stella runs it with stdin null. `-y` is the short
+                // form the CLI prints in its own hint ("use --yes (-y) … to install
+                // without prompts").
+                &["npx", "skills", "add", "--yes", "{id}"],
             ),
             use_cmd: parse("STELLA_SKILLS_USE_CMD", &["npx", "skills", "use", "{id}"]),
             workspace_root,
@@ -698,5 +703,28 @@ mod tests {
             ToolOutput::Ok { content } => assert_eq!(content, "inner ran bash"),
             other => panic!("expected inner fallthrough, got {other:?}"),
         }
+    }
+
+    /// The default install command must carry `--yes`: `npx skills add` is
+    /// otherwise an interactive multi-select that hangs forever when stella
+    /// runs it with stdin null. Locking the default here guards against a
+    /// regression that would silently re-break TUI installs.
+    #[test]
+    fn default_install_cmd_is_non_interactive() {
+        // Clear any override so the default path is exercised.
+        let _lock = crate::test_env::lock();
+        unsafe {
+            std::env::remove_var("STELLA_SKILLS_INSTALL_CMD");
+        }
+        let reg = SkillRegistry::from_env(std::path::PathBuf::from("/ws"));
+        assert!(
+            reg.install_cmd
+                .iter()
+                .any(|t| t == "--yes" || t == "-y"),
+            "default install cmd must be non-interactive (have --yes/-y): {:?}",
+            reg.install_cmd
+        );
+        // The {id} placeholder is still present for substitution.
+        assert!(reg.install_cmd.iter().any(|t| t.contains("{id}")));
     }
 }

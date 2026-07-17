@@ -339,9 +339,15 @@ pub fn adopt_tree(
     let dest_root = scope_root(scope, workspace_root)
         .ok_or_else(|| "no $HOME for the user scope".to_string())?;
     let dest = dest_root.join(&slug);
-    std::fs::create_dir_all(&dest).map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
+    // Write both the pinned `SKILL.md` the recall loader reads and a `versions/v1`
+    // snapshot, so an installed skill is managed like a created one: the tab shows
+    // a real version, and edit/pin start from a proper history rather than the
+    // `.max(1)` fallback for a version-less entry.
+    let v1 = dest.join("versions").join("v1");
+    std::fs::create_dir_all(&v1).map_err(|e| format!("cannot create {}: {e}", v1.display()))?;
     std::fs::write(dest.join("SKILL.md"), &content)
         .map_err(|e| format!("cannot write skill: {e}"))?;
+    std::fs::write(v1.join("SKILL.md"), &content).map_err(|e| e.to_string())?;
     let name = skill_from_file_with_origin(
         &dest.join("SKILL.md").display().to_string(),
         &content,
@@ -846,5 +852,18 @@ mod tests {
                 .iter()
                 .any(|r| r.name == "auth-helper" && r.scope == SkillScope::User)
         );
+        // An adopted skill has a real v1 history (not the version-less fallback),
+        // so the tab shows a version and edit/pin start from a proper baseline.
+        assert!(
+            home.join(".config/stella/skills/auth-helper/versions/v1/SKILL.md")
+                .exists(),
+            "adopted skill gets a versions/v1 snapshot"
+        );
+        let row = enumerate(&ws)
+            .into_iter()
+            .find(|r| r.name == "auth-helper")
+            .unwrap();
+        assert_eq!(row.version, 1);
+        assert_eq!(row.latest, 1);
     }
 }
