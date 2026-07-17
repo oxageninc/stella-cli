@@ -215,6 +215,7 @@ fn join_rows(memories: Vec<NodeRow>, stats: &[MemoryCitationStats]) -> Vec<Memor
                 truthful_rate: s.truthful_rate,
                 positive_streak: s.positive_streak,
                 eligible: s.eligible,
+                quarantined: s.quarantined,
                 memory: node.content.trim().to_string(),
             }),
             None => uncited.push(MemoryListRow {
@@ -224,6 +225,7 @@ fn join_rows(memories: Vec<NodeRow>, stats: &[MemoryCitationStats]) -> Vec<Memor
                 truthful_rate: 0.0,
                 positive_streak: 0,
                 eligible: false,
+                quarantined: false,
                 memory: node.content.trim().to_string(),
             }),
         }
