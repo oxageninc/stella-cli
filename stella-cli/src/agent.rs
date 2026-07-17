@@ -1011,7 +1011,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     }
 
     loop {
-        print!("{} ", ">".bright_cyan().bold());
+        print!("{} ", ">".yellow().bold());
         std::io::stdout().flush().map_err(|e| e.to_string())?;
 
         let mut input = String::new();
@@ -1608,7 +1608,7 @@ pub async fn run_init(
             let provider = build_provider(&cfg)?;
             println!(
                 "  {} inferring domains with {}/{}…",
-                "◈".cyan(),
+                "◈".yellow(),
                 cfg.provider.id,
                 cfg.model_id
             );
@@ -1631,7 +1631,7 @@ pub async fn run_init(
         println!(
             "    {} {} — {} [{}]",
             "·".dimmed(),
-            domain.name.bright_blue(),
+            domain.name.bright_magenta(),
             domain.description.dimmed(),
             domain.paths.join(", ").dimmed()
         );
@@ -1746,7 +1746,7 @@ pub(crate) async fn connect_mcp(
         if set.connected_count() > 0 {
             println!(
                 "  {} {} MCP server(s) connected",
-                "◆".cyan(),
+                "◆".yellow(),
                 set.connected_count()
             );
         }
@@ -1844,7 +1844,7 @@ pub fn run_tools_listing() -> Result<(), String> {
         println!(
             "    {} {} — {}",
             "·".green(),
-            tool.name.bright_blue(),
+            tool.name.bright_magenta(),
             tool.description.dimmed()
         );
     }
@@ -1921,7 +1921,7 @@ pub fn run_tools_validation(dir: Option<&std::path::Path>) -> Result<(), String>
             .as_deref()
             .map(|n| format!(" ({n})"))
             .unwrap_or_default();
-        println!("  {mark} {}{}", manifest.path.display(), name.bright_blue());
+        println!("  {mark} {}{}", manifest.path.display(), name.bright_magenta());
         for issue in &manifest.issues {
             let (label, message) = match issue.severity {
                 validate::Severity::Error => ("error:".red().bold(), issue.message.red()),
@@ -2428,8 +2428,8 @@ async fn run_goal_turn(
         println!(
             "  {} cross-family judge: {} worker · {} judge — independent, bias-resistant \
              assessment\n",
-            "◆".cyan(),
-            cfg.provider.id.bright_blue(),
+            "◆".yellow(),
+            cfg.provider.id.bright_magenta(),
             judge_id.bright_green(),
         );
     }
@@ -2765,46 +2765,46 @@ fn resolve_cross_family_judge(
 }
 
 fn print_help() {
-    println!("  {}\n", "Stella Commands".cyan().bold());
+    println!("  {}\n", "Stella Commands".yellow().bold());
     println!("  {}  Send a prompt to the agent", "type message".dimmed());
     println!(
         "  {}       List configured providers and models",
-        "/models".bright_blue()
+        "/models".bright_magenta()
     );
     println!(
         "  {}        Show current configuration",
-        "/config".bright_blue()
+        "/config".bright_magenta()
     );
     println!(
         "  {}         Clear conversation history",
-        "/clear".bright_blue()
+        "/clear".bright_magenta()
     );
     println!(
         "  {}  Work in judged rounds until a judge confirms the goal is met",
-        "/goal <text>".bright_blue()
+        "/goal <text>".bright_magenta()
     );
     println!(
         "  {}       Show files touched this session",
-        "/files".bright_blue()
+        "/files".bright_magenta()
     );
     println!(
         "  {}      List custom agents (⚡ from .stella/agents or ~/.config/stella/agents)",
-        "/agents".bright_blue()
+        "/agents".bright_magenta()
     );
     println!(
         "  {} Rename this terminal tab",
-        "/rename <name>".bright_blue()
+        "/rename <name>".bright_magenta()
     );
     println!(
         "  {}  Change the accent color (multi-window)",
-        "/color <name>".bright_blue()
+        "/color <name>".bright_magenta()
     );
     println!(
         "  {}          Index the workspace: domain taxonomy + code graph",
-        "/init".bright_blue()
+        "/init".bright_magenta()
     );
-    println!("  {}          Show this help", "/help".bright_blue());
-    println!("  {}          Exit Stella", "/exit".bright_blue());
+    println!("  {}          Show this help", "/help".bright_magenta());
+    println!("  {}          Exit Stella", "/exit".bright_magenta());
     println!("  {}         Exit Stella", "Ctrl+D".dimmed());
     println!();
 }

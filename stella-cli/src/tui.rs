@@ -45,13 +45,15 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
 /// Selectable accent palette — `/color` switches the session's accent so
 /// multiple terminal windows running stella are visually distinct at a
 /// glance (see [`set_accent`], and [`rename_tab`] for the `/rename` sibling).
-const PALETTE: [(&str, Color); 6] = [
-    ("magenta", Color::Magenta),
-    ("cyan", Color::Cyan),
+// Only Stella's principle hues (plus the shared success green) — no cyan, no
+// blue. `colored`'s named ANSI colors are the portable stand-ins for the brand
+// palette: violet≈bright-magenta, gold≈yellow, ember≈bright-red, crimson≈magenta.
+const PALETTE: [(&str, Color); 5] = [
+    ("violet", Color::BrightMagenta),
+    ("gold", Color::Yellow),
+    ("ember", Color::BrightRed),
+    ("crimson", Color::Magenta),
     ("green", Color::Green),
-    ("yellow", Color::Yellow),
-    ("blue", Color::Blue),
-    ("red", Color::Red),
 ];
 
 static ACCENT: AtomicUsize = AtomicUsize::new(0);
@@ -101,7 +103,7 @@ pub fn files_touched_panel(entries: &[(String, String)]) {
             .chars()
             .map(|op| match op {
                 'C' => "C".green().to_string(),
-                'R' => "R".blue().to_string(),
+                'R' => "R".bright_magenta().to_string(),
                 'U' => "U".yellow().to_string(),
                 'D' => "D".red().to_string(),
                 other => other.to_string(),
@@ -133,8 +135,8 @@ fn file_tool_card(name: &str, input: &serde_json::Value) -> bool {
             };
             println!(
                 "  {} {} {}{}",
-                "▷".blue(),
-                "read".blue(),
+                "▷".bright_magenta(),
+                "read".bright_magenta(),
                 path,
                 range.dimmed()
             );
@@ -180,7 +182,7 @@ pub fn tool_call_card(name: &str, input: &serde_json::Value, status: &str) {
         return;
     }
     let icon = match status {
-        "running" => "▶".cyan(),
+        "running" => "▶".bright_red(),
         "ok" => "✓".green(),
         "error" => "✗".red(),
         _ => "·".dimmed(),
@@ -197,7 +199,7 @@ pub fn tool_call_card(name: &str, input: &serde_json::Value, status: &str) {
                     } else {
                         v.to_string()
                     };
-                    format!("{}={}", k.bright_blue(), val_str)
+                    format!("{}={}", k.bright_magenta(), val_str)
                 })
                 .collect();
             summary.join(" ")
@@ -262,7 +264,7 @@ pub fn cost_summary(cost_usd: f64, model: &str, elapsed: Duration) {
     println!(
         "\n  {} {} · {} · {:.1}s",
         "◆".dimmed(),
-        model.bright_blue(),
+        model.bright_magenta(),
         fmt_cost(cost_usd),
         elapsed.as_secs_f64(),
     );
@@ -286,8 +288,8 @@ pub fn welcome_banner(provider: &str, model: &str, workspace: &str) {
     );
     println!(
         "  {} {} · {} · {}",
-        "◆".cyan(),
-        format!("{provider}/{model}").bright_blue(),
+        "◆".yellow(),
+        format!("{provider}/{model}").bright_magenta(),
         workspace.dimmed(),
         "type your prompt, Ctrl+D to exit".dimmed(),
     );
@@ -363,7 +365,7 @@ pub fn render_event(event: &AgentEvent) {
 /// tone via `colored` (bold when `strong`), the detail tail is dimmed.
 fn styled_event_line(line: &EventLine) -> String {
     let glyph = match line.tone {
-        Tone::Info => line.glyph.cyan(),
+        Tone::Info => line.glyph.bright_magenta(),
         Tone::Success => line.glyph.green(),
         Tone::Warn => line.glyph.yellow(),
         Tone::Error => line.glyph.red(),

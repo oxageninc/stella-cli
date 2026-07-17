@@ -720,11 +720,11 @@ impl Config {
     }
 
     pub fn print_config(&self) {
-        println!("{}\n", "Stella — Current Configuration".cyan().bold());
-        println!("  Provider:   {}", self.provider.display_name.bright_blue());
+        println!("{}\n", "Stella — Current Configuration".yellow().bold());
+        println!("  Provider:   {}", self.provider.display_name.bright_magenta());
         println!(
             "  Model:      {}/{}",
-            self.provider.id.bright_blue(),
+            self.provider.id.bright_magenta(),
             self.model_id.bright_white()
         );
         println!("  API Key:    {}", self.api_key.redacted_preview().dimmed());
@@ -839,7 +839,7 @@ impl Config {
         };
         println!(
             "{}\n",
-            "Stella — Available Providers & Models".cyan().bold()
+            "Stella — Available Providers & Models".yellow().bold()
         );
         let key_status = |p: &ProviderConfig, settings_key: bool| {
             let has_key = settings_key
@@ -862,7 +862,7 @@ impl Config {
             println!(
                 "  {} {}/{}  {}  [{}]",
                 key_status(&p, settings_key),
-                p.id.bright_blue(),
+                p.id.bright_magenta(),
                 p.default_model.bright_white(),
                 p.display_name,
                 p.base_url.dimmed(),
@@ -888,7 +888,7 @@ impl Config {
             println!(
                 "  {} {}/{}  {}  [{}] ({})",
                 key_status(&p, settings_key),
-                p.id.bright_blue(),
+                p.id.bright_magenta(),
                 if p.default_model.is_empty() {
                     "<model>"
                 } else {

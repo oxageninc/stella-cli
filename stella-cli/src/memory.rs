@@ -514,7 +514,7 @@ impl SessionMemory {
                             println!(
                                 "  {} new skill auto-created from recurring observations: {} ({})",
                                 "✦".magenta().bold(),
-                                candidate.name.bright_blue(),
+                                candidate.name.bright_magenta(),
                                 path.display()
                             );
                         }

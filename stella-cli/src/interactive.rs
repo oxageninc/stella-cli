@@ -56,7 +56,7 @@ impl AskUserIo for TtyAskUserIo {
     async fn prompt(&self, question: &str, options: &[String]) -> Result<String, String> {
         println!("\n  {} {}", "?".yellow().bold(), question.bold());
         for (i, option) in options.iter().enumerate() {
-            println!("    {} {}", format!("{})", i + 1).cyan(), option);
+            println!("    {} {}", format!("{})", i + 1).yellow(), option);
         }
         print!("  {} ", "answer (number or text):".dimmed());
         std::io::stdout().flush().map_err(|e| e.to_string())?;

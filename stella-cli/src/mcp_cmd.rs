@@ -211,7 +211,7 @@ fn run_list(workspace_root: &Path) -> Result<(), String> {
         println!(
             "  {} {} {} {}",
             "·".green(),
-            name.bright_blue(),
+            name.bright_magenta(),
             format!("[{}]", transport.kind_label()).dimmed(),
             auth
         );
@@ -246,7 +246,7 @@ fn run_search(workspace_root: &Path, query: &str, limit: u32) -> Result<(), Stri
         println!(
             "  {} {} {}",
             "·".green(),
-            server.name.bright_blue(),
+            server.name.bright_magenta(),
             format!("[{kinds}]").dimmed()
         );
         if let Some(desc) = &server.description {
@@ -267,9 +267,9 @@ fn run_install(workspace_root: &Path, name: &str, alias: Option<String>) -> Resu
     install(workspace_root, &alias, option.transport)?;
     println!(
         "  {} installed {} as {} ({})",
-        "◆".cyan(),
-        name.bright_blue(),
-        alias.bright_blue(),
+        "◆".yellow(),
+        name.bright_magenta(),
+        alias.bright_magenta(),
         option.label.dimmed()
     );
     if !option.auth.is_empty() {
@@ -293,7 +293,7 @@ fn run_install(workspace_root: &Path, name: &str, alias: Option<String>) -> Resu
 
 fn run_remove(workspace_root: &Path, name: &str) -> Result<(), String> {
     if remove(workspace_root, name)? {
-        println!("  {} removed {}", "◆".cyan(), name.bright_blue());
+        println!("  {} removed {}", "◆".yellow(), name.bright_magenta());
         Ok(())
     } else {
         Err(format!("no configured MCP server named `{name}`"))
@@ -321,8 +321,8 @@ fn run_usage(workspace_root: &Path) -> Result<(), String> {
         println!(
             "  {} {} {} {} {}",
             "·".green(),
-            format!("{}×", stat.calls).bright_blue(),
-            stat.server.bright_blue(),
+            format!("{}×", stat.calls).bright_magenta(),
+            stat.server.bright_magenta(),
             stat.tool,
             reason
         );

@@ -327,7 +327,7 @@ fn render_watch_line(watch: &BranchWatch) {
     println!(
         "  {mark} {} {} — {ci} · {pr}",
         watch.task_id.bold(),
-        watch.branch.bright_blue()
+        watch.branch.bright_magenta()
     );
 }
 
@@ -525,7 +525,7 @@ fn render_report(plan: &Plan, report: &FleetRunReport, dot_stella: &Path) {
             println!(
                 "      {} {} @ {}",
                 "↳".dimmed(),
-                worktree.branch.bright_blue(),
+                worktree.branch.bright_magenta(),
                 worktree.path.display().to_string().dimmed()
             );
         }

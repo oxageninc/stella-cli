@@ -167,7 +167,7 @@ fn promote_in(workspace_root: &std::path::Path, id: &str) -> Result<(), String> 
             println!(
                 "  {} promoted memory {} → {}",
                 "✦".magenta().bold(),
-                id.bright_blue(),
+                id.bright_magenta(),
                 path.display()
             );
             println!(
