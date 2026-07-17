@@ -1,11 +1,12 @@
 # Self-improvement: current state and what's missing
 
-<<<<<<< HEAD
 **Status: All 5 proposals implemented.** See the implementation summary at
 the bottom of this document.
 
-=======
->>>>>>> origin/main
+**Status: All 5 proposals implemented.** See the implementation summary at
+the bottom of this document.
+
+>>>>>>> 528c53636f7627e7437551f36873affa3e206e42
 An honest assessment of whether the reflection-and-recall loop actually
 makes the agent better over time, and concrete proposals to guarantee
 improvement instead of relying on hope.
@@ -16,10 +17,10 @@ improvement instead of relying on hope.
 
 Four mechanisms exist today, each verified against the live workspace:
 
-```
+```bash
             ┌─────────────────────────────────────────────────────┐
             │                                                     │
-  recall    │  turn start: similarity + domain + recency recall  │
+  recall    │  turn start: similarity + domain + recency recall   │
    ───────► │  injects a volatile [auto-recalled context] block   │
             │  after the byte-stable system prefix (L-E8)         │
             │                                                     │
@@ -51,7 +52,7 @@ So the machinery runs. The question is whether it *works*.
 
 ---
 
-## Does it give me an advantage? Honestly: partially.
+## Does it give me an advantage? Honestly: partially
 
 ### What works
 
@@ -112,11 +113,11 @@ conversation — a real failure mode that produces no lesson.
 A self-improvement loop needs three properties to *guarantee* monotonic
 improvement rather than hopeful accumulation:
 
-| property | meaning | current state |
-|---|---|---|
-| **directionality** | a measurable signal for "better" | partial — episode outcomes exist but aren't connected to reflection |
-| **attribution** | link outcomes to specific lessons/behaviors | weak — citations measure usage, not causal impact |
-| **pruning** | remove lessons that are wrong or stale | absent — `truthful=false` exists but has no effect on recall ranking |
+| property           | meaning                                     | current state                                                        |
+| ------------------ | ------------------------------------------- | -------------------------------------------------------------------- |
+| **directionality** | a measurable signal for "better"            | partial — episode outcomes exist but aren't connected to reflection  |
+| **attribution**    | link outcomes to specific lessons/behaviors | weak — citations measure usage, not causal impact                    |
+| **pruning**        | remove lessons that are wrong or stale      | absent — `truthful=false` exists but has no effect on recall ranking |
 
 The proposals below address each gap. They are ordered by leverage: the
 first three are high-impact and relatively low-effort; the last two are
@@ -244,13 +245,13 @@ be re-checked with a `definitions` query.
 
 ## Summary: the gap between "wired" and "working"
 
-| mechanism | wired? | ever fired? | measures impact? |
-|---|---|---|---|
-| reflection recording | ✅ | ✅ (12 lessons) | ❌ no outcome signal |
-| recall at turn start | ✅ | ✅ (this session) | ❌ no control |
-| skill auto-creation | ✅ | ❌ (0 skills) | n/a |
-| memory citation | ✅ | ✅ (2 rows) | ❌ usage, not impact |
-| citation-driven pruning | ✅ | ❌ (no effect on recall) | ❌ |
+| mechanism               | wired? | ever fired?              | measures impact?     |
+| ----------------------- | ------ | ------------------------ | -------------------- |
+| reflection recording    | y      | yes (12 lessons)         | no outcome signal    |
+| recall at turn start    | y      | yes (this session)       | no control           |
+| skill auto-creation     | y      | no (0 skills)            | n/a                  |
+| memory citation         | y      | yes (2 rows)             | no usage, not impact |
+| citation-driven pruning | y      | no (no effect on recall) | no                   |
 
 The system is **architecturally complete but feedback-starved**. Every
 mechanism is built and tested, but the loop is open: outcomes don't reach
@@ -272,7 +273,7 @@ The five proposals close the loop in priority order:
 Together they transform the loop from "accumulate lessons and hope" to
 "record outcomes, attribute them, prune failures, and measure the delta."
 That is what guarantees improvement over time.
-<<<<<<< HEAD
+>>>>>>> 528c53636f7627e7437551f36873affa3e206e42
 
 ---
 
@@ -280,7 +281,8 @@ That is what guarantees improvement over time.
 
 All five proposals are now implemented and tested:
 
-### Proposal 1: Outcome-grounded reflection ✅
+### Proposal 1: Outcome-grounded reflection
+
 - `reflect_and_record` and `reflect_on_turn` now accept a `succeeded: bool`
   parameter.
 - On failure: the prompt asks "identify the root cause — wrong assumption,
@@ -289,12 +291,14 @@ All five proposals are now implemented and tested:
   updated to pass the outcome.
 
 ### Proposal 2: Failure-to-lesson pipeline ✅ (via Proposal 1)
+
 - The outcome-grounded prompt IS the failure-to-lesson pipeline: on a
   failed turn the model is asked to produce a root-cause lesson directly
   from the failure evidence. The failure prompt explicitly asks for
   actionable, forward-looking lessons ("what should change next time").
 
-### Proposal 3: Truthful suppression ✅
+### Proposal 3: Truthful suppression
+
 - `QUARANTINE_NEGATIVES_THRESHOLD = 2` — a memory cited untruthful ≥ 2 times
   is quarantined (total untruthful count, not streak).
 - `MemoryCitationStats` gains a `quarantined` field, computed by
@@ -305,7 +309,8 @@ All five proposals are now implemented and tested:
 - `stella memory list` shows quarantined memories in the STATUS column
   and prints a summary count.
 
-### Proposal 4: A/B measurement ✅
+### Proposal 4: A/B measurement
+
 - `SessionMemory::maybe_suppress_recall(rate)` — deterministic `1/N` coin
   flip suppresses recall for that turn.
 - `STELLA_AB_RECALL_RATE = 10` — ~10% of REPL turns are control turns.
@@ -313,12 +318,11 @@ All five proposals are now implemented and tested:
   for later analysis.
 - Wired into the interactive REPL's recall path.
 
-### Proposal 5: Periodic re-validation ✅
+### Proposal 5: Periodic re-validation
+
 - `stella memory validate` subcommand scans each memory for file-path
   anchors (`stella-cli/src/agent.rs`, `docs/hooks.md`), checks whether
   those paths still exist, and reports stale memories.
 - `extract_path_anchors` extracts workspace-relative paths from memory text.
 - `validate_memories` checks anchors against the current file tree.
 - Reports ok / stale / no-anchors counts with per-memory detail.
-=======
->>>>>>> origin/main
