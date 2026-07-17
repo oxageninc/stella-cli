@@ -431,9 +431,6 @@ pub async fn run_deck_session(
                     }
                     continue 'session;
                 }
-                // A stray answer/decision/control with no turn in flight has
-                // nothing to act on.
-                Some(_) => continue 'session,
                 // LLM-assisted agent creation needs the provider, which is
                 // free here (no turn in flight) — draft, install, refresh.
                 Some(WorkspaceInput::AgentCreate { description, scope }) => {
