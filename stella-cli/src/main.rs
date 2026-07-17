@@ -350,7 +350,7 @@ fn use_deck(plain_flag: bool) -> bool {
     !plain_flag && !plain_env && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-/// The five code-graph queries, mirroring the `code_graph` agent tool's ops
+/// The five code-graph queries, mirroring the `graph_query` agent tool's ops
 /// one-for-one so a human at the CLI and the model inside a turn see the
 /// same frames for the same question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -380,7 +380,7 @@ impl GraphOp {
 }
 
 /// `stella graph <op> <target>` — the human door to the same query surface
-/// the `code_graph` tool gives the agent. Frames print exactly as the model
+/// the `graph_query` tool gives the agent. Frames print exactly as the model
 /// would receive them.
 fn run_graph(op: GraphOp, target: &str) -> Result<(), String> {
     let root =

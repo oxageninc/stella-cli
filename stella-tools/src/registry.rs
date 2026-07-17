@@ -46,7 +46,7 @@ struct PendingTouch {
 /// persisted as the session's file-touch telemetry.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
-    /// Tools enabled AFTER construction — currently just `code_graph`, once a
+    /// Tools enabled AFTER construction — currently just `graph_query`, once a
     /// mid-session `stella init` / `/init` builds the index. Kept in a
     /// separate interior-mutable overlay so the primary `tools` map stays
     /// immutable and lock-free; the overlay is consulted as a fallback in the
@@ -216,9 +216,10 @@ impl ToolRegistry {
         self.bus.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// Enable the `code_graph` query tool if `stella init` has since built the
-    /// index and it isn't already registered. Idempotent, cheap, and safe to
-    /// call every turn. Lets a mid-session `/init` expose `code_graph` to
+    /// Enable the `graph_query` tool once the code-graph index has been built
+    /// and it isn't already registered. Idempotent, cheap, and safe to
+    /// call every turn. Lets a background session-start build (or a mid-session
+    /// `/init`) expose `graph_query` to
     /// subsequent turns without rebuilding the whole registry (and its MCP
     /// wrapper) — the overlay is shared through every `&ToolRegistry` /
     /// `Arc<ToolRegistry>` reference the session already holds.
@@ -869,12 +870,12 @@ mod tests {
         }
 
         // Conditionally-registered tools never show up in a bare registry's
-        // schemas (code_graph needs an index on disk, the media tools need a
+        // schemas (graph_query needs an index on disk, the media tools need a
         // capable key), so the registry-driven loop above can't catch them
         // drifting out of RESERVED_NAMES. Pin them explicitly — if you add a
         // new conditionally-registered tool, add its name to this array.
         const CONDITIONALLY_REGISTERED: &[&str] = &[
-            "code_graph",
+            "graph_query",
             "generate_image",
             "generate_video",
             "poll_video",
@@ -1020,19 +1021,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn code_graph_tool_is_enabled_after_a_mid_session_index_build() {
+    async fn graph_query_tool_is_enabled_after_a_mid_session_index_build() {
         // A session that starts without a code-graph index doesn't advertise
-        // `code_graph`; once `stella init` / `/init` builds the index,
+        // `graph_query`; once the background build / `/init` builds the index,
         // `enable_code_graph_if_available` must expose it for the rest of the
         // session (schema advertised AND dispatchable) without a rebuild.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let reg = ToolRegistry::with_issue_backend(root.clone(), None);
-        let has_code_graph = |r: &ToolRegistry| r.schemas().iter().any(|s| s.name == "code_graph");
+        let has_graph_query =
+            |r: &ToolRegistry| r.schemas().iter().any(|s| s.name == "graph_query");
 
-        assert!(!has_code_graph(&reg), "no index → not advertised");
+        assert!(!has_graph_query(&reg), "no index → not advertised");
         reg.enable_code_graph_if_available(&root); // no index yet: a no-op
-        assert!(!has_code_graph(&reg));
+        assert!(!has_graph_query(&reg));
 
         // Build a minimal index, exactly what `stella init` does.
         std::fs::write(root.join("lib.rs"), "pub fn f() {}\n").unwrap();
@@ -1043,15 +1045,15 @@ mod tests {
         graph.shutdown();
 
         reg.enable_code_graph_if_available(&root);
-        assert!(has_code_graph(&reg), "index built → now advertised");
+        assert!(has_graph_query(&reg), "index built → now advertised");
         // And it actually dispatches through the overlay.
         let out = reg
             .execute(
-                "code_graph",
+                "graph_query",
                 &serde_json::json!({"op": "definitions", "target": "f"}),
             )
             .await;
-        assert!(!out.is_error(), "code_graph must dispatch: {out:?}");
+        assert!(!out.is_error(), "graph_query must dispatch: {out:?}");
     }
 
     #[test]

@@ -55,7 +55,7 @@ You have these tools available:
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
 - bash: Run a shell command in the workspace root (with timeout)
-- code_graph: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. Appears only when `.stella/codegraph.db` exists (run `stella init` to build it).
+- graph_query: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. The index is built automatically at session start and refreshes live as files change.
 - grep: Search file contents with regex (shells to ripgrep)
 - glob: Find files matching a glob pattern
 - build_project: Build with the workspace's own toolchain (cargo/npm/go/make)
@@ -68,7 +68,7 @@ You have these tools available:
 Some tools have prerequisites: issue tracking (create_issue/update_issue/close_issue/search_issues/start_work_on_issue) appears only when configured; ci_status requires the gh CLI. Use them when present.
 
 Rules:
-- For "where is X defined", "who calls/references X", or "what depends on this file" questions, reach for code_graph FIRST when it is available — it is precise and cheap. Fall back to grep/glob only when the graph can't answer (free-text search, a symbol the index doesn't carry, or no index yet).
+- For "where is X defined", "who calls/references X", or "what depends on this file" questions, reach for graph_query FIRST when it is available — it is precise and cheap. Fall back to grep/glob only when the graph can't answer (free-text search, a symbol the index doesn't carry, or no index yet).
 - Always read a file before editing it — never edit blind.
 - Make minimal, surgical edits. Use edit_file, not write_file, for changes to existing files.
 - After changing behavior, use run_tests to check the suite, and verify_done to prove the change with a witness test rather than trusting a green suite.
@@ -87,7 +87,7 @@ You have these tools available:
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
 - bash: Run a shell command in the workspace root (with timeout)
-- code_graph: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. Appears only when `.stella/codegraph.db` exists (run `stella init` to build it). For symbol and dependency questions it is precise and cheaper than grep.
+- graph_query: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. The index is built automatically at session start and refreshes live as files change. For symbol and dependency questions it is precise and cheaper than grep.
 - grep: Search file contents with regex (shells to ripgrep)
 - glob: Find files matching a glob pattern
 - build_project: Build with the workspace's own toolchain (cargo/npm/go/make)
@@ -101,7 +101,7 @@ Some tools have prerequisites: issue tracking (create_issue/update_issue/close_i
 
 Methodology (always follow in order):
 1. REPRODUCE: Run the failing test or reproduce the bug before touching any file. Never edit blind, you must see the actual error first.
-2. LOCALIZE: Trace the error to its root cause. Read the failing code path. When code_graph is available, use it FIRST to find definitions, references, and import edges — it is precise and cheap; fall back to grep and glob for free-text search or when the graph has no answer.
+2. LOCALIZE: Trace the error to its root cause. Read the failing code path. When graph_query is available, use it FIRST to find definitions, references, and import edges — it is precise and cheap; fall back to grep and glob for free-text search or when the graph has no answer.
 3. MINIMAL FIX: Make the smallest change that resolves the issue. No refactoring. No style changes. No "while I'm here" edits. One logical change.
 4. VERIFY: Run the target test. If it passes, use verify_done to witness the change. If it fails, read the error and adjust.
 
@@ -288,13 +288,16 @@ async fn run_pipeline_one_shot(
         Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
-    let mcp = connect_mcp(
-        cfg,
+    // Auto-build + live-refresh the code graph in the background so the
+    // pipeline's localize step can reach for `graph_query` once it is ready.
+    // Status goes to stderr — stdout may be machine-readable JSON.
+    let (_session_graph, _graph_build) = spawn_session_graph(
+        &cfg.workspace_root,
         registry.clone(),
-        Some(registry.mcp_usage_ledger()),
-        format == OutputFormat::Text,
-    )
-    .await;
+        Box::new(|line| eprintln!("  {line}")),
+        Box::new(|| {}),
+    );
+    let mcp = connect_mcp(cfg, registry.clone(), format == OutputFormat::Text).await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -743,6 +746,15 @@ async fn run_raw_one_shot(
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    // Auto-build + live-refresh the code graph in the background so a
+    // multi-step one-shot turn can reach for `graph_query` once the index is
+    // ready. Status goes to stderr — stdout may be machine-readable JSON.
+    let (_session_graph, _graph_build) = spawn_session_graph(
+        &cfg.workspace_root,
+        registry.clone(),
+        Box::new(|line| eprintln!("  {line}")),
+        Box::new(|| {}),
+    );
     let mcp = connect_mcp(
         cfg,
         registry.clone(),
@@ -845,6 +857,15 @@ pub async fn run_goal_cmd(
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    // Auto-build + live-refresh the code-graph index in the background so
+    // `graph_query` is available for the goal loop without a manual `stella
+    // init`. Non-blocking; status to stderr. Kept alive until the goal returns.
+    let (_session_graph, _graph_build) = spawn_session_graph(
+        &cfg.workspace_root,
+        registry.clone(),
+        Box::new(|line| eprintln!("  {line}")),
+        Box::new(|| {}),
+    );
     let mcp = connect_mcp(
         cfg,
         registry.clone(),
@@ -936,6 +957,17 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     .await;
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    // Auto-build the code-graph index in the background (a cheap incremental
+    // refresh if it already exists) and keep it fresh via the live watcher, so
+    // `graph_query` becomes available this session without a manual `stella
+    // init`. Non-blocking; status goes to stderr so it never disturbs the
+    // prompt. Kept alive for the whole REPL; the watcher stops when it drops.
+    let (_session_graph, _graph_build) = spawn_session_graph(
+        &cfg.workspace_root,
+        registry.clone(),
+        Box::new(|line| eprintln!("  {line}")),
+        Box::new(|| {}),
+    );
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -1025,7 +1057,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                     // A fresh index may name tables/types the schema gate
                     // should know about this session, not just the next one.
                     populate_schema_index(&registry, &cfg.workspace_root);
-                    // The code graph now exists — expose the `code_graph` tool
+                    // The code graph now exists — expose the `graph_query` tool
                     // to the rest of this session (it is registered only when
                     // an index is present, so a session that started without
                     // one otherwise wouldn't see it until relaunch).
@@ -1238,14 +1270,6 @@ pub(crate) async fn record_turn_episode(
 /// `init` once a toolchain/parser is available. Progress goes to `emit`
 /// (plain text, no ANSI) so both the CLI and the deck transcript can show it.
 async fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut(String)) {
-    let dot_stella = workspace_root.join(".stella");
-    if let Err(e) = std::fs::create_dir_all(&dot_stella) {
-        emit(format!(
-            "! could not create .stella for the code graph: {e} — skipped"
-        ));
-        return;
-    }
-    let db_path = dot_stella.join("codegraph.db");
     emit("◈ indexing code graph…".to_string());
     // A full-tree tree-sitter index is seconds-to-minutes of blocking file
     // reads + parsing + SQLite on a large repo. Run it on the blocking pool
@@ -1255,44 +1279,152 @@ async fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut
     // watch.rs). `emit` stays on this side of the boundary: the only
     // pre-completion line is the one above.
     let root = workspace_root.to_path_buf();
-    let outcome =
-        tokio::task::spawn_blocking(
-            move || match stella_graph::CodeGraph::open(&root, &db_path) {
-                Ok(graph) => match graph.index_all() {
-                    Ok(stats) => {
-                        graph.shutdown();
-                        Ok(stats)
-                    }
-                    Err(e) => Err(format!(
-                        "! code-graph indexing failed: {e} — run `stella init` again to retry"
-                    )),
-                },
-                Err(e) => Err(format!("! code-graph store unavailable: {e} — skipped")),
-            },
-        )
-        .await;
+    let outcome = tokio::task::spawn_blocking(move || index_workspace_graph_blocking(&root)).await;
     match outcome {
-        Ok(Ok(stats)) => {
-            emit(format!(
-                "✓ code graph: {} symbols, {} imports across {} file{} \
-                 ({} parsed, {} unchanged)",
-                stats.symbols,
-                stats.imports,
-                stats.files_parsed + stats.files_skipped_unchanged,
-                if stats.files_parsed + stats.files_skipped_unchanged == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-                stats.files_parsed,
-                stats.files_skipped_unchanged,
-            ));
-        }
+        Ok(Ok(stats)) => emit(format_graph_stats(&stats)),
         Ok(Err(warning)) => emit(warning),
         Err(e) => emit(format!(
             "! code-graph indexing task failed: {e} — run `stella init` again to retry"
         )),
     }
+}
+
+/// Blocking: create `.stella/`, open the store, run one full incremental index
+/// pass (sha-skip makes byte-identical files free, L-C2), and shut down.
+/// Returns the stats or a ready-to-emit human warning. Emits nothing itself —
+/// so it is `Send` and callable from any spawned task; both `stella init`'s
+/// [`build_code_graph`] and the session auto-builder [`spawn_session_graph`]
+/// drive it, then narrate the result on their own side of the async boundary.
+fn index_workspace_graph_blocking(
+    workspace_root: &std::path::Path,
+) -> Result<stella_graph::IndexStats, String> {
+    let dot_stella = workspace_root.join(".stella");
+    std::fs::create_dir_all(&dot_stella)
+        .map_err(|e| format!("! could not create .stella for the code graph: {e} — skipped"))?;
+    let db_path = dot_stella.join("codegraph.db");
+    let graph = stella_graph::CodeGraph::open(workspace_root, &db_path)
+        .map_err(|e| format!("! code-graph store unavailable: {e} — skipped"))?;
+    let stats = graph.index_all().map_err(|e| {
+        format!("! code-graph indexing failed: {e} — run `stella init` again to retry")
+    })?;
+    graph.shutdown();
+    Ok(stats)
+}
+
+/// The `✓ code graph: N symbols, M imports…` summary line, shared by `stella
+/// init` and the session auto-builder so both surfaces read identically.
+fn format_graph_stats(stats: &stella_graph::IndexStats) -> String {
+    let files = stats.files_parsed + stats.files_skipped_unchanged;
+    format!(
+        "✓ code graph: {} symbols, {} imports across {} file{} ({} parsed, {} unchanged)",
+        stats.symbols,
+        stats.imports,
+        files,
+        if files == 1 { "" } else { "s" },
+        stats.files_parsed,
+        stats.files_skipped_unchanged,
+    )
+}
+
+/// A session-lifetime holder for the live code graph. It keeps the in-process
+/// `notify` watcher (and its debounce task) alive so file changes — the
+/// agent's own edits and external ones — incrementally re-index into
+/// `.stella/codegraph.db` for the rest of the session. Dropping it (or calling
+/// [`SessionGraph::shutdown`]) tears the watcher down cleanly. The mounted
+/// graph is installed only once the background build finishes, so an early
+/// session exit simply leaves the slot empty (and the never-installed watcher
+/// never armed).
+pub(crate) struct SessionGraph {
+    graph: Arc<std::sync::Mutex<Option<stella_graph::CodeGraph>>>,
+}
+
+impl SessionGraph {
+    /// Stop the watcher and its background tasks. Idempotent; also runs on drop.
+    pub(crate) fn shutdown(&self) {
+        if let Some(graph) = self.graph.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            graph.shutdown();
+        }
+    }
+}
+
+impl Drop for SessionGraph {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Ensure the workspace code-graph index exists and stays fresh for the life of
+/// a session — WITHOUT blocking startup and WITHOUT re-running the full,
+/// LLM-driven [`init_workspace`]. This is the *data* side of init only:
+///
+/// 1. If there is no index yet it is built in the background
+///    ([`index_workspace_graph_blocking`], the same index step `stella init`
+///    runs); if one already exists it is a cheap incremental catch-up
+///    (byte-identical files are skipped, L-C2).
+/// 2. The moment the index is ready the `graph_query` tool is enabled for the
+///    rest of the session ([`ToolRegistry::enable_code_graph_if_available`])
+///    and the schema gate learns any new table/type names — so a session that
+///    launched in a repo with no `.stella/codegraph.db` gains the tool
+///    mid-session, no restart, no manual `stella init`.
+/// 3. The live `notify` watcher is then armed via
+///    [`stella_graph::CodeGraph::mount`] so subsequent edits incrementally
+///    re-index. mount's own catch-up sha-skips everything just indexed in
+///    step 1 — the watcher is the point of the second open.
+///
+/// Non-blocking: returns immediately with a [`SessionGraph`] the caller keeps
+/// alive for the session (dropping it stops the watcher) and the setup task's
+/// `JoinHandle`, which completes once the tool has been enabled — a
+/// deterministic "index ready" signal for tests. `status` receives the same
+/// `◈ indexing code graph…` / `✓ …` lines `stella init` prints (route it to
+/// stderr or the deck transcript, never to a machine-readable stdout);
+/// `on_ready` fires once after the tool is enabled (the deck refreshes its
+/// Graph tab there; other callers pass a no-op).
+pub(crate) fn spawn_session_graph(
+    workspace_root: &std::path::Path,
+    registry: Arc<ToolRegistry>,
+    mut status: Box<dyn FnMut(String) + Send>,
+    on_ready: Box<dyn FnOnce() + Send>,
+) -> (SessionGraph, tokio::task::JoinHandle<()>) {
+    let slot: Arc<std::sync::Mutex<Option<stella_graph::CodeGraph>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let slot_task = slot.clone();
+    let root = workspace_root.to_path_buf();
+    let handle = tokio::spawn(async move {
+        // 1) Build (fresh) or incrementally refresh (existing) the index to
+        //    completion, on the blocking pool. `status` (a `Send` box) is
+        //    called between awaits, never held across one — so this task stays
+        //    `Send`. (We drive the shared blocking helper directly rather than
+        //    `build_code_graph`, whose `&mut dyn FnMut` emit is not `Send`.)
+        status("◈ indexing code graph…".to_string());
+        let build_root = root.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || index_workspace_graph_blocking(&build_root)).await;
+        match outcome {
+            Ok(Ok(stats)) => status(format_graph_stats(&stats)),
+            Ok(Err(warning)) => status(warning),
+            Err(e) => status(format!(
+                "! code-graph indexing task failed: {e} — the graph tool stays off this session"
+            )),
+        }
+        // 2) Expose `graph_query` for the rest of the session and teach the
+        //    schema gate any table/type names the fresh index now carries.
+        registry.enable_code_graph_if_available(&root);
+        populate_schema_index(&registry, &root);
+        on_ready();
+        // 3) Arm the live watcher on a mounted graph kept alive for the
+        //    session. Best-effort: a mount failure only loses live refresh, it
+        //    never loses the index built in step 1.
+        let db_path = stella_tools::graph::graph_db_path(&root);
+        match stella_graph::CodeGraph::mount(&root, &db_path).await {
+            Ok(graph) => {
+                *slot_task.lock().unwrap_or_else(|p| p.into_inner()) = Some(graph);
+            }
+            Err(e) => status(format!(
+                "! code-graph watcher unavailable: {e} — the index will refresh on the next launch"
+            )),
+        }
+    });
+    (SessionGraph { graph: slot }, handle)
 }
 
 /// The shared init flow behind `stella init` and the `/init` chat command:
@@ -2774,6 +2906,98 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         assert!(graph_snapshot(root.path()).is_none());
         assert!(graph_snapshot_focus(root.path(), Some("x.rs")).is_none());
+    }
+
+    /// Auto-build on session start (task part A): a workspace with a source
+    /// file but NO `.stella/codegraph.db` does not advertise `graph_query` on
+    /// turn 1; once [`spawn_session_graph`]'s background build completes the
+    /// tool is advertised AND dispatchable — no manual `stella init`, no
+    /// restart. Awaiting the returned handle is the deterministic "index
+    /// ready" signal.
+    #[tokio::test]
+    async fn spawn_session_graph_auto_builds_and_enables_graph_query() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("lib.rs"), "pub fn find_me() {}\n").unwrap();
+
+        let registry = Arc::new(ToolRegistry::with_issue_backend(root.clone(), None));
+        let advertises = |r: &ToolRegistry| r.schemas().iter().any(|s| s.name == "graph_query");
+
+        // Turn 1: absent — no index on disk yet.
+        assert!(!stella_tools::graph::graph_available(&root));
+        assert!(
+            !advertises(&registry),
+            "graph_query must be absent before the index is built"
+        );
+
+        let (session_graph, build) =
+            spawn_session_graph(&root, registry.clone(), Box::new(|_| {}), Box::new(|| {}));
+        build.await.expect("background build task");
+
+        // After the build: the db exists, the tool is advertised, and it
+        // dispatches against the freshly built index.
+        assert!(
+            stella_tools::graph::graph_available(&root),
+            "the background build must create .stella/codegraph.db"
+        );
+        assert!(
+            advertises(&registry),
+            "graph_query must be advertised once the index is built"
+        );
+        let out = registry
+            .execute(
+                "graph_query",
+                &serde_json::json!({"op": "definitions", "target": "find_me"}),
+            )
+            .await;
+        assert!(!out.is_error(), "graph_query must dispatch: {out:?}");
+        session_graph.shutdown();
+    }
+
+    /// Live freshness (task part B): after the session graph is up, a
+    /// brand-new source file the agent (or an external tool) writes is
+    /// incrementally re-indexed by the live `notify` watcher, so the very next
+    /// `graph_query` reflects it — the staleness that makes the model distrust
+    /// the graph is gone. Polls with a generous budget because the OS watcher
+    /// + debounce are asynchronous, and re-writes the file each iteration so a
+    /// create event lost during the watcher's async arming window is retried
+    /// (the un-indexed file re-parses on the first event that lands).
+    #[tokio::test]
+    async fn session_graph_live_refreshes_after_a_file_is_added() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("lib.rs"), "pub fn original() {}\n").unwrap();
+
+        let registry = Arc::new(ToolRegistry::with_issue_backend(root.clone(), None));
+        let (session_graph, build) =
+            spawn_session_graph(&root, registry.clone(), Box::new(|_| {}), Box::new(|| {}));
+        build.await.expect("background build task");
+
+        // The new symbol is absent from the just-built index.
+        let before = stella_tools::graph::run_query(&root, "definitions", "added_later");
+        assert!(
+            matches!(&before, ToolOutput::Ok { content } if content.contains("no definitions")),
+            "the new symbol must not be indexed yet: {before:?}"
+        );
+
+        let added = root.join("added.rs");
+        let mut reflected = false;
+        for _ in 0..150 {
+            std::fs::write(&added, "pub fn added_later() {}\n").unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let ToolOutput::Ok { content } =
+                stella_tools::graph::run_query(&root, "definitions", "added_later")
+                && content.contains("added_later")
+            {
+                reflected = true;
+                break;
+            }
+        }
+        assert!(
+            reflected,
+            "the live watcher must re-index the new file so graph_query reflects it"
+        );
+        session_graph.shutdown();
     }
 
     /// Tier-1 rule wiring (issue #103): a workspace rule renders into the

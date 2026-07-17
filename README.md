@@ -264,7 +264,7 @@ writes a failing test whose fail→pass flip proves the work (`docs/pipeline.md`
 | `read_file` · `write_file` · `edit_file` · `delete_file` | File CRUD with surgical exact-substring edits |
 | `bash` | Run a shell command (timeout kill; `trace: true` echoes each line) |
 | `grep` · `glob` | Regex content search (ripgrep) · glob file discovery (fd) |
-| `code_graph` | Query the indexed code graph: symbol definitions/references, file imports/importers/neighborhood — available after `stella init` |
+| `graph_query` | Query the indexed code graph: symbol definitions/references, file imports/importers/neighborhood — auto-built at session start, refreshed live |
 | `build_project` · `run_tests` | Build/test with the workspace's toolchain (cargo/npm/go/make) |
 | `verify_done` | Replay new test files against `git HEAD` to prove the change works |
 | `explorations` · `save_exploration` | Shared codebase maps — explore once, reuse everywhere |
@@ -291,7 +291,8 @@ which is why the default is `off`. Fail-closed: an unknown value, a missing
 running unsandboxed.
 
 **Conditional tools:** issue tools need `LINEAR_API_KEY` or a `gh auth login`;
-`code_graph` needs the `stella init` index; `generate_image` needs
+`graph_query` needs the code-graph index (auto-built at session start);
+`generate_image` needs
 `ZAI_API_KEY` or `OPENAI_API_KEY`. Without their prerequisites, these tools are
 not registered.
 
@@ -362,7 +363,7 @@ flowchart TD
     MCP["stella-mcp<br/>external MCP servers"] -.->|merges tools into registry| TOOLS
     CORE -->|emits AgentEvent stream| STORE["stella-store<br/>SQLite: executions · events · telemetry"]
     U -->|"recall · episodes · bi-temporal facts"| CTX["stella-context — context plane<br/>recall · embeddings · memory"]
-    GRAPH["stella-graph — tree-sitter code index"] -->|"indexed on `stella init` · queried via `code_graph` + `stella graph`"| DB[("SQLite code graph<br/>.stella/codegraph.db")]
+    GRAPH["stella-graph — tree-sitter code index"] -->|"auto-indexed at session start · queried via `graph_query` + `stella graph`"| DB[("SQLite code graph<br/>.stella/codegraph.db")]
     MODEL -.->|versioned serde| PROTO["stella-protocol — shared types + Provider/tool ports"]
     TOOLS -.-> PROTO
     STORE -.-> PROTO

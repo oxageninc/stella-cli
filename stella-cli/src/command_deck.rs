@@ -307,6 +307,39 @@ pub async fn run_deck_session(
     // never waits on the driver (and vice versa).
     let deck = tokio::spawn(run_deck(opts, in_rx, sub_tx));
 
+    // Auto-build the code-graph index in the background (a cheap incremental
+    // refresh if it already exists) and keep it fresh via the live watcher, so
+    // `graph_query` is available this session — and the Graph tab populates —
+    // without a manual `stella init`. Spawned AFTER the deck is up so its
+    // `◈ indexing…`/`✓ …` lines render as transcript events; non-blocking, and
+    // the watcher stops when `_session_graph` drops at session end. `_graph_build`
+    // (the setup task's JoinHandle) is detached — freshness outlives it.
+    let status_tx = in_tx.clone();
+    let ready_tx = in_tx.clone();
+    let ready_root = cfg.workspace_root.clone();
+    let (_session_graph, _graph_build) = agent::spawn_session_graph(
+        &cfg.workspace_root,
+        registry.clone(),
+        Box::new(move |line| {
+            let _ = status_tx.send(Inbound::Event {
+                agent: LEAD.to_string(),
+                event: AgentEvent::Text { delta: line },
+            });
+        }),
+        Box::new(move || {
+            // Populate the Graph tab now the index exists (it opened on the
+            // "run stella init" hint), and restore the lead to idle — the
+            // status Text events above fold it to `Running`.
+            if let Some(snapshot) = agent::graph_snapshot(&ready_root) {
+                let _ = ready_tx.send(Inbound::GraphSnapshot(snapshot));
+            }
+            let _ = ready_tx.send(Inbound::Status {
+                agent: LEAD.to_string(),
+                status: AgentStatus::WaitingInput,
+            });
+        }),
+    );
+
     // ── MCP connect, behind the live deck (#98) ─────────────────────────────
     // This await used to run during assembly, before the deck spawned — a
     // slow or unreachable server meant a blank terminal for up to the 10s
@@ -1630,7 +1663,7 @@ async fn run_deck_command(
                     // A fresh index may name tables/types the schema gate
                     // should know about this session, not just the next one.
                     agent::populate_schema_index(registry, &cfg.workspace_root);
-                    // Expose the `code_graph` tool for the rest of the session
+                    // Expose the `graph_query` tool for the rest of the session
                     // now that the index exists (it is registered only when an
                     // index is present at construction).
                     registry.enable_code_graph_if_available(&cfg.workspace_root);

@@ -1,5 +1,6 @@
-//! `code_graph` — query the workspace's code graph (tree-sitter symbols +
-//! import edges, indexed by `stella init` into `.stella/codegraph.db`).
+//! `graph_query` — query the workspace's code graph (tree-sitter symbols +
+//! import edges, auto-indexed at session start into `.stella/codegraph.db`
+//! and kept fresh by the live watcher).
 //!
 //! This is the runtime retrieval surface of `stella-graph`: instead of
 //! grepping for a symbol, the agent asks the graph — where is `run_turn`
@@ -41,11 +42,12 @@ pub struct CodeGraphQuery;
 impl Tool for CodeGraphQuery {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "code_graph".into(),
+            name: "graph_query".into(),
             description: "Query the indexed code graph instead of grepping: where a symbol is \
                           defined or referenced, what a file imports, which files import it, or \
                           a file's full graph neighborhood. Cheaper and more precise than \
-                          grep for symbol/dependency questions. Re-index with `stella init`."
+                          grep for symbol/dependency questions. The index builds automatically \
+                          and refreshes live as files change — no manual re-index needed."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -197,7 +199,7 @@ mod tests {
     #[test]
     fn schema_is_read_only_and_named() {
         let schema = CodeGraphQuery.schema();
-        assert_eq!(schema.name, "code_graph");
+        assert_eq!(schema.name, "graph_query");
         assert!(schema.read_only);
     }
 
