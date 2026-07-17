@@ -25,7 +25,7 @@ use crate::error::ContextError;
 use ocp_types::FrameKind;
 
 /// The current on-disk schema version, tracked in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// The v1 schema. Applied once, inside the migration transaction. Bi-temporal
 /// columns (`valid_from`/`valid_to`/`recorded_at`/`superseded_at`) exist on both
@@ -141,6 +141,21 @@ CREATE TABLE memory (
     recorded_at  TEXT NOT NULL
 );
 CREATE INDEX idx_memory_kind ON memory(kind);
+";
+
+/// V3 — evict the code graph's tables from `context.db`. Historically the
+/// tree-sitter index shared this one file (`stella-graph`'s original
+/// single-file design, prefixing its tables `code_graph_`); it now lives in its
+/// own `.stella/codegraph.db`, which every consumer (`graph_query`, the OCP
+/// `GraphProvider`) reads. Any `code_graph_*` tables still in `context.db` are
+/// orphaned duplicates no code reads or updates — dropping them removes the
+/// "two databases hold the code graph" duplication. Children (FK to
+/// `code_graph_files`) are dropped first. `IF EXISTS` so a fresh store is a
+/// no-op.
+const MIGRATION_V3: &str = "\
+DROP TABLE IF EXISTS code_graph_symbols;
+DROP TABLE IF EXISTS code_graph_imports;
+DROP TABLE IF EXISTS code_graph_files;
 ";
 
 /// Typed node vocabulary (`06-context-protocol.md` §2.2). Stored as its
@@ -515,6 +530,9 @@ fn migrate(conn: &Connection) -> Result<(), ContextError> {
     }
     if version < 2 {
         tx.execute_batch(MIGRATION_V2)?;
+    }
+    if version < 3 {
+        tx.execute_batch(MIGRATION_V3)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -1245,6 +1263,45 @@ mod tests {
         let s2 = ContextStore::open(&path).unwrap();
         assert_eq!(s2.node_count().unwrap(), 1, "data survives reopen");
         s2.integrity_check().unwrap();
+    }
+
+    #[test]
+    fn opening_drops_orphaned_code_graph_tables_from_context_db() {
+        // A legacy context.db that still carries the code graph's tables (from
+        // the era when the tree-sitter index shared this one file) must have
+        // them dropped on open — the graph now lives in codegraph.db, and
+        // leaving duplicates here is the "two DBs hold the code graph" defect.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("context.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            // Simulate the orphaned graph tables + a pre-V3 schema version.
+            conn.execute_batch(
+                "CREATE TABLE code_graph_files (id INTEGER PRIMARY KEY, path TEXT);\
+                 CREATE TABLE code_graph_symbols (id INTEGER PRIMARY KEY, file_id INTEGER);\
+                 CREATE TABLE code_graph_imports (id INTEGER PRIMARY KEY, from_file_id INTEGER);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2i64).unwrap();
+        }
+        // Reopen through the store: the V3 migration must evict the orphans.
+        let store = ContextStore::open(&path).unwrap();
+        let conn = store.conn();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name LIKE 'code_graph_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "orphaned code_graph_* tables must be dropped");
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
     }
 
     #[test]

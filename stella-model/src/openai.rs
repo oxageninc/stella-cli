@@ -428,6 +428,7 @@ impl Provider for OpenAiProvider {
             usage,
             model: self.model.clone(),
             cost_usd,
+            finish_reason: None,
         })
     }
 }

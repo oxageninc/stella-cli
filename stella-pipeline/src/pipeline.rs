@@ -1851,6 +1851,7 @@ mod tests {
             usage: CompletionUsage::default(),
             model: "scripted".into(),
             cost_usd: 0.0001,
+            finish_reason: None,
         }
     }
 

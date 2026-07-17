@@ -1332,7 +1332,7 @@ async fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut
 /// drive it, then narrate the result on their own side of the async boundary.
 fn index_workspace_graph_blocking(
     workspace_root: &std::path::Path,
-) -> Result<stella_graph::IndexStats, String> {
+) -> Result<GraphSummary, String> {
     let dot_stella = workspace_root.join(".stella");
     std::fs::create_dir_all(&dot_stella)
         .map_err(|e| format!("! could not create .stella for the code graph: {e} — skipped"))?;
@@ -1342,22 +1342,44 @@ fn index_workspace_graph_blocking(
     let stats = graph.index_all().map_err(|e| {
         format!("! code-graph indexing failed: {e} — run `stella init` again to retry")
     })?;
+    // Report the whole-index TOTALS (what the model can actually query), not
+    // this pass's parse delta: an incremental pass over an unchanged tree
+    // re-parses nothing, so `stats.symbols`/`stats.imports` are 0 even though
+    // the graph is fully populated — the misleading "0 symbols" line users saw.
+    let summary = GraphSummary {
+        total_symbols: graph.symbol_count().unwrap_or(0),
+        total_imports: graph.import_count().unwrap_or(0),
+        total_files: graph
+            .file_count()
+            .unwrap_or(stats.files_parsed + stats.files_skipped_unchanged),
+        files_parsed: stats.files_parsed,
+        files_unchanged: stats.files_skipped_unchanged,
+    };
     graph.shutdown();
-    Ok(stats)
+    Ok(summary)
+}
+
+/// Whole-index totals plus this pass's parse/skip split, for the startup line.
+struct GraphSummary {
+    total_symbols: usize,
+    total_imports: usize,
+    total_files: usize,
+    files_parsed: usize,
+    files_unchanged: usize,
 }
 
 /// The `✓ code graph: N symbols, M imports…` summary line, shared by `stella
 /// init` and the session auto-builder so both surfaces read identically.
-fn format_graph_stats(stats: &stella_graph::IndexStats) -> String {
-    let files = stats.files_parsed + stats.files_skipped_unchanged;
+/// Reports index totals; the parenthetical is this pass's parse/skip split.
+fn format_graph_stats(summary: &GraphSummary) -> String {
     format!(
-        "✓ code graph: {} symbols, {} imports across {} file{} ({} parsed, {} unchanged)",
-        stats.symbols,
-        stats.imports,
-        files,
-        if files == 1 { "" } else { "s" },
-        stats.files_parsed,
-        stats.files_skipped_unchanged,
+        "✓ code graph: {} symbols, {} imports across {} file{} ({} re-parsed, {} unchanged this pass)",
+        summary.total_symbols,
+        summary.total_imports,
+        summary.total_files,
+        if summary.total_files == 1 { "" } else { "s" },
+        summary.files_parsed,
+        summary.files_unchanged,
     )
 }
 

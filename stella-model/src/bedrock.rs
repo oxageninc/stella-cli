@@ -544,6 +544,7 @@ impl Provider for BedrockProvider {
             usage,
             model: self.model.clone(),
             cost_usd,
+            finish_reason: None,
         })
     }
 }

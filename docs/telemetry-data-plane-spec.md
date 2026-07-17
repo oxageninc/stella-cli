@@ -466,5 +466,90 @@ carry `status` so the UI can mark accepted/dismissed and stop re-nagging.
   reconcile the "one DB" doc with the two-durable-file reality.
 ```
 
-*(File:line fix targets for the truncation handler and glm-5.2 output cap are
-appended in §9 once the code trace completes.)*
+### 9.1 Guarantee: a turn never stops silently
+
+**Invariant to enforce:** *every* turn terminates in exactly one **explicit,
+user-visible outcome**. "Silently `completed` with no output" must be made
+structurally impossible. Exec 41 violated this — 0 text, 0 tool calls, yet
+`outcome=completed`.
+
+**Step 1 — replace the boolean success with an exhaustive outcome enum.**
+Today `executions.outcome` is effectively `completed | error`. Classify every
+turn end and render a line for anything that isn't a clean answer:
+
+| Outcome | Condition | What the user sees |
+|---|---|---|
+| `answered` | emitted text and/or made progress (tool results, files written) | the normal response |
+| `truncated_output` | `finish_reason == "length"` | "⚠ Response hit the output-token limit (N). `/continue` to resume." |
+| `empty` | `finish_reason == stop` but no text **and** no tool calls | "The model returned nothing this turn — retrying / try a stronger model." |
+| `stopped_budget` / `stopped_max_steps` | harness loop cap ended the turn | "Stopped after N steps / $X budget. `/continue` to keep going." |
+| `error` | provider / stream / tool failure | the error message (already surfaced) |
+| `aborted` | user cancelled | "Cancelled." |
+
+**Step 2 — the one-line guard that would have caught the screenshot.** At turn
+finalize, assert: `outcome == answered` **⇒** `produced_output == true`
+(had text, a tool call, or a file write). If the assertion fails, **downgrade
+the outcome** (to `empty`/`truncated_output`) and synthesize a user-facing
+message. This belt-and-suspenders check catches any future silent-stop path we
+didn't anticipate — it is the cheapest high-value fix.
+
+**Step 3 — handle the actual exec-41 cause (reasoning ate the whole budget).**
+- Inspect `finish_reason` on the Z.ai stream (currently not acted on). On
+  `length`: keep any partial answer, and if there is **none** (all reasoning),
+  either **auto-continue once** (re-request so the model can produce its answer,
+  bounded to prevent loops) or surface the truncation and stop — never close
+  clean.
+- **Raise / adapt the output cap.** 8,192 output tokens is low for `glm-5.2`
+  with reasoning on; budget reasoning separately from the answer, or bump the
+  cap for reasoning-capable models so the answer isn't starved by thinking.
+
+**Step 4 — always show liveness.** 133 s of silent generation must not look like
+a hang. Stream reasoning to a collapsed "thinking…" panel (or at minimum a
+token/elapsed heartbeat), and add a **stall watchdog**: if no event (text /
+reasoning / tool) for T seconds, emit "still working (Ns)…", and past a hard
+ceiling offer to interrupt. A real hang then also gets explained.
+
+**Step 5 — make loop/step exits loud.** The existing repeated-identical-tool-call
+guard already emits an `error` event (good — that path *is* surfaced). Extend the
+same "always surface" rule to the quiet exits: max-steps, budget, and end-of-
+stream-without-finish-reason.
+
+**Confirmed root cause and exact fix points (code trace):**
+
+1. **`stella-core/src/driver.rs:602-619` — `dispatch_completion` (the core bug).**
+   It branches on `result.tool_calls.is_empty()` *alone*: an empty result pushes
+   empty content, emits `Stage{Complete}` + `Complete`, and returns
+   `TurnOutcome::Completed`. The `Text` event is only sent when text is non-empty
+   (`driver.rs:596`), so an empty step shows the user nothing yet is recorded as
+   success. **Fix:** when `text.is_empty()` **and** `tool_calls.is_empty()`, do
+   not finalize as `Completed` — classify `empty`/`truncated_output`, surface a
+   message, and (bounded) auto-continue or abort. This one guard would have
+   caught exec 41.
+2. **`stella-protocol/src/completion.rs:113-126` — `CompletionResult` carries no
+   `finish_reason`.** The driver *cannot* see truncation. **Fix:** add a
+   `finish_reason` / `truncated` field so the truncation signal propagates from
+   adapter → driver.
+3. **`stella-model/src/zai.rs:514-603` — the adapter detects `finish_reason=="length"`
+   (zai.rs:514) but only uses it to blame a tool-call index; with **zero** tool
+   calls the truncation branches (zai.rs:559/580) are skipped and it returns
+   `Ok(...)` at **zai.rs:603**, dropping the signal. **Fix:** surface
+   `truncated_at_token_limit` even with no tool call.
+4. **`stella-model/src/zai.rs:279-285` — `ZaiStreamDelta` only deserializes
+   `content` + `tool_calls`.** glm-5.2's reasoning tokens arrive under a different
+   key and are silently discarded — that is *why* 8,192 output tokens produced 0
+   `text` events. **Fix:** deserialize the reasoning field and stream it into the
+   already-defined `AgentEvent::Reasoning` / `AGENT_THINKING_*` bus topics
+   (`stella-pipeline/src/replay.rs:204`, `stella-core/src/bus.rs:93-95`) so the
+   user sees a "thinking…" panel and truncation is visible.
+5. **`stella-core/src/driver.rs:107` — the flat `max_output_tokens: Some(8192)`
+   default** (no per-model override; the deck inherits it via
+   `agent::engine_config_for`, `stella-cli/src/agent.rs:215-219`). glm-5.2's
+   window is 200k (`stella-model/src/catalog.rs:124`) but its answer is starved by
+   an 8k output cap shared with reasoning. **Fix:** raise/adapt the cap per model
+   (or budget reasoning separately from the answer).
+
+Compaction is *not* implicated: it is active on the deck path
+(`driver.rs:288/356`, threshold `150_000` at `driver.rs:112`) and fired normally.
+The `execution_reflection.{produced_output, truncated}` and
+`execution_rollup.{outcome, produced_output}` fields defined above are exactly
+what make this invariant observable end to end.

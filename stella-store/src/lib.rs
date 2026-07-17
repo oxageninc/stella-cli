@@ -374,7 +374,7 @@ type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// a file at `user_version` i to i + 1. Fresh files never run these — they
 /// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
 /// directly.
-const MIGRATIONS: [Migration; 6] = [
+const MIGRATIONS: [Migration; 7] = [
     // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
     // their write paths have always assumed.
     migrate_v0_to_v1,
@@ -398,6 +398,10 @@ const MIGRATIONS: [Migration; 6] = [
     // Renumbered from v4 at cascade-merge behind the agent_uses (v4) and
     // skill_usage (v5) migrations; SCHEMA_VERSION follows MIGRATIONS.len().
     migrate_v5_to_v6,
+    // v6 → v7: the data-plane tables (all purely additive) — `tool_calls`
+    // (normalized per-call log), `execution_reflection` (per-turn self-review
+    // tied to the prompt), and `reflections` (unified durable lessons).
+    migrate_v6_to_v7,
 ];
 
 /// The schema version this build writes — the `PRAGMA user_version` of
@@ -408,7 +412,7 @@ const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// Every table the store owns — the allowlist for [`Store::count`] and the
 /// fresh-file probe in [`Store::migrate`].
-const TABLES: [&str; 12] = [
+const TABLES: [&str; 15] = [
     "executions",
     "events",
     "telemetry",
@@ -421,6 +425,9 @@ const TABLES: [&str; 12] = [
     "graph_edges",
     "agent_uses",
     "skill_usage",
+    "tool_calls",
+    "execution_reflection",
+    "reflections",
 ];
 
 /// Tables whose shape has not changed since v0. `IF NOT EXISTS` keeps one
@@ -627,6 +634,68 @@ const MCP_USAGE_DDL: &str = "CREATE TABLE IF NOT EXISTS mcp_usage (
      CREATE INDEX IF NOT EXISTS mcp_usage_by_server
        ON mcp_usage(server, tool);";
 
+/// `tool_calls` DDL at [`SCHEMA_VERSION`] — one queryable row per tool call
+/// (native, MCP, skill, or agent), normalized from the append-only `events`
+/// stream (`tool_start` + `tool_result`) so the dashboard can query call
+/// histograms without JSON-scanning the event log. Large outputs are NOT
+/// stored here — only shape, timing, and success (`bytes_out` records the
+/// result size, not the result). UNIQUE (execution_id, seq) is the house
+/// double-write guard. The by-name index is the access path for usage
+/// histograms (e.g. "grep called N times, graph_query zero").
+const TOOL_CALLS_DDL: &str = "CREATE TABLE IF NOT EXISTS tool_calls (
+       execution_id INTEGER NOT NULL,
+       seq INTEGER NOT NULL,
+       call_id TEXT NOT NULL DEFAULT '',
+       name TEXT NOT NULL,
+       surface TEXT NOT NULL DEFAULT 'native',
+       args_json TEXT NOT NULL DEFAULT '{}',
+       args_digest TEXT NOT NULL DEFAULT '',
+       reason TEXT NOT NULL DEFAULT '',
+       ok INTEGER NOT NULL DEFAULT 1,
+       error TEXT NOT NULL DEFAULT '',
+       bytes_out INTEGER NOT NULL DEFAULT 0,
+       duration_ms INTEGER NOT NULL DEFAULT 0,
+       ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       UNIQUE (execution_id, seq)
+     );
+     CREATE INDEX IF NOT EXISTS tool_calls_by_name
+       ON tool_calls(name, execution_id);";
+
+/// `execution_reflection` DDL at [`SCHEMA_VERSION`] — the agent's own
+/// assessment of ONE turn, tied 1:1 to its execution (and thus to
+/// `executions.prompt`). Pairs the model's self-view (`delivered`,
+/// `self_rating`, `what_went_well`, `what_to_improve`, `critique`) with the
+/// objective companions (`produced_output`, `wrote_files`, `truncated`) so a
+/// self-silent, zero-output turn is visibly a failure even if the model would
+/// rate itself kindly.
+const EXECUTION_REFLECTION_DDL: &str = "CREATE TABLE IF NOT EXISTS execution_reflection (
+       execution_id INTEGER PRIMARY KEY,
+       prompt TEXT NOT NULL DEFAULT '',
+       delivered INTEGER,
+       self_rating INTEGER,
+       what_went_well TEXT NOT NULL DEFAULT '',
+       what_to_improve TEXT NOT NULL DEFAULT '',
+       critique TEXT NOT NULL DEFAULT '',
+       produced_output INTEGER NOT NULL DEFAULT 0,
+       wrote_files INTEGER NOT NULL DEFAULT 0,
+       truncated INTEGER NOT NULL DEFAULT 0,
+       recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+     );";
+
+/// `reflections` DDL at [`SCHEMA_VERSION`] — the durable, unified home for
+/// lessons and self-critiques (superset of the loose `.stella/reflections.jsonl`
+/// and the context.db memory nodes). `execution_id` is NULL for cross-turn
+/// lessons; `domains` is a JSON array of domain tags.
+const REFLECTIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS reflections (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       execution_id INTEGER,
+       kind TEXT NOT NULL,
+       content TEXT NOT NULL,
+       domains TEXT NOT NULL DEFAULT '[]',
+       occurred_at INTEGER NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS reflections_by_kind ON reflections(kind);";
+
 /// The full latest schema, applied in one shot to fresh databases only.
 /// Existing files never see this — [`MIGRATIONS`] upgrades them shape by
 /// shape, so this can always describe the CURRENT shape.
@@ -641,6 +710,9 @@ fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(AGENT_USES_DDL)?;
     tx.execute_batch(SKILL_USAGE_DDL)?;
     tx.execute_batch(MCP_USAGE_DDL)?;
+    tx.execute_batch(TOOL_CALLS_DDL)?;
+    tx.execute_batch(EXECUTION_REFLECTION_DDL)?;
+    tx.execute_batch(REFLECTIONS_DDL)?;
     Ok(())
 }
 
@@ -855,6 +927,15 @@ fn migrate_v4_to_v5(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// touched, so no rebuild, no dedupe, no backfill.
 fn migrate_v5_to_v6(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(MCP_USAGE_DDL)?;
+    Ok(())
+}
+
+/// v6 → v7: the additive data-plane tables — `tool_calls`,
+/// `execution_reflection`, and `reflections`. No existing table changes shape.
+fn migrate_v6_to_v7(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(TOOL_CALLS_DDL)?;
+    tx.execute_batch(EXECUTION_REFLECTION_DDL)?;
+    tx.execute_batch(REFLECTIONS_DDL)?;
     Ok(())
 }
 

@@ -110,6 +110,23 @@ pub struct CompletionUsage {
     pub cache_write_tokens: u64,
 }
 
+/// Why the model stopped generating, normalized across providers. Lets the
+/// engine tell a natural stop from a truncation (`Length`) so an empty or
+/// cut-off turn is surfaced to the user instead of being recorded as a clean
+/// completion (the "turn ends with no feedback" defect).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    /// Natural end of the response.
+    Stop,
+    /// Output was cut off at the token limit (OpenAI-compatible `length`).
+    Length,
+    /// The model stopped in order to make tool calls.
+    ToolCalls,
+    /// A provider content filter halted generation.
+    ContentFilter,
+}
+
 /// The result of a completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionResult {
@@ -123,6 +140,11 @@ pub struct CompletionResult {
     pub model: String,
     /// Estimated provider cost in USD (0 for on-device/local).
     pub cost_usd: f64,
+    /// Why generation stopped, when the adapter can determine it. `None` when
+    /// the provider doesn't report it. `serde(default)` so envelopes
+    /// serialized before this field existed still parse.
+    #[serde(default)]
+    pub finish_reason: Option<FinishReason>,
 }
 
 #[cfg(test)]
@@ -161,6 +183,7 @@ mod tests {
             },
             model: "glm-5.2".into(),
             cost_usd: 0.0012,
+            finish_reason: None,
         };
         let json = serde_json::to_string(&result).expect("serialize");
         assert!(

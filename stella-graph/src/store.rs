@@ -377,6 +377,21 @@ pub(crate) fn file_count(conn: &Connection) -> Result<usize, GraphError> {
     Ok(count as usize)
 }
 
+/// Total indexed symbols across the whole tree — the graph total, not a
+/// per-pass delta. The startup summary reports this so an incremental pass over
+/// an unchanged tree (which re-parses nothing) still shows the real symbol
+/// count instead of a misleading zero.
+pub(crate) fn symbol_count(conn: &Connection) -> Result<usize, GraphError> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM code_graph_symbols", [], |r| r.get(0))?;
+    Ok(count as usize)
+}
+
+/// Total indexed import edges across the whole tree.
+pub(crate) fn import_count(conn: &Connection) -> Result<usize, GraphError> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM code_graph_imports", [], |r| r.get(0))?;
+    Ok(count as usize)
+}
+
 /// The best-connected file in the index: most symbols plus import edges in
 /// both directions. UI consumers use it as a default focus when the caller
 /// hasn't picked a file yet. `None` on an empty index.

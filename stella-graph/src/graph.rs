@@ -224,6 +224,17 @@ impl CodeGraph {
         store::file_count(&self.inner.read_guard())
     }
 
+    /// Total symbols across the whole index (the graph total, not a per-pass
+    /// delta). Used by the startup summary line.
+    pub fn symbol_count(&self) -> Result<usize, GraphError> {
+        store::symbol_count(&self.inner.read_guard())
+    }
+
+    /// Total import edges across the whole index.
+    pub fn import_count(&self) -> Result<usize, GraphError> {
+        store::import_count(&self.inner.read_guard())
+    }
+
     /// Frames for every definition of `name`.
     pub fn definitions(&self, name: &str) -> Result<Vec<ContextFrame>, GraphError> {
         frames::definitions(&self.inner.read_guard(), &self.inner.root, name)

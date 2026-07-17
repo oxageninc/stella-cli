@@ -58,8 +58,8 @@ use std::pin::Pin;
 
 use futures_util::StreamExt;
 use stella_protocol::{
-    AgentEvent, CompletionMessage, CompletionRequest, MessageRole, Provider, ProviderError,
-    ReasoningEffort, StageKind, ToolCall, ToolOutput, ToolResult,
+    AgentEvent, CompletionMessage, CompletionRequest, FinishReason, MessageRole, Provider,
+    ProviderError, ReasoningEffort, StageKind, ToolCall, ToolOutput, ToolResult,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -104,7 +104,12 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            max_output_tokens: Some(8192),
+            // 16k, not 8k: reasoning models (e.g. glm-5.2) can spend their whole
+            // output budget on chain-of-thought and get cut off before emitting
+            // any answer. 16k gives the answer room to land after reasoning and
+            // is within every seeded catalog model's output ceiling. Per-model
+            // caps in the catalog are the eventual refinement.
+            max_output_tokens: Some(16384),
             temperature: Some(0.0),
             effort: None,
             retry_policy: RetryPolicy::standard(),
@@ -600,6 +605,44 @@ impl<'a> Engine<'a> {
         }
 
         if result.tool_calls.is_empty() {
+            // A turn that produced neither a tool call NOR any visible text is
+            // never a real completion: the model was cut off at its output
+            // limit (usually mid-reasoning) or returned nothing at all.
+            // Recording it as `Completed` shows the user a silent, blank turn
+            // (the "turn ends with no feedback" defect). Surface why and abort
+            // cleanly so the caller can retry instead of swallowing it.
+            if result.text.trim().is_empty() {
+                let reason = match result.finish_reason {
+                    Some(FinishReason::Length) => format!(
+                        "The model reached its output-token limit ({} tokens) before producing \
+                         any visible response — its budget was likely spent on reasoning. Retry, \
+                         raise the output cap, or run /compact to shrink the context.",
+                        result.usage.output_tokens
+                    ),
+                    _ => format!(
+                        "The model returned an empty response this turn — no text and no tool \
+                         call ({} output tokens). Retry, or switch to a different model.",
+                        result.usage.output_tokens
+                    ),
+                };
+                let _ = events.send(AgentEvent::Error {
+                    message: reason.clone(),
+                    retryable: true,
+                });
+                return Some(TurnOutcome::Aborted { reason });
+            }
+            // A non-empty answer that was still truncated at the limit: keep the
+            // partial answer (already emitted above) but tell the user it was
+            // cut off, so a mid-thought stop is never mistaken for a full one.
+            if result.finish_reason == Some(FinishReason::Length) {
+                let _ = events.send(AgentEvent::Text {
+                    delta: format!(
+                        "\n\n⚠ Response was truncated at the output-token limit ({} tokens); \
+                         ask to continue if it was cut off mid-thought.",
+                        result.usage.output_tokens
+                    ),
+                });
+            }
             messages.push(CompletionMessage {
                 role: MessageRole::Assistant,
                 content: result.text.clone(),
@@ -958,6 +1001,7 @@ mod tests {
             usage: CompletionUsage::default(),
             model: "scripted".into(),
             cost_usd: 0.0001,
+            finish_reason: None,
         }
     }
 
@@ -972,6 +1016,7 @@ mod tests {
             usage: CompletionUsage::default(),
             model: "scripted".into(),
             cost_usd: 0.0001,
+            finish_reason: None,
         }
     }
 
@@ -1016,6 +1061,67 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::Complete { .. }))
+        );
+    }
+
+    fn empty_result(finish_reason: Option<FinishReason>) -> CompletionResultAlias {
+        CompletionResultAlias {
+            text: String::new(),
+            tool_calls: vec![],
+            usage: CompletionUsage {
+                input_tokens: 100,
+                output_tokens: 8192,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            model: "scripted".into(),
+            cost_usd: 0.05,
+            finish_reason,
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_completion_aborts_with_a_visible_message_not_a_silent_success() {
+        // A turn that yields no text AND no tool calls — e.g. the model spent
+        // its whole output budget on reasoning and was cut off at
+        // finish_reason "length" — must never be recorded as a clean
+        // completion. It must surface why and abort. Regression for the
+        // "turn ends with no feedback, feature never built" defect.
+        let provider = ScriptedProvider {
+            id: "scripted".into(),
+            script: TokioMutex::new(vec![Ok(empty_result(Some(FinishReason::Length)))]),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let tools = CountingTools {
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let sleeper = NoopSleeper;
+        let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("build the feature"),
+        ];
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        assert!(
+            matches!(outcome, TurnOutcome::Aborted { .. }),
+            "an empty completion must abort, not complete: {outcome:?}"
+        );
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error { .. })),
+            "the user must see an error explaining the empty turn"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Complete { .. })),
+            "an empty turn must NOT emit a Complete success marker"
         );
     }
 
@@ -1271,6 +1377,7 @@ mod tests {
                 usage: CompletionUsage::default(),
                 model: format!("{dialect}-model"),
                 cost_usd: 0.00001,
+                finish_reason: None,
             }));
         }
         script.push(Ok(text_result(&format!("{dialect} turn complete"))));
@@ -1381,6 +1488,7 @@ mod tests {
             usage: CompletionUsage::default(),
             model: "scripted".into(),
             cost_usd: 0.0001,
+            finish_reason: None,
         }
     }
 

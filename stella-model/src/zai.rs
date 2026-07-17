@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use stella_protocol::{
-    CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, MessageRole,
-    ProviderError, ToolCall,
+    CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, FinishReason,
+    MessageRole, ProviderError, ToolCall,
 };
 
 use crate::catalog::{Catalog, Pricing};
@@ -280,6 +280,14 @@ struct ZaiStreamChoice {
 struct ZaiStreamDelta {
     #[serde(default)]
     content: Option<String>,
+    /// GLM streams chain-of-thought under `reasoning_content`, separate from
+    /// the answer in `content`. Without deserializing it, a turn that spends
+    /// its whole output budget reasoning (and is cut off before emitting any
+    /// `content`) looks empty — the adapter returns no text and no tool call,
+    /// and the driver used to record that as a clean completion (the "turn
+    /// ends with no feedback" defect). Captured so it can be surfaced.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ZaiStreamToolCallDelta>,
 }
@@ -449,7 +457,8 @@ impl Provider for ZaiProvider {
             ));
         }
 
-        let (text, tool_calls, usage) = aggregate_zai_stream(response, &self.label).await?;
+        let (text, tool_calls, usage, finish_reason) =
+            aggregate_zai_stream(response, &self.label).await?;
         let cost_usd = self.pricing.map(|p| p.cost_usd(&usage)).unwrap_or(0.0);
         Ok(CompletionResult {
             text,
@@ -457,6 +466,7 @@ impl Provider for ZaiProvider {
             usage,
             model: self.model.clone(),
             cost_usd,
+            finish_reason,
         })
     }
 }
@@ -473,9 +483,13 @@ struct ToolCallAccumulator {
 async fn aggregate_zai_stream(
     response: reqwest::Response,
     label: &str,
-) -> Result<(String, Vec<ToolCall>, CompletionUsage), ProviderError> {
+) -> Result<(String, Vec<ToolCall>, CompletionUsage, Option<FinishReason>), ProviderError> {
     let mut decoder = SseDecoder::new();
     let mut text = String::new();
+    // Chain-of-thought streamed under `reasoning_content`, kept separate from
+    // the answer. Used only as a fallback when `content` never arrives, so a
+    // reasoning-only turn is visible instead of blank.
+    let mut reasoning = String::new();
     let mut usage = CompletionUsage::default();
     let mut tool_calls: BTreeMap<usize, ToolCallAccumulator> = BTreeMap::new();
     // Set once any choice reports `finish_reason: "length"` — the output was
@@ -516,6 +530,9 @@ async fn aggregate_zai_stream(
                 }
                 if let Some(content) = choice.delta.content {
                     text.push_str(&content);
+                }
+                if let Some(rc) = choice.delta.reasoning_content {
+                    reasoning.push_str(&rc);
                 }
                 for tc_delta in choice.delta.tool_calls {
                     let acc = tool_calls.entry(tc_delta.index).or_default();
@@ -600,7 +617,22 @@ async fn aggregate_zai_stream(
         });
     }
 
-    Ok((text, calls, usage))
+    // Reasoning-only fallback: if the model emitted no answer `content` but did
+    // stream chain-of-thought, surface the reasoning as the text so the turn is
+    // never blank. Normal turns keep `content` as the answer and ignore it.
+    if text.trim().is_empty() && !reasoning.trim().is_empty() {
+        text = reasoning;
+    }
+
+    let finish_reason = if truncated_at_token_limit {
+        Some(FinishReason::Length)
+    } else if !calls.is_empty() {
+        Some(FinishReason::ToolCalls)
+    } else {
+        Some(FinishReason::Stop)
+    };
+
+    Ok((text, calls, usage, finish_reason))
 }
 
 #[cfg(test)]

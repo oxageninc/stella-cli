@@ -15,7 +15,8 @@ pub mod role;
 pub mod tool;
 
 pub use completion::{
-    CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, MessageRole,
+    CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, FinishReason,
+    MessageRole,
     ReasoningEffort,
 };
 pub use error::ProviderError;
