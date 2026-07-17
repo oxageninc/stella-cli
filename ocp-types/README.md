@@ -6,7 +6,7 @@ queries, capabilities, and provenance.
 `ocp-types` is the industry-facing artifact of the OCP crates: **MIT
 licensed, zero dependencies beyond `serde`.** You can implement an OCP
 provider or host in Rust against this crate alone, with no dependency on
-[Stella](https://github.com/oxageninc/stella) or any of its other crates.
+[Stella](https://github.com/macanderson/stella) or any of its other crates.
 
 Protocol version: `ocp/1.0-draft` (see [`stability.md`][stability] for what
 that means for this crate's semver).
@@ -70,10 +70,10 @@ protocol; there is no separate IDL.
 - [Running conformance][conformance] — proving your provider is conformant.
 - [Stability][stability] — the crate-semver vs. protocol-version relationship.
 
-[protocol-surface]: https://github.com/oxageninc/stella/blob/main/docs/ocp/protocol-surface.md
-[implementing]: https://github.com/oxageninc/stella/blob/main/docs/ocp/implementing-a-provider.md
-[conformance]: https://github.com/oxageninc/stella/blob/main/docs/ocp/running-conformance.md
-[stability]: https://github.com/oxageninc/stella/blob/main/docs/ocp/stability.md
+[protocol-surface]: https://github.com/macanderson/stella/blob/main/docs/ocp/protocol-surface.md
+[implementing]: https://github.com/macanderson/stella/blob/main/docs/ocp/implementing-a-provider.md
+[conformance]: https://github.com/macanderson/stella/blob/main/docs/ocp/running-conformance.md
+[stability]: https://github.com/macanderson/stella/blob/main/docs/ocp/stability.md
 [`ContextFrame`]: https://docs.rs/ocp-types/latest/ocp_types/frame/struct.ContextFrame.html
 [`FrameKind`]: https://docs.rs/ocp-types/latest/ocp_types/frame/enum.FrameKind.html
 [`Provenance`]: https://docs.rs/ocp-types/latest/ocp_types/frame/struct.Provenance.html
@@ -86,5 +86,5 @@ protocol; there is no separate IDL.
 
 ## License
 
-MIT — see [`LICENSE-MIT`](https://github.com/oxageninc/stella/blob/main/LICENSE-MIT)
+MIT — see [`LICENSE-MIT`](https://github.com/macanderson/stella/blob/main/LICENSE-MIT)
 in the workspace root.

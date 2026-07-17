@@ -59,7 +59,7 @@ See [Running conformance][conformance] for the full guide.
 
 [`ocp-types`](https://crates.io/crates/ocp-types) and
 [`ocp-host`](https://crates.io/crates/ocp-host) — no dependency on
-[Stella](https://github.com/oxageninc/stella) or any of its other crates.
+[Stella](https://github.com/macanderson/stella) or any of its other crates.
 
 ## Docs
 
@@ -69,15 +69,15 @@ See [Running conformance][conformance] for the full guide.
 - [Running conformance][conformance] — this crate's full guide.
 - [Stability][stability] — the crate-semver vs. protocol-version relationship.
 
-[protocol-surface]: https://github.com/oxageninc/stella/blob/main/docs/ocp/protocol-surface.md
-[implementing]: https://github.com/oxageninc/stella/blob/main/docs/ocp/implementing-a-provider.md
-[conformance]: https://github.com/oxageninc/stella/blob/main/docs/ocp/running-conformance.md
-[stability]: https://github.com/oxageninc/stella/blob/main/docs/ocp/stability.md
+[protocol-surface]: https://github.com/macanderson/stella/blob/main/docs/ocp/protocol-surface.md
+[implementing]: https://github.com/macanderson/stella/blob/main/docs/ocp/implementing-a-provider.md
+[conformance]: https://github.com/macanderson/stella/blob/main/docs/ocp/running-conformance.md
+[stability]: https://github.com/macanderson/stella/blob/main/docs/ocp/stability.md
 [`run_conformance`]: https://docs.rs/ocp-conformance/latest/ocp_conformance/fn.run_conformance.html
 [`ConformanceReport`]: https://docs.rs/ocp-conformance/latest/ocp_conformance/struct.ConformanceReport.html
 
 ## License
 
-MIT OR Apache-2.0 — see [`LICENSE-MIT`](https://github.com/oxageninc/stella/blob/main/LICENSE-MIT)
-/ [`LICENSE-APACHE`](https://github.com/oxageninc/stella/blob/main/LICENSE-APACHE)
+MIT OR Apache-2.0 — see [`LICENSE-MIT`](https://github.com/macanderson/stella/blob/main/LICENSE-MIT)
+/ [`LICENSE-APACHE`](https://github.com/macanderson/stella/blob/main/LICENSE-APACHE)
 in the workspace root.

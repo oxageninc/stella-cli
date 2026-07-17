@@ -13,7 +13,7 @@ its `token_cost` has its frames dropped and reported, never silently trusted.
 
 Depends only on [`ocp-types`](https://crates.io/crates/ocp-types) plus
 ordinary async/transport crates (`tokio`, `reqwest`) — no dependency on
-[Stella](https://github.com/oxageninc/stella) or any of its other crates.
+[Stella](https://github.com/macanderson/stella) or any of its other crates.
 
 ## Example: query a stdio provider
 
@@ -84,14 +84,14 @@ Rust) and the consent-gating contract for `egress` providers.
   with `ocp-conformance`.
 - [Stability][stability] — the crate-semver vs. protocol-version relationship.
 
-[protocol-surface]: https://github.com/oxageninc/stella/blob/main/docs/ocp/protocol-surface.md
-[implementing]: https://github.com/oxageninc/stella/blob/main/docs/ocp/implementing-a-provider.md
-[conformance]: https://github.com/oxageninc/stella/blob/main/docs/ocp/running-conformance.md
-[stability]: https://github.com/oxageninc/stella/blob/main/docs/ocp/stability.md
+[protocol-surface]: https://github.com/macanderson/stella/blob/main/docs/ocp/protocol-surface.md
+[implementing]: https://github.com/macanderson/stella/blob/main/docs/ocp/implementing-a-provider.md
+[conformance]: https://github.com/macanderson/stella/blob/main/docs/ocp/running-conformance.md
+[stability]: https://github.com/macanderson/stella/blob/main/docs/ocp/stability.md
 [`ContextProvider`]: https://docs.rs/ocp-host/latest/ocp_host/provider/trait.ContextProvider.html
 
 ## License
 
-MIT OR Apache-2.0 — see [`LICENSE-MIT`](https://github.com/oxageninc/stella/blob/main/LICENSE-MIT)
-/ [`LICENSE-APACHE`](https://github.com/oxageninc/stella/blob/main/LICENSE-APACHE)
+MIT OR Apache-2.0 — see [`LICENSE-MIT`](https://github.com/macanderson/stella/blob/main/LICENSE-MIT)
+/ [`LICENSE-APACHE`](https://github.com/macanderson/stella/blob/main/LICENSE-APACHE)
 in the workspace root.

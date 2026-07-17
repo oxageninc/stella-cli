@@ -46,8 +46,8 @@ This is also why local pre-publish verification is asymmetric:
 ## One-time prerequisites
 
 1. A crates.io account with a verified email, linked to a GitHub account with
-   write access to `oxageninc/stella` (or another account willing to transfer
-   ownership to the `oxageninc` GitHub org's crates.io team once one exists).
+   write access to `macanderson/stella` (or another account willing to transfer
+   ownership to the `macanderson` GitHub org's crates.io team once one exists).
 2. `cargo login <token>` locally, using a crates.io API token scoped to
    `publish-new` + `publish-update` (crates.io Account Settings → API
    Tokens). Do not commit this token; it's not an env var this repo reads.

@@ -8,8 +8,8 @@
 
 <p align="center"><strong>A fast, BYOK, model-agnostic terminal coding agent, built in Rust.</strong></p>
 <p align="center">
-  <a href="https://github.com/oxageninc/stella/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/oxageninc/stella/ci.yml?branch=main&style=flat-square&logo=github&label=ci" alt="CI status"></a>
-  <a href="https://github.com/oxageninc/stella/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/oxageninc/stella/release.yml?style=flat-square&logo=github&label=release" alt="Release status"></a>
+  <a href="https://github.com/macanderson/stella/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/macanderson/stella/ci.yml?branch=main&style=flat-square&logo=github&label=ci" alt="CI status"></a>
+  <a href="https://github.com/macanderson/stella/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/macanderson/stella/release.yml?style=flat-square&logo=github&label=release" alt="Release status"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-FFAC26?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/rust-1.90%2B-FFAC26?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.90+">
   <img src="https://img.shields.io/badge/providers-9%20%2B%20local-FFAC26?style=flat-square" alt="9 providers + local">
@@ -67,7 +67,7 @@ workspace of focused crates.
 **Prebuilt binary:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oxageninc/stella/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/macanderson/stella/main/install.sh | sh
 stella --version
 ```
 
@@ -77,7 +77,7 @@ falls back to `cargo install` when no prebuilt binary matches your platform.
 **Homebrew:**
 
 ```bash
-brew install oxageninc/stella/stella
+brew install macanderson/stella/stella
 ```
 
 To build from source via Homebrew:
@@ -86,14 +86,14 @@ To build from source via Homebrew:
 **From cargo** (requires Rust 1.90+ and git):
 
 ```bash
-cargo install --locked --git https://github.com/oxageninc/stella stella-cli
+cargo install --locked --git https://github.com/macanderson/stella stella-cli
 stella --version
 ```
 
 **From source:**
 
 ```bash
-git clone https://github.com/oxageninc/stella.git
+git clone https://github.com/macanderson/stella.git
 cd stella
 cargo build --release
 ./target/release/stella --version
@@ -436,9 +436,9 @@ tests, and a release build on every PR.
 
 | You have… | Do this |
 |---|---|
-| A bug | [File it with a repro](https://github.com/oxageninc/stella/issues/new?template=bug_report.yml) |
-| An idea | [Open a feature request](https://github.com/oxageninc/stella/issues/new?template=feature_request.yml) or start a [discussion](https://github.com/oxageninc/stella/discussions) |
-| An evening | Grab a [`good first issue`](https://github.com/oxageninc/stella/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) |
+| A bug | [File it with a repro](https://github.com/macanderson/stella/issues/new?template=bug_report.yml) |
+| An idea | [Open a feature request](https://github.com/macanderson/stella/issues/new?template=feature_request.yml) or start a [discussion](https://github.com/macanderson/stella/discussions) |
+| An evening | Grab a [`good first issue`](https://github.com/macanderson/stella/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) |
 
 ## License
 

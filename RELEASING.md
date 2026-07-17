@@ -16,16 +16,16 @@ The tag-triggered workflow publishes the Homebrew formula to a **tap repo**.
 This has to exist and be writable before the first release:
 
 1. **Create the tap repo.** A public repo named exactly
-   [`oxageninc/homebrew-stella`](https://github.com/oxageninc/homebrew-stella)
-   (Homebrew maps the tap `oxageninc/stella` → repo `homebrew-stella`). It can
+   [`macanderson/homebrew-stella`](https://github.com/macanderson/homebrew-stella)
+   (Homebrew maps the tap `macanderson/stella` → repo `homebrew-stella`). It can
    start empty; the release job commits `Formula/stella.rb` into it.
 
 2. **Create a push token.** A GitHub token with **contents: write** on the tap
-   repo — a fine-grained PAT scoped to `oxageninc/homebrew-stella`, or a classic
+   repo — a fine-grained PAT scoped to `macanderson/homebrew-stella`, or a classic
    PAT with `repo`. The default `GITHUB_TOKEN` can't push to another repo, so a
    dedicated one is required.
 
-3. **Add it as a secret** on **this** repo (`oxageninc/stella`):
+3. **Add it as a secret** on **this** repo (`macanderson/stella`):
    Settings → Secrets and variables → Actions → New repository secret →
    name `HOMEBREW_TAP_TOKEN`, value the token from step 2.
 
@@ -86,14 +86,14 @@ means cutting a new version.
 Homebrew (prebuilt binary, no Rust toolchain):
 
 ```bash
-brew install oxageninc/stella/stella
-# equivalently: brew tap oxageninc/stella && brew install stella
+brew install macanderson/stella/stella
+# equivalently: brew tap macanderson/stella && brew install stella
 ```
 
 Shell installer (macOS/Linux, no Homebrew):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oxageninc/stella/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/macanderson/stella/main/install.sh | sh
 ```
 
 The installer detects the platform, downloads the matching tarball from the

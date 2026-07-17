@@ -20,11 +20,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/oxageninc/stella"
+repository = "https://github.com/macanderson/stella"
 homepage = "https://docs.oxagen.sh/stella"
 publish = false
 
@@ -71,7 +71,7 @@ wiremock = "0.6"
 # The installers to generate for each app
 installers = ["shell", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
-tap = "oxageninc/homebrew-stella"
+tap = "macanderson/homebrew-stella"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)

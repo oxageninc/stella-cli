@@ -24,8 +24,8 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-REPO="oxageninc/stella"
-TAP_REPO="oxageninc/homebrew-stella"
+REPO="macanderson/stella"
+TAP_REPO="macanderson/homebrew-stella"
 BIN="stella"
 CRATE="stella-cli"
 MAC_TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)

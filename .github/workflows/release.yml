@@ -219,7 +219,7 @@ jobs:
 
   # Renders .github/homebrew/stella.rb.tmpl with the real version + per-target
   # SHA-256 sums and commits it as Formula/stella.rb to the tap repo
-  # (oxageninc/homebrew-stella). Runs only after the GitHub Release exists, so
+  # (macanderson/homebrew-stella). Runs only after the GitHub Release exists, so
   # the formula's release-asset URLs resolve. Auth: HOMEBREW_TAP_DEPLOY_KEY
   # (an SSH deploy key with write access to the tap repo — scoped to exactly
   # that one repo, unlike a PAT), with HOMEBREW_TAP_TOKEN (https) honored as a
@@ -293,10 +293,10 @@ jobs:
             printf '%s\n' "${HOMEBREW_TAP_DEPLOY_KEY}" > "${keyfile}"
             chmod 600 "${keyfile}"
             export GIT_SSH_COMMAND="ssh -i ${keyfile} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-            git clone --depth 1 "git@github.com:oxageninc/homebrew-stella.git" tap
+            git clone --depth 1 "git@github.com:macanderson/homebrew-stella.git" tap
           else
             git clone --depth 1 \
-              "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/oxageninc/homebrew-stella.git" tap
+              "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/macanderson/homebrew-stella.git" tap
           fi
 
           mkdir -p tap/Formula
