@@ -1311,28 +1311,117 @@ fn skills_snapshot(workspace_root: &std::path::Path, status: Option<String>) -> 
     })
 }
 
-/// Parse `npx skills find` stdout into hit rows: one per non-empty line (cap
-/// 50); `id` = the leading token (skipping a list marker), `label` = the whole
-/// line kept verbatim for display.
+/// Parse `npx skills find` output into structured hits (cap 50). The output is
+/// ANSI-colored and — under a TTY — carries a banner + an "Install with" line +
+/// per-hit `└ url` continuation lines. We strip the escapes and **allowlist**
+/// only the result rows: a leading `owner/repo@skill` token, optionally
+/// followed by an `<N> installs` popularity string, with the following URL line
+/// attached. Everything else (banner, instructions, blanks) is ignored, so no
+/// raw escape codes or ASCII-art ever reach the UI.
 fn parse_skill_hits(out: &str) -> Vec<SkillSearchHit> {
-    out.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .take(50)
-        .map(|line| {
-            let mut toks = line.split_whitespace();
-            let first = toks.next().unwrap_or("");
-            let id = if matches!(first, "-" | "*" | "•" | "▸") {
-                toks.next().unwrap_or(first)
-            } else {
-                first
-            };
-            SkillSearchHit {
-                id: id.to_string(),
-                label: line.to_string(),
+    let mut hits: Vec<SkillSearchHit> = Vec::new();
+    for raw in out.lines() {
+        if hits.len() >= 50 {
+            break;
+        }
+        let line = strip_ansi(raw);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // A URL continuation line belongs to the hit just above it.
+        if let Some(url) = skill_url_in(line) {
+            if let Some(last) = hits.last_mut() {
+                if last.url.is_empty() {
+                    last.url = url;
+                }
             }
-        })
-        .collect()
+            continue;
+        }
+        // Otherwise, only a genuine `owner/repo@skill …` result row is kept.
+        if let Some((id, installs, rank)) = parse_result_line(line) {
+            hits.push(SkillSearchHit {
+                id,
+                installs,
+                installs_rank: rank,
+                url: String::new(),
+            });
+        }
+    }
+    hits
+}
+
+/// Strip ANSI/CSI escape sequences (`ESC [ … final`) from a line, leaving the
+/// visible text. Robust to the SGR color codes `npx skills` emits.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // A CSI sequence: '[' then params/intermediates, then a final byte
+            // in 0x40..=0x7e. Consume through the final byte.
+            if chars.next() == Some('[') {
+                for n in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// If a (de-ANSI'd) line is a URL continuation (`└ https://skills.sh/…`),
+/// return the URL. Matching on `http` is robust to the leading box-drawing
+/// glyph, which the registry sometimes emits mojibake'd.
+fn skill_url_in(line: &str) -> Option<String> {
+    let pos = line.find("https://").or_else(|| line.find("http://"))?;
+    Some(line[pos..].split_whitespace().next()?.to_string())
+}
+
+/// Parse a result row into `(id, installs_display, installs_rank)`. The row's
+/// first whitespace token must be an `owner/repo@skill` id (has both `/` and
+/// `@`, no angle-bracket placeholder); the rest, if any, is the installs
+/// string (`"15.8K installs"`). Non-result lines (banner, "Install with …")
+/// return `None`.
+fn parse_result_line(line: &str) -> Option<(String, String, u64)> {
+    let mut toks = line.split_whitespace();
+    let id = toks.next()?;
+    if !id.contains('/') || !id.contains('@') || id.contains('<') || id.contains('>') {
+        return None;
+    }
+    let rest = toks.collect::<Vec<_>>().join(" ");
+    let rest = rest.trim();
+    if rest.is_empty() {
+        Some((id.to_string(), String::new(), 0))
+    } else {
+        Some((id.to_string(), rest.to_string(), parse_installs_count(rest)))
+    }
+}
+
+/// The numeric install count from a string like `"15.8K installs"` — the first
+/// token parseable as a number with an optional K/M/B suffix. `0` if none.
+fn parse_installs_count(s: &str) -> u64 {
+    s.split_whitespace().find_map(parse_count_token).unwrap_or(0)
+}
+
+/// Parse one token like `15.8K` / `9K` / `342` into an absolute count.
+fn parse_count_token(tok: &str) -> Option<u64> {
+    let t = tok.trim();
+    let (num, mult) = match t.chars().last() {
+        Some('K') | Some('k') => (&t[..t.len() - 1], 1_000.0),
+        Some('M') | Some('m') => (&t[..t.len() - 1], 1_000_000.0),
+        Some('B') | Some('b') => (&t[..t.len() - 1], 1_000_000_000.0),
+        _ => (t, 1.0),
+    };
+    let v: f64 = num.parse().ok()?;
+    if v < 0.0 {
+        return None;
+    }
+    Some((v * mult) as u64)
 }
 
 /// Run `npx skills add <id>` in an isolated temp dir, then adopt the produced
@@ -1361,19 +1450,46 @@ async fn install_skill(
     }
 }
 
-/// A crude popularity signal: the largest integer on a registry result line
-/// (stars/downloads if the CLI prints them), else 0.
-fn hit_popularity(label: &str) -> u64 {
-    label
-        .split(|c: char| !c.is_ascii_digit())
-        .filter_map(|t| t.parse::<u64>().ok())
-        .max()
-        .unwrap_or(0)
+/// Fetch a not-yet-installed skill's `SKILL.md` for the ctrl+o preview via
+/// `npx skills use <id>`, which prints the body wrapped in `<SKILL.md>…`. A
+/// larger output cap than search keeps the full body. Returns `(body, status)`
+/// — on failure `body` is empty and `status` carries the reason.
+async fn fetch_skill_markdown(registry: &SkillRegistry, id: &str) -> (String, Option<String>) {
+    let argv = SkillRegistry::render(&registry.use_cmd, "{id}", id);
+    match registry.run_capped(argv, 120, 200_000).await {
+        Ok(out) => (extract_skill_md_from_use(&out), None),
+        Err(e) => (String::new(), Some(format!("preview failed: {e}"))),
+    }
+}
+
+/// Pull the `SKILL.md` body out of `npx skills use` output. Prefer the content
+/// between the `<SKILL.md>` / `</SKILL.md>` markers; if the format drifts, fall
+/// back to the text after a leading preamble (from the first `---` frontmatter
+/// or `#` heading), never a blank preview.
+fn extract_skill_md_from_use(out: &str) -> String {
+    let out = strip_ansi(out);
+    if let Some(start) = out.find("<SKILL.md>") {
+        let after = &out[start + "<SKILL.md>".len()..];
+        let body = match after.find("</SKILL.md>") {
+            Some(end) => &after[..end],
+            None => after,
+        };
+        return body.trim().to_string();
+    }
+    // Fallback: drop the preamble by starting at the frontmatter or first heading.
+    if let Some(fm) = out.find("\n---").or_else(|| out.find("---")) {
+        return out[fm..].trim().to_string();
+    }
+    if let Some(h) = out.find("\n#").or_else(|| out.find('#')) {
+        return out[h..].trim().to_string();
+    }
+    out.trim().to_string()
 }
 
 /// Rank registry hits for LLM-assisted creation by (a) relevance — how many of
-/// the request's words appear in the hit's line — then (b) popularity as a
-/// usefulness signal. Returns the top few labels, most useful first.
+/// the request's words appear in the hit's id — then (b) popularity
+/// (`installs_rank`) as a usefulness signal. Returns the top few as
+/// `"id (installs)"` labels, most useful first.
 fn rank_hits(hits: &[SkillSearchHit], request: &str) -> Vec<String> {
     let want: Vec<String> = request
         .split(|c: char| !c.is_alphanumeric())
@@ -1383,16 +1499,22 @@ fn rank_hits(hits: &[SkillSearchHit], request: &str) -> Vec<String> {
     let mut scored: Vec<(usize, u64, &SkillSearchHit)> = hits
         .iter()
         .map(|h| {
-            let lower = h.label.to_ascii_lowercase();
+            let lower = h.id.to_ascii_lowercase();
             let relevance = want.iter().filter(|w| lower.contains(w.as_str())).count();
-            (relevance, hit_popularity(&h.label), h)
+            (relevance, h.installs_rank, h)
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
     scored
         .into_iter()
         .take(6)
-        .map(|(_, _, h)| h.label.clone())
+        .map(|(_, _, h)| {
+            if h.installs.is_empty() {
+                h.id.clone()
+            } else {
+                format!("{} ({})", h.id, h.installs)
+            }
+        })
         .collect()
 }
 
@@ -1555,6 +1677,15 @@ fn handle_skills_input(
                     hits,
                     status,
                 });
+            });
+        }
+        SkillOp::Preview { id } => {
+            let registry = registry.clone();
+            let in_tx = in_tx.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                let (body, status) = fetch_skill_markdown(&registry, &id).await;
+                let _ = in_tx.send(Inbound::SkillPreview { id, body, status });
             });
         }
         SkillOp::Install { scope, id } => {
@@ -2198,45 +2329,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_skill_hits_takes_id_first_and_keeps_the_label() {
-        let out = "acme/auth  OAuth helper\n- foo/bar  another one\n\n";
+    fn parse_skill_hits_strips_ansi_and_extracts_id_installs_url() {
+        // The real `npx skills find` shape: ANSI SGR codes, an "Install with"
+        // instruction line, result rows, and `└ url` continuation lines.
+        let out = "\n\u{1b}[38;5;102mInstall with\u{1b}[0m npx skills add <owner/repo@skill>\n\n\
+\u{1b}[38;5;145mwshobson/agents@rust-async-patterns\u{1b}[0m \u{1b}[36m15.8K installs\u{1b}[0m\n\
+\u{1b}[38;5;102m└ https://skills.sh/wshobson/agents/rust-async-patterns\u{1b}[0m\n\n\
+\u{1b}[38;5;145mapollographql/skills@rust-best-practices\u{1b}[0m \u{1b}[36m13.9K installs\u{1b}[0m\n\
+\u{1b}[38;5;102m└ https://skills.sh/apollographql/skills/rust-best-practices\u{1b}[0m\n";
         let hits = parse_skill_hits(out);
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].id, "acme/auth");
-        assert_eq!(hits[0].label, "acme/auth  OAuth helper");
-        assert_eq!(hits[1].id, "foo/bar", "leading list marker skipped");
+        assert_eq!(hits.len(), 2, "only the two result rows: {hits:?}");
+        assert_eq!(hits[0].id, "wshobson/agents@rust-async-patterns");
+        assert_eq!(hits[0].installs, "15.8K installs");
+        assert_eq!(hits[0].installs_rank, 15_800);
+        assert_eq!(
+            hits[0].url,
+            "https://skills.sh/wshobson/agents/rust-async-patterns"
+        );
+        assert_eq!(hits[1].id, "apollographql/skills@rust-best-practices");
+        assert_eq!(hits[1].installs_rank, 13_900);
+        // Never leak escape codes or the instruction line into a hit.
+        for h in &hits {
+            assert!(!h.id.contains('\u{1b}') && !h.id.contains('['), "{h:?}");
+            assert!(!h.id.contains("Install"), "instruction line rejected: {h:?}");
+        }
+    }
+
+    #[test]
+    fn parse_skill_hits_rejects_rows_without_owner_repo_at_skill() {
+        // A plain description line (no `@`) and the placeholder are not results.
+        let out = "acme/auth  not a real hit\nInstall with npx skills add <owner/repo@skill>\n";
+        assert!(parse_skill_hits(out).is_empty());
+    }
+
+    #[test]
+    fn parse_installs_count_handles_k_m_and_plain() {
+        assert_eq!(parse_installs_count("15.8K installs"), 15_800);
+        assert_eq!(parse_installs_count("9K installs"), 9_000);
+        assert_eq!(parse_installs_count("2.5M installs"), 2_500_000);
+        assert_eq!(parse_installs_count("342 installs"), 342);
+        assert_eq!(parse_installs_count("installs"), 0);
     }
 
     #[test]
     fn parse_skill_hits_caps_at_fifty() {
         let out = (0..100)
-            .map(|i| format!("pkg/skill-{i}  desc"))
+            .map(|i| format!("pkg/repo@skill-{i}  {i} installs"))
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(parse_skill_hits(&out).len(), 50);
     }
 
     #[test]
+    fn extract_skill_md_from_use_unwraps_the_wrapped_body() {
+        let out = "You are being given a Skill.\n\nUse the following SKILL.md as your instructions:\n\n<SKILL.md>\n---\nname: rust-async\n---\n\n# Rust Async\n\nbody\n</SKILL.md>\n";
+        let md = extract_skill_md_from_use(out);
+        assert!(md.starts_with("---"), "starts at frontmatter: {md}");
+        assert!(md.contains("# Rust Async"));
+        assert!(!md.contains("You are being given"), "preamble dropped: {md}");
+        assert!(!md.contains("</SKILL.md>"), "close marker dropped: {md}");
+    }
+
+    #[test]
     fn rank_hits_orders_by_relevance_then_popularity() {
         let hits = vec![
             SkillSearchHit {
-                id: "a/pdf".into(),
-                label: "a/pdf extract pdf tables  120".into(),
+                id: "a/pkg@pdf-extract".into(),
+                installs: "120 installs".into(),
+                installs_rank: 120,
+                url: String::new(),
             },
             SkillSearchHit {
-                id: "b/img".into(),
-                label: "b/img resize images  9000".into(),
+                id: "b/pkg@img-resize".into(),
+                installs: "9K installs".into(),
+                installs_rank: 9_000,
+                url: String::new(),
             },
             SkillSearchHit {
-                id: "c/pdf".into(),
-                label: "c/pdf pdf reader  5".into(),
+                id: "c/pkg@pdf-reader".into(),
+                installs: "5 installs".into(),
+                installs_rank: 5,
+                url: String::new(),
             },
         ];
         let ranked = rank_hits(&hits, "extract tables from pdf");
-        assert!(ranked[0].contains("a/pdf"), "{ranked:?}");
+        assert!(ranked[0].contains("a/pkg@pdf-extract"), "{ranked:?}");
         assert!(
-            ranked.iter().position(|l| l.contains("a/pdf"))
-                < ranked.iter().position(|l| l.contains("b/img")),
+            ranked.iter().position(|l| l.contains("a/pkg"))
+                < ranked.iter().position(|l| l.contains("b/pkg")),
             "relevance beats popularity: {ranked:?}"
         );
     }

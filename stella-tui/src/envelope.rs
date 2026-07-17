@@ -174,6 +174,15 @@ pub enum Inbound {
         hits: Vec<SkillSearchHit>,
         status: Option<String>,
     },
+    /// The rendered `SKILL.md` body for the ctrl+o preview overlay, fetched by
+    /// the driver (`npx skills use <id>`) for a not-yet-installed search hit.
+    /// Out-of-band like [`Inbound::SkillSearch`]; `id` lets the tab drop a
+    /// stale reply if the user closed or re-targeted the preview meanwhile.
+    SkillPreview {
+        id: String,
+        body: String,
+        status: Option<String>,
+    },
     /// A refreshed snapshot of the configured MCP servers for the MCP tab.
     /// Out-of-band view state exactly like [`Inbound::GraphSnapshot`]: applied
     /// straight to `DeckUi::mcp` by [`crate::deck_ui::ingest_inbound`], ignored
@@ -385,12 +394,18 @@ pub struct SkillRow {
     pub removable: bool,
 }
 
-/// One registry search hit. Minimal by design: `id` (the leading token,
-/// passed verbatim to `npx skills add`) + the full `label` line as printed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One registry search hit, parsed from `npx skills find` into structured
+/// fields — never the raw ANSI-laden line. `id` (`owner/repo@skill`) is the
+/// display name AND the token passed verbatim to `npx skills add` / `use`;
+/// `installs` is the human popularity string (`"15.8K installs"`, empty if the
+/// registry printed none) with `installs_rank` its numeric form for ranking/
+/// the popularity bar; `url` is the `skills.sh` page (shown in the preview).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SkillSearchHit {
     pub id: String,
-    pub label: String,
+    pub installs: String,
+    pub installs_rank: u64,
+    pub url: String,
 }
 
 /// The full installed-skills read-model rendered by the SKILLS tab.
@@ -421,6 +436,10 @@ pub enum SkillOp {
     Uninstall { scope: SkillScope, name: String },
     /// `npx skills find <query>` → [`Inbound::SkillSearch`].
     Search { query: String },
+    /// Fetch a search hit's `SKILL.md` for the ctrl+o preview overlay
+    /// (`npx skills use <id>`, extracting the wrapped body) →
+    /// [`Inbound::SkillPreview`]. No disk write — preview only.
+    Preview { id: String },
     /// Install a registry skill into `scope` → refresh the list.
     Install { scope: SkillScope, id: String },
     /// LLM-assisted creation from a short description → refresh the list.

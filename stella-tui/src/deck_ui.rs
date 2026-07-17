@@ -204,6 +204,25 @@ pub enum ScopeAction {
     Create { description: String },
 }
 
+/// The ctrl+o markdown preview overlay: a scrollable, read-only render of a
+/// skill's `SKILL.md`. Opened from either pane — for an installed skill the
+/// body is on hand (`SkillRow::body`, so `body` is `Some` immediately); for a
+/// registry hit it is fetched (`body` starts `None` = loading, filled by
+/// [`Inbound::SkillPreview`] whose `id` must match `pending`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SkillPreview {
+    /// Heading shown in the popup border (the skill id or name).
+    pub title: String,
+    /// A dim sub-line under the title — the `skills.sh` url or the scope/origin.
+    pub subtitle: String,
+    /// The awaited hit `id` while `body` is `None`; `None` for a local body.
+    pub pending: Option<String>,
+    /// The markdown body once available; `None` renders a loading state.
+    pub body: Option<String>,
+    /// Vertical scroll offset in lines, clamped to content at render time.
+    pub scroll: u16,
+}
+
 /// All SKILLS-tab view state. The installed list + `busy`/`status` come from
 /// [`Inbound::Skills`] snapshots the driver owns; the rest (selection, the
 /// live search query, transient arming, the active overlay) is local.
@@ -229,6 +248,8 @@ pub struct SkillsPanel {
     pub uninstall_armed: bool,
     /// An active overlay capturing keys ahead of the panes.
     pub prompt: Option<SkillPrompt>,
+    /// The ctrl+o markdown preview overlay (modal, scroll + esc), or `None`.
+    pub preview: Option<SkillPreview>,
 }
 
 /// All ephemeral view state for the deck.
@@ -518,6 +539,25 @@ pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut De
         });
         return;
     }
+    if let Inbound::SkillPreview { id, body, status } = inbound {
+        // Only fill if this reply still matches the open, still-loading preview
+        // — the user may have closed it or re-targeted another hit meanwhile.
+        if let Some(preview) = ui.skills.preview.as_mut()
+            && preview.pending.as_deref() == Some(id.as_str())
+        {
+            preview.body = Some(if body.trim().is_empty() {
+                "*(no preview available)*".to_string()
+            } else {
+                body.clone()
+            });
+            preview.pending = None;
+            preview.scroll = 0;
+        }
+        if let Some(status) = status {
+            ui.skills.status = Some(status.clone());
+        }
+        return;
+    }
     if let Inbound::McpServers(servers) = inbound {
         ui.mcp.servers = servers.clone();
         ui.mcp.selected = ui.mcp.selected.min(ui.mcp.servers.len().saturating_sub(1));
@@ -661,8 +701,10 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
     // Ctrl-O: the expand/collapse verb. On a ↑/↓-highlighted message it
     // toggles that message; from the prompt it toggles the most recent
     // expandable message, and a second consecutive press escalates to the
-    // all-thinking toggle (chain-of-thought everywhere).
-    if is_ctrl_o {
+    // all-thinking toggle (chain-of-thought everywhere). The SKILLS tab reuses
+    // ctrl+o for its own markdown preview overlay, so it must NOT be claimed
+    // here on that tab — the keyboard-owning skills handler below owns it.
+    if is_ctrl_o && ui.tab != DeckTab::Skills {
         if let Some(sel) = ui.session_selected {
             // Only a genuinely expandable entry toggles — a no-op press must
             // not bump `expanded_rev` and invalidate the settled fold cache.
@@ -1161,6 +1203,11 @@ fn handle_pick_version_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
 /// that should fall through to the deck-global handlers — Tab still leaves the
 /// tab and `?` still opens help from the installed pane.
 fn handle_skills_key(key: KeyEvent, ui: &mut DeckUi) -> Option<DeckAction> {
+    // The ctrl+o preview overlay is fully modal (scroll + esc close) and sits
+    // ahead of every pane and the other prompts.
+    if ui.skills.preview.is_some() {
+        return Some(handle_skills_preview_key(key, ui));
+    }
     // An overlay (scope picker / create / edit / pin) is fully modal.
     if ui.skills.prompt.is_some() {
         return Some(handle_skills_prompt_key(key, ui));
@@ -1170,6 +1217,88 @@ fn handle_skills_key(key: KeyEvent, ui: &mut DeckUi) -> Option<DeckAction> {
         SkillsFocus::Installed => handle_skills_installed_key(key, ui, ctrl),
         SkillsFocus::Search => handle_skills_search_key(key, ui),
     }
+}
+
+/// Open the ctrl+o preview for the highlighted installed skill — its body is
+/// already in hand (`SkillRow::body`), so no driver round-trip.
+fn open_installed_preview(ui: &mut DeckUi) -> Option<DeckAction> {
+    let row = ui.skills.view.rows.get(ui.skills.sel)?;
+    ui.skills.preview = Some(SkillPreview {
+        title: row.name.clone(),
+        subtitle: format!("{} · {} · v{}", row.scope.label(), row.origin, row.version),
+        pending: None,
+        body: Some(if row.body.trim().is_empty() {
+            "*(this skill has an empty body)*".to_string()
+        } else {
+            row.body.clone()
+        }),
+        scroll: 0,
+    });
+    Some(DeckAction::Handled)
+}
+
+/// Open the ctrl+o preview for the highlighted registry hit — the body is not
+/// local, so show a loading state and ask the driver to fetch the `SKILL.md`.
+fn open_search_preview(ui: &mut DeckUi) -> Option<DeckAction> {
+    if ui.skills.hits.is_empty() {
+        return Some(DeckAction::Handled);
+    }
+    let idx = ui.skills.search_sel.min(ui.skills.hits.len() - 1);
+    let hit = &ui.skills.hits[idx];
+    let id = hit.id.clone();
+    ui.skills.preview = Some(SkillPreview {
+        title: hit.id.clone(),
+        subtitle: if hit.url.is_empty() {
+            hit.installs.clone()
+        } else {
+            hit.url.clone()
+        },
+        pending: Some(id.clone()),
+        body: None,
+        scroll: 0,
+    });
+    Some(DeckAction::Send(WorkspaceInput::Skill(SkillOp::Preview {
+        id,
+    })))
+}
+
+/// The preview overlay keys (fully modal): scroll the body (↑/↓, PageUp/Down,
+/// Home/End) and dismiss (esc / ctrl+o / q).
+fn handle_skills_preview_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let Some(preview) = ui.skills.preview.as_mut() else {
+        return DeckAction::Handled;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            ui.skills.preview = None;
+        }
+        KeyCode::Char('o') if ctrl => {
+            ui.skills.preview = None;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            preview.scroll = preview.scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            // Upper bound is clamped to real content height at render time.
+            preview.scroll = preview.scroll.saturating_add(1);
+        }
+        KeyCode::PageUp => {
+            preview.scroll = preview.scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            preview.scroll = preview.scroll.saturating_add(10);
+        }
+        KeyCode::Home => {
+            preview.scroll = 0;
+        }
+        KeyCode::End => {
+            // A large value; render clamps it down to the last page.
+            preview.scroll = u16::MAX;
+        }
+        _ => {}
+    }
+    DeckAction::Handled
 }
 
 /// The installed-skills (manage) pane: navigate, toggle enabled (space),
@@ -1250,6 +1379,8 @@ fn handle_skills_installed_key(key: KeyEvent, ui: &mut DeckUi, ctrl: bool) -> Op
                 Some(DeckAction::Handled)
             }
         }
+        // Preview the selected skill's rendered SKILL.md (scrollable, esc closes).
+        KeyCode::Char('o') if ctrl => open_installed_preview(ui),
         // Edit the selected skill's body (saving makes a new pinned version).
         KeyCode::Char('e') if !ctrl => {
             if let Some(row) = ui.skills.view.rows.get(ui.skills.sel) {
@@ -1310,6 +1441,9 @@ fn handle_skills_search_key(key: KeyEvent, ui: &mut DeckUi) -> Option<DeckAction
             }
             Some(DeckAction::Handled)
         }
+        // Preview the highlighted hit's rendered SKILL.md — fetched by the
+        // driver, shown scrollable (esc closes).
+        KeyCode::Char('o') if ctrl => open_search_preview(ui),
         KeyCode::Backspace => {
             ui.skills.query.pop();
             ui.skills.query_dirty = true;
@@ -1711,6 +1845,11 @@ fn handle_mcp_search_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
                 match ui.mcp.selected_search_name().map(str::to_string) {
                     Some(name) => {
                         ui.mcp.status = Some(format!("installing {name}…"));
+                        // Drop back to the Browse list so the refreshed
+                        // installed-servers snapshot (pushed once the install
+                        // lands) is actually on screen — Search mode would
+                        // otherwise hide it behind now-stale results.
+                        ui.mcp.mode = McpMode::Browse;
                         DeckAction::Send(WorkspaceInput::McpInstall { name })
                     }
                     None => DeckAction::Handled,
@@ -3852,7 +3991,9 @@ mod tests {
         ui.skills.focus = SkillsFocus::Search;
         ui.skills.hits = vec![SkillSearchHit {
             id: "acme/auth".into(),
-            label: "acme/auth  oauth".into(),
+            installs: "1.2K installs".into(),
+            installs_rank: 1200,
+            url: "https://skills.sh/acme/auth".into(),
         }];
         ui.skills.query = "auth".into();
         ui.skills.query_dirty = false;
@@ -3876,6 +4017,112 @@ mod tests {
             }))
         );
         assert!(ui.skills.prompt.is_none());
+    }
+
+    #[test]
+    fn skills_ctrl_o_on_installed_opens_preview_with_local_body() {
+        let model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        let mut r = a_row("sql-style", SkillScope::Project, true);
+        r.body = "# SQL Style\n\nUse lowercase keywords.".to_string();
+        ui.skills.view = SkillsView {
+            rows: vec![r],
+            status: None,
+            busy: false,
+        };
+        // ctrl+o must NOT toggle chain-of-thought on the SKILLS tab — it opens
+        // the preview, with the body on hand (no driver round-trip).
+        let a = handle_deck_key(ctrl('o'), &model, &mut ui);
+        assert_eq!(a, DeckAction::Handled);
+        let preview = ui.skills.preview.as_ref().expect("preview opened");
+        assert_eq!(preview.pending, None, "installed body is local");
+        assert!(
+            preview.body.as_deref().unwrap().contains("SQL Style"),
+            "body carried from the row"
+        );
+    }
+
+    #[test]
+    fn skills_ctrl_o_on_search_hit_requests_preview_and_shows_loading() {
+        let model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        ui.skills.focus = SkillsFocus::Search;
+        ui.skills.hits = vec![SkillSearchHit {
+            id: "acme/auth@oauth".into(),
+            installs: "1.2K installs".into(),
+            installs_rank: 1200,
+            url: "https://skills.sh/acme/auth/oauth".into(),
+        }];
+        let a = handle_deck_key(ctrl('o'), &model, &mut ui);
+        assert_eq!(
+            a,
+            DeckAction::Send(WorkspaceInput::Skill(SkillOp::Preview {
+                id: "acme/auth@oauth".into()
+            }))
+        );
+        let preview = ui.skills.preview.as_ref().expect("preview opened");
+        assert_eq!(preview.pending.as_deref(), Some("acme/auth@oauth"));
+        assert_eq!(preview.body, None, "loading until the driver replies");
+    }
+
+    #[test]
+    fn skills_preview_ingest_fills_matching_id_ignores_stale_and_esc_closes() {
+        let mut model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        ui.skills.preview = Some(SkillPreview {
+            title: "acme/auth@oauth".into(),
+            subtitle: String::new(),
+            pending: Some("acme/auth@oauth".into()),
+            body: None,
+            scroll: 0,
+        });
+        // A reply for a DIFFERENT hit is dropped (stale / re-targeted).
+        ingest_inbound(
+            &Inbound::SkillPreview {
+                id: "other/skill@x".into(),
+                body: "wrong".into(),
+                status: None,
+            },
+            &mut model,
+            &mut ui,
+        );
+        assert_eq!(ui.skills.preview.as_ref().unwrap().body, None, "stale drop");
+        // The matching reply fills the body and clears the pending marker.
+        ingest_inbound(
+            &Inbound::SkillPreview {
+                id: "acme/auth@oauth".into(),
+                body: "# OAuth\n\nbody".into(),
+                status: None,
+            },
+            &mut model,
+            &mut ui,
+        );
+        let preview = ui.skills.preview.as_ref().unwrap();
+        assert!(preview.body.as_deref().unwrap().contains("OAuth"));
+        assert_eq!(preview.pending, None);
+        // Esc closes the overlay.
+        let a = handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
+        assert_eq!(a, DeckAction::Handled);
+        assert!(ui.skills.preview.is_none(), "esc closes the preview");
+    }
+
+    #[test]
+    fn skills_preview_scroll_keys_move_the_offset() {
+        let model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        ui.skills.preview = Some(SkillPreview {
+            title: "x".into(),
+            subtitle: String::new(),
+            pending: None,
+            body: Some("a\nb\nc".into()),
+            scroll: 0,
+        });
+        handle_deck_key(key(KeyCode::Down), &model, &mut ui);
+        assert_eq!(ui.skills.preview.as_ref().unwrap().scroll, 1);
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        assert_eq!(ui.skills.preview.as_ref().unwrap().scroll, 0);
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        assert_eq!(ui.skills.preview.as_ref().unwrap().scroll, 0, "clamped at 0");
     }
 
     #[test]

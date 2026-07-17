@@ -112,6 +112,9 @@ pub fn default_ask_io(interactive_output: bool) -> Box<dyn AskUserIo> {
 pub struct SkillRegistry {
     pub search_cmd: Vec<String>,
     pub install_cmd: Vec<String>,
+    /// `npx skills use <id>` — prints a not-yet-installed skill's `SKILL.md`
+    /// (wrapped in `<SKILL.md>…</SKILL.md>`); used for the ctrl+o preview.
+    pub use_cmd: Vec<String>,
     pub workspace_root: std::path::PathBuf,
 }
 
@@ -132,6 +135,7 @@ impl SkillRegistry {
                 "STELLA_SKILLS_INSTALL_CMD",
                 &["npx", "skills", "add", "{id}"],
             ),
+            use_cmd: parse("STELLA_SKILLS_USE_CMD", &["npx", "skills", "use", "{id}"]),
             workspace_root,
         }
     }
@@ -145,6 +149,19 @@ impl SkillRegistry {
     }
 
     pub(crate) async fn run(&self, argv: Vec<String>, timeout_secs: u64) -> Result<String, String> {
+        // Search/install output is a terse list — 6 KB is ample and guards the
+        // debug log / UI from a runaway subprocess.
+        self.run_capped(argv, timeout_secs, 6000).await
+    }
+
+    /// Like [`Self::run`] but with an explicit output cap. The ctrl+o preview
+    /// passes a larger cap so a full `SKILL.md` body is not truncated.
+    pub(crate) async fn run_capped(
+        &self,
+        argv: Vec<String>,
+        timeout_secs: u64,
+        max_bytes: usize,
+    ) -> Result<String, String> {
         let Some((program, args)) = argv.split_first() else {
             return Err("empty registry command".into());
         };
@@ -171,12 +188,12 @@ impl SkillRegistry {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let mut text = format!("{}\n{}", stdout.trim(), stderr.trim());
-        if text.len() > 6000 {
-            // Truncate on a char boundary — `String::truncate` panics if byte
-            // 6000 lands inside a multi-byte character (subprocess output can
+        if text.len() > max_bytes {
+            // Truncate on a char boundary — `String::truncate` panics if the
+            // cap lands inside a multi-byte character (subprocess output can
             // contain accents/emoji/box-drawing), which would unwind the whole
             // CLI session.
-            let end = (0..=6000)
+            let end = (0..=max_bytes)
                 .rev()
                 .find(|&i| text.is_char_boundary(i))
                 .unwrap_or(0);

@@ -33,6 +33,11 @@ pub fn render(_model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Bu
     if ui.skills.prompt.is_some() {
         render_overlay(ui, area, buf);
     }
+    // The ctrl+o markdown preview is the topmost overlay (mutually exclusive
+    // with the prompts at the key layer, but drawn last defensively).
+    if ui.skills.preview.is_some() {
+        render_preview(ui, area, buf);
+    }
 }
 
 /// The manage pane: one row per installed skill with its enabled box, pinned
@@ -154,30 +159,87 @@ fn render_search(ui: &DeckUi, area: Rect, buf: &mut Buffer) {
             .search_sel
             .min(ui.skills.hits.len().saturating_sub(1));
         let start = window_start(ui.skills.hits.len(), sel, visible);
+        // The most-installed hit anchors the popularity bar's full width.
+        let peak = ui
+            .skills
+            .hits
+            .iter()
+            .map(|h| h.installs_rank)
+            .max()
+            .unwrap_or(0);
+        let width = inner.width as usize;
         for (i, hit) in ui.skills.hits.iter().enumerate().skip(start).take(visible) {
             let is_sel = i == sel && focused;
             let marker = if is_sel { "▸ " } else { "  " };
-            let text = truncate(&hit.label, (inner.width as usize).saturating_sub(3));
-            let mut line = Line::from(vec![
+            // Right column: an amber popularity bar + the dim installs metric,
+            // both empty when the registry printed no count.
+            let bar = popularity_bar(hit.installs_rank, peak);
+            let metric = hit.installs.clone();
+            let bar_w = bar.chars().count();
+            let metric_w = metric.chars().count();
+            // Widths: bar, one gap before the metric, and one gap before the bar.
+            let right_w = if metric.is_empty() {
+                0
+            } else {
+                bar_w + usize::from(bar_w > 0) + metric_w + 1
+            };
+            let name = truncate(&hit.id, width.saturating_sub(marker.len() + right_w).max(4));
+            let pad = width
+                .saturating_sub(marker.len() + name.chars().count() + right_w)
+                .max(1);
+            let mut spans = vec![
                 Span::styled(marker, Style::default().fg(theme::AMBER)),
-                Span::styled(text, theme::body()),
-            ]);
+                Span::styled(name, theme::body()),
+                Span::styled(" ".repeat(pad), theme::muted()),
+            ];
+            if !bar.is_empty() {
+                spans.push(Span::styled(format!("{bar} "), Style::default().fg(theme::AMBER)));
+            }
+            if !metric.is_empty() {
+                spans.push(Span::styled(metric, theme::muted()));
+            }
+            let mut line = Line::from(spans);
             if is_sel {
                 line = line.style(Style::default().add_modifier(Modifier::REVERSED));
             }
             lines.push(line);
         }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "ctrl+o preview · ⏎ install",
+            theme::muted(),
+        )));
     }
     Paragraph::new(lines).render(inner, buf);
+}
+
+/// The `▰▱`-style micro-bar for a hit's install count relative to the
+/// most-installed hit in the result set. Empty when there is no signal.
+fn popularity_bar(rank: u64, peak: u64) -> String {
+    if peak == 0 || rank == 0 {
+        return String::new();
+    }
+    // 1..=4 filled blocks, scaled against the peak.
+    let filled = (((rank as f64 / peak as f64) * 4.0).round() as usize).clamp(1, 4);
+    let mut s = String::with_capacity(4 * 3);
+    for _ in 0..filled {
+        s.push('▰');
+    }
+    for _ in filled..4 {
+        s.push('▱');
+    }
+    s
 }
 
 /// The bottom status / legend line.
 fn render_status(ui: &DeckUi, area: Rect, buf: &mut Buffer) {
     let legend = match ui.skills.focus {
         SkillsFocus::Installed => {
-            "space on/off · ctrl+x×2 delete · e edit · p pin · n new · → search · Tab leaves"
+            "space on/off · ctrl+o preview · ctrl+x×2 delete · e edit · p pin · n new · → search"
         }
-        SkillsFocus::Search => "⏎ search / install · ↑/↓ pick · ← installed · Tab leaves",
+        SkillsFocus::Search => {
+            "⏎ search / install · ↑/↓ pick · ctrl+o preview · ← installed · Tab leaves"
+        }
     };
     let line = match &ui.skills.status {
         Some(status) => Line::from(Span::styled(
@@ -329,6 +391,68 @@ fn render_edit_overlay(name: &str, buffer: &str, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines).render(inner, buf);
 }
 
+/// The ctrl+o markdown preview: a large centered popup with the skill's
+/// `SKILL.md` rendered via `tui-markdown` and scrolled vertically. A `None`
+/// body renders a loading state; the scroll offset is clamped to content here
+/// (the key handler only increments it).
+fn render_preview(ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
+    let Some(preview) = ui.skills.preview.as_mut() else {
+        return;
+    };
+    let w = area.width.saturating_sub(4).clamp(24, 100);
+    let h = area.height.saturating_sub(2).clamp(6, 32);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    Clear.render(rect, buf);
+    let title = truncate(&preview.title, (w as usize).saturating_sub(20).max(8));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::accent())
+        .title(format!(" {title} — ↑/↓ scroll · esc close "));
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    // A dim subtitle line (url / scope), then the scrollable body below it.
+    let bands = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+    if !preview.subtitle.is_empty() {
+        Paragraph::new(Line::from(Span::styled(
+            truncate(&preview.subtitle, inner.width as usize),
+            theme::muted(),
+        )))
+        .render(bands[0], buf);
+    }
+    let body_area = bands[1];
+
+    match preview.body.clone() {
+        None => {
+            Paragraph::new("fetching SKILL.md…")
+                .style(theme::muted())
+                .alignment(Alignment::Center)
+                .render(centered_row(body_area), buf);
+        }
+        Some(body) => {
+            // Render the markdown to styled `Text`, then scroll it. The offset
+            // is clamped to raw line count so the last page stays reachable.
+            let text = tui_markdown::from_str(&body);
+            let content_h = text.height();
+            let max_scroll =
+                content_h.saturating_sub(body_area.height as usize) as u16;
+            let scroll = preview.scroll.min(max_scroll);
+            preview.scroll = scroll;
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
+                .render(body_area, buf);
+        }
+    }
+}
+
 /// A centered bordered popup with `title` and `lines`.
 fn popup(title: &str, lines: Vec<Line<'static>>, area: Rect, buf: &mut Buffer) {
     let w = area.width.min(60);
@@ -382,7 +506,8 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envelope::{SkillRow, SkillScope, SkillsView};
+    use crate::deck_ui::SkillPreview;
+    use crate::envelope::{SkillRow, SkillScope, SkillSearchHit, SkillsView};
 
     fn buffer_text(buf: &Buffer) -> String {
         let area = *buf.area();
@@ -466,5 +591,85 @@ mod tests {
         assert!(text.contains("Project"), "{text}");
         assert!(text.contains("User"), "{text}");
         assert!(text.contains("acme/auth"), "{text}");
+    }
+
+    fn hit(id: &str, installs: &str, rank: u64) -> SkillSearchHit {
+        SkillSearchHit {
+            id: id.to_string(),
+            installs: installs.to_string(),
+            installs_rank: rank,
+            url: format!("https://skills.sh/{}", id.replace('@', "/")),
+        }
+    }
+
+    #[test]
+    fn search_pane_shows_clean_name_and_installs_no_ansi_leak() {
+        let mut ui = DeckUi {
+            tab: crate::deck::DeckTab::Skills,
+            ..Default::default()
+        };
+        ui.skills.focus = SkillsFocus::Search;
+        ui.skills.query = "rust".into();
+        ui.skills.query_dirty = false;
+        ui.skills.hits = vec![
+            hit("wshobson/agents@rust-async-patterns", "15.8K installs", 15800),
+            hit("apollographql/skills@rust-best-practices", "13.9K installs", 13900),
+        ];
+        let area = Rect::new(0, 0, 90, 14);
+        let mut buf = Buffer::empty(area);
+        render(&WorkspaceModel::new(), &mut ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("wshobson/agents@rust-async-patterns"),
+            "hit name shown:\n{text}"
+        );
+        assert!(text.contains("15.8K installs"), "installs shown:\n{text}");
+        // The whole point: no raw ANSI / SGR codes leak into the rendered list.
+        assert!(!text.contains("[38;5"), "no raw ANSI escapes:\n{text}");
+        assert!(!text.contains("[0m"), "no raw reset codes:\n{text}");
+    }
+
+    #[test]
+    fn preview_overlay_renders_markdown_heading_and_body() {
+        let mut ui = DeckUi {
+            tab: crate::deck::DeckTab::Skills,
+            ..Default::default()
+        };
+        ui.skills.preview = Some(SkillPreview {
+            title: "acme/auth@oauth".into(),
+            subtitle: "https://skills.sh/acme/auth/oauth".into(),
+            pending: None,
+            body: Some("# OAuth Guide\n\nAlways use PKCE for public clients.".into()),
+            scroll: 0,
+        });
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        render(&WorkspaceModel::new(), &mut ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("acme/auth@oauth"), "title in border:\n{text}");
+        assert!(text.contains("OAuth Guide"), "rendered heading:\n{text}");
+        assert!(text.contains("PKCE"), "rendered body:\n{text}");
+    }
+
+    #[test]
+    fn preview_overlay_shows_loading_state_when_body_absent() {
+        let mut ui = DeckUi {
+            tab: crate::deck::DeckTab::Skills,
+            ..Default::default()
+        };
+        ui.skills.preview = Some(SkillPreview {
+            title: "x/y@z".into(),
+            subtitle: String::new(),
+            pending: Some("x/y@z".into()),
+            body: None,
+            scroll: 0,
+        });
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        render(&WorkspaceModel::new(), &mut ui, area, &mut buf);
+        assert!(
+            buffer_text(&buf).contains("fetching"),
+            "loading state shown"
+        );
     }
 }

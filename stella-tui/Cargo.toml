@@ -20,6 +20,7 @@ ratatui-comfy-tabs.workspace = true
 tachyonfx.workspace = true
 sysinfo.workspace = true
 tui-big-text.workspace = true
+tui-markdown.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

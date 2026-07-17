@@ -64,6 +64,10 @@ ratatui-comfy-tabs = "0.5.12"
 tachyonfx = "0.25.1"
 sysinfo = "0.38.4"
 tui-big-text = "0.8.8"
+# Markdown → ratatui Text renderer for the SKILLS-tab preview overlay.
+# default-features = false drops the `highlight-code` feature (syntect) — we
+# only need headings/lists/tables/emphasis for a scrollable preview.
+tui-markdown = { version = "0.3.8", default-features = false }
 wiremock = "0.6"
 
 # Config for 'dist'
