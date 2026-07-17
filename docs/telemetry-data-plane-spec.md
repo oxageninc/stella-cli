@@ -7,6 +7,27 @@ lives (project tier vs. user tier), and the data plane for a future local
 web-hosted usage dashboard that makes developer-specific recommendations
 (skills / MCP servers / agents).
 
+### Implemented in this pass (code landed + tested)
+
+- **Silent-stop fix** — a turn that yields no text and no tool calls now aborts
+  with a visible message instead of being recorded as a clean success;
+  `FinishReason` is plumbed through the completion envelope; glm-5.2 reasoning
+  tokens are captured (with a visible fallback) instead of silently dropped; the
+  output cap was raised 8,192 → 16,384. (`stella-protocol`, `stella-model/zai`,
+  `stella-core/driver`; regression test `empty_completion_aborts_…`.)
+- **Code-graph cleanup** — the startup line reports graph **totals** ("N symbols
+  across K files"), not the misleading per-pass "0 symbols"; a `context.db` **V3
+  migration drops the orphaned `code_graph_*` tables**. (`stella-graph`,
+  `stella-cli/agent`, `stella-context/store`; regression tests added.)
+- **Data-plane tables (project tier)** — `tool_calls`, `execution_reflection`,
+  and `reflections` added to `store.db` as an additive **v7 migration**, with
+  record/read methods and a `tool_call_name_counts()` histogram. (`stella-store`;
+  roundtrip + migration tests.)
+
+Remaining (larger, not yet built): the **user-tier `usage.db`** + sync, the
+producer wiring that populates `tool_calls`/`execution_reflection` from the live
+event stream each turn, and the **dashboard + recommendation engine** (§6–§7).
+
 It was motivated by three concrete defects found while investigating "Stella
 never uses the code-graph tool" and "turns complete with no output." Those
 findings are summarized first because they shape the design.

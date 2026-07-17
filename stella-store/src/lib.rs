@@ -1394,6 +1394,92 @@ impl Store {
         Ok(fold_mcp_usage_stats(&calls))
     }
 
+    /// Record the normalized per-call `tool_calls` log for an execution
+    /// (materialized from the `events` stream). `seq` is the call's index in
+    /// the drained batch; UNIQUE (execution_id, seq) guards double-writes.
+    pub fn record_tool_calls(&self, execution_id: i64, calls: &[ToolCallRow]) -> Result<()> {
+        let conn = self.lock();
+        for (seq, row) in calls.iter().enumerate() {
+            conn.execute(
+                "INSERT OR REPLACE INTO tool_calls \
+                 (execution_id, seq, call_id, name, surface, args_json, args_digest, \
+                  reason, ok, error, bytes_out, duration_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    execution_id,
+                    seq as i64,
+                    row.call_id,
+                    row.name,
+                    row.surface,
+                    row.args_json,
+                    row.args_digest,
+                    row.reason,
+                    row.ok as i64,
+                    row.error,
+                    row.bytes_out,
+                    row.duration_ms,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Per-tool-name call counts across all executions, most-used first —
+    /// the histogram behind "you grep symbols N times but never call
+    /// graph_query". Deterministic ordering (count desc, then name).
+    pub fn tool_call_name_counts(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT name, COUNT(*) AS n FROM tool_calls \
+             GROUP BY name ORDER BY n DESC, name ASC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Record (or replace) the agent's self-review for one turn, 1:1 with its
+    /// execution.
+    pub fn record_execution_reflection(
+        &self,
+        execution_id: i64,
+        r: &ExecutionReflectionRow,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT OR REPLACE INTO execution_reflection \
+             (execution_id, prompt, delivered, self_rating, what_went_well, \
+              what_to_improve, critique, produced_output, wrote_files, truncated) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                execution_id,
+                r.prompt,
+                r.delivered.map(|b| b as i64),
+                r.self_rating,
+                r.what_went_well,
+                r.what_to_improve,
+                r.critique,
+                r.produced_output as i64,
+                r.wrote_files as i64,
+                r.truncated as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Append a durable reflection/lesson, returning its row id.
+    pub fn record_reflection(&self, r: &ReflectionRow) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO reflections (execution_id, kind, content, domains, occurred_at) \
+             VALUES (?, ?, ?, ?, ?)",
+            params![r.execution_id, r.kind, r.content, r.domains, r.occurred_at],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
     /// Close an execution record.
     pub fn finish_execution(&self, execution_id: i64, outcome: &str, cost_usd: f64) -> Result<()> {
         self.lock().execute(
@@ -2030,6 +2116,120 @@ mod tests {
     }
 
     #[test]
+    fn data_plane_tables_roundtrip_and_tool_histogram() {
+        let store = Store::in_memory().unwrap();
+        let id = store
+            .begin_execution("deck", "build the feature", "zai", "glm-5.2")
+            .unwrap();
+
+        store
+            .record_tool_calls(
+                id,
+                &[
+                    ToolCallRow {
+                        call_id: "c1".into(),
+                        name: "grep".into(),
+                        surface: "native".into(),
+                        args_json: "{\"pattern\":\"foo\"}".into(),
+                        args_digest: "d1".into(),
+                        reason: "find foo".into(),
+                        ok: true,
+                        error: String::new(),
+                        bytes_out: 120,
+                        duration_ms: 14,
+                    },
+                    ToolCallRow {
+                        call_id: "c2".into(),
+                        name: "grep".into(),
+                        surface: "native".into(),
+                        args_json: "{}".into(),
+                        args_digest: "d2".into(),
+                        reason: String::new(),
+                        ok: true,
+                        error: String::new(),
+                        bytes_out: 0,
+                        duration_ms: 9,
+                    },
+                    ToolCallRow {
+                        call_id: "c3".into(),
+                        name: "read_file".into(),
+                        surface: "native".into(),
+                        args_json: "{}".into(),
+                        args_digest: "d3".into(),
+                        reason: String::new(),
+                        ok: false,
+                        error: "nope".into(),
+                        bytes_out: 0,
+                        duration_ms: 3,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.count("tool_calls").unwrap(), 3);
+        // The histogram powers the "grep a lot, graph_query never" signal.
+        let counts = store.tool_call_name_counts().unwrap();
+        assert_eq!(counts[0], ("grep".to_string(), 2));
+
+        store
+            .record_execution_reflection(
+                id,
+                &ExecutionReflectionRow {
+                    prompt: "build the feature".into(),
+                    delivered: Some(false),
+                    self_rating: Some(2),
+                    what_went_well: "explored the codebase".into(),
+                    what_to_improve: "actually implement".into(),
+                    critique: "over-explored, never wrote a line".into(),
+                    produced_output: false,
+                    wrote_files: false,
+                    truncated: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.count("execution_reflection").unwrap(), 1);
+
+        let rid = store
+            .record_reflection(&ReflectionRow {
+                execution_id: Some(id),
+                kind: "lesson".into(),
+                content: "read prod code before trusting a failing test".into(),
+                domains: "[\"pipeline\"]".into(),
+                occurred_at: 1_783_832_747,
+            })
+            .unwrap();
+        assert!(rid > 0);
+        assert_eq!(store.count("reflections").unwrap(), 1);
+    }
+
+    #[test]
+    fn v7_migration_adds_data_plane_tables_to_a_legacy_database() {
+        let root = temp_root("v7_data_plane");
+        {
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
+            conn.execute_batch(LEGACY_V0_SCHEMA).unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+        assert_eq!(store.count("tool_calls").unwrap(), 0);
+        assert_eq!(store.count("execution_reflection").unwrap(), 0);
+        assert_eq!(store.count("reflections").unwrap(), 0);
+        // New write paths work on the migrated file.
+        let id = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_reflection(&ReflectionRow {
+                execution_id: Some(id),
+                kind: "lesson".into(),
+                content: "x".into(),
+                domains: "[]".into(),
+                occurred_at: 1,
+            })
+            .unwrap();
+        assert_eq!(store.count("reflections").unwrap(), 1);
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn v2_migration_rebuilds_files_touched_with_dedupe_and_backfill() {
         let root = temp_root("v2_files_touched");
         {
@@ -2171,9 +2371,10 @@ mod tests {
     fn skill_usage_records_per_execution_version_rows() {
         let store = Store::in_memory().unwrap();
         assert_eq!(user_version(&store), SCHEMA_VERSION);
-        // skill_usage lands at v5; the additive mcp_usage migration takes v6
-        // behind it (reconciled at cascade-merge), so SCHEMA_VERSION is now 6.
-        assert_eq!(SCHEMA_VERSION, 6);
+        // skill_usage lands at v5; mcp_usage takes v6; the data-plane tables
+        // (tool_calls / execution_reflection / reflections) take v7, so
+        // SCHEMA_VERSION is now 7.
+        assert_eq!(SCHEMA_VERSION, 7);
 
         let id = store
             .begin_execution("deck", "format the sql", "zai", "glm-5.2")
