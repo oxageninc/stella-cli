@@ -997,7 +997,9 @@ mod tests {
     async fn complete_sends_cache_points_for_claude_models() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(body_string_contains("\"cachePoint\":{\"type\":\"default\"}"))
+            .and(body_string_contains(
+                "\"cachePoint\":{\"type\":\"default\"}",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
                 "stopReason": "end_turn",

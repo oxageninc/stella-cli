@@ -297,7 +297,13 @@ async fn run_pipeline_one_shot(
         Box::new(|line| eprintln!("  {line}")),
         Box::new(|| {}),
     );
-    let mcp = connect_mcp(cfg, registry.clone(), format == OutputFormat::Text).await;
+    let mcp = connect_mcp(
+        cfg,
+        registry.clone(),
+        Some(registry.mcp_usage_ledger()),
+        format == OutputFormat::Text,
+    )
+    .await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,

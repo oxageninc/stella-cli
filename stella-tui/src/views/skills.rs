@@ -290,8 +290,8 @@ fn render_overlay(ui: &DeckUi, area: Rect, buf: &mut Buffer) {
 /// A taller popup for the edit buffer: the (multi-line) body with a caret and a
 /// save/cancel legend. The buffer scrolls to keep the last line visible.
 fn render_edit_overlay(name: &str, buffer: &str, area: Rect, buf: &mut Buffer) {
-    let w = area.width.saturating_sub(6).min(88).max(20);
-    let h = area.height.saturating_sub(2).min(20).max(6);
+    let w = area.width.saturating_sub(6).clamp(20, 88);
+    let h = area.height.saturating_sub(2).clamp(6, 20);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -412,8 +412,10 @@ mod tests {
 
     #[test]
     fn installed_pane_shows_rows_with_enabled_box_and_version() {
-        let mut ui = DeckUi::default();
-        ui.tab = crate::deck::DeckTab::Skills;
+        let mut ui = DeckUi {
+            tab: crate::deck::DeckTab::Skills,
+            ..Default::default()
+        };
         ui.skills.view = SkillsView {
             rows: vec![
                 row("sql-style", SkillScope::Project, true, 2, 3),
@@ -435,8 +437,10 @@ mod tests {
 
     #[test]
     fn empty_installed_pane_hints_at_search() {
-        let mut ui = DeckUi::default();
-        ui.tab = crate::deck::DeckTab::Skills;
+        let mut ui = DeckUi {
+            tab: crate::deck::DeckTab::Skills,
+            ..Default::default()
+        };
         let area = Rect::new(0, 0, 100, 10);
         let mut buf = Buffer::empty(area);
         render(&WorkspaceModel::new(), &mut ui, area, &mut buf);
@@ -445,8 +449,10 @@ mod tests {
 
     #[test]
     fn scope_overlay_lists_both_destinations() {
-        let mut ui = DeckUi::default();
-        ui.tab = crate::deck::DeckTab::Skills;
+        let mut ui = DeckUi {
+            tab: crate::deck::DeckTab::Skills,
+            ..Default::default()
+        };
         ui.skills.prompt = Some(SkillPrompt::Scope {
             action: crate::deck_ui::ScopeAction::Install {
                 id: "acme/auth".into(),
