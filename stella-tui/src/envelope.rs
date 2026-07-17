@@ -174,6 +174,16 @@ pub enum Inbound {
         hits: Vec<SkillSearchHit>,
         status: Option<String>,
     },
+    /// A refreshed snapshot of the configured MCP servers for the MCP tab.
+    /// Out-of-band view state exactly like [`Inbound::GraphSnapshot`]: applied
+    /// straight to `DeckUi::mcp` by [`crate::deck_ui::ingest_inbound`], ignored
+    /// by the model fold. The driver sends one at startup and after every MCP
+    /// action (install, toggle, auth, remove) so the tab reflects live state.
+    McpServers(Vec<McpServerInfo>),
+    /// The result of an MCP registry search the tab requested
+    /// ([`WorkspaceInput::McpSearch`]) — also out-of-band, applied to
+    /// `DeckUi::mcp` search results.
+    McpSearchResults(McpSearchOutcome),
 }
 
 /// Which config level an installed agent definition lives at.
@@ -304,6 +314,29 @@ pub enum WorkspaceInput {
     /// create / edit / pin). The driver owns the skills on disk + npx + model
     /// and answers with a refreshed [`Inbound::Skills`] / [`Inbound::SkillSearch`].
     Skill(SkillOp),
+    /// MCP tab: flip a configured server's session enable/disable state. The
+    /// driver toggles the shared disabled-servers set (hiding/showing the
+    /// server's tools on the next model call) and pushes a fresh
+    /// [`Inbound::McpServers`] snapshot.
+    McpToggle { name: String },
+    /// MCP tab: search the configured registry for `query`. The driver runs
+    /// the async search and replies with [`Inbound::McpSearchResults`].
+    McpSearch { query: String },
+    /// MCP tab: install the registry server named `name` into `.stella/mcp.toml`
+    /// (then refresh the snapshot).
+    McpInstall { name: String },
+    /// MCP tab: remove a configured server from `.stella/mcp.toml`.
+    McpRemove { name: String },
+    /// MCP tab: set an auth credential (env var for stdio, header for http) on a
+    /// configured server. The value is a [`Secret`] — its `Debug` is redacted,
+    /// so it never reaches the deck's debug log.
+    McpAuth {
+        server: String,
+        field: String,
+        value: Secret,
+    },
+    /// MCP tab: rebuild and re-push the [`Inbound::McpServers`] snapshot.
+    McpRefresh,
     /// Tear down the deck.
     Quit,
 }
@@ -407,6 +440,78 @@ pub enum SkillOp {
         name: String,
         version: u32,
     },
+}
+
+/// A configured MCP server's full state for the MCP tab. The four state axes
+/// are distinct on purpose: a server can be *configured* (in `mcp.toml`) yet
+/// not *connected* (failed to start, or added after session start), and
+/// *enabled* (session intent) is separate from *connected*.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpServerInfo {
+    /// The local alias (config key + tool-namespace segment).
+    pub name: String,
+    /// Transport discriminant: `stdio` or `http`.
+    pub kind: String,
+    /// Enabled for this session (not in the disabled set).
+    pub enabled: bool,
+    /// Connected in the live tool set this session (tools are actually
+    /// reachable). A newly-installed server shows `configured` but not
+    /// `connected` until the next session.
+    pub connected: bool,
+    /// Short health label when connected (e.g. `live`, `reconnecting`).
+    pub health: Option<String>,
+    /// How many tools it advertises this session (0 when disabled/unconnected).
+    pub tool_count: usize,
+    /// Configured credential field names (env vars / headers) — presence means
+    /// auth is set; the values are never carried here.
+    pub auth_fields: Vec<String>,
+    /// Total recorded calls to this server's tools (from local telemetry).
+    pub calls: u64,
+}
+
+/// The outcome of an MCP registry search requested from the tab.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpSearchOutcome {
+    /// The query that produced these results (echoed for display).
+    pub query: String,
+    pub items: Vec<McpSearchItem>,
+    /// Set when the search failed (network/registry error) instead of matching.
+    pub error: Option<String>,
+    /// Whether the registry reported more pages beyond this one.
+    pub has_more: bool,
+}
+
+/// One registry search result row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpSearchItem {
+    pub name: String,
+    pub description: String,
+    /// A compact install-kinds hint, e.g. `npm, remote`.
+    pub kinds: String,
+    /// Whether a server of this name is already configured locally.
+    pub installed: bool,
+}
+
+/// A secret string whose `Debug` is redacted, so it can ride the deck's input
+/// channel (and any debug log of it) without leaking. The value is readable
+/// only via [`Secret::reveal`], used solely to write the credential to config.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Secret(value.into())
+    }
+    /// The raw value — only for writing the credential into config.
+    pub fn reveal(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Secret").field(&"<redacted>").finish()
+    }
 }
 
 /// The agent-control verbs surfaced by the dashboard. `Stop` maps to a clean

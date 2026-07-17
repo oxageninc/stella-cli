@@ -81,7 +81,8 @@ pub use deck_ui::{
 };
 pub use envelope::{
     AgentControl, AgentId, AgentMeta, AgentScope, AgentStatus, AgentVersionInfo, Inbound,
-    InstalledAgentEntry, SkillOp, SkillRow, SkillScope, SkillSearchHit, SkillsView, WorkspaceInput,
+    InstalledAgentEntry, McpSearchItem, McpSearchOutcome, McpServerInfo, Secret, SkillOp, SkillRow,
+    SkillScope, SkillSearchHit, SkillsView, WorkspaceInput,
 };
 pub use graph::{GraphEdge, GraphNode, GraphSnapshot};
 pub use resource::ResourceMonitor;

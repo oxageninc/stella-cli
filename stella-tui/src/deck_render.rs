@@ -75,6 +75,7 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
         DeckTab::Graph => views::graph::render(model, ui, content, buf),
         DeckTab::Files => views::files::render(model, ui, content, buf),
         DeckTab::Skills => views::skills::render(model, ui, content, buf),
+        DeckTab::Mcp => views::mcp::render(model, ui, content, buf),
     }
 
     crate::progress::render(model, ui, bands[2], buf);
@@ -131,7 +132,8 @@ fn render_tab_bar(tab: DeckTab, area: Rect, buf: &mut Buffer) {
         .style(theme::muted())
         .highlight_style(theme::accent())
         .border_style(theme::rule());
-    // Fresh state each frame: 5 tabs always fit, so there is no scroll to keep.
+    // Fresh state each frame: the tab set always fits, so there is no scroll to
+    // keep (comfy-tabs handles any overflow itself).
     let mut state = TabNavState::new(selected);
     StatefulWidget::render(nav, area, buf, &mut state);
 }

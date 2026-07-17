@@ -62,6 +62,13 @@ pub struct ToolRegistry {
     /// drained once per execution by the persistence layer, exactly like
     /// the file-touch ledger above but as an event log, never aggregated.
     agent_uses: std::sync::Mutex<crate::agent_use::AgentUseLedger>,
+    /// The session's MCP tool-usage ledger. External MCP tools bypass this
+    /// registry (they run through `stella-mcp`'s `McpToolSet`), so nothing here
+    /// writes to it — the CLI hands a clone ([`ToolRegistry::mcp_usage_ledger`])
+    /// to the `McpToolSet` at connect, which appends, and drains it per
+    /// execution via [`ToolRegistry::take_mcp_usage`]. The registry is just the
+    /// carrier so `record_execution_end` has one handle for every ledger.
+    mcp_usage: stella_core::mcp_usage::McpUsageLedger,
     schema_index: std::sync::Mutex<SchemaIndex>,
     /// The session's extension hook bus, once a host attaches one
     /// ([`ToolRegistry::attach_bus`]). Every emission is `None`-guarded, so
@@ -119,6 +126,7 @@ impl ToolRegistry {
         media_backend: Option<crate::media::MediaBackend>,
     ) -> Self {
         let citations: crate::memory::CitationLedger = Arc::default();
+        let mcp_usage: stella_core::mcp_usage::McpUsageLedger = Arc::default();
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         let mut entries: Vec<Arc<dyn Tool>> = vec![
             Arc::new(crate::read::ReadFile),
@@ -179,6 +187,7 @@ impl ToolRegistry {
             touched: std::sync::Mutex::new(FileTouchLedger::default()),
             citations,
             agent_uses: std::sync::Mutex::new(crate::agent_use::AgentUseLedger::default()),
+            mcp_usage,
             schema_index: std::sync::Mutex::new(SchemaIndex::default()),
             bus: std::sync::RwLock::new(None),
         }
@@ -753,6 +762,20 @@ impl ToolRegistry {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .drain()
+    }
+
+    /// A clone of the MCP usage-ledger handle, for handing to the `McpToolSet`
+    /// at connect so its successful calls are recorded against this registry's
+    /// ledger (which [`ToolRegistry::take_mcp_usage`] later drains).
+    pub fn mcp_usage_ledger(&self) -> stella_core::mcp_usage::McpUsageLedger {
+        self.mcp_usage.clone()
+    }
+
+    /// Drain the MCP tool calls recorded since the last drain — the counterpart
+    /// of [`ToolRegistry::take_memory_citations`], persisted under exactly one
+    /// execution id so per-call counts never inflate.
+    pub fn take_mcp_usage(&self) -> Vec<stella_core::mcp_usage::McpUsageRecord> {
+        stella_core::mcp_usage::drain_usage(&self.mcp_usage)
     }
 
     /// Comma-separated sorted list of registered tool names, for error

@@ -84,6 +84,35 @@ pub struct Settings {
     /// see [`Settings::load`] for the project-scope trust boundary.
     #[serde(default)]
     pub hooks: Option<Hooks>,
+    /// MCP settings — currently just the server registry URL the MCP tab
+    /// searches. Optional; the default registry is applied at the read site
+    /// ([`Settings::mcp_registry_url`]).
+    #[serde(default)]
+    pub mcp: Option<McpSettings>,
+}
+
+/// The `mcp` section of settings.json. All fields optional so an absent
+/// section behaves exactly as the defaults.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct McpSettings {
+    /// Base URL of an MCP Server Registry API (the frozen `GET /v0.1/servers`
+    /// contract). Any registry serving that shape works; unset means the
+    /// official registry ([`stella_mcp::DEFAULT_REGISTRY_URL`]).
+    #[serde(default)]
+    pub registry_url: Option<String>,
+}
+
+impl Settings {
+    /// The configured MCP registry URL, or the official default. Applied at the
+    /// read site (the house convention) rather than baked into serde.
+    pub fn mcp_registry_url(&self) -> String {
+        self.mcp
+            .as_ref()
+            .and_then(|m| m.registry_url.as_deref())
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or(stella_mcp::DEFAULT_REGISTRY_URL)
+            .to_string()
+    }
 }
 
 /// Append `extra`'s matchers onto `base`, per event. `None + None` stays
@@ -193,6 +222,14 @@ impl Settings {
             if let Some(hooks) = &scope.hooks {
                 concat_hooks(&mut merged.hooks, hooks);
             }
+            // MCP settings are last-scope-wins per field (a project scope can
+            // point at a different registry than the user default).
+            if let Some(mcp) = &scope.mcp {
+                let target = merged.mcp.get_or_insert_with(McpSettings::default);
+                if let Some(url) = &mcp.registry_url {
+                    target.registry_url = Some(url.clone());
+                }
+            }
         }
         Ok(merged)
     }
@@ -259,6 +296,32 @@ mod tests {
         // …and user-scope fields it left unset survive.
         assert_eq!(entry.api_key_env.as_deref(), Some("TOGETHER_KEY"));
         assert_eq!(entry.default_model.as_deref(), Some("user-model"));
+    }
+
+    #[test]
+    fn mcp_registry_url_defaults_and_takes_the_last_scope() {
+        // Unset → the official default.
+        let empty = Settings::default();
+        assert_eq!(empty.mcp_registry_url(), stella_mcp::DEFAULT_REGISTRY_URL);
+
+        let dir = tempfile::tempdir().unwrap();
+        let user = write(
+            dir.path(),
+            "user.json",
+            r#"{"mcp": {"registry_url": "https://user.registry/"}}"#,
+        );
+        let project = write(
+            dir.path(),
+            "project.json",
+            r#"{"mcp": {"registry_url": "https://project.registry/"}}"#,
+        );
+        // Last scope wins.
+        let merged = Settings::load_from(&[user.clone(), project]).unwrap();
+        assert_eq!(merged.mcp_registry_url(), "https://project.registry/");
+        // A scope that doesn't speak `mcp` leaves the earlier value intact.
+        let bare = write(dir.path(), "bare.json", r#"{"providers": {}}"#);
+        let merged = Settings::load_from(&[user, bare]).unwrap();
+        assert_eq!(merged.mcp_registry_url(), "https://user.registry/");
     }
 
     #[test]

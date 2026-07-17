@@ -169,6 +169,14 @@ async fn main() -> std::io::Result<()> {
                         busy: false,
                     }));
                 }
+                // The MCP tab's actions are serviced by the real CLI driver;
+                // this demo has no MCP state, so they are inert here.
+                WorkspaceInput::McpToggle { .. }
+                | WorkspaceInput::McpSearch { .. }
+                | WorkspaceInput::McpInstall { .. }
+                | WorkspaceInput::McpRemove { .. }
+                | WorkspaceInput::McpAuth { .. }
+                | WorkspaceInput::McpRefresh => {}
                 WorkspaceInput::Quit => break,
             }
         }

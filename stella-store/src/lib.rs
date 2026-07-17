@@ -196,6 +196,32 @@ pub struct MemoryCitationStats {
     pub eligible: bool,
 }
 
+/// One MCP tool call, ready to persist: which server + tool, an optional
+/// reason (best-effort — external MCP tools rarely carry one), and the call
+/// time in epoch millis. Unlike a file-touch (aggregated per path), this is a
+/// per-call log row, so repeat calls to the same tool are distinct rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpUsageRow {
+    pub server: String,
+    pub tool: String,
+    pub reason: String,
+    pub called_at_ms: i64,
+}
+
+/// Per-(server, tool) MCP usage aggregate — the data behind the MCP tab's
+/// "N calls" column and `stella mcp usage`. Ordered most-used first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpUsageStat {
+    pub server: String,
+    pub tool: String,
+    /// How many times this tool was called (all executions).
+    pub calls: i64,
+    /// The most recent non-empty reason recorded, or empty if none ever was.
+    pub last_reason: String,
+    /// Epoch millis of the most recent call.
+    pub last_called_at_ms: i64,
+}
+
 /// One extension-authored workspace rule, as stored: the full rule markdown
 /// in the `.stella/rules/*.md` authoring format plus the writer's label.
 #[derive(Debug, Clone, PartialEq)]
@@ -334,7 +360,7 @@ type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// a file at `user_version` i to i + 1. Fresh files never run these — they
 /// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
 /// directly.
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
     // their write paths have always assumed.
     migrate_v0_to_v1,
@@ -354,6 +380,10 @@ const MIGRATIONS: [Migration; 5] = [
     // NOTE: same naive-slot caveat — may need a one-line renumber at
     // cascade-merge since sibling branches also append migrations.
     migrate_v4_to_v5,
+    // v5 → v6: the additive `mcp_usage` table (per-call MCP tool telemetry).
+    // Renumbered from v4 at cascade-merge behind the agent_uses (v4) and
+    // skill_usage (v5) migrations; SCHEMA_VERSION follows MIGRATIONS.len().
+    migrate_v5_to_v6,
 ];
 
 /// The schema version this build writes — the `PRAGMA user_version` of
@@ -364,13 +394,14 @@ const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// Every table the store owns — the allowlist for [`Store::count`] and the
 /// fresh-file probe in [`Store::migrate`].
-const TABLES: [&str; 11] = [
+const TABLES: [&str; 12] = [
     "executions",
     "events",
     "telemetry",
     "files_touched",
     "memory_citations",
     "rules",
+    "mcp_usage",
     "file_locks",
     "graph_nodes",
     "graph_edges",
@@ -561,6 +592,27 @@ const SKILL_USAGE_DDL: &str = "CREATE TABLE IF NOT EXISTS skill_usage (
      CREATE INDEX IF NOT EXISTS skill_usage_by_skill
        ON skill_usage(skill, version, execution_id);";
 
+/// `mcp_usage` DDL at [`SCHEMA_VERSION`].
+///
+/// A per-call log (NOT a per-key aggregate like `files_touched`): the same
+/// server+tool called twice is two rows. UNIQUE (execution_id, seq) is the
+/// house double-write guard (the `events` pattern) — `seq` is the row's index
+/// in an execution's drained batch, so re-persisting the same drained batch is
+/// an error, not a silent double-count. `called_at_ms` is the call time
+/// captured at the tool call (not the drain time). The by-server index is the
+/// access path of [`Store::mcp_usage_stats`].
+const MCP_USAGE_DDL: &str = "CREATE TABLE IF NOT EXISTS mcp_usage (
+       execution_id INTEGER NOT NULL,
+       seq INTEGER NOT NULL,
+       server TEXT NOT NULL,
+       tool TEXT NOT NULL,
+       reason TEXT NOT NULL DEFAULT '',
+       called_at_ms INTEGER NOT NULL,
+       UNIQUE (execution_id, seq)
+     );
+     CREATE INDEX IF NOT EXISTS mcp_usage_by_server
+       ON mcp_usage(server, tool);";
+
 /// The full latest schema, applied in one shot to fresh databases only.
 /// Existing files never see this — [`MIGRATIONS`] upgrades them shape by
 /// shape, so this can always describe the CURRENT shape.
@@ -574,6 +626,7 @@ fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(MEMORY_CITATIONS_DDL)?;
     tx.execute_batch(AGENT_USES_DDL)?;
     tx.execute_batch(SKILL_USAGE_DDL)?;
+    tx.execute_batch(MCP_USAGE_DDL)?;
     Ok(())
 }
 
@@ -781,6 +834,13 @@ fn migrate_v3_to_v4(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// SKILLS tab). Purely additive, mirroring [`migrate_v3_to_v4`].
 fn migrate_v4_to_v5(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(SKILL_USAGE_DDL)?;
+    Ok(())
+}
+
+/// v5 → v6: the `mcp_usage` table. Purely additive — no existing table is
+/// touched, so no rebuild, no dedupe, no backfill.
+fn migrate_v5_to_v6(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(MCP_USAGE_DDL)?;
     Ok(())
 }
 
@@ -1130,6 +1190,54 @@ impl Store {
         Ok(stats)
     }
 
+    /// Persist the MCP tool calls recorded during an execution: one row per
+    /// call, in drain order. `seq` (the batch index) with UNIQUE
+    /// (execution_id, seq) makes re-persisting the same drained batch an error
+    /// rather than a silent double-count.
+    pub fn record_mcp_usage(&self, execution_id: i64, calls: &[McpUsageRow]) -> Result<()> {
+        let conn = self.lock();
+        for (seq, row) in calls.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO mcp_usage \
+                 (execution_id, seq, server, tool, reason, called_at_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    execution_id,
+                    seq as i64,
+                    row.server,
+                    row.tool,
+                    row.reason,
+                    row.called_at_ms,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Per-(server, tool) MCP usage aggregates ([`McpUsageStat`]) — the data
+    /// behind the MCP tab's call counts and `stella mcp usage`. Most-used
+    /// first (ties broken by server then tool, so output is deterministic).
+    pub fn mcp_usage_stats(&self) -> Result<Vec<McpUsageStat>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT server, tool, reason, called_at_ms FROM mcp_usage \
+             ORDER BY called_at_ms ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(McpUsageRow {
+                server: row.get(0)?,
+                tool: row.get(1)?,
+                reason: row.get(2)?,
+                called_at_ms: row.get(3)?,
+            })
+        })?;
+        let mut calls = Vec::new();
+        for row in rows {
+            calls.push(row?);
+        }
+        Ok(fold_mcp_usage_stats(&calls))
+    }
+
     /// Close an execution record.
     pub fn finish_execution(&self, execution_id: i64, outcome: &str, cost_usd: f64) -> Result<()> {
         self.lock().execute(
@@ -1368,6 +1476,42 @@ impl Store {
     }
 }
 
+/// Fold chronologically-ordered MCP usage rows into per-(server, tool)
+/// aggregates: a call count, the most recent non-empty reason, and the latest
+/// call time. Input is expected in ascending call-time order (the shape
+/// [`Store::mcp_usage_stats`]'s query produces); output is most-used first,
+/// ties broken by server then tool for determinism.
+pub fn fold_mcp_usage_stats(rows: &[McpUsageRow]) -> Vec<McpUsageStat> {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<(String, String), McpUsageStat> = BTreeMap::new();
+    for row in rows {
+        let entry = by_key
+            .entry((row.server.clone(), row.tool.clone()))
+            .or_insert_with(|| McpUsageStat {
+                server: row.server.clone(),
+                tool: row.tool.clone(),
+                calls: 0,
+                last_reason: String::new(),
+                last_called_at_ms: 0,
+            });
+        entry.calls += 1;
+        // Rows arrive in ascending time order, so the last non-empty reason
+        // seen is the most recent one.
+        if !row.reason.is_empty() {
+            entry.last_reason = row.reason.clone();
+        }
+        entry.last_called_at_ms = entry.last_called_at_ms.max(row.called_at_ms);
+    }
+    let mut stats: Vec<McpUsageStat> = by_key.into_values().collect();
+    stats.sort_by(|a, b| {
+        b.calls
+            .cmp(&a.calls)
+            .then_with(|| a.server.cmp(&b.server))
+            .then_with(|| a.tool.cmp(&b.tool))
+    });
+    stats
+}
+
 /// Fold chronologically-ordered citations (grouped by `memory_id` — the shape
 /// [`Store::memory_citation_stats`]'s query produces) into per-memory
 /// aggregates. The positive streak counts consecutive positive citations from
@@ -1590,6 +1734,50 @@ mod tests {
     }
 
     #[test]
+    fn mcp_usage_roundtrips_and_aggregates_per_server_tool() {
+        let store = Store::in_memory().unwrap();
+        let id = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        // Two calls to github/search_issues (one with a reason), one to fs/read.
+        let usage = |server: &str, tool: &str, reason: &str, t: i64| McpUsageRow {
+            server: server.into(),
+            tool: tool.into(),
+            reason: reason.into(),
+            called_at_ms: t,
+        };
+        store
+            .record_mcp_usage(
+                id,
+                &[
+                    usage("github", "search_issues", "", 100),
+                    usage("github", "search_issues", "find the flake", 200),
+                    usage("fs", "read", "", 150),
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.count("mcp_usage").unwrap(), 3);
+
+        // A different execution's calls are separate rows (per-call log — the
+        // same server+tool is NOT a UNIQUE violation, unlike memory citations).
+        let other = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_mcp_usage(other, &[usage("github", "search_issues", "", 300)])
+            .unwrap();
+        assert_eq!(store.count("mcp_usage").unwrap(), 4);
+
+        let stats = store.mcp_usage_stats().unwrap();
+        // Most-used first: github/search_issues (3) before fs/read (1).
+        assert_eq!(stats[0].server, "github");
+        assert_eq!(stats[0].tool, "search_issues");
+        assert_eq!(stats[0].calls, 3);
+        // The most recent non-empty reason is kept.
+        assert_eq!(stats[0].last_reason, "find the flake");
+        assert_eq!(stats[0].last_called_at_ms, 300);
+        assert_eq!(stats[1].server, "fs");
+        assert_eq!(stats[1].calls, 1);
+        assert_eq!(stats[1].last_reason, "");
+    }
+
+    #[test]
     fn promotion_eligibility_requires_strictly_more_than_ten_positive_citations() {
         let positives = |n: usize| -> Vec<MemoryCitationRow> {
             (0..n).map(|_| citation("nod_x", 5, true, "held")).collect()
@@ -1787,7 +1975,9 @@ mod tests {
     fn skill_usage_records_per_execution_version_rows() {
         let store = Store::in_memory().unwrap();
         assert_eq!(user_version(&store), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 5, "skill_usage lands at v5 on this branch");
+        // skill_usage lands at v5; the additive mcp_usage migration takes v6
+        // behind it (reconciled at cascade-merge), so SCHEMA_VERSION is now 6.
+        assert_eq!(SCHEMA_VERSION, 6);
 
         let id = store
             .begin_execution("deck", "format the sql", "zai", "glm-5.2")

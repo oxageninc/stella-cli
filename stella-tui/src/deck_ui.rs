@@ -29,13 +29,14 @@ use crate::composer::{
 };
 use crate::deck::{DeckTab, WorkspaceModel};
 use crate::envelope::{
-    AgentControl, AgentId, AgentScope, AgentStatus, Inbound, InstalledAgentEntry, SkillOp,
+    AgentControl, AgentId, AgentScope, AgentStatus, Inbound, InstalledAgentEntry, Secret, SkillOp,
     SkillScope, SkillSearchHit, SkillsView, WorkspaceInput,
 };
 use crate::graph::GraphSnapshot;
 use crate::input::{ScopeDecision, UserInput};
 use crate::scroll::ScrollState;
 use crate::splash::SplashState;
+use crate::views::mcp::{AuthPrompt, AuthStep, McpMode};
 
 /// How long a turn-stopping Esc stays armed for the double-Esc escalation: a
 /// second Esc inside this window (with no other key in between) is "full
@@ -264,6 +265,11 @@ pub struct DeckUi {
     /// Selected row in the picker, indexing the *filtered* match list
     /// ([`GraphSnapshot::matching_files`]). Reset to 0 on every query edit.
     pub graph_picker_sel: usize,
+    /// All MCP-tab state: the configured-servers snapshot, the list cursor, the
+    /// search/auth sub-modes and their input buffers (the auth value is
+    /// redacted in `Debug`). Out-of-band, driven by [`Inbound::McpServers`] /
+    /// [`Inbound::McpSearchResults`].
+    pub mcp: crate::views::mcp::McpTabState,
     pub files_sel: usize,
     pub files_diff_open: bool,
     pub files_diff_scroll: ScrollState,
@@ -354,6 +360,7 @@ impl Default for DeckUi {
             graph_picker_open: false,
             graph_picker_query: String::new(),
             graph_picker_sel: 0,
+            mcp: crate::views::mcp::McpTabState::default(),
             files_sel: 0,
             files_diff_open: false,
             files_diff_scroll: ScrollState::default(),
@@ -509,6 +516,20 @@ pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut De
                 format!("{} result(s) — ⏎ installs the selected one", hits.len())
             })
         });
+        return;
+    }
+    if let Inbound::McpServers(servers) = inbound {
+        ui.mcp.servers = servers.clone();
+        ui.mcp.selected = ui.mcp.selected.min(ui.mcp.servers.len().saturating_sub(1));
+        // A refreshed snapshot means the last action landed — clear the
+        // transient status once the state it reported is visible.
+        ui.mcp.status = None;
+        return;
+    }
+    if let Inbound::McpSearchResults(outcome) = inbound {
+        ui.mcp.searching = false;
+        ui.mcp.search_selected = 0;
+        ui.mcp.search = Some(outcome.clone());
         return;
     }
     model.apply_inbound(inbound);
@@ -776,6 +797,7 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         DeckTab::Traces => handle_traces_key(key, model, ui, composer_empty),
         DeckTab::Graph => handle_graph_key(key, ui, composer_empty),
         DeckTab::Files => handle_files_key(key, model, ui, composer_empty),
+        DeckTab::Mcp => handle_mcp_key(key, ui, composer_empty),
         DeckTab::Session => handle_session_key(key, model, ui),
         // The SKILLS tab claims its keys earlier (before the composer), so a
         // key that reaches here fell through on purpose — leave it to the
@@ -882,6 +904,10 @@ fn handle_slash_key(key: KeyEvent, matches: &[String], ui: &mut DeckUi) -> Optio
                 ui.set_tab(DeckTab::Skills);
                 ui.skills.status = Some("loading skills…".to_string());
                 DeckAction::Send(WorkspaceInput::Skill(SkillOp::List))
+            }
+            "/mcp" => {
+                ui.set_tab(DeckTab::Mcp);
+                DeckAction::Handled
             }
             // Everything else — including `/help` — is enqueued for the
             // driver, which owns the session vocabulary and answers into the
@@ -1581,6 +1607,182 @@ fn handle_focused_gates(
         }
     }
     None
+}
+
+/// MCP tab keys. Three sub-modes: Browse (navigate the configured servers and
+/// act on the selection), Search (type a registry query, then Enter to search
+/// and Enter again to install the highlighted result), and Auth (a two-step
+/// masked credential prompt). Search/Auth are modal — they claim every key so
+/// typing never leaks into the composer — while Browse's letter actions gate on
+/// `composer_empty` so they don't shadow the first character of a prompt.
+fn handle_mcp_key(key: KeyEvent, ui: &mut DeckUi, composer_empty: bool) -> Option<DeckAction> {
+    match ui.mcp.mode {
+        McpMode::Browse => handle_mcp_browse_key(key, ui, composer_empty),
+        McpMode::Search => Some(handle_mcp_search_key(key, ui)),
+        McpMode::Auth => Some(handle_mcp_auth_key(key, ui)),
+    }
+}
+
+fn handle_mcp_browse_key(
+    key: KeyEvent,
+    ui: &mut DeckUi,
+    composer_empty: bool,
+) -> Option<DeckAction> {
+    let count = ui.mcp.servers.len();
+    match key.code {
+        KeyCode::Up => {
+            ui.mcp.selected = ui.mcp.selected.saturating_sub(1);
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Down => {
+            if count > 0 {
+                ui.mcp.selected = (ui.mcp.selected + 1).min(count - 1);
+            }
+            Some(DeckAction::Handled)
+        }
+        // Enter search mode. `/` is safe: it only reaches here on a blank
+        // composer (else it opens the slash popup).
+        KeyCode::Char('/') if composer_empty => {
+            ui.mcp.mode = McpMode::Search;
+            ui.mcp.status = None;
+            Some(DeckAction::Handled)
+        }
+        // Enable/disable the selected server (session-scoped, live).
+        KeyCode::Char('e') | KeyCode::Char(' ') if composer_empty => {
+            ui.mcp.selected_server().map(|s| {
+                DeckAction::Send(WorkspaceInput::McpToggle {
+                    name: s.name.clone(),
+                })
+            })
+        }
+        // Enter the auth prompt for the selected server, prefilled with its
+        // first configured credential field (if any).
+        KeyCode::Char('a') if composer_empty => {
+            let server = ui.mcp.selected_server()?;
+            let name = server.name.clone();
+            let field = server.auth_fields.first().cloned().unwrap_or_default();
+            ui.mcp.auth = AuthPrompt {
+                server: name,
+                field,
+                value: String::new(),
+                step: AuthStep::Field,
+            };
+            ui.mcp.mode = McpMode::Auth;
+            Some(DeckAction::Handled)
+        }
+        // Remove the selected server from mcp.toml.
+        KeyCode::Char('x') if composer_empty => ui.mcp.selected_server().map(|s| {
+            DeckAction::Send(WorkspaceInput::McpRemove {
+                name: s.name.clone(),
+            })
+        }),
+        // Rebuild the snapshot.
+        KeyCode::Char('r') if composer_empty => Some(DeckAction::Send(WorkspaceInput::McpRefresh)),
+        _ => None,
+    }
+}
+
+fn handle_mcp_search_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    match key.code {
+        KeyCode::Esc => {
+            ui.mcp.mode = McpMode::Browse;
+            ui.mcp.searching = false;
+            DeckAction::Handled
+        }
+        KeyCode::Backspace => {
+            ui.mcp.query.pop();
+            DeckAction::Handled
+        }
+        KeyCode::Up => {
+            ui.mcp.search_selected = ui.mcp.search_selected.saturating_sub(1);
+            DeckAction::Handled
+        }
+        KeyCode::Down => {
+            let items = ui.mcp.search.as_ref().map(|o| o.items.len()).unwrap_or(0);
+            if items > 0 {
+                ui.mcp.search_selected = (ui.mcp.search_selected + 1).min(items - 1);
+            }
+            DeckAction::Handled
+        }
+        KeyCode::Enter => {
+            // Results already match the query → Enter installs the highlight;
+            // otherwise Enter runs the search.
+            if ui.mcp.results_match_query() {
+                match ui.mcp.selected_search_name().map(str::to_string) {
+                    Some(name) => {
+                        ui.mcp.status = Some(format!("installing {name}…"));
+                        DeckAction::Send(WorkspaceInput::McpInstall { name })
+                    }
+                    None => DeckAction::Handled,
+                }
+            } else {
+                let query = ui.mcp.query.trim().to_string();
+                if query.is_empty() {
+                    return DeckAction::Handled;
+                }
+                ui.mcp.searching = true;
+                ui.mcp.search = None;
+                DeckAction::Send(WorkspaceInput::McpSearch { query })
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            ui.mcp.query.push(c);
+            DeckAction::Handled
+        }
+        // Modal: swallow everything else so nothing leaks to the composer.
+        _ => DeckAction::Handled,
+    }
+}
+
+fn handle_mcp_auth_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    match key.code {
+        KeyCode::Esc => {
+            ui.mcp.mode = McpMode::Browse;
+            ui.mcp.auth = AuthPrompt::default();
+            DeckAction::Handled
+        }
+        KeyCode::Enter => match ui.mcp.auth.step {
+            AuthStep::Field => {
+                if ui.mcp.auth.field.trim().is_empty() {
+                    return DeckAction::Handled;
+                }
+                ui.mcp.auth.step = AuthStep::Value;
+                DeckAction::Handled
+            }
+            AuthStep::Value => {
+                let server = ui.mcp.auth.server.clone();
+                let field = ui.mcp.auth.field.trim().to_string();
+                let value = std::mem::take(&mut ui.mcp.auth.value);
+                ui.mcp.mode = McpMode::Browse;
+                ui.mcp.auth = AuthPrompt::default();
+                ui.mcp.status = Some(format!("set credential {field} for {server}"));
+                DeckAction::Send(WorkspaceInput::McpAuth {
+                    server,
+                    field,
+                    value: Secret::new(value),
+                })
+            }
+        },
+        KeyCode::Backspace => {
+            match ui.mcp.auth.step {
+                AuthStep::Field => {
+                    ui.mcp.auth.field.pop();
+                }
+                AuthStep::Value => {
+                    ui.mcp.auth.value.pop();
+                }
+            }
+            DeckAction::Handled
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            match ui.mcp.auth.step {
+                AuthStep::Field => ui.mcp.auth.field.push(c),
+                AuthStep::Value => ui.mcp.auth.value.push(c),
+            }
+            DeckAction::Handled
+        }
+        _ => DeckAction::Handled,
+    }
 }
 
 fn handle_agents_key(
@@ -3034,6 +3236,127 @@ mod tests {
     }
 
     #[test]
+    fn slash_mcp_switches_to_the_mcp_tab() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.slash_commands = vec![SlashCommand::new("/mcp", "mcp")];
+        for c in "/mcp".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(action, DeckAction::Handled, "/mcp is consumed locally");
+        assert_eq!(ui.tab, DeckTab::Mcp);
+    }
+
+    #[test]
+    fn mcp_tab_navigates_toggles_and_enters_search() {
+        use crate::envelope::McpServerInfo;
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.set_tab(DeckTab::Mcp);
+        ui.mcp.servers = vec![
+            McpServerInfo {
+                name: "github".into(),
+                kind: "http".into(),
+                enabled: true,
+                connected: true,
+                health: Some("live".into()),
+                tool_count: 3,
+                auth_fields: vec!["Authorization".into()],
+                calls: 5,
+            },
+            McpServerInfo {
+                name: "fs".into(),
+                kind: "stdio".into(),
+                enabled: true,
+                connected: false,
+                health: None,
+                tool_count: 0,
+                auth_fields: vec![],
+                calls: 0,
+            },
+        ];
+        // ↓ moves the selection.
+        handle_deck_key(key(KeyCode::Down), &model, &mut ui);
+        assert_eq!(ui.mcp.selected, 1);
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        assert_eq!(ui.mcp.selected, 0);
+
+        // `e` toggles the selected server (session enable/disable).
+        let action = handle_deck_key(ch('e'), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::McpToggle {
+                name: "github".into()
+            })
+        );
+
+        // `/` enters search mode; typing builds the query; Enter searches.
+        handle_deck_key(ch('/'), &model, &mut ui);
+        assert_eq!(ui.mcp.mode, crate::views::mcp::McpMode::Search);
+        for c in "git".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        assert_eq!(ui.mcp.query, "git");
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::McpSearch {
+                query: "git".into()
+            })
+        );
+        assert!(ui.mcp.searching);
+        // Esc leaves search mode.
+        handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
+        assert_eq!(ui.mcp.mode, crate::views::mcp::McpMode::Browse);
+    }
+
+    #[test]
+    fn mcp_auth_prompt_captures_a_masked_value_as_a_redacted_secret() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.set_tab(DeckTab::Mcp);
+        ui.mcp.servers = vec![crate::envelope::McpServerInfo {
+            name: "github".into(),
+            kind: "http".into(),
+            enabled: true,
+            connected: true,
+            health: Some("live".into()),
+            tool_count: 1,
+            auth_fields: vec![],
+            calls: 0,
+        }];
+        // `a` enters auth mode.
+        handle_deck_key(ch('a'), &model, &mut ui);
+        assert_eq!(ui.mcp.mode, crate::views::mcp::McpMode::Auth);
+        // Type the field name, Enter advances to the value step.
+        for c in "TOKEN".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(ui.mcp.auth.step, crate::views::mcp::AuthStep::Value);
+        for c in "sk-secret".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        match action {
+            DeckAction::Send(WorkspaceInput::McpAuth {
+                server,
+                field,
+                value,
+            }) => {
+                assert_eq!(server, "github");
+                assert_eq!(field, "TOKEN");
+                assert_eq!(value.reveal(), "sk-secret");
+                // The secret never appears under Debug.
+                assert!(!format!("{value:?}").contains("sk-secret"));
+            }
+            other => panic!("expected McpAuth, got {other:?}"),
+        }
+        assert_eq!(ui.mcp.mode, crate::views::mcp::McpMode::Browse);
+    }
+
+    #[test]
     fn slash_diff_switches_to_files_and_opens_the_diff() {
         let model = model_with(&["lead"]);
         let mut ui = ready_ui();
@@ -3708,6 +4031,8 @@ mod tests {
         let model = WorkspaceModel::new();
         let mut ui = skills_ui();
         handle_deck_key(key(KeyCode::Tab), &model, &mut ui);
-        assert_eq!(ui.tab, DeckTab::Session, "Tab cycles Skills → Session");
+        // The MCP tab now sits after SKILLS in the cycle, so Tab leaves SKILLS
+        // for MCP (still proving SKILLS is not a dead end).
+        assert_eq!(ui.tab, DeckTab::Mcp, "Tab cycles Skills → Mcp");
     }
 }

@@ -25,6 +25,7 @@ mod domains;
 mod extensions;
 mod fleet_cmd;
 mod interactive;
+mod mcp_cmd;
 mod memory;
 mod memory_cmd;
 mod ocp;
@@ -249,11 +250,54 @@ enum Command {
         cmd: MemoryCmd,
     },
 
+    /// Manage MCP servers: search a registry, install into .stella/mcp.toml,
+    /// list configured servers, and show tool-usage telemetry. Enable/disable
+    /// is per-session and lives in the deck's MCP tab (`/mcp`). Reads/writes
+    /// local state (+ the registry over HTTP); needs no API key.
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
+
     /// Show current configuration
     Config,
 
     /// Print the version and exit
     Version,
+}
+
+/// `stella mcp` subcommands — the scriptable half of the MCP management surface
+/// (the deck's MCP tab is the interactive half; per-session enable/disable and
+/// the masked auth prompt live only there).
+#[derive(Subcommand)]
+pub enum McpCmd {
+    /// List configured MCP servers (.stella/mcp.toml)
+    List,
+    /// Search the MCP server registry (settings.json `mcp.registry_url`, else
+    /// the official registry)
+    Search {
+        /// Substring to match server names (omit to list)
+        query: Vec<String>,
+        /// Max results in the page
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Install a registry server into .stella/mcp.toml (overwrites — MCP
+    /// servers are not versioned)
+    Install {
+        /// The registry server name (as shown by `stella mcp search`)
+        name: String,
+        /// Local alias / tool-namespace segment (default: sanitized name)
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    /// Remove a configured server from .stella/mcp.toml
+    Remove {
+        /// The configured server's local name
+        name: String,
+    },
+    /// Show MCP tool-usage telemetry (.stella/store.db): calls per server/tool
+    Usage,
 }
 
 /// `stella memory` subcommands — the inspection and promotion surface of the
@@ -411,6 +455,11 @@ fn run(cli: Cli) -> Result<(), String> {
                 MemoryCmd::Promote { id } => memory_cmd::run_memory_promote(id),
             };
         }
+        Some(Command::Mcp { cmd }) => {
+            // MCP management reads/writes local config + the registry over
+            // HTTP — no provider or API key required.
+            return mcp_cmd::run(cmd);
+        }
         Some(Command::Version) => {
             println!("stella v{}", version_string());
             return Ok(());
@@ -511,6 +560,7 @@ fn run(cli: Cli) -> Result<(), String> {
         | Command::Graph { .. }
         | Command::Stats { .. }
         | Command::Memory { .. }
+        | Command::Mcp { .. }
         | Command::Models
         | Command::Version => {
             unreachable!("handled before provider resolution")

@@ -316,6 +316,14 @@ pub async fn run_deck_session(
     // submitted while this await runs are never lost — the deck's input
     // never blocks, and everything it sends buffers in `sub_rx` until the
     // driver loop below starts reading.
+    // Session-scoped MCP management state, shared with the MCP tab:
+    //   • `mcp_disabled` — server names disabled this session; toggling it
+    //     hides a server's tools from the model on the next call (live, no
+    //     reconnect), because the engine re-reads schemas each call.
+    //   • the usage ledger (from the registry) records every MCP call for the
+    //     `mcp_usage` telemetry table.
+    let mcp_disabled: stella_mcp::DisabledServers =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let mcp = match agent::load_mcp_plan(cfg) {
         agent::McpPlan::None => None,
         agent::McpPlan::Invalid(reason) => {
@@ -336,7 +344,13 @@ pub async fn run_deck_session(
                     delta: format!("connecting {} MCP server(s)…", servers.len()),
                 },
             });
-            let set = agent::connect_mcp_servers(&servers, registry.clone()).await;
+            let set = agent::connect_mcp_servers(
+                &servers,
+                registry.clone(),
+                Some(registry.mcp_usage_ledger()),
+                Some(mcp_disabled.clone()),
+            )
+            .await;
             let _ = in_tx.send(Inbound::Event {
                 agent: LEAD.to_string(),
                 event: AgentEvent::Text {
@@ -357,6 +371,8 @@ pub async fn run_deck_session(
         Some(set) => set,
         None => &*registry,
     };
+    // Seed the MCP tab with the configured servers and their live state.
+    send_mcp_snapshot(cfg, &mcp, &mcp_disabled, &in_tx).await;
 
     // ── The driver loop ─────────────────────────────────────────────────────
     let mut queue: VecDeque<String> = VecDeque::new();
@@ -449,13 +465,15 @@ pub async fn run_deck_session(
                     handle_agent_create(&description, scope, cfg, &*provider, &in_tx).await;
                     continue 'session;
                 }
-                // The INSTALLED AGENTS pane's synchronous ops (refresh /
-                // save / pin) are pure filesystem work — the shared helper
-                // serves this idle site and the in-turn site alike. A stray
-                // answer/decision/control with no turn in flight falls
-                // through it with nothing to act on.
+                // Fallthrough for everything else, serviced between turns
+                // (install/search hit the network, so they must not stall a
+                // live turn): MCP tab actions first, then the INSTALLED AGENTS
+                // pane's synchronous filesystem ops. A stray answer/decision/
+                // control with no turn in flight falls through both no-ops.
                 Some(other) => {
-                    handle_agents_input(&other, cfg, &in_tx);
+                    if !service_mcp_action(&other, cfg, &mcp, &mcp_disabled, &in_tx).await {
+                        handle_agents_input(&other, cfg, &in_tx);
+                    }
                     continue 'session;
                 }
             },
@@ -700,6 +718,25 @@ pub async fn run_deck_session(
                         Some(WorkspaceInput::Skill(op)) => {
                             handle_skills_input(&op, cfg, &in_tx, &skill_registry);
                         }
+                        // MCP tab: a live enable/disable toggle mid-turn is
+                        // honored immediately — it only flips the shared set the
+                        // tool layer already consults, so the next model call in
+                        // this turn sees the change (the tab display refreshes at
+                        // the next idle snapshot). The other MCP actions (search,
+                        // install, remove, auth) touch config/network and are
+                        // serviced between turns; mid-turn they are no-ops.
+                        Some(WorkspaceInput::McpToggle { name }) => {
+                            let mut set =
+                                mcp_disabled.lock().unwrap_or_else(|p| p.into_inner());
+                            if !set.remove(&name) {
+                                set.insert(name);
+                            }
+                        }
+                        Some(WorkspaceInput::McpSearch { .. })
+                        | Some(WorkspaceInput::McpInstall { .. })
+                        | Some(WorkspaceInput::McpRemove { .. })
+                        | Some(WorkspaceInput::McpAuth { .. })
+                        | Some(WorkspaceInput::McpRefresh) => {}
                         // Scope review is not engine-driven yet, and deep
                         // pause/resume/restart need the fleet supervisor —
                         // both named seams, both no-ops here.
@@ -831,6 +868,186 @@ fn mcp_outcome_report(connected: &[&str], failed: &[(String, String)]) -> String
     lines.join("\n")
 }
 
+/// Build the MCP tab snapshot: every configured server (`.stella/mcp.toml`)
+/// joined with its live session state — enabled (not in the disabled set),
+/// connected (in the live tool set), health, per-server tool count (derived
+/// from the advertised schemas, so it is 0 the moment a server is disabled),
+/// configured credential field names, and total recorded tool calls.
+async fn mcp_snapshot(
+    cfg: &Config,
+    mcp: &Option<stella_mcp::McpToolSet>,
+    disabled: &stella_mcp::DisabledServers,
+) -> Vec<stella_tui::McpServerInfo> {
+    let config = crate::mcp_cmd::load_config(&cfg.workspace_root).unwrap_or_default();
+    let connected: std::collections::HashSet<String> = mcp
+        .as_ref()
+        .map(|s| {
+            s.connected_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let health = match mcp {
+        Some(s) => s.health().await,
+        None => Vec::new(),
+    };
+    let schemas = mcp.as_ref().map(|s| s.schemas()).unwrap_or_default();
+    let usage = crate::mcp_cmd::usage_stats(&cfg.workspace_root).unwrap_or_default();
+    let disabled_set = disabled.lock().unwrap_or_else(|p| p.into_inner()).clone();
+
+    config
+        .names()
+        .into_iter()
+        .map(|name| {
+            let transport = config.get(name).expect("name came from the config");
+            let enabled = !disabled_set.contains(name);
+            let connected_now = connected.contains(name);
+            let prefix = format!("mcp__{name}__");
+            let tool_count = schemas
+                .iter()
+                .filter(|s| s.name.starts_with(&prefix))
+                .count();
+            let health = health.iter().find(|h| h.name == name).map(|h| {
+                match h.state {
+                    stella_mcp::HealthState::Live => "live",
+                    stella_mcp::HealthState::Reconnecting => "reconnecting",
+                    stella_mcp::HealthState::Down => "down",
+                }
+                .to_string()
+            });
+            let calls: u64 = usage
+                .iter()
+                .filter(|s| s.server == name)
+                .map(|s| s.calls.max(0) as u64)
+                .sum();
+            stella_tui::McpServerInfo {
+                name: name.to_string(),
+                kind: transport.kind_label().to_string(),
+                enabled,
+                connected: connected_now,
+                health: connected_now.then_some(health).flatten(),
+                tool_count,
+                auth_fields: transport
+                    .credential_names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                calls,
+            }
+        })
+        .collect()
+}
+
+/// Build and push a fresh MCP tab snapshot.
+async fn send_mcp_snapshot(
+    cfg: &Config,
+    mcp: &Option<stella_mcp::McpToolSet>,
+    disabled: &stella_mcp::DisabledServers,
+    in_tx: &mpsc::UnboundedSender<Inbound>,
+) {
+    let _ = in_tx.send(Inbound::McpServers(mcp_snapshot(cfg, mcp, disabled).await));
+}
+
+/// Run a registry search and shape it for the tab, flagging already-configured
+/// servers and deduping the registry's per-version rows to one per name.
+async fn run_mcp_search(cfg: &Config, query: &str) -> stella_tui::McpSearchOutcome {
+    let query = query.trim().to_string();
+    let configured: std::collections::HashSet<String> =
+        crate::mcp_cmd::load_config(&cfg.workspace_root)
+            .map(|c| c.names().into_iter().map(str::to_string).collect())
+            .unwrap_or_default();
+    let registry_url = crate::mcp_cmd::resolve_registry_url(&cfg.workspace_root);
+    match crate::mcp_cmd::search(&registry_url, Some(&query), None, 20).await {
+        Ok(page) => {
+            let mut seen = std::collections::HashSet::new();
+            let items = page
+                .entries
+                .into_iter()
+                .filter(|e| seen.insert(e.server.name.clone()))
+                .map(|e| {
+                    let alias = e.server.default_alias();
+                    stella_tui::McpSearchItem {
+                        installed: configured.contains(&e.server.name)
+                            || configured.contains(&alias),
+                        kinds: crate::mcp_cmd::install_kinds(&e.server),
+                        description: e.server.description.clone().unwrap_or_default(),
+                        name: e.server.name,
+                    }
+                })
+                .collect();
+            stella_tui::McpSearchOutcome {
+                query,
+                items,
+                error: None,
+                has_more: page.next_cursor.is_some(),
+            }
+        }
+        Err(error) => stella_tui::McpSearchOutcome {
+            query,
+            items: Vec::new(),
+            error: Some(error),
+            has_more: false,
+        },
+    }
+}
+
+/// Service one MCP-tab action from the deck. Returns `true` if `input` was an
+/// MCP verb (so the caller skips its own dispatch). Search/install/remove/auth
+/// touch `.stella/mcp.toml` (and, for search, the registry over HTTP); toggle
+/// flips the shared disabled set that the tool layer consults live.
+async fn service_mcp_action(
+    input: &WorkspaceInput,
+    cfg: &Config,
+    mcp: &Option<stella_mcp::McpToolSet>,
+    disabled: &stella_mcp::DisabledServers,
+    in_tx: &mpsc::UnboundedSender<Inbound>,
+) -> bool {
+    match input {
+        WorkspaceInput::McpToggle { name } => {
+            {
+                let mut set = disabled.lock().unwrap_or_else(|p| p.into_inner());
+                if !set.remove(name) {
+                    set.insert(name.clone());
+                }
+            }
+            send_mcp_snapshot(cfg, mcp, disabled, in_tx).await;
+        }
+        WorkspaceInput::McpRefresh => send_mcp_snapshot(cfg, mcp, disabled, in_tx).await,
+        WorkspaceInput::McpRemove { name } => {
+            let _ = crate::mcp_cmd::remove(&cfg.workspace_root, name);
+            send_mcp_snapshot(cfg, mcp, disabled, in_tx).await;
+        }
+        WorkspaceInput::McpAuth {
+            server,
+            field,
+            value,
+        } => {
+            let _ = crate::mcp_cmd::set_credential(
+                &cfg.workspace_root,
+                server,
+                field,
+                value.reveal().to_string(),
+            );
+            send_mcp_snapshot(cfg, mcp, disabled, in_tx).await;
+        }
+        WorkspaceInput::McpSearch { query } => {
+            let outcome = run_mcp_search(cfg, query).await;
+            let _ = in_tx.send(Inbound::McpSearchResults(outcome));
+        }
+        WorkspaceInput::McpInstall { name } => {
+            let registry_url = crate::mcp_cmd::resolve_registry_url(&cfg.workspace_root);
+            if let Ok((alias, option)) = crate::mcp_cmd::resolve_install(&registry_url, name).await
+            {
+                let _ = crate::mcp_cmd::install(&cfg.workspace_root, &alias, option.transport);
+            }
+            send_mcp_snapshot(cfg, mcp, disabled, in_tx).await;
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// The disposition of a would-be slash command.
 enum DeckCommand {
     /// Not a command — run the model turn as usual.
@@ -868,6 +1085,7 @@ const DECK_BUILTINS: &[(&str, &str)] = &[
     ("/diff", "open the diff viewer"),
     ("/graph", "open the code-graph tab"),
     ("/skills", "open the SKILLS tab: manage · search · create"),
+    ("/mcp", "open the MCP servers tab"),
 ];
 
 /// The deck's reserved command names — see [`DECK_BUILTINS`].
@@ -1422,10 +1640,10 @@ async fn run_deck_command(
             }
         }
         // Deck-local commands (tab switches, `/agents` opening the Agents
-        // tab) are normally consumed TUI-side, but a queued one reaches
-        // here — accept it as handled (a no-op) rather than calling it
-        // "unknown".
-        "/files" | "/diff" | "/graph" | "/agents" | "/skills" => {}
+        // tab, `/skills` and `/mcp` opening their tabs) are normally consumed
+        // TUI-side, but a queued one reaches here — accept it as handled (a
+        // no-op) rather than calling it "unknown".
+        "/files" | "/diff" | "/graph" | "/agents" | "/skills" | "/mcp" => {}
         _ => {
             // A custom command/skill/agent (⚡): expand its template —
             // arguments and all — into the prompt the model turn runs.

@@ -243,8 +243,8 @@ pub fn color_mode(no_color: bool, colorterm: Option<&str>, term: Option<&str>) -
     if truecolor_supported(colorterm, term) {
         return ColorMode::Truecolor;
     }
-    let has_256 = colorterm.is_some()
-        || term.is_some_and(|t| t.to_ascii_lowercase().contains("256color"));
+    let has_256 =
+        colorterm.is_some() || term.is_some_and(|t| t.to_ascii_lowercase().contains("256color"));
     if has_256 {
         ColorMode::Ansi256
     } else {
@@ -615,7 +615,10 @@ mod tests {
     fn color_mode_no_color_beats_every_color_signal() {
         // NO_COLOR wins even on a truecolor terminal.
         assert_eq!(color_mode(true, Some("truecolor"), None), ColorMode::None);
-        assert_eq!(color_mode(true, None, Some("xterm-256color")), ColorMode::None);
+        assert_eq!(
+            color_mode(true, None, Some("xterm-256color")),
+            ColorMode::None
+        );
     }
 
     #[test]
@@ -657,7 +660,10 @@ mod tests {
 
     #[test]
     fn resolve_leaves_unmapped_colors_unchanged_when_indexed() {
-        assert_eq!(resolve(Color::Indexed(9), ColorMode::Ansi256), Color::Indexed(9));
+        assert_eq!(
+            resolve(Color::Indexed(9), ColorMode::Ansi256),
+            Color::Indexed(9)
+        );
         assert_eq!(resolve(Color::Reset, ColorMode::Ansi16), Color::Reset);
     }
 

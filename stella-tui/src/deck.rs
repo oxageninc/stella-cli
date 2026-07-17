@@ -26,7 +26,7 @@ use stella_protocol::{AgentEvent, FileChangeKind};
 use crate::envelope::{AgentId, AgentMeta, AgentStatus, Inbound};
 use crate::model::SessionModel;
 
-/// The five top-level tabs of the deck.
+/// The top-level tabs of the deck.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeckTab {
     Session,
@@ -35,16 +35,18 @@ pub enum DeckTab {
     Graph,
     Files,
     Skills,
+    Mcp,
 }
 
 impl DeckTab {
-    pub const ALL: [DeckTab; 6] = [
+    pub const ALL: [DeckTab; 7] = [
         DeckTab::Session,
         DeckTab::Agents,
         DeckTab::Traces,
         DeckTab::Graph,
         DeckTab::Files,
         DeckTab::Skills,
+        DeckTab::Mcp,
     ];
 
     /// The tab-bar label. Deck tab labels are UPPERCASE by convention —
@@ -57,6 +59,7 @@ impl DeckTab {
             DeckTab::Graph => "GRAPH",
             DeckTab::Files => "FILES",
             DeckTab::Skills => "SKILLS",
+            DeckTab::Mcp => "MCP",
         }
     }
 
@@ -333,15 +336,17 @@ impl WorkspaceModel {
             // The driver flipped staged-pipeline routing (`/pipeline`) — the
             // PIPELINE stat box tracks it live.
             Inbound::Pipeline(on) => self.pipeline = *on,
-            // The graph snapshot, the slash vocabulary, and the installed-
-            // agents list are out-of-band read-models, not part of the
-            // event-log fold — the view state owns them, applied in
+            // The graph snapshot, the slash vocabulary, the installed-agents
+            // list, and the MCP snapshots are out-of-band read-models, not part
+            // of the event-log fold — the view state owns them, applied in
             // `ingest_inbound`, so the model deliberately ignores them here.
             Inbound::GraphSnapshot(_)
             | Inbound::SlashCommands(_)
             | Inbound::AgentsList { .. }
             | Inbound::Skills(_)
-            | Inbound::SkillSearch { .. } => {}
+            | Inbound::SkillSearch { .. }
+            | Inbound::McpServers(_)
+            | Inbound::McpSearchResults(_) => {}
         }
     }
 
@@ -1308,9 +1313,12 @@ mod tests {
     #[test]
     fn deck_tab_cycles_both_ways() {
         assert_eq!(DeckTab::Session.next(), DeckTab::Agents);
-        assert_eq!(DeckTab::Session.prev(), DeckTab::Skills);
+        // Tab order ends …Files → Skills → Mcp; Mcp wraps to Session and is
+        // Session's predecessor backward.
         assert_eq!(DeckTab::Files.next(), DeckTab::Skills);
-        assert_eq!(DeckTab::Skills.next(), DeckTab::Session);
+        assert_eq!(DeckTab::Skills.next(), DeckTab::Mcp);
+        assert_eq!(DeckTab::Mcp.next(), DeckTab::Session);
+        assert_eq!(DeckTab::Session.prev(), DeckTab::Mcp);
     }
 
     #[test]

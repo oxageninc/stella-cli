@@ -53,6 +53,7 @@ pub mod config;
 pub mod error;
 pub mod http;
 pub mod protocol;
+pub mod registry;
 mod sse;
 pub mod stdio;
 pub mod toolset;
@@ -62,6 +63,10 @@ pub use client::{HealthState, McpClient, McpToolInfo, ServerHealth, render_conte
 pub use config::{McpConfig, McpServerConfig, McpTransport};
 pub use error::McpError;
 pub use http::HttpTransport;
+pub use registry::{
+    AuthField, AuthLocation, DEFAULT_REGISTRY_URL, InstallOption, RegistryClient, RegistryEntry,
+    RegistryPage, RegistryServer,
+};
 pub use stdio::StdioTransport;
-pub use toolset::{DEFAULT_CALL_TIMEOUT, McpToolSet};
+pub use toolset::{DEFAULT_CALL_TIMEOUT, DisabledServers, McpToolSet};
 pub use transport::Transport;

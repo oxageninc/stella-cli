@@ -51,11 +51,47 @@ impl McpConfig {
             .map(|(name, transport)| McpServerConfig { name, transport })
             .collect()
     }
+
+    /// The configured server names, in stable (sorted) order.
+    pub fn names(&self) -> Vec<&str> {
+        self.servers.keys().map(String::as_str).collect()
+    }
+
+    /// Look up a configured server's transport.
+    pub fn get(&self, name: &str) -> Option<&McpTransport> {
+        self.servers.get(name)
+    }
+
+    /// Look up a configured server's transport for editing (e.g. an auth flow
+    /// setting a credential in place).
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut McpTransport> {
+        self.servers.get_mut(name)
+    }
+
+    /// Insert or replace a server entry. Installing a registry server is an
+    /// upsert: MCP servers are not versioned, so re-installing simply
+    /// overwrites the transport under the same alias.
+    pub fn upsert(&mut self, name: impl Into<String>, transport: McpTransport) {
+        self.servers.insert(name.into(), transport);
+    }
+
+    /// Remove a server entry, returning whether it existed.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.servers.remove(name).is_some()
+    }
+
+    /// Serialize the whole document back to TOML (for writing `mcp.toml`).
+    /// Note this writes credential values (env/headers) verbatim to disk, the
+    /// pre-existing `mcp.toml` convention; the redacted [`McpTransport`] `Debug`
+    /// keeps those same values out of logs.
+    pub fn to_toml_string(&self) -> Result<String, McpError> {
+        toml::to_string_pretty(self).map_err(|e| McpError::Config(e.to_string()))
+    }
 }
 
 /// One named server: its `name` (used as the tool-namespace segment) and its
 /// transport.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
     #[serde(flatten)]
@@ -64,7 +100,14 @@ pub struct McpServerConfig {
 
 /// How to reach a server. `transport` is the discriminant; the remaining
 /// fields depend on it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is **hand-written to redact credential values** (env values and
+/// header values) — a plain derive would print an `Authorization` bearer or an
+/// API-key env var verbatim under `{:?}`, leaking it into any log or panic
+/// message. The keys are kept (they say *which* credentials are configured);
+/// only the values become `<redacted>`. Serialization is unaffected, so the
+/// on-disk `mcp.toml` still round-trips.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum McpTransport {
     /// Spawn a child process and speak newline-delimited JSON-RPC over its
@@ -87,6 +130,79 @@ pub enum McpTransport {
         #[serde(default)]
         headers: BTreeMap<String, String>,
     },
+}
+
+impl McpTransport {
+    /// The transport discriminant, for display.
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            McpTransport::Stdio { .. } => "stdio",
+            McpTransport::Http { .. } => "http",
+        }
+    }
+
+    /// The names of the credential-bearing fields configured on this transport:
+    /// env-var names for stdio, header names for http. Values are never
+    /// returned — this is for a "which credentials are set" UI, not for reading
+    /// secrets.
+    pub fn credential_names(&self) -> Vec<&str> {
+        match self {
+            McpTransport::Stdio { env, .. } => env.keys().map(String::as_str).collect(),
+            McpTransport::Http { headers, .. } => headers.keys().map(String::as_str).collect(),
+        }
+    }
+
+    /// Whether any credential field is set (auth appears configured).
+    pub fn has_credentials(&self) -> bool {
+        match self {
+            McpTransport::Stdio { env, .. } => !env.is_empty(),
+            McpTransport::Http { headers, .. } => !headers.is_empty(),
+        }
+    }
+
+    /// Set a credential value in place: an env var for stdio, a header for
+    /// http. Used by the auth flow. The value is stored (and later written to
+    /// `mcp.toml`) but never logged — see the redacted `Debug`.
+    pub fn set_credential(&mut self, field: impl Into<String>, value: String) {
+        match self {
+            McpTransport::Stdio { env, .. } => {
+                env.insert(field.into(), value);
+            }
+            McpTransport::Http { headers, .. } => {
+                headers.insert(field.into(), value);
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for McpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McpTransport::Stdio { cmd, args, env } => f
+                .debug_struct("Stdio")
+                .field("cmd", cmd)
+                .field("args", args)
+                .field("env", &RedactedValues(env))
+                .finish(),
+            McpTransport::Http { url, headers } => f
+                .debug_struct("Http")
+                .field("url", url)
+                .field("headers", &RedactedValues(headers))
+                .finish(),
+        }
+    }
+}
+
+/// A `Debug` adapter for a string map that prints keys but replaces every value
+/// with `<redacted>` — so credential values never reach a log or panic message.
+struct RedactedValues<'a>(&'a BTreeMap<String, String>);
+
+impl std::fmt::Debug for RedactedValues<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|k| (k, "<redacted>")))
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -174,5 +290,94 @@ mod tests {
     fn empty_document_yields_no_servers() {
         let cfg = McpConfig::from_toml_str("").unwrap();
         assert!(cfg.into_servers().is_empty());
+    }
+
+    #[test]
+    fn debug_redacts_credential_values_but_keeps_keys() {
+        // stdio env value (an API key) must never appear under `{:?}`.
+        let mut env = BTreeMap::new();
+        env.insert("API_KEY".to_string(), "super-secret-token".to_string());
+        let stdio = McpTransport::Stdio {
+            cmd: "srv".into(),
+            args: vec!["--flag".into()],
+            env,
+        };
+        let shown = format!("{stdio:?}");
+        assert!(
+            !shown.contains("super-secret-token"),
+            "value leaked: {shown}"
+        );
+        assert!(shown.contains("API_KEY"), "key should be visible: {shown}");
+        assert!(shown.contains("<redacted>"));
+        // Non-secret command line stays visible for debugging.
+        assert!(shown.contains("srv") && shown.contains("--flag"));
+
+        // http header value (a bearer) must never appear either.
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "Bearer leak-me".to_string());
+        let http = McpTransport::Http {
+            url: "https://h/mcp".into(),
+            headers,
+        };
+        let shown = format!("{http:?}");
+        assert!(!shown.contains("leak-me"), "bearer leaked: {shown}");
+        assert!(shown.contains("Authorization"));
+        // The whole server config (derived Debug) also stays redacted.
+        let cfg = McpServerConfig {
+            name: "s".into(),
+            transport: http,
+        };
+        assert!(!format!("{cfg:?}").contains("leak-me"));
+    }
+
+    #[test]
+    fn upsert_remove_and_toml_roundtrip() {
+        let mut cfg = McpConfig::default();
+        cfg.upsert(
+            "fs",
+            McpTransport::Stdio {
+                cmd: "mcp-fs".into(),
+                args: vec!["--root".into(), "/w".into()],
+                env: BTreeMap::new(),
+            },
+        );
+        // Re-installing overwrites (MCP servers are not versioned).
+        cfg.upsert(
+            "fs",
+            McpTransport::Stdio {
+                cmd: "mcp-fs".into(),
+                args: vec!["--root".into(), "/other".into()],
+                env: BTreeMap::new(),
+            },
+        );
+        assert_eq!(cfg.names(), vec!["fs"]);
+
+        // Serialize → parse → identical document.
+        let toml_text = cfg.to_toml_string().unwrap();
+        let back = McpConfig::from_toml_str(&toml_text).unwrap();
+        assert_eq!(back.get("fs"), cfg.get("fs"));
+
+        assert!(cfg.remove("fs"));
+        assert!(!cfg.remove("fs"));
+        assert!(cfg.names().is_empty());
+    }
+
+    #[test]
+    fn set_credential_targets_env_or_headers() {
+        let mut stdio = McpTransport::Stdio {
+            cmd: "s".into(),
+            args: vec![],
+            env: BTreeMap::new(),
+        };
+        stdio.set_credential("TOKEN", "v".into());
+        assert!(stdio.has_credentials());
+        assert_eq!(stdio.credential_names(), vec!["TOKEN"]);
+
+        let mut http = McpTransport::Http {
+            url: "https://h".into(),
+            headers: BTreeMap::new(),
+        };
+        http.set_credential("Authorization", "Bearer v".into());
+        assert_eq!(http.credential_names(), vec!["Authorization"]);
     }
 }

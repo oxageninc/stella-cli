@@ -18,6 +18,7 @@ mod glob;
 pub mod goal;
 pub mod hooks;
 pub mod loop_detect;
+pub mod mcp_usage;
 pub(crate) mod mining;
 pub mod ports;
 pub mod retry;
@@ -42,6 +43,7 @@ pub use extensions::{
 pub use goal::{GoalConfig, GoalOutcome};
 pub use hooks::{HookEvent, HookPayload, HookRunOutcome, HookRunner, Hooks, run_hooks};
 pub use loop_detect::{LoopDetectionConfig, LoopVerdict, detect_loop};
+pub use mcp_usage::{McpUsageLedger, McpUsageRecord, drain_usage, push_usage};
 pub use ports::{Clock, ToolExecutor};
 pub use retry::{RetryOutcome, RetryPolicy, retry_with_backoff};
 pub use router::{RoleTable, Router};

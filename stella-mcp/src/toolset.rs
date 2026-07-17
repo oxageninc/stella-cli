@@ -38,16 +38,23 @@
 //! [`McpToolSet::health`] for a non-fatal CLI/TUI/telemetry diagnostic.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use stella_core::mcp_usage::{McpUsageLedger, McpUsageRecord, push_usage};
 use stella_core::ports::ToolExecutor;
 use stella_protocol::{ToolOutput, ToolSchema};
 
 use crate::client::{McpClient, ServerHealth};
 use crate::config::McpServerConfig;
+
+/// A session-scoped set of server names disabled by the operator. Shared with
+/// the CLI/TUI so a toggle takes effect on the next model call — the engine
+/// re-reads [`McpToolSet::schemas`] each call, so a disabled server's tools
+/// simply disappear from the advertised set (and any stray call errors).
+pub type DisabledServers = Arc<Mutex<HashSet<String>>>;
 
 /// The tool-namespace prefix.
 const NS_PREFIX: &str = "mcp__";
@@ -66,6 +73,12 @@ pub struct McpToolSet {
     /// reason)`. They advertise no tools but never block the rest.
     failed: Vec<(String, String)>,
     native: Option<Arc<dyn ToolExecutor>>,
+    /// Where each successful MCP call is recorded (server, tool, reason, time)
+    /// for the `mcp_usage` telemetry table. `None` = no telemetry (a no-op).
+    usage: Option<McpUsageLedger>,
+    /// Server names disabled for this session. A disabled server's tools are
+    /// hidden from `schemas()` and its calls error, without disconnecting it.
+    disabled: Option<DisabledServers>,
 }
 
 impl McpToolSet {
@@ -107,6 +120,8 @@ impl McpToolSet {
             routes: HashMap::new(),
             failed,
             native: None,
+            usage: None,
+            disabled: None,
         };
         set.rebuild_routes();
         set
@@ -141,6 +156,8 @@ impl McpToolSet {
             routes: HashMap::new(),
             failed,
             native: None,
+            usage: None,
+            disabled: None,
         };
         set.rebuild_routes();
         set
@@ -151,6 +168,31 @@ impl McpToolSet {
     pub fn wrapping(mut self, native: Arc<dyn ToolExecutor>) -> Self {
         self.native = Some(native);
         self
+    }
+
+    /// Record every successful MCP call into `ledger` (server, tool, reason,
+    /// call time) for the `mcp_usage` telemetry table. Without this the set
+    /// still works — telemetry is simply not collected.
+    pub fn with_usage_ledger(mut self, ledger: McpUsageLedger) -> Self {
+        self.usage = Some(ledger);
+        self
+    }
+
+    /// Consult `disabled` (a shared, session-scoped set of server names) so a
+    /// disabled server's tools are hidden and its calls error, live, without a
+    /// reconnect. The set is shared with the CLI/TUI, which toggles it.
+    pub fn with_disabled_servers(mut self, disabled: DisabledServers) -> Self {
+        self.disabled = Some(disabled);
+        self
+    }
+
+    /// Whether `server` is currently disabled for this session.
+    fn is_disabled(&self, server: &str) -> bool {
+        self.disabled.as_ref().is_some_and(|set| {
+            set.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(server)
+        })
     }
 
     /// Override the per-call timeout (default [`DEFAULT_CALL_TIMEOUT`]),
@@ -214,7 +256,20 @@ impl McpToolSet {
     /// only names the server and turns an `Err` into model-visible data.
     async fn execute_mcp(&self, client: &McpClient, raw_tool: &str, input: &Value) -> ToolOutput {
         match client.call_tool(raw_tool, input.clone()).await {
-            Ok(output) => output,
+            Ok(output) => {
+                // Record the successful call for the `mcp_usage` telemetry
+                // table. `reason` is best-effort: external MCP tools rarely
+                // carry one, so it is usually empty.
+                if let Some(ledger) = &self.usage {
+                    let reason = input
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    push_usage(ledger, McpUsageRecord::now(client.name(), raw_tool, reason));
+                }
+                output
+            }
             Err(err) => ToolOutput::Error {
                 message: format!(
                     "mcp server `{}` failed calling `{raw_tool}`: {}",
@@ -235,6 +290,12 @@ impl ToolExecutor for McpToolSet {
             schemas.extend(native.schemas());
         }
         for (idx, client) in self.clients.iter().enumerate() {
+            // A disabled server advertises nothing this session — the engine
+            // re-reads schemas each model call, so the model stops seeing its
+            // tools the moment it is toggled off.
+            if self.is_disabled(client.name()) {
+                continue;
+            }
             for tool in client.tools() {
                 let namespaced = namespaced_name(client.name(), &tool.name);
                 // Only advertise tools that actually route back to this client
@@ -256,7 +317,16 @@ impl ToolExecutor for McpToolSet {
 
     async fn execute(&self, name: &str, input: &Value) -> ToolOutput {
         if let Some((idx, raw_tool)) = self.routes.get(name) {
-            return self.execute_mcp(&self.clients[*idx], raw_tool, input).await;
+            let client = &self.clients[*idx];
+            if self.is_disabled(client.name()) {
+                return ToolOutput::Error {
+                    message: format!(
+                        "mcp server `{}` is disabled for this session — tool `{name}` unavailable",
+                        client.name()
+                    ),
+                };
+            }
+            return self.execute_mcp(client, raw_tool, input).await;
         }
         // A namespaced name we don't recognize is an MCP miss, not a native
         // tool — never fall through to native for it.
@@ -473,5 +543,54 @@ mod tests {
             .collect();
         assert!(reasons.iter().any(|r| r.contains("duplicate")));
         assert!(reasons.iter().any(|r| r.contains("reserved")));
+    }
+
+    #[tokio::test]
+    async fn usage_ledger_records_a_successful_call_with_server_tool_and_reason() {
+        let client = connected_client("files", "read").await;
+        let ledger: McpUsageLedger = Arc::default();
+        let set = McpToolSet::from_clients(vec![client]).with_usage_ledger(ledger.clone());
+
+        let out = set
+            .execute(
+                "mcp__files__read",
+                &serde_json::json!({ "reason": "inspect config" }),
+            )
+            .await;
+        assert!(!out.is_error());
+
+        let drained = stella_core::mcp_usage::drain_usage(&ledger);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].server, "files");
+        assert_eq!(drained[0].tool, "read");
+        assert_eq!(drained[0].reason, "inspect config");
+        assert!(drained[0].called_at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_server_is_hidden_from_schemas_and_errors_on_execute() {
+        let client = connected_client("files", "read").await;
+        let disabled: DisabledServers = Arc::new(Mutex::new(HashSet::new()));
+        disabled.lock().unwrap().insert("files".to_string());
+        let set = McpToolSet::from_clients(vec![client]).with_disabled_servers(disabled.clone());
+
+        // Hidden from the advertised schema while disabled.
+        assert!(
+            set.schemas().iter().all(|s| s.name != "mcp__files__read"),
+            "disabled server's tool must not be advertised"
+        );
+        // And a direct call errors, naming the disabled server.
+        match set.execute("mcp__files__read", &Value::Null).await {
+            ToolOutput::Error { message } => assert!(message.contains("disabled")),
+            other => panic!("expected a disabled error, got {other:?}"),
+        }
+
+        // Re-enabling (clearing the set) makes the tool visible again — live,
+        // no reconnect.
+        disabled.lock().unwrap().clear();
+        assert!(
+            set.schemas().iter().any(|s| s.name == "mcp__files__read"),
+            "re-enabled server's tool must reappear"
+        );
     }
 }

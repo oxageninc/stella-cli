@@ -288,7 +288,13 @@ async fn run_pipeline_one_shot(
         Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
-    let mcp = connect_mcp(cfg, registry.clone(), format == OutputFormat::Text).await;
+    let mcp = connect_mcp(
+        cfg,
+        registry.clone(),
+        Some(registry.mcp_usage_ledger()),
+        format == OutputFormat::Text,
+    )
+    .await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -737,7 +743,13 @@ async fn run_raw_one_shot(
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
-    let mcp = connect_mcp(cfg, registry.clone(), format == OutputFormat::Text).await;
+    let mcp = connect_mcp(
+        cfg,
+        registry.clone(),
+        Some(registry.mcp_usage_ledger()),
+        format == OutputFormat::Text,
+    )
+    .await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -833,7 +845,13 @@ pub async fn run_goal_cmd(
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
-    let mcp = connect_mcp(cfg, registry.clone(), true).await;
+    let mcp = connect_mcp(
+        cfg,
+        registry.clone(),
+        Some(registry.mcp_usage_ledger()),
+        true,
+    )
+    .await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -909,7 +927,13 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     let provider = build_provider(cfg)?;
     let registry: std::sync::Arc<ToolRegistry> =
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
-    let mcp = connect_mcp(cfg, registry.clone(), true).await;
+    let mcp = connect_mcp(
+        cfg,
+        registry.clone(),
+        Some(registry.mcp_usage_ledger()),
+        true,
+    )
+    .await;
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let base_tools: &dyn ToolExecutor = match &mcp {
@@ -1530,10 +1554,22 @@ pub(crate) fn load_mcp_plan(cfg: &Config) -> McpPlan {
 pub(crate) async fn connect_mcp_servers(
     servers: &[McpServerConfig],
     native: std::sync::Arc<dyn ToolExecutor>,
+    usage: Option<stella_core::mcp_usage::McpUsageLedger>,
+    disabled: Option<stella_mcp::DisabledServers>,
 ) -> McpToolSet {
-    McpToolSet::connect(servers, MCP_CONNECT_TIMEOUT)
+    let mut set = McpToolSet::connect(servers, MCP_CONNECT_TIMEOUT)
         .await
-        .wrapping(native)
+        .wrapping(native);
+    // Record each successful MCP call into the session's usage ledger, and
+    // honor the session's disabled-servers set (both may be absent for a
+    // one-shot run that never toggles servers).
+    if let Some(usage) = usage {
+        set = set.with_usage_ledger(usage);
+    }
+    if let Some(disabled) = disabled {
+        set = set.with_disabled_servers(disabled);
+    }
+    set
 }
 
 /// Connect the workspace's MCP servers (.stella/mcp.toml), wrapping the
@@ -1547,6 +1583,7 @@ pub(crate) async fn connect_mcp_servers(
 pub(crate) async fn connect_mcp(
     cfg: &Config,
     native: std::sync::Arc<dyn ToolExecutor>,
+    usage: Option<stella_core::mcp_usage::McpUsageLedger>,
     print_diagnostics: bool,
 ) -> Option<McpToolSet> {
     let servers = match load_mcp_plan(cfg) {
@@ -1559,7 +1596,8 @@ pub(crate) async fn connect_mcp(
         }
         McpPlan::Servers(servers) => servers,
     };
-    let set = connect_mcp_servers(&servers, native).await;
+    // A one-shot run has no interactive enable/disable, so no disabled set.
+    let set = connect_mcp_servers(&servers, native, usage, None).await;
     if print_diagnostics {
         for (name, reason) in set.failed_servers() {
             eprintln!(
@@ -2085,10 +2123,28 @@ pub(crate) fn record_execution_end(
         })
         .collect();
     let uses_ok = uses.is_empty() || store.record_agent_uses(execution_id, &uses).is_ok();
+    let mcp_usage = mcp_usage_rows(registry);
+    let mcp_usage_ok = store.record_mcp_usage(execution_id, &mcp_usage).is_ok();
     let finish_ok = store
         .finish_execution(execution_id, outcome_label, cost_usd)
         .is_ok();
-    files_ok && citations_ok && uses_ok && finish_ok
+    files_ok && citations_ok && uses_ok && mcp_usage_ok && finish_ok
+}
+
+/// The registry's MCP tool-usage ledger as store rows. This DRAINS the ledger
+/// (like memory citations) so each call persists under exactly one execution —
+/// re-persisting under later turns would inflate the per-tool call counts.
+fn mcp_usage_rows(registry: &ToolRegistry) -> Vec<stella_store::McpUsageRow> {
+    registry
+        .take_mcp_usage()
+        .into_iter()
+        .map(|u| stella_store::McpUsageRow {
+            server: u.server,
+            tool: u.tool,
+            reason: u.reason,
+            called_at_ms: u.called_at_ms as i64,
+        })
+        .collect()
 }
 
 /// The registry's session file-touch telemetry as store rows: one per
