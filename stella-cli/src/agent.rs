@@ -118,6 +118,11 @@ Rules:
 /// the prompt cache on every call, so they must stay dense.
 const MEMORY_PROMPT_BUDGET_CHARS: usize = 16_000;
 
+/// A/B recall measurement rate (Proposal 4): `1/N` turns suppress recall
+/// entirely so the outcome can be compared against recalled turns. 10 means
+/// ~10% of turns are control turns. 0 disables the A/B mechanism.
+const STELLA_AB_RECALL_RATE: u32 = 10;
+
 /// Assemble the session's system prompt from a `base` instruction set plus
 /// the workspace's saved memories and the workspace rules section (Tier 1
 /// soft adherence, `stella_core::rules`). Both are loaded ONCE per session
@@ -1274,8 +1279,20 @@ pub(crate) async fn record_turn_episode(
     } else {
         EpisodeOutcome::Failure
     };
-    m.record_episode(prompt, episode_outcome, &turn_files, started_unix)
-        .await;
+    // Proposal 4: tag the episode summary when recall was suppressed (A/B
+    // control turn) so future analysis can compare recalled vs control.
+    let ab_tag = if m.recall_was_suppressed() {
+        " [ab-control]"
+    } else {
+        ""
+    };
+    m.record_episode(
+        &format!("{prompt}{ab_tag}"),
+        episode_outcome,
+        &turn_files,
+        started_unix,
+    )
+    .await;
 }
 
 /// Build the workspace code-graph index into `.stella/codegraph.db` (the
