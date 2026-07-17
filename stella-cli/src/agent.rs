@@ -1921,7 +1921,11 @@ pub fn run_tools_validation(dir: Option<&std::path::Path>) -> Result<(), String>
             .as_deref()
             .map(|n| format!(" ({n})"))
             .unwrap_or_default();
-        println!("  {mark} {}{}", manifest.path.display(), name.bright_magenta());
+        println!(
+            "  {mark} {}{}",
+            manifest.path.display(),
+            name.bright_magenta()
+        );
         for issue in &manifest.issues {
             let (label, message) = match issue.severity {
                 validate::Severity::Error => ("error:".red().bold(), issue.message.red()),

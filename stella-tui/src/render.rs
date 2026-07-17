@@ -771,10 +771,7 @@ fn wrap_one_indent(
                 // space stacks on top of `indent` and pushes every wrapped row
                 // one column right of the clean left edge — the "extra blank
                 // space after the colon" bug.
-                let lead = remainder
-                    .iter()
-                    .take_while(|(c, _)| *c == ' ')
-                    .count();
+                let lead = remainder.iter().take_while(|(c, _)| *c == ' ').count();
                 remainder.drain(..lead);
                 flush(&mut current, is_first, out);
                 is_first = false;

@@ -721,7 +721,10 @@ impl Config {
 
     pub fn print_config(&self) {
         println!("{}\n", "Stella — Current Configuration".yellow().bold());
-        println!("  Provider:   {}", self.provider.display_name.bright_magenta());
+        println!(
+            "  Provider:   {}",
+            self.provider.display_name.bright_magenta()
+        );
         println!(
             "  Model:      {}/{}",
             self.provider.id.bright_magenta(),
