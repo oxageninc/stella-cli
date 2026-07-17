@@ -183,7 +183,8 @@ fn render_search(ui: &DeckUi, area: Rect, buf: &mut Buffer) {
             } else {
                 bar_w + usize::from(bar_w > 0) + metric_w + 1
             };
-            let name = truncate(&hit.id, width.saturating_sub(marker.len() + right_w).max(4));
+            let name =
+                truncate_skill_id(&hit.id, width.saturating_sub(marker.len() + right_w).max(4));
             let pad = width
                 .saturating_sub(marker.len() + name.chars().count() + right_w)
                 .max(1);
@@ -492,6 +493,28 @@ fn centered_row(inner: Rect) -> Rect {
     Rect::new(inner.x, y, inner.width, 1)
 }
 
+/// Truncate an `owner/repo@skill` id to `max` columns, preferring to keep the
+/// `@skill` segment (the most identifying part) whole — the owner/repo prefix
+/// gives way to an ellipsis first. Falls back to a plain tail-ellipsis when
+/// even `@skill` cannot fit.
+fn truncate_skill_id(id: &str, max: usize) -> String {
+    if id.chars().count() <= max || max == 0 {
+        return truncate(id, max);
+    }
+    if let Some(at) = id.rfind('@') {
+        let skill = &id[at..]; // "@skill"
+        let skill_w = skill.chars().count();
+        // Keep the whole @skill tail plus an ellipsis, filling the rest with the
+        // head of owner/repo — but only when that leaves real owner context.
+        if skill_w + 2 <= max {
+            let owner_room = max - skill_w - 1; // room minus the ellipsis
+            let owner_head: String = id[..at].chars().take(owner_room).collect();
+            return format!("{owner_head}…{skill}");
+        }
+    }
+    truncate(id, max)
+}
+
 /// Truncate to `max` chars with a trailing ellipsis, char-safe.
 fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
@@ -625,13 +648,16 @@ mod tests {
                 13900,
             ),
         ];
-        let area = Rect::new(0, 0, 90, 14);
+        // A realistic deck width; the search pane is 45% of it.
+        let area = Rect::new(0, 0, 120, 14);
         let mut buf = Buffer::empty(area);
         render(&WorkspaceModel::new(), &mut ui, area, &mut buf);
         let text = buffer_text(&buf);
+        // The identifying `@skill` segment survives truncation (owner/repo gives
+        // way first), and the installs metric shows.
         assert!(
-            text.contains("wshobson/agents@rust-async-patterns"),
-            "hit name shown:\n{text}"
+            text.contains("@rust-async-patterns"),
+            "skill segment shown:\n{text}"
         );
         assert!(text.contains("15.8K installs"), "installs shown:\n{text}");
         // The whole point: no raw ANSI / SGR codes leak into the rendered list.
