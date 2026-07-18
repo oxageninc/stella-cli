@@ -44,7 +44,7 @@
 //!      Loading namespaced commands as `/ns:name` is a separate feature
 //!      decision, not this rule's concern.
 //!
-//! # No I/O in this module (`02-architecture.md` §1.3)
+//! # No I/O in this module
 //!
 //! Scanning directories, reading definition files, and creating symlinks are
 //! real I/O — `stella-cli` owns all of it. This module only plans and

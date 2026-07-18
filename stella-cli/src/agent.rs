@@ -7,7 +7,7 @@
 //! `AgentEvent` stream live via a spawned draining task. This replaces the
 //! Phase 0/1 ad-hoc loop that lived here directly (no retry, no
 //! compaction, no budget, a flat iteration cap instead of real loop
-//! detection) — see `03-plan.md` Phase 2.
+//! detection) — Phase 2.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -899,7 +899,7 @@ async fn run_raw_one_shot(
 /// monitor` composed on top of it). The judge is routed by role: when a
 /// second provider family is configured (BYOK), `run_goal_turn` builds a
 /// role `Router` and resolves `Role::Judge` to a DIFFERENT family than the
-/// worker for bias-resistant assessment (`07-model-matrix.md` §1); with a
+/// worker for bias-resistant assessment; with a
 /// single family it stays the worker provider, identical to before. The
 /// worker turns get the full tool stack (MCP + custom + interactive +
 /// skills), same as `run_one_shot`.
@@ -2314,7 +2314,7 @@ fn spawn_renderer(
             match format {
                 OutputFormat::StreamJson => {
                     // One line per event — the stable machine interface
-                    // (02-architecture.md §4). Serialization of a protocol
+                    //. Serialization of a protocol
                     // enum never fails; if it somehow does, surface it on
                     // stderr rather than silently dropping the event.
                     match serde_json::to_string(&event) {
@@ -2537,7 +2537,7 @@ pub(crate) fn persist_event(
 /// The judge is routed by role (`resolve_cross_family_judge`): when a second
 /// provider family is configured and the `Router` selects it, the judge runs
 /// on a DIFFERENT model family than the worker (bias-resistant assessment,
-/// `07-model-matrix.md` §1) and a one-line notice is printed. With a single
+///) and a one-line notice is printed. With a single
 /// configured family — or on any discovery/build failure — the judge is the
 /// worker provider itself, identical to before: no second provider is built
 /// and no extra cost is incurred. Text-mode rendering only — goal and
@@ -2662,7 +2662,7 @@ async fn run_goal_turn(
 /// providers — `gemini-3-pro` on both `gemini` and `vertex`) so an
 /// unrecognized model slug is a hard, immediate, named error — never a
 /// silent construction of a provider that will simply fail its first live
-/// call (`07-model-matrix.md` §3, L-M1/L-M2). The one exemption is `local`:
+/// call (L-M1/L-M2). The one exemption is `local`:
 /// a local server's models are whatever the user pulled into it — there is
 /// no curated catalog to check against, and the anti-phantom-slug rule
 /// exists to catch drift in OUR seed data, not to veto the user's own
@@ -2818,7 +2818,7 @@ fn build_provider_parts(
 
 /// Cross-family grouping key for judge selection. Same-vendor providers must
 /// count as the SAME family so a routed judge is genuinely a different model
-/// (`07-model-matrix.md` §1): a Gemini judge assessing Gemini-via-Vertex work
+/// : a Gemini judge assessing Gemini-via-Vertex work
 /// carries the same bias, as does an Anthropic Claude judge over Bedrock
 /// Claude. Anything without a known sibling is its own family (its id).
 fn provider_family(provider_id: &str) -> String {

@@ -2,7 +2,7 @@
 //! whichever renderer (TUI or the JSON serializer) is listening.
 //! `--output-format stream-json` is a `serde_json` serialization of this
 //! exact enum, one line per event: a stable, versioned machine interface
-//! (`docs/specs/stella-rust-cli/02-architecture.md` §4).
+//!.
 //!
 //! This is deliberately a *subset* at Phase 0 (only what a bare
 //! provider-streaming spike needs); later phases append variants as the
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::tool::{ToolCall, ToolOutput};
 
 /// A named point in the turn's data flow
-/// (`docs/specs/stella-rust-cli/02-architecture.md` §5). Exactly one stage
+///. Exactly one stage
 /// vocabulary exists in this workspace — never duplicated per-crate (the
 /// TS-era `StageKind` duplication this structurally forbids, L-E1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,7 +44,7 @@ pub enum StageKind {
     Complete,
 }
 
-/// Budget enforcement mode (`07-model-matrix.md` §6): `off` (no metering),
+/// Budget enforcement mode : `off` (no metering),
 /// `observed` (meter + warn), `enforced` (hard stop with a clean turn
 /// abort — never a mid-tool kill).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +93,7 @@ pub enum AgentEvent {
         deduped: usize,
     },
     /// Emitted after every provider/media call that spends money
-    /// (`07-model-matrix.md` §6). The TUI HUD renders spend live from this
+    ///. The TUI HUD renders spend live from this
     /// stream; nothing user-visible about spend is derived from state that
     /// isn't also in this event.
     BudgetTick {
@@ -162,7 +162,7 @@ pub enum AgentEvent {
         kind: FileChangeKind,
         diff: Option<String>,
     },
-    /// Context recall completed (`06-context-protocol.md`): which frames
+    /// Context recall completed : which frames
     /// reached the prompt, from which providers, at what token cost. Every
     /// frame carries a human `citation_label`, never a raw id (L-C4).
     ContextRecall {
@@ -171,7 +171,7 @@ pub enum AgentEvent {
         tokens: u32,
     },
     /// Context write-back completed: episode summaries, fact upserts,
-    /// supersession (`06-context-protocol.md` §2.2 — bi-temporal,
+    /// supersession (bi-temporal,
     /// close-not-delete per L-C3).
     ContextWrite {
         provider: String,
@@ -206,7 +206,7 @@ pub enum AgentEvent {
         question: String,
         options: Vec<String>,
     },
-    /// A media generation job changed state (`08-multimodal.md`). Video
+    /// A media generation job changed state. Video
     /// jobs are async and long-lived; this event is how the TUI shows
     /// progress without polling shared state (L-T1).
     MediaProgress {
@@ -295,7 +295,7 @@ pub struct ScopeProposal {
     pub estimated_cost_usd: Option<f64>,
 }
 
-/// Which kind of media artifact a job produces (`08-multimodal.md`).
+/// Which kind of media artifact a job produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
@@ -322,7 +322,7 @@ pub struct MediaArtifactRef {
     pub id: String,
     pub kind: MediaKind,
     /// Path under `.stella/artifacts/` (the generation tools may never
-    /// write outside it — `02-architecture.md` §8).
+    /// write outside it).
     pub path: String,
     /// Human label for citation/display.
     pub label: String,

@@ -1,6 +1,6 @@
 //! Emit-shape helpers: turn media job transitions into `stella_protocol`
-//! event *values* (`08-multimodal.md`; event vocabulary in
-//! `02-architecture.md` §4). These return `AgentEvent`s as plain data — this
+//! event *values* (event vocabulary in
+//!). These return `AgentEvent`s as plain data — this
 //! crate has no channel dependency, so the caller owns how they reach the
 //! renderer. Centralizing the mapping means a `MediaJob` and a
 //! `MediaJobStatus` translate to `MediaProgress`/`MediaComplete` one way, not
@@ -12,7 +12,7 @@ use crate::provider::{MediaJob, MediaJobStatus};
 
 /// Build a `MediaProgress` event for `job` transitioning to `state`. The
 /// `artifact_id` and `kind` come from the job so events and the eventual
-/// artifact share one identity across a resume (`08-multimodal.md` §6).
+/// artifact share one identity across a resume.
 pub fn media_progress(job: &MediaJob, state: MediaJobState) -> AgentEvent {
     AgentEvent::MediaProgress {
         artifact_id: job.artifact_id.clone(),
@@ -28,7 +28,7 @@ pub fn progress_from_status(job: &MediaJob, status: &MediaJobStatus) -> AgentEve
 }
 
 /// Build the `MediaComplete` event announcing a persisted artifact
-/// (`08-multimodal.md` §3 — the artifact landed under `.stella/artifacts/`).
+/// (the artifact landed under `.stella/artifacts/`).
 pub fn media_complete(artifact: MediaArtifactRef) -> AgentEvent {
     AgentEvent::MediaComplete { artifact }
 }

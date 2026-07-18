@@ -4,7 +4,7 @@
 //! status, and the model's response prints as soon as it's ready.
 //!
 //! `render_event` is the TUI's one entry point onto `stella_core::Engine`'s
-//! event stream (`02-architecture.md` §4, L-T1: the TUI renders exclusively
+//! event stream (L-T1: the TUI renders exclusively
 //! from `AgentEvent`s — no panel owns state that isn't reconstructible by
 //! replaying the event log). It's deliberately a thin dispatcher onto the
 //! existing per-kind print helpers below, not a rewrite of them.

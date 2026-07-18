@@ -1,6 +1,6 @@
 //! `stella-context` — **the context plane**: the single door between the
 //! engine and everything the agent knows that isn't already in the prompt
-//! (`02-architecture.md` §7, `06-context-protocol.md` §2). One SQLite file, one
+//!. One SQLite file, one
 //! engine ([`ContextStore`]) holds a bi-temporal property graph, a fingerprinted
 //! embedding index, and episodic memory; on top of it sits a hybrid, budgeted,
 //! cited retrieval pipeline ([`ContextStore::recall`]) and a bi-temporal
@@ -38,7 +38,7 @@
 //!
 //! The built-in default is the offline, pure-Rust [`HashEmbedder`]. The product
 //! default — a local ONNX bge-small model — is the tracked follow-up
-//! (`06-context-protocol.md` §4, risk R14); [`Embedder`] is the seam that makes
+//! (risk R14); [`Embedder`] is the seam that makes
 //! swapping it in trivial. Wire types are built on `ocp-types`, never
 //! duplicated (principle #7 / `L-E1`).
 

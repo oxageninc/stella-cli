@@ -139,7 +139,7 @@ impl CodeGraph {
     /// tests, or any caller that drives [`CodeGraph::index_all`] itself.
     ///
     /// `root` must exist; it is canonicalized so the workspace-root jail and
-    /// relative-path computation are consistent (`02-architecture.md` §8).
+    /// relative-path computation are consistent.
     pub fn open(root: &Path, db_path: &Path) -> Result<CodeGraph, GraphError> {
         let root = root.canonicalize().map_err(|source| GraphError::Root {
             root: root.to_path_buf(),
@@ -264,7 +264,7 @@ impl CodeGraph {
     }
 
     /// The OCP-provider query entrypoint: budgeted, provenance-carrying frames
-    /// (`06-context-protocol.md` §3.3), in-process shape. Consumed at runtime
+    ///, in-process shape. Consumed at runtime
     /// by the CLI's OCP host (`stella-cli/src/ocp.rs`, `GraphProvider`), which
     /// fans recall out to this alongside the memory store on every turn.
     pub fn query(&self, q: &ContextQuery) -> Result<Vec<ContextFrame>, GraphError> {

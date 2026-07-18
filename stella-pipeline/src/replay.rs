@@ -1,4 +1,4 @@
-//! Golden-trajectory replay harness (`03-plan.md` Phase 4 item 3). Two jobs,
+//! Golden-trajectory replay harness ( Phase 4 item 3). Two jobs,
 //! both pure: **validate** that an `AgentEvent` stream obeys the protocol's
 //! structural invariants, and **structurally diff** two streams (kinds + order,
 //! ignoring volatile fields like durations and exact costs) so a Rust-stack
@@ -10,7 +10,7 @@
 //! fixtures under `tests/fixtures/` are **synthetic** streams that exercise the
 //! invariants and the differ. *Recording real TS-engine trajectories* on fixed
 //! tasks and checking the Rust stack against them is the next step
-//! (`03-plan.md` Phase 4 item 3, "record TS-engine trajectories … replay
+//! ( Phase 4 item 3, "record TS-engine trajectories … replay
 //! through the Rust stack") — it is deliberately not faked here. This module is
 //! the machinery those recordings will be validated with once they exist.
 //!
@@ -37,7 +37,7 @@ pub struct StreamViolation {
 }
 
 /// Validate a stream against the protocol's structural invariants
-/// (`02-architecture.md` §4, §5):
+/// :
 ///
 /// 1. **Legal stage ordering** — consecutive `Stage` events move forward in
 ///    the canonical order or take a known revise back-edge (Verify/Judge →
@@ -59,7 +59,7 @@ pub fn validate_stream(events: &[AgentEvent]) -> Vec<StreamViolation> {
     violations
 }
 
-/// Canonical rank of a stage in the one-turn data flow (`02-architecture.md`
+/// Canonical rank of a stage in the one-turn data flow (
 /// §5). Forward motion is any non-decreasing rank; the only legal backward
 /// motion is the revise/best-of-N loop back to Execute.
 fn stage_rank(stage: StageKind) -> u8 {

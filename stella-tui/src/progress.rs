@@ -406,7 +406,7 @@ fn render_track(
 
             // Shimmer: a soft light band on truecolor (a lightened RGB has no
             // indexed fallback, so it must not reach a lesser terminal), which
-            // degrades to a single moving highlight cell (§3).
+            // degrades to a single moving highlight cell.
             if let Some(center) = shimmer_center {
                 if truecolor {
                     let d = (i as f64 - center).abs();

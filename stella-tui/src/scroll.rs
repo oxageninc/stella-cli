@@ -1,4 +1,4 @@
-//! Line-exact viewport math (`09-lessons-learned.md` L-T4).
+//! Line-exact viewport math ( L-T4).
 //!
 //! In the TS era Ink 7 clipped **both** box edges during scroll; the fix was
 //! explicit `clipTop`-style math property-tested at every boundary offset.

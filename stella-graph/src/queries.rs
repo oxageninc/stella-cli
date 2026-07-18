@@ -1,6 +1,6 @@
 //! Tree-sitter S-expression queries, one pair (symbols + imports) per
 //! language, as `const &str` **compile-time data** — never loaded from a file
-//! at runtime (`09-lessons-learned.md` L-L2: built-in assets that resolve
+//! at runtime ( L-L2: built-in assets that resolve
 //! relative to the binary's install path broke the moment the artifact was
 //! bundled differently; embedding them as module data is the fix).
 //!
@@ -52,7 +52,7 @@ pub const PYTHON_SYMBOLS: &str = r#"
 "#;
 
 /// Both import statement forms; the relative-import decode (dots → package
-/// directory) that the spec calls out (`03-plan.md` Phase 3 item 3, "fix the
+/// directory) that the spec calls out ( Phase 3 item 3, "fix the
 /// known thin Python import-edge resolution") happens structurally in
 /// [`crate::parse`] against the captured statement nodes.
 pub const PYTHON_IMPORTS: &str = r#"

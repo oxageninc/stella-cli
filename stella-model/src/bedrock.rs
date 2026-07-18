@@ -1,5 +1,5 @@
 //! Amazon Bedrock adapter — the Converse API
-//! (`07-model-matrix.md` §2: "Bedrock | AWS chain | Converse/ConverseStream |
+//! (: "Bedrock | AWS chain | Converse/ConverseStream |
 //! catalog-driven … Model Garden by ARN"). Two deliberate v1 scopings, both
 //! consistent with postures already recorded elsewhere in this crate:
 //!

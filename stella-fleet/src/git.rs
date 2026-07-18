@@ -1,4 +1,4 @@
-//! Git-worktree isolation (`02-architecture.md` §2 "git-worktree isolation").
+//! Git-worktree isolation ( "git-worktree isolation").
 //!
 //! We shell out to the `git` binary through the [`GitCli`] port rather than
 //! linking libgit2/git2 — a deliberate design constraint: the native build is
@@ -241,7 +241,7 @@ pub struct WorktreeManager<G: GitCli> {
 
 impl<G: GitCli> WorktreeManager<G> {
     /// A manager rooted at `repo_root`, placing worktrees under
-    /// `<repo_root>/.stella/worktrees/` (`02-architecture.md` §6, alongside
+    /// `<repo_root>/.stella/worktrees/` (alongside
     /// the fleet ledger) with branches named `fleet/<task-slug>`.
     pub fn new(git: G, repo_root: impl Into<PathBuf>) -> Self {
         let repo_root = repo_root.into();

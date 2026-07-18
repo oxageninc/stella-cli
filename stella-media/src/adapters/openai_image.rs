@@ -1,4 +1,4 @@
-//! OpenAI gpt-image adapter (`08-multimodal.md` §2). `POST /images/generations`
+//! OpenAI gpt-image adapter. `POST /images/generations`
 //! with `response_format` defaulting to base64: gpt-image-1 returns the image
 //! inline as `b64_json`, which this adapter decodes to bytes (no second
 //! download round trip, unlike Z.ai's URL response).
@@ -23,7 +23,7 @@ use crate::provider::{
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// Default gpt-image slug used when the caller doesn't pin one.
 pub const DEFAULT_MODEL: &str = "gpt-image-1";
-/// Documented default rate — catalog data once wired (`08-multimodal.md` §2).
+/// Documented default rate — catalog data once wired.
 const DEFAULT_IMAGE_USD_EACH: f64 = 0.04;
 
 /// A gpt-image provider.
@@ -146,7 +146,7 @@ impl MediaProvider for OpenAiImageProvider {
     }
 
     async fn generate_video(&self, _req: VideoRequest) -> Result<MediaJob, MediaError> {
-        // Sora is entitlement-gated and not wired here (`08-multimodal.md` §2).
+        // Sora is entitlement-gated and not wired here.
         Err(MediaError::CapabilityUnavailable {
             capability: "video".into(),
             enabling_keys: "a video-capable provider (e.g. ZAI_API_KEY for CogVideoX)".into(),

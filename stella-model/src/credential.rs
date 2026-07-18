@@ -1,8 +1,8 @@
 //! Credential resolution. Never `Display`/`Debug`-leaks the secret value —
 //! credentials are never logged, never in trace JSONL
-//! (`docs/specs/stella-rust-cli/02-architecture.md` §8).
+//!.
 //!
-//! Resolution order per `01-product-spec.md` §4: CLI flag -> env var ->
+//! Resolution order : CLI flag -> env var ->
 //! provider-native config (`~/.config/stella/credentials.toml` here; the AWS
 //! profile file and Google ADC file remain deferred — the Bedrock/Vertex
 //! adapters take ready credentials from env vars for now, see their module
@@ -72,7 +72,7 @@ impl ApiKey {
         }
     }
 
-    /// The full resolution chain (`01-product-spec.md` §4): CLI flag -> env
+    /// The full resolution chain : CLI flag -> env
     /// var -> `credentials_file` -> interactive prompt. `provider_id` keys
     /// both the credentials-file lookup and, on a successful interactive
     /// prompt, what gets written back so the user is only ever prompted
@@ -173,7 +173,7 @@ fn prompt_for_key(provider_id: &str, env_var: &str) -> Result<String, Credential
 }
 
 /// `~/.config/stella/credentials.toml` — optional provider keys for users
-/// who prefer file storage over env vars (`02-architecture.md` §6). Written
+/// who prefer file storage over env vars. Written
 /// with `0600` permissions on Unix (owner read/write only) since it holds
 /// secrets in plaintext, same threat model as `~/.ssh/config`.
 ///

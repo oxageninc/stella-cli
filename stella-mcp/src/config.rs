@@ -4,7 +4,7 @@
 //! whole-file document ([`McpConfig`]) and a single entry
 //! ([`McpServerConfig`]) round-trip through serde + TOML.
 //!
-//! Security (`02-architecture.md` §8): a `stdio` server inherits **no**
+//! Security : a `stdio` server inherits **no**
 //! ambient environment. Only the keys listed in its `env` table reach the
 //! child — nothing else, so an `ANTHROPIC_API_KEY` in the parent shell can
 //! never leak into an MCP subprocess.
@@ -118,7 +118,7 @@ pub enum McpTransport {
         args: Vec<String>,
         /// The only environment variables passed to the child. Everything
         /// else — including every credential in the parent shell — is
-        /// stripped (`02-architecture.md` §8).
+        /// stripped.
         #[serde(default)]
         env: BTreeMap<String, String>,
     },

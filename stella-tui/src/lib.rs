@@ -1,5 +1,5 @@
-//! `stella-tui` — the ratatui event-log REPL (`02-architecture.md` §2,
-//! ADR-023, `09-lessons-learned.md` §T).
+//! `stella-tui` — the ratatui event-log REPL (
+//! ADR-023, §T).
 //!
 //! This crate renders **exclusively** from [`stella_protocol::AgentEvent`]s
 //! (L-T1). It never touches the engine directly: `AgentEvent`s flow in over a
@@ -19,7 +19,7 @@
 //!   loop, and the two channels. It carries no decision logic — key→action is
 //!   [`handle_key`], event→state is [`ingest`], both unit-tested.
 //!
-//! Binding TUI requirements from `09-lessons-learned.md` §T are honored
+//! Binding TUI requirements §T are honored
 //! structurally: event-derived rendering (L-T1), mouse-off-by-default for
 //! native copy (L-T2, [`RunOptions::mouse_capture`]), paste chips (L-T3,
 //! [`Composer::paste`]), line-exact scroll (L-T4, [`ScrollState`]), diffs on

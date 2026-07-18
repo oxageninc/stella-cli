@@ -1,5 +1,5 @@
 //! The SVG pipeline: generate → **validate** → **sanitize** → **optimize**,
-//! with a bounded repair loop (`08-multimodal.md` §4, L-V2). LLM-generated
+//! with a bounded repair loop (L-V2). LLM-generated
 //! SVG is code generation and gets code discipline: it is mechanically
 //! validated and rendered inert before it is ever written — never trusted
 //! because it "looked right".
@@ -42,7 +42,7 @@
 //!    `url(//…)`), or `javascript:` anywhere in the value — covers
 //!    `fill="url(http://…)"`, external paint servers, filters, and masks.
 //!
-//! # Optimization (light, `08-multimodal.md` §4 step 4)
+//! # Optimization (light, step 4)
 //! Comments and processing instructions are dropped; `<metadata>` elements
 //! are dropped; insignificant whitespace in text is collapsed. A `viewBox` is
 //! backfilled on the root from `width`/`height` when absent (spec §4 "enforce
@@ -60,7 +60,7 @@ const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
 
 /// Recommended attempt budget for [`SvgPipeline::generate`]: one initial
-/// generation plus two repair rounds (`08-multimodal.md` §4 step 2, "max 2
+/// generation plus two repair rounds ( step 2, "max 2
 /// repair rounds").
 pub const DEFAULT_SVG_ATTEMPTS: u32 = 3;
 
@@ -94,14 +94,14 @@ pub struct ProcessedSvg {
 
 /// A model-backed SVG generator, injected by CLI glue (this crate must not
 /// depend on `stella-model`). `prior_error` carries the previous attempt's
-/// parse/validation failure so the model can repair it (`08-multimodal.md`
+/// parse/validation failure so the model can repair it (
 /// §4 step 2).
 #[async_trait]
 pub trait SvgGenerator: Send + Sync {
     async fn generate(&self, prompt: &str, prior_error: Option<&str>) -> String;
 }
 
-/// The stateless SVG pipeline (`08-multimodal.md` §4).
+/// The stateless SVG pipeline.
 pub struct SvgPipeline;
 
 impl SvgPipeline {
@@ -129,7 +129,7 @@ impl SvgPipeline {
     /// Generate SVG through `generator` with a bounded repair loop: up to
     /// `max_attempts` tries, feeding each parse/validation error back into
     /// the next generation, then failing with the last error
-    /// (`08-multimodal.md` §4 step 2; property: the loop always terminates).
+    /// ( step 2; property: the loop always terminates).
     /// `max_attempts` is clamped to at least 1.
     pub async fn generate(
         generator: &dyn SvgGenerator,

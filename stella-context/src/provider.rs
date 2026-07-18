@@ -1,4 +1,4 @@
-//! The provider registry seam (`02-architecture.md` §7, `06-context-protocol.md`
+//! The provider registry seam (
 //! §2). One interface — [`ContextProvider`] — behind which context sources
 //! register: the built-in [`ContextStore`] implements it (so the store is both
 //! the primary backend and a first-class provider), and the shipping CLI's
@@ -24,7 +24,7 @@ use crate::store::{ContextStore, NodeKind};
 #[async_trait]
 pub trait ContextProvider: Send + Sync {
     /// Identity and data-flow declaration surfaced at install/consent time
-    /// (`06-context-protocol.md` §3.2, §3.5). A host gates `egress` providers
+    ///. A host gates `egress` providers
     /// on explicit consent using this.
     fn info(&self) -> ProviderInfo;
 

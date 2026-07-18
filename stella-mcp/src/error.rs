@@ -1,4 +1,4 @@
-//! Typed errors for the MCP client (`02-architecture.md` §1.5 — fail loud,
+//! Typed errors for the MCP client (fail loud,
 //! never `panic!` in the hot path). Every fallible operation in this crate
 //! returns [`McpError`]; the boundary that faces `stella-core` — the engine's
 //! [`crate::McpToolSet`] — maps each of these onto a model-visible
@@ -51,7 +51,7 @@ pub enum McpError {
 impl McpError {
     /// A one-line, credential-free summary safe to surface to the model as a
     /// `ToolOutput::Error` message. (No `McpError` variant ever carries a
-    /// secret — credentials are never logged nor forwarded, `02-architecture.md`
+    /// secret — credentials are never logged nor forwarded,
     /// §8 — so this is just the `Display` form, named for intent.)
     pub fn user_message(&self) -> String {
         self.to_string()

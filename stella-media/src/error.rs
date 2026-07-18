@@ -1,15 +1,15 @@
-//! Typed media errors (`02-architecture.md` §1.5: fail loud, recover
+//! Typed media errors (: fail loud, recover
 //! gracefully — never `panic!` in the hot path). This mirrors
 //! `stella_protocol::ProviderError`'s category shape (transport / rate-limit /
 //! auth / malformed / cancelled / terminal) with its own type because
 //! `stella-media` may not depend on `stella-model` (parallel-workstream
 //! isolation, see the crate-level doc). Two categories are added beyond the
-//! chat provider's set, both required by `08-multimodal.md`:
+//! chat provider's set, both required by :
 //!
-//! * [`MediaError::ContentPolicy`] — a provider refusal (`08-multimodal.md`
+//! * [`MediaError::ContentPolicy`] — a provider refusal (
 //!   §7 lists content-policy refusals as a failure shape the fixtures must
 //!   cover); terminal, never retried.
-//! * [`MediaError::CostDenied`] — the video cost gate (`08-multimodal.md` §6)
+//! * [`MediaError::CostDenied`] — the video cost gate
 //!   said no; terminal.
 
 use thiserror::Error;
@@ -39,12 +39,12 @@ pub enum MediaError {
     Auth(String),
 
     /// The provider refused the prompt on safety/content-policy grounds
-    /// (`08-multimodal.md` §7). Terminal.
+    ///. Terminal.
     #[error("media provider refused the request (content policy): {0}")]
     ContentPolicy(String),
 
     /// A capability was requested that no configured key can serve
-    /// (`08-multimodal.md` §2: "fails loudly, naming which keys would enable
+    /// (: "fails loudly, naming which keys would enable
     /// it"). Terminal.
     #[error(
         "media capability `{capability}` is unavailable with the configured providers; \
@@ -66,7 +66,7 @@ pub enum MediaError {
     Cancelled,
 
     /// The cost gate denied a video job above the confirmation threshold
-    /// (`08-multimodal.md` §6). Terminal.
+    ///. Terminal.
     #[error(
         "cost gate denied the job (estimated ${estimated_usd:.4}, threshold ${threshold_usd:.4})"
     )]
@@ -89,7 +89,7 @@ pub enum MediaError {
 impl MediaError {
     /// Whether a caller's retry loop should retry this with backoff.
     /// Transport and rate-limit only — everything else is terminal
-    /// (matches `ProviderError::is_retryable`, `02-architecture.md` §5).
+    /// (matches `ProviderError::is_retryable`).
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,

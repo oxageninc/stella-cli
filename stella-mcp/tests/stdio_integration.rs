@@ -87,7 +87,7 @@ async fn environment_is_scrubbed_but_configured_vars_pass_through() {
         }
     );
 
-    // …but the ambient PATH does not — the environment was scrubbed (§8).
+    // …but the ambient PATH does not — the environment was scrubbed.
     let path = client
         .call_tool("env_probe", serde_json::json!({ "var": "PATH" }))
         .await

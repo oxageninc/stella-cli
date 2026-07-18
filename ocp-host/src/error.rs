@@ -1,9 +1,9 @@
 //! `HostError` — the one typed error the host runtime raises
-//! (`02-architecture.md` §1.5 "fail loud"). Everything a fan-out or a single
+//! ( "fail loud"). Everything a fan-out or a single
 //! provider exchange can go wrong with is a named variant here; nothing in
 //! the hot path panics. `ocp-host` owns its own error type rather than
 //! borrowing `stella`'s so the crate stays industry-facing and dependency-
-//! light (`02-architecture.md` §2 — depends only on `ocp-types` + transport
+//! light (depends only on `ocp-types` + transport
 //! crates).
 
 use ocp_types::DataFlow;
@@ -12,7 +12,7 @@ use ocp_types::DataFlow;
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
     /// The provider speaks an incompatible protocol family
-    /// (`06-context-protocol.md` §3). Reported the instant the handshake ack
+    ///. Reported the instant the handshake ack
     /// arrives — never a hang (task deliverable 1).
     #[error(
         "protocol version mismatch: host speaks {host}, provider {provider} speaks {provider_version}"
@@ -24,7 +24,7 @@ pub enum HostError {
     },
 
     /// A line/body could not be encoded to or decoded from the wire envelope
-    /// (`06-context-protocol.md` §3.1). A malformed provider message is a
+    ///. A malformed provider message is a
     /// clean error, never a host crash (task deliverable 5).
     #[error("wire encode/decode error: {0}")]
     Wire(String),
@@ -48,7 +48,7 @@ pub enum HostError {
     Provider { id: String, message: String },
 
     /// The provider declares `egress` and has no recorded consent, so the
-    /// host refuses to transmit a query to it (`06-context-protocol.md`
+    /// host refuses to transmit a query to it (
     /// §3.5 — a host MUST NOT auto-enable egress providers). The query
     /// payload never left the host.
     #[error(

@@ -1,6 +1,6 @@
 //! Full stdio round-trip against the real `ocp-example-docs` fixture,
 //! exercising `ocp-host`'s `Host` + `StdioProvider` end-to-end (the external
-//! child-process path, `06-context-protocol.md` §3.2), and the
+//! child-process path), and the
 //! crash-consistency guarantee: a crashing child never poisons a healthy
 //! sibling in a fan-out (task deliverable 5).
 
@@ -43,7 +43,7 @@ async fn host_queries_a_real_stdio_provider_end_to_end() {
     assert_eq!(fanout.outcomes.len(), 1);
     assert_eq!(fanout.accepted_frames().count(), 2);
 
-    // Every frame is citable by a human label, never a bare id (§3.4).
+    // Every frame is citable by a human label, never a bare id.
     for frame in fanout.accepted_frames() {
         assert!(
             frame

@@ -1,5 +1,5 @@
 //! Persisted video-job state so a dollar-cost job is never orphaned by a
-//! dropped terminal (`08-multimodal.md` §6). Submitted job handles are written
+//! dropped terminal. Submitted job handles are written
 //! to `jobs.json` inside the artifacts dir; after a Ctrl-C or a process
 //! restart, `stella gen video --resume <id>` reattaches.
 //!

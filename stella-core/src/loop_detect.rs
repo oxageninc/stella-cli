@@ -1,7 +1,7 @@
 //! Loop detection — pure synchronous analysis of recent tool calls
-//! (`02-architecture.md` §1 design principle 3: "loop detection ... plain
+//! ( design principle 3: "loop detection... plain
 //! synchronous functions over owned data — easy to property-test";
-//! `03-plan.md` Phase 2 step 4 names loop detection as a step-driver
+//! Phase 2 step 4 names loop detection as a step-driver
 //! responsibility alongside compaction and budget eviction).
 //!
 //! The interim CLI loop (`stella-cli/src/agent.rs::run_turn`) only has a
@@ -97,7 +97,7 @@ impl LoopVerdict {
     }
 
     /// A human-readable evidence string for the driver to surface when it
-    /// aborts (`03-plan.md` Phase 2 step 4: "the driver can intervene").
+    /// aborts ( Phase 2 step 4: "the driver can intervene").
     /// `None` for `NoLoop`.
     pub fn evidence(&self) -> Option<String> {
         match self {

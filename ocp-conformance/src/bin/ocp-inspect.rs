@@ -1,5 +1,5 @@
 //! `ocp-inspect` — an interactive OCP prober, analogous to MCP's inspector
-//! (`06-context-protocol.md` §3.6). Point it at a provider; it completes the
+//!. Point it at a provider; it completes the
 //! handshake, prints the negotiated capabilities, optionally fires a test
 //! query, and runs the conformance suite — all in human-readable colored
 //! output.
@@ -18,7 +18,7 @@ use ocp_types::{Capabilities, ContextQuery, ProviderInfo};
 #[derive(Parser)]
 #[command(
     name = "ocp-inspect",
-    about = "Probe and conformance-test an Open Context Protocol provider (06-context-protocol.md §3.6)."
+    about = "Probe and conformance-test an Open Context Protocol provider."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -206,7 +206,7 @@ async fn fire_query(host: &Host, id: &str, goal: &str) {
                 format!("── {} frame(s) for “{goal}” ──", result.frames.len()).dimmed()
             );
             for frame in &result.frames {
-                // Cite by human label, never the raw id (§3.4).
+                // Cite by human label, never the raw id.
                 let label = frame
                     .citation_label
                     .as_deref()

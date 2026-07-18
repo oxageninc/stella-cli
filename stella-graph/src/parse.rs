@@ -1,9 +1,9 @@
 //! Tree-sitter parsing: turn a source file into [`Symbol`]s and raw
-//! [`ImportSpec`]s. Pure and synchronous (`02-architecture.md` §1.3 — logic is
+//! [`ImportSpec`]s. Pure and synchronous (logic is
 //! sync, easy to test); the indexer ([`crate::store`]) is the only thing that
 //! touches I/O around it.
 //!
-//! **Skip-with-record, never abort** (task quality bar, `09-lessons-learned.md`
+//! **Skip-with-record, never abort** (task quality bar,
 //! L-L1): [`parse_file`] returns `None` when a grammar cannot be armed or the
 //! source cannot be parsed at all, and the indexer records that as a parse
 //! failure and moves on. Tree-sitter is error-tolerant, so a *syntactically
@@ -25,7 +25,7 @@ use crate::symbol::{Symbol, SymbolKind};
 /// behind the [`crate::graph::CodeGraph`] handle and is reused by the
 /// background watcher). Compiling the queries here — not per file — keeps
 /// re-indexing cheap while still sourcing them from compile-time data
-/// (`09-lessons-learned.md` L-L2).
+/// ( L-L2).
 pub(crate) struct Grammars {
     rust: LangPack,
     python: LangPack,

@@ -12,7 +12,7 @@
 //! recorded ([`McpClient::negotiated_version`]). A server that names a
 //! revision outside that set is a hard [`McpError::UnsupportedProtocol`] — a
 //! client that guessed at an unknown wire format would be worse than one that
-//! failed loudly (`02-architecture.md` §1.5).
+//! failed loudly.
 //!
 //! # Content mapping
 //!

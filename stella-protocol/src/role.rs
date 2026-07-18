@@ -1,6 +1,6 @@
 //! Model roles, not model names. Every model reference in the engine is a
 //! `Role`, resolved through one router; no call site names a model literal.
-//! See `docs/specs/stella-rust-cli/07-model-matrix.md` §1.
+//! See
 //!
 //! "Auto mode is the absence of a pin, not a magic slug": selection is
 //! `Option<ModelRef>`; `None` means the router chooses by task class. There

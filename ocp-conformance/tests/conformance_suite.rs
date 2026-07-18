@@ -1,5 +1,5 @@
 //! End-to-end conformance-suite tests against the real `ocp-example-docs`
-//! fixture (`06-context-protocol.md` §3.6). A well-behaved provider passes
+//! fixture. A well-behaved provider passes
 //! every check; each `--misbehave` mode trips exactly the check it violates,
 //! proving the suite catches a broken provider (task deliverable).
 

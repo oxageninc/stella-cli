@@ -1,5 +1,5 @@
 //! `ContextFrame` — the unit of exchange between an OCP host and a provider.
-//! `docs/specs/stella-rust-cli/06-context-protocol.md` §3.4 fixes this exact
+//! fixes this exact
 //! shape; frames, never blobs, carry relevance, cost, and provenance so a
 //! budgeting, citing host can compose sources honestly.
 

@@ -1,8 +1,8 @@
 //! The artifact store: the single writer to `.stella/artifacts/`
-//! (`02-architecture.md` §8 — "the agent cannot overwrite arbitrary paths via
+//! ("the agent cannot overwrite arbitrary paths via
 //! a generation tool"). Every generated file lands as `<id>.<ext>` *inside*
 //! the caller-supplied root, and a manifest row records its provenance
-//! (`08-multimodal.md` §3).
+//!.
 //!
 //! Path-traversal safety is structural: ids are generated here (never
 //! caller-supplied), and the filename is sanitized to `[a-z0-9_.-]` with any
@@ -78,7 +78,7 @@ impl ArtifactStore {
 
     /// Persist a [`MediaArtifact`], using its declared extension and label.
     /// The id is generated; returns the citation-friendly
-    /// [`MediaArtifactRef`] (`02-architecture.md` §4).
+    /// [`MediaArtifactRef`].
     pub fn save_artifact(&self, art: &MediaArtifact) -> Result<MediaArtifactRef, MediaError> {
         self.save_with_ext(&art.bytes, art.kind, &art.extension, &art.label)
     }

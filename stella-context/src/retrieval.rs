@@ -1,5 +1,5 @@
-//! The hybrid, budgeted, cited retrieval pipeline (`06-context-protocol.md`
-//! §2.3, `02-architecture.md` §7). [`ContextStore::recall`] fuses three signals
+//! The hybrid, budgeted, cited retrieval pipeline (
+//! §2.3). [`ContextStore::recall`] fuses three signals
 //! — vector similarity, recency, and 1-hop graph adjacency — via reciprocal-
 //! rank fusion, dedupes by content hash, diversifies with MMR, then **packs to
 //! the query's token budget and reports what was dropped** (silent truncation
@@ -9,9 +9,9 @@
 //! dressing weak context up as grounding (`L-C6`).
 //!
 //! The scoring/fusion/packing steps are plain synchronous functions over owned
-//! data (`02-architecture.md` §1.3) — brute-force top-k cosine is fine at
+//! data — brute-force top-k cosine is fine at
 //! CLI-local scale; an ANN accelerator is a size-threshold follow-up per
-//! `02-architecture.md` §6. They are property-tested at the bottom of the file.
+//! They are property-tested at the bottom of the file.
 
 use std::collections::{HashMap, HashSet};
 
@@ -68,7 +68,7 @@ pub struct DroppedFrame {
     pub reason: DropReason,
 }
 
-/// The typed, inspectable result of a recall (`02-architecture.md` §1: typed
+/// The typed, inspectable result of a recall (: typed
 /// outputs, not stringly telemetry). Carries the packed frames, the dropped
 /// report, the coverage score, and the honesty flag for lexical fallback.
 #[derive(Debug, Clone)]
@@ -431,7 +431,7 @@ fn rrf_fuse(lists: &[Vec<i64>], k: f64) -> HashMap<i64, f64> {
 
 /// Collapse fused scores to one entry per content hash (keep the strongest),
 /// returning `(node_id, fused_score)` sorted by score descending. Dedup by
-/// content hash is `06-context-protocol.md` §2.3 step 4.
+/// content hash is step 4.
 fn dedup_by_content_hash(
     fused: &HashMap<i64, f64>,
     node_by_id: &HashMap<i64, &NodeRow>,

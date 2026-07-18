@@ -1,7 +1,7 @@
 //! OpenAI adapter — the Responses API (`POST /responses`), not the
 //! Chat Completions API. This is the third of the three provider dialects
-//! Phase 2's exit criterion requires (`03-plan.md` step 1,
-//! `07-model-matrix.md` §2: "Responses API (streaming, tool-use, reasoning
+//! Phase 2's exit criterion requires ( step 1,
+//! : "Responses API (streaming, tool-use, reasoning
 //! effort)"). Before this file existed, `stella-cli` routed `OPENAI_API_KEY`
 //! through `zai::ZaiProvider` pointed at a different base URL — that works
 //! only because `/v1/chat/completions` happens to also exist on OpenAI's
@@ -128,7 +128,7 @@ struct OpenAiToolSchema {
 /// `messages` array every other adapter here uses — text turns are
 /// `message` items, an assistant's tool call is its own `function_call`
 /// item, and a tool result is its own `function_call_output` item
-/// correlated back by `call_id` (`07-model-matrix.md` §4).
+/// correlated back by `call_id`.
 #[derive(Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OpenAiInputItem {

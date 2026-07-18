@@ -1,5 +1,5 @@
 //! Context compaction — pure synchronous logic over owned data
-//! (`02-architecture.md` §1.3). Two mechanisms, applied in order:
+//!. Two mechanisms, applied in order:
 //!
 //! 1. **Tool-output eviction**: oldest large tool outputs are replaced with
 //!    a stub once the conversation exceeds the budget. A tool result whose

@@ -1,5 +1,5 @@
 //! Model catalog. Binding rule from
-//! `docs/specs/stella-rust-cli/07-model-matrix.md` §3: **a slug not present
+//! : **a slug not present
 //! in the catalog is a hard, immediate, named error, never a silent
 //! fallback** (the TS-era phantom `glm-5.2-turbo` slug and gateway
 //! slug-drift lessons, L-M1/L-M2). The seed below covers every provider
@@ -13,7 +13,7 @@
 
 use stella_protocol::{CompletionUsage, ProviderError};
 
-/// Per-model list pricing in USD per million tokens (`07-model-matrix.md`
+/// Per-model list pricing in USD per million tokens (
 /// §6). Seed values below are day-0 offline approximations of each
 /// provider's published list price; `stella models refresh` (future work)
 /// overwrites them with live data. Cached input is billed at its own,
@@ -52,7 +52,7 @@ impl Pricing {
 }
 
 /// Which tool-call dialect a model's provider speaks
-/// (`07-model-matrix.md` §4).
+///.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolDialect {
     AnthropicTools,
@@ -74,7 +74,7 @@ pub enum ToolDialect {
     /// correlated by function *name* (no wire call ids), args arriving as
     /// complete JSON objects rather than streamed string fragments, and
     /// Gemini 3 thought signatures riding on call parts
-    /// (`07-model-matrix.md` §4 `gemini-functions`).
+    /// ( `gemini-functions`).
     GeminiFunctions,
     /// Amazon Bedrock's Converse dialect
     /// (`stella_model::bedrock::BedrockProvider`): `toolUse`/`toolResult`

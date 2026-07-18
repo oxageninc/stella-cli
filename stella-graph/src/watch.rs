@@ -1,5 +1,5 @@
 //! Live, in-process incremental re-index while a session runs
-//! (`02-architecture.md` §6: "The code-graph watcher is an in-process
+//! (: "The code-graph watcher is an in-process
 //! `notify` task alive only while a session runs" — no daemon, no background
 //! network listener). Filesystem events are debounced so an editor's
 //! save-storm collapses into a single re-index batch.

@@ -1,4 +1,4 @@
-//! Workspace rules engine (`03-plan.md` Phase 2 item 5; ported from
+//! Workspace rules engine ( Phase 2 item 5; ported from
 //! `apps/cli/src/rules/{types,loader,enforce,promote}.ts`).
 //!
 //! A rule is a binding instruction for the agent. The engine models two tiers:
@@ -7,7 +7,7 @@
 //! a [`RuleGuard`] checked at the tool boundary ([`evaluate_guards`]) to block a
 //! violating tool call before it runs and return the rule text so the model can
 //! self-correct. Rules are authored as markdown under `.stella/rules/*.md`
-//! (`02-architecture.md` §6, ADR-008 filesystem-first).
+//! (ADR-008 filesystem-first).
 //!
 //! Status: wired into the shipping CLI (issue #103). The production
 //! [`RuleSource`] lives in `stella-cli`'s `rules` module: the on-disk rule
@@ -21,7 +21,7 @@
 //! `stella-tools::registry`) — a violation denies the call and returns the
 //! rule text to the model.
 //!
-//! # No I/O in this module (`02-architecture.md` §1.3)
+//! # No I/O in this module
 //!
 //! Discovering rule files means reading a directory and its file contents —
 //! real I/O, which `stella-core` never performs directly. [`RuleSource`] is
@@ -138,7 +138,7 @@ pub struct RuleFile {
     pub contents: String,
 }
 
-/// The filesystem discovery port for rule files (`02-architecture.md`
+/// The filesystem discovery port for rule files (
 /// §1.3). A real implementation (owned by `stella-cli`/`stella-tools`)
 /// walks each directory in `dirs`, in the given order, and returns every
 /// `.md` file's contents — files within one directory sorted by name,

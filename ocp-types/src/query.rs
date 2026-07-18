@@ -1,5 +1,5 @@
 //! `context/query` request/response shapes
-//! (`docs/specs/stella-rust-cli/06-context-protocol.md` §3.3). Budget-aware
+//!. Budget-aware
 //! by contract: every query carries `max_tokens`; a conforming provider
 //! never returns more than the budget and never lies about cost.
 

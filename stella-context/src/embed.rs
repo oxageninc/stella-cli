@@ -4,7 +4,7 @@
 //!
 //! # Why a hashing embedder is the default
 //!
-//! `06-context-protocol.md` §4 and risk register R14 make the *product*
+//! and risk register R14 make the *product*
 //! default a local ONNX model (bge-small-class, ~130 MB, checksum-pinned
 //! weight fetch + a native runtime). That is the tracked follow-up. Shipping
 //! it is a supply-chain and binary-size decision that must not block the
@@ -16,7 +16,7 @@
 //! embedder — Z.ai, OpenAI, Gemini) trivial: the store keys every vector by
 //! `(content_hash, fingerprint)`, so switching embedders is just a new
 //! fingerprint and an incremental re-embed on next touch (`L-C2`); retrieval
-//! never mixes fingerprints (`02-architecture.md` §6).
+//! never mixes fingerprints.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ pub enum EmbedError {
 
 /// Identifies exactly which embedder produced a vector. Stored beside every
 /// vector; retrieval compares only vectors sharing the active fingerprint
-/// (`02-architecture.md` §6, `L-C2`). Changing any field is a new fingerprint
+/// (`L-C2`). Changing any field is a new fingerprint
 /// and invalidates old vectors incrementally rather than in place.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbedderFingerprint {

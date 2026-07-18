@@ -1,10 +1,10 @@
-//! Retry + backoff for the step-driver (`02-architecture.md` §1.3, §3). Pure
+//! Retry + backoff for the step-driver. Pure
 //! decision logic plus one narrow async driver — `stella-core` has zero I/O
 //! of its own, so even the async loop here drives through an injectable
 //! [`Sleeper`] port rather than calling `tokio::time::sleep` directly, the
 //! same "ports, not concretions" seam as [`crate::ports::Clock`].
 //!
-//! Binding lessons this module encodes (`09-lessons-learned.md`):
+//! Binding lessons this module encodes :
 //!
 //! - **L-M4**: deterministic fast paths (triage/classification) run with
 //!   `max_retries = 0` and fall through on the first failure — never hang,
@@ -139,7 +139,7 @@ pub struct RetryOutcome<T> {
 /// different points in it instead of all waking at the same instant
 /// (thundering herd).
 ///
-/// Pure and synchronous by design (`02-architecture.md` §1.3) — the only
+/// Pure and synchronous by design — the only
 /// non-determinism is the injected `rng`, so bounds and shape are directly
 /// assertable without sleeping.
 pub fn compute_backoff_delay_ms(policy: &RetryPolicy, attempt: u32, rng: &mut impl Rng) -> u64 {

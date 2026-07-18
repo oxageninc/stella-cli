@@ -1,6 +1,6 @@
 //! Configuration: provider/model resolution, BYOK credential lookup.
 //!
-//! Resolution order per 01-product-spec.md §4: CLI flag -> env var ->
+//! Resolution order : CLI flag -> env var ->
 //! `~/.config/stella/credentials.toml` -> interactive prompt on first use.
 //! The full chain lives in `stella_model::credential::ApiKey::resolve`; this
 //! module's job is picking WHICH provider (from `--model`, or the first one
@@ -200,7 +200,7 @@ pub static PROVIDERS: &[ProviderConfig] = &[
 
 /// The `local` pseudo-provider: any OpenAI-compatible endpoint the user
 /// points `--base-url` at (Ollama, vLLM, LM Studio, llama.cpp server —
-/// `07-model-matrix.md` §2). Not in [`PROVIDERS`]: it is never auto-detected
+///). Not in [`PROVIDERS`]: it is never auto-detected
 /// (there is no ambient signal a local server exists), has no default model
 /// (the server's models are whatever the user pulled), and its API key is
 /// optional (`LOCAL_API_KEY`, defaulting to a placeholder — most local
@@ -679,7 +679,7 @@ impl Config {
                 provider.display_name
             )
         })?;
-        // "Interactive prompt on first use" (01-product-spec.md §4) implies
+        // "Interactive prompt on first use" implies
         // exactly that — first use. Persist so next invocation resolves via
         // the config-file step instead of prompting again. Best-effort: a
         // save failure (e.g. read-only home dir) shouldn't fail the command
@@ -1002,7 +1002,7 @@ pub struct ConfiguredProvider {
 /// environment alone provides.
 ///
 /// The goal loop calls this to build a role Router that can pick a
-/// cross-family JUDGE (`07-model-matrix.md` §1); with one configured family
+/// cross-family JUDGE; with one configured family
 /// it returns a single entry and the judge stays the worker provider.
 pub fn discover_configured_providers() -> Vec<ConfiguredProvider> {
     // A corrupt/unreadable credentials file must not break judge routing —

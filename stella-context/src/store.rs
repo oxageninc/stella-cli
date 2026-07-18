@@ -1,5 +1,5 @@
 //! [`ContextStore`] — the one SQLite file, one engine that backs the context
-//! plane (`02-architecture.md` §6: "SQLite everywhere … one WAL, one backup
+//! plane (: "SQLite everywhere … one WAL, one backup
 //! story, one file format"). It holds the bi-temporal property graph
 //! (`node` + `edge`), the fingerprinted embedding index (`embedding`),
 //! episodic memory (`episode`), and the embedder-fingerprint registry.
@@ -158,7 +158,7 @@ DROP TABLE IF EXISTS code_graph_imports;
 DROP TABLE IF EXISTS code_graph_files;
 ";
 
-/// Typed node vocabulary (`06-context-protocol.md` §2.2). Stored as its
+/// Typed node vocabulary. Stored as its
 /// `as_str` form; retrieval maps it onto an `ocp_types::FrameKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -636,7 +636,7 @@ fn node_public_id(kind: NodeKind, natural_key: &str) -> String {
     format!("nod_{}", &hex[..24])
 }
 
-/// Encode a vector as a little-endian f32 BLOB (`02-architecture.md` §6).
+/// Encode a vector as a little-endian f32 BLOB.
 pub(crate) fn vector_to_blob(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
     for x in v {
@@ -880,7 +880,7 @@ pub(crate) struct EdgeView {
 static EDGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Insert a fact edge. `supersedes` links to the edge this one replaced (the
-/// `SUPERSEDES` relation of `06-context-protocol.md` §2.2), or `None` for a
+/// `SUPERSEDES` relation of), or `None` for a
 /// fresh assertion. Returns the new edge's rowid.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_edge(

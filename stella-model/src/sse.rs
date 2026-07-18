@@ -1,6 +1,6 @@
 //! Minimal, dependency-free Server-Sent-Events line parser shared by every
 //! streaming adapter. Retiring "raw SSE parsing quality" as a Phase 0 risk
-//! (`03-plan.md`) means this parser is unit-tested against the exact
+//! means this parser is unit-tested against the exact
 //! chunking pathologies a real HTTP stream produces: a `data:` line split
 //! across two reads, multiple events in one read, and a trailing partial
 //! line held over to the next chunk.

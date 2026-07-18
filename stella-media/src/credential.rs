@@ -5,7 +5,7 @@
 //! `stella-media` may not depend on `stella-model` (parallel-workstream
 //! isolation — see the crate-level doc), so the secret type is duplicated
 //! here rather than imported. The security contract is identical to
-//! `02-architecture.md` §8: the value is never `Display`ed, its `Debug` is
+//! : the value is never `Display`ed, its `Debug` is
 //! redacted, and the only accessor is [`ApiKey::reveal`], used solely to
 //! build an `Authorization` header.
 //!

@@ -1,7 +1,7 @@
 //! Handshake and capability negotiation types
-//! (`docs/specs/stella-rust-cli/06-context-protocol.md` §3.2). `DataFlow` is
+//!. `DataFlow` is
 //! the security-critical field: hosts surface it at install/consent time,
-//! and `egress: true` providers must never be auto-enabled (§3.5).
+//! and `egress: true` providers must never be auto-enabled.
 
 use serde::{Deserialize, Serialize};
 

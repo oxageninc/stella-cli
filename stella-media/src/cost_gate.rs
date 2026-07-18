@@ -1,4 +1,4 @@
-//! The video cost gate (`08-multimodal.md` §6). Video generation spends real
+//! The video cost gate. Video generation spends real
 //! money, so before a job is submitted its estimated cost is checked against a
 //! configurable USD threshold; above the threshold, the job requires explicit
 //! confirmation through a [`CostGate`] port. Headless callers deny by default
@@ -12,7 +12,7 @@
 use crate::error::MediaError;
 use crate::provider::CostEstimate;
 
-/// Default confirmation threshold (`08-multimodal.md` §6: "default: any
+/// Default confirmation threshold (: "default: any
 /// video"). At `$0.00`, every video with a positive estimate consults the
 /// gate; a caller can raise it to auto-approve cheap jobs.
 pub const DEFAULT_VIDEO_COST_THRESHOLD_USD: f64 = 0.0;
@@ -34,7 +34,7 @@ pub trait CostGate: Send + Sync {
 
 /// Headless gate: approves only when constructed with `bypass = true` (the
 /// `--yes` flag). The safe default — an unattended run never silently spends
-/// on video (`08-multimodal.md` §6).
+/// on video.
 #[derive(Clone, Copy, Debug)]
 pub struct HeadlessCostGate {
     bypass: bool,
@@ -57,7 +57,7 @@ impl CostGate for HeadlessCostGate {
     }
 }
 
-/// The pure gate decision (`08-multimodal.md` §6): if the estimate is at or
+/// The pure gate decision : if the estimate is at or
 /// below `threshold_usd`, the job passes without consulting the gate;
 /// otherwise the gate decides. A denial is a terminal
 /// [`MediaError::CostDenied`] carrying the numbers.

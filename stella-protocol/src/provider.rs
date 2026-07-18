@@ -1,4 +1,4 @@
-//! The `Provider` port (`02-architecture.md` §3). Lives in `stella-protocol`,
+//! The `Provider` port. Lives in `stella-protocol`,
 //! not `stella-model`, so `stella-core` can drive every model call through
 //! `&dyn Provider` without depending on any concrete adapter — `stella-model`
 //! depends on this crate to implement the trait, never the reverse.

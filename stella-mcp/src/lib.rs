@@ -2,7 +2,7 @@
 //! Protocol servers (stdio child processes and streamable-HTTP endpoints),
 //! discovers their tools, and merges them into the engine's tool registry so
 //! `stella-core::Engine` can call them exactly like a built-in tool
-//! (`02-architecture.md` §2).
+//!.
 //!
 //! The single integration point is [`McpToolSet`], which implements
 //! `stella_core::ports::ToolExecutor` — the same port `stella-tools`'
@@ -38,7 +38,7 @@
 //! - **Tolerant by construction.** As a client of a public protocol, every
 //!   inbound type ignores unknown fields and defaults missing ones — a server
 //!   on a newer minor revision never breaks us ([`protocol`]).
-//! - **Security (`02-architecture.md` §8).** stdio servers are spawned with a
+//! - **Security.** stdio servers are spawned with a
 //!   *scrubbed* environment: no ambient credential is ever inherited by a
 //!   child ([`stdio`]).
 //! - **Resilience.** Per-call timeouts; a dead/hung server yields a

@@ -2,8 +2,8 @@
 //!
 //! Image, SVG, and video generation for the Oxagen CLI, all client-side and
 //! all BYOK, through one [`MediaProvider`] port and the same artifact
-//! discipline as the rest of the engine (`08-multimodal.md`,
-//! `02-architecture.md` §3, §8).
+//! discipline as the rest of the engine (
+//!).
 //!
 //! ## What's here
 //! * [`provider`] — the [`MediaProvider`] trait plus its request/response
@@ -13,12 +13,12 @@
 //!   runtime-skipped live smokes (L-V4).
 //! * [`artifact`] — [`ArtifactStore`]: the single writer to
 //!   `.stella/artifacts/`, path-traversal-proof, with a crash-atomic manifest
-//!   (`02-architecture.md` §8).
+//!.
 //! * [`svg`] — the [`SvgPipeline`]: validate → sanitize → optimize with a
 //!   bounded model-repair loop, treating LLM SVG as untrusted code (L-V2).
 //! * [`preview`] — the terminal preview ladder (kitty / iTerm2 / plain), pure
-//!   string builders, no TTY writes (`08-multimodal.md` §5).
-//! * [`cost_gate`] — the video confirmation gate (`08-multimodal.md` §6):
+//! string builders, no TTY writes.
+//! * [`cost_gate`] — the video confirmation gate :
 //!   deny-by-default headless, threshold-configurable.
 //! * [`jobs`] — persisted video-job state + live reconciliation so a
 //!   dollar-cost job survives a dropped terminal and is never reported from
@@ -27,7 +27,7 @@
 //!   *values* (`MediaProgress` / `MediaComplete`), no channel dependency.
 //!
 //! ## Deliberate architecture deviation (recorded follow-up)
-//! `02-architecture.md` §2 nominally places vendor media HTTP clients in
+//! nominally places vendor media HTTP clients in
 //! `stella-model` (alongside the chat/embedding adapters). They live **here**
 //! instead, so this Phase-5 workstream stays self-contained and this crate
 //! does **not** depend on `stella-model`. The consequences of that isolation:
@@ -37,7 +37,7 @@
 //! `stella-model`'s provider set (sharing one secret type and one HTTP layer)
 //! is the recorded migration follow-up.
 //!
-//! ## Non-goals in v1 (`08-multimodal.md` §8)
+//! ## Non-goals in v1
 //! Audio (TTS/STT/music) and 3D fit the [`MediaProvider`] shape but are not
 //! scoped; the trait reserves that method-space by contract without shipping a
 //! stub. Image *understanding* (screenshots as input) is the chat `vision`

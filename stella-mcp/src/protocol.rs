@@ -6,7 +6,7 @@
 //! This crate is a *client of a public protocol*, so every inbound type is
 //! deliberately permissive: `#[serde(default)]` on optional fields and
 //! **never** `deny_unknown_fields`. A server that adds a field, or speaks a
-//! newer minor revision, must not break us (`02-architecture.md` §1.4, §7).
+//! newer minor revision, must not break us.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -1,4 +1,4 @@
-//! The orchestrator: the staged turn flow (`02-architecture.md` §5) that sits
+//! The orchestrator: the staged turn flow that sits
 //! *above* `stella-core::Engine`. It sequences evaluate → enhance → route →
 //! witness → execute → verify → judge → revise over the injected ports,
 //! emitting a `Stage` event at every boundary and exactly one terminal

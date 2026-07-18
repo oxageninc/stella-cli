@@ -1,5 +1,5 @@
-//! `stella-fleet` — the multi-agent fleet layer (`02-architecture.md` §2;
-//! `03-plan.md` Phase 5 item 2).
+//! `stella-fleet` — the multi-agent fleet layer (
+//! Phase 5 item 2).
 //!
 //! Four pieces, one seam:
 //!
@@ -21,7 +21,7 @@
 //! duration, stamping lineage into the ledger, and metering child spend into
 //! the parent [`stella_core::BudgetGuard`].
 //!
-//! Design constraints (from the task and `02-architecture.md`): we shell out
+//! Design constraints (from the task and): we shell out
 //! to the `git`/`gh` binaries via `tokio::process` behind port traits rather
 //! than linking libgit2 (heavy native build), every external interaction is a
 //! port so every test runs against fakes, and there is no `unwrap`/`panic`

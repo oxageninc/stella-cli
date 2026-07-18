@@ -1,4 +1,4 @@
-//! Typed context-plane errors (`docs/specs/stella-rust-cli/02-architecture.md`
+//! Typed context-plane errors (
 //! §1.5: "fail loud, recover gracefully" — errors are `thiserror`, never
 //! `panic!` in the hot path). The retrieval/write-back pipelines classify
 //! failures at the source so callers never re-derive a category downstream.
@@ -29,7 +29,7 @@ pub enum ContextError {
     MissingCitation { id: String },
 
     /// Retrieval was asked to mix embeddings from two different embedders.
-    /// `02-architecture.md` §6 and `L-C2`: retrieval never mixes fingerprints
+    /// and `L-C2`: retrieval never mixes fingerprints
     /// — a stored vector under a stale fingerprint is invisible, never
     /// silently compared against a fresh query vector.
     #[error("embedder fingerprint mismatch: query is `{query}`, candidate is `{candidate}`")]

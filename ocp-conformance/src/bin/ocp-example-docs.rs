@@ -1,7 +1,7 @@
 //! `ocp-example-docs` — a minimal reference OCP provider over stdio.
 //!
 //! It serves a couple of canned "documentation" frames, proving the external
-//! child-process path end-to-end (`06-context-protocol.md` §3.6 seed
+//! child-process path end-to-end ( seed
 //! providers). It is also the child-process **test fixture** for the
 //! conformance suite: `--misbehave <mode>` deliberately breaks one protocol
 //! guarantee at a time so tests can prove the suite catches a broken

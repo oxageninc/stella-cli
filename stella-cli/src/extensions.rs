@@ -4,7 +4,7 @@
 //! chat surfaces use to offer them (⚡ slash-menu rows, `/agents`).
 //!
 //! All planning and parsing is pure and lives in `stella-core`; this module
-//! owns exactly the I/O halves (`02-architecture.md` §1.3): directory
+//! owns exactly the I/O halves : directory
 //! scanning with symlink detection, symlink creation, and definition-file
 //! reads.
 //!

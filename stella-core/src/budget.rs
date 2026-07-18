@@ -1,4 +1,4 @@
-//! USD spend metering — the *money* meter (`07-model-matrix.md` §6). This is
+//! USD spend metering — the *money* meter. This is
 //! a distinct concern from `crate::compaction`'s *token*-budget eviction:
 //! compaction manages context-window pressure, `budget` manages dollars
 //! spent against a turn and/or session cap. Ported from the TS per-turn
@@ -7,7 +7,7 @@
 //!
 //! # The mid-tool-kill lesson
 //!
-//! Per `07-model-matrix.md` §6, `enforced` mode is "a hard stop with a
+//! Per, `enforced` mode is "a hard stop with a
 //! clean turn abort — never a mid-tool kill." This module cannot enforce
 //! *when* the caller checks the outcome — that discipline belongs to the
 //! `driver.rs` step-driver, which only consults
@@ -24,7 +24,7 @@
 //!
 //! [`BudgetGuard::record_spend`] takes a bare `cost_usd: f64` and does not
 //! care what produced it — a text completion, an image job, or a video job
-//! all settle through the same call (`07-model-matrix.md` §6 "media counts").
+//! all settle through the same call ( "media counts").
 //! `stella-media` does not exist yet; no special-casing is needed here for
 //! that to fall out for free later.
 //!
@@ -32,7 +32,7 @@
 //!
 //! Spend accumulates via plain `f64` addition. This guard is an in-memory
 //! running total for gating and HUD display (`BudgetTick`,
-//! `02-architecture.md` §4) — it is not the billing system of record (that
+//!) — it is not the billing system of record (that
 //! lives in adapter-reported usage plus, for the platform's own metered
 //! products, ClickHouse/Stripe). Summation drift across a session-length
 //! number of calls is negligible at USD-cent granularity; callers needing
@@ -88,7 +88,7 @@ pub enum BudgetOutcome {
 
 /// Tracks USD spend against an optional per-turn limit and an optional
 /// per-session limit, and reports a [`BudgetOutcome`] after every recorded
-/// cost (`07-model-matrix.md` §6).
+/// cost.
 ///
 /// A `None` limit on an axis means that axis never triggers, regardless of
 /// mode. A session accumulates spend across multiple turns; call

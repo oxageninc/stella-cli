@@ -1,7 +1,7 @@
 //! Import edges (`file → imported module/file`) and the resolution of
 //! relative specifiers to actual files.
 //!
-//! The spec singles this out (`03-plan.md` Phase 3 item 3): "fix the known
+//! The spec singles this out ( Phase 3 item 3): "fix the known
 //! thin Python import-edge resolution rather than porting it". So Python
 //! **relative** imports (`from . import x`, `from ..pkg import y`) resolve to
 //! real files, and TS/JS relative specifiers (`./x`, `../y`) resolve through
@@ -237,7 +237,7 @@ fn append_ext(path: &Path, ext: &str) -> PathBuf {
 /// If `candidate` is an existing regular file inside `root`, return its
 /// forward-slash path relative to `root`; otherwise `None`. Canonicalization
 /// resolves any `..` segments and symlinks so the root-jail check is honest
-/// (`02-architecture.md` §8 workspace-root jail).
+/// ( workspace-root jail).
 fn existing_within_root(candidate: &Path, root: &Path) -> Option<String> {
     if !candidate.is_file() {
         return None;

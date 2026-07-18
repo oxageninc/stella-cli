@@ -1,5 +1,5 @@
 //! `stella-pipeline` — the orchestration plane that sits *above*
-//! `stella-core::Engine` (`02-architecture.md` §5). It drives one prompt
+//! `stella-core::Engine`. It drives one prompt
 //! through the staged turn flow — **evaluate → enhance → route → witness →
 //! execute → verify → judge → revise** — over injected ports, emitting an
 //! `AgentEvent` at every stage boundary.

@@ -1,7 +1,7 @@
-//! The planner DAG (`02-architecture.md` §2 "planner DAG";
-//! `03-plan.md` Phase 5 item 2). Pure scheduling logic over owned data — no
+//! The planner DAG ( "planner DAG";
+//! Phase 5 item 2). Pure scheduling logic over owned data — no
 //! I/O, no async — so every property is table- and proptest-checkable
-//! (`02-architecture.md` §1.3).
+//!.
 //!
 //! A [`Plan`] is a set of [`Task`]s with `depends_on` edges. The fleet
 //! executes it wave by wave: [`Plan::ready_tasks`] returns the tasks whose
@@ -13,7 +13,7 @@
 //! Tasks isolate by default ([`Isolation::Isolated`] — a dedicated git
 //! worktree per task): a fleet worker must never be able to see or clobber a
 //! sibling's uncommitted files unless the plan author *explicitly* opts a
-//! task into [`Isolation::SharedTree`] (`02-architecture.md` §2
+//! task into [`Isolation::SharedTree`] (
 //! "git-worktree isolation").
 
 use std::cmp::Reverse;

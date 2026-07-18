@@ -59,8 +59,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 
-/// How turn output reaches the caller (`01-product-spec.md`,
-/// `02-architecture.md` §4: stream-json is a line-per-`AgentEvent`
+/// How turn output reaches the caller (
+/// : stream-json is a line-per-`AgentEvent`
 /// serialization of the exact protocol enum — a stable machine interface).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -86,7 +86,7 @@ struct Cli {
 
     /// API key for the selected provider, highest-precedence step of the
     /// credential chain (CLI flag -> env var -> credentials file ->
-    /// interactive prompt, 01-product-spec.md §4). Prefer an env var or
+    /// interactive prompt). Prefer an env var or
     /// ~/.config/stella/credentials.toml for anything long-lived — a flag
     /// value is visible in shell history and `ps`.
     #[arg(long)]
@@ -105,7 +105,7 @@ struct Cli {
     output_format: OutputFormat,
 
     /// Hard USD spend limit for the whole run/session — enforced mode
-    /// (07-model-matrix.md §6): work aborts cleanly (never mid-tool) once
+    /// : work aborts cleanly (never mid-tool) once
     /// total spend exceeds this. Omit to meter spend for the cost summary
     /// without ever blocking (observed mode).
     #[arg(long, env = "STELLA_BUDGET", value_parser = parse_budget)]

@@ -2,7 +2,7 @@
 //!
 //! A tree-sitter symbol + import-edge indexer over a workspace, persisted in
 //! SQLite, exposed as a **built-in OCP provider** feeding `stella-context`
-//! (`02-architecture.md` §2: "implemented AS a built-in OCP provider … the
+//! (: "implemented AS a built-in OCP provider … the
 //! protocol's first proof of non-triviality"). It depends only on `ocp-types`
 //! for the wire shape — never on `stella-context` — so the provider boundary
 //! stays one-directional.
@@ -12,16 +12,16 @@
 //! - **Indexes** Rust, TypeScript, TSX, JavaScript, and Python: symbols
 //!   (functions, methods, structs/classes/enums/traits/interfaces) and import
 //!   edges (`file → module/file`), via compile-time tree-sitter queries
-//!   (`09-lessons-learned.md` L-L2).
+//! ( L-L2).
 //! - **Resolves** Python relative imports (`from . import x`,
 //!   `from ..pkg import y`) and TS/JS relative specifiers (`./x`, `../y`,
 //!   `index.*`) to real files; bare package specifiers are recorded
-//!   unresolved (`03-plan.md` Phase 3 item 3).
+//! unresolved ( Phase 3 item 3).
 //! - **Warms at mount** and re-indexes live via an in-process `notify`
-//!   watcher (L-C1, `02-architecture.md` §6).
+//! watcher (L-C1).
 //! - **Skips byte-identical content** on re-index (L-C2).
 //! - **Answers queries as frames** with mandatory human citation labels and
-//!   `code-graph` provenance (L-C4, `06-context-protocol.md` §3.4).
+//! `code-graph` provenance (L-C4).
 //!
 //! # Example
 //!

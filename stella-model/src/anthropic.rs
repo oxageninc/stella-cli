@@ -1,8 +1,8 @@
 //! Anthropic adapter — Messages API, SSE streaming, native tool-use. One of
-//! the two Phase 0 spikes (`03-plan.md` step 3): retires raw-SSE-parsing
+//! the two Phase 0 spikes ( step 3): retires raw-SSE-parsing
 //! risk against a second, structurally different dialect from Z.ai's
 //! OpenAI-compatible one (`anthropic-tools` vs. `openai-json`,
-//! `07-model-matrix.md` §4).
+//!).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

@@ -1,5 +1,5 @@
 //! The pure render model: a deterministic fold of the `AgentEvent` log into
-//! the derived state every panel draws from (`09-lessons-learned.md` L-T1).
+//! the derived state every panel draws from ( L-T1).
 //!
 //! [`SessionModel`] owns **only** state that is reconstructible by replaying
 //! the event log from seq 1 — transcript lines, the files-touched map, HUD

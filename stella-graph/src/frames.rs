@@ -1,5 +1,5 @@
 //! Query → [`ContextFrame`] assembly: the code graph as a built-in OCP
-//! provider (`02-architecture.md` §2, `06-context-protocol.md` §3.4).
+//! provider.
 //!
 //! Two rules from the lessons registry are load-bearing here:
 //! - **L-C4 (cite by human label):** every frame's `title` and mandatory
@@ -13,7 +13,7 @@
 //! These are synchronous SQLite reads plus small, bounded file reads (to quote
 //! a definition's source or a reference's line); `stella-context` wraps them
 //! for its async `ContextPlane`. Budget-packing here mirrors the retrieval
-//! contract (`06-context-protocol.md` §2.3 / L-C5): frames declare a
+//! contract ( / L-C5): frames declare a
 //! `token_cost` and assembly never exceeds `max_tokens`/`max_frames`.
 
 use std::collections::{HashMap, HashSet};
@@ -63,7 +63,7 @@ pub(crate) fn definitions(
 /// Best-effort textual references: whole-word occurrences of `name` across
 /// indexed files. Linear in the indexed corpus and capped at
 /// [`MAX_REFERENCES`] — the spec labels this "best-effort" retrieval, not an
-/// index (`06-context-protocol.md` CLI surface note).
+/// index ( CLI surface note).
 pub(crate) fn references(
     conn: &Connection,
     root: &Path,

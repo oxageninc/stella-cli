@@ -1,19 +1,19 @@
 //! SQLite storage for the code graph.
 //!
-//! `02-architecture.md` §6 mandates **one** `context.db` file with one engine:
+//! mandates **one** `context.db` file with one engine:
 //! `stella-context` owns the rest of that file's schema, so every table this
 //! crate creates is prefixed `code_graph_` to share the file without
 //! colliding. The store is opened against a caller-supplied path so the
 //! integration pass can point both crates at the same file.
 //!
-//! Durability contract (`09-lessons-learned.md` L-L1, "a kill during indexing
+//! Durability contract ( L-L1, "a kill during indexing
 //! leaves a consistent store"): WAL journal mode, and **every index batch is
 //! a single transaction**. A process killed mid-batch has committed nothing;
 //! reopening sees the previous consistent state and a re-index completes. The
 //! crash-consistency test in this module proves it by dropping a transaction
 //! (rusqlite rolls back on drop) and asserting the store is unchanged.
 //!
-//! Byte-compat skip (`09-lessons-learned.md` L-C2): a file whose content
+//! Byte-compat skip ( L-C2): a file whose content
 //! sha256 matches the stored value is never re-parsed. [`IndexStats::files_parsed`]
 //! counts real parse invocations, which the skip test asserts drops to zero on
 //! an unchanged second pass.

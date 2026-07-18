@@ -1,7 +1,7 @@
-//! The pipeline's port boundary (`02-architecture.md` §1.1, §3). Like
+//! The pipeline's port boundary. Like
 //! `stella-core`, `stella-pipeline` never imports a provider SDK, a shell, a
 //! context store, or a terminal — it orchestrates the staged turn flow
-//! (`02-architecture.md` §5) entirely through the traits defined here. The
+//! entirely through the traits defined here. The
 //! `stella-cli` glue layer implements each of them against the real
 //! subsystems (`stella-model`, `stella-tools`, `stella-context`, the TUI's
 //! approval prompt); tests implement them with scripted doubles.
@@ -35,12 +35,12 @@ pub trait ProviderResolver: Send + Sync {
     fn provider_for(&self, model: &ModelRef) -> Option<&dyn Provider>;
 }
 
-/// One frame recalled from the context plane at turn start (`02-architecture.md`
+/// One frame recalled from the context plane at turn start (
 /// §5 "context recall"). A deliberately minimal local shape: the real
 /// `stella-context` crate is being built in parallel and owns the rich
 /// `ContextFrame`/retrieval types; the CLI glue adapts its frames down to
 /// this at the seam so `stella-pipeline` takes **no** dependency on
-/// `stella-context` (dependency direction discipline, `02-architecture.md`
+/// `stella-context` (dependency direction discipline,
 /// §1). `citation_label` is mandatory and human-readable (L-C4); a
 /// not-yet-materialized frame carries `id: None`.
 #[derive(Debug, Clone, PartialEq, Eq)]

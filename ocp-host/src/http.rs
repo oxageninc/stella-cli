@@ -1,5 +1,5 @@
 //! Streamable-HTTP transport: a remote OCP provider reached by POSTing the
-//! envelope to its URL (`06-context-protocol.md` §3.2 "remote providers:
+//! envelope to its URL ( "remote providers:
 //! streamable HTTP"). The reference host uses request/response JSON — the
 //! [`Envelope`] as the POST body, one [`Envelope`] back as the response body
 //! — which any streamable-HTTP server satisfies; chunked frame streaming is

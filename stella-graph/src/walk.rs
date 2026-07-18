@@ -1,6 +1,6 @@
 //! Directory walk that yields indexable source files.
 //!
-//! `09-lessons-learned.md` L-S5 makes ripgrep-semantics (gitignore-aware,
+//! L-S5 makes ripgrep-semantics (gitignore-aware,
 //! hidden-excluded) the contract for search tooling. This module implements a
 //! **deny-list approximation** rather than pulling ripgrep's `ignore` crate:
 //! it skips hidden directories (leading `.`), the usual build/vendor caches

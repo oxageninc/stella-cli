@@ -1,7 +1,7 @@
 //! The [`Host`] — one uniform handle over every provider, and the fan-out
-//! router (`06-context-protocol.md` §2.3, §3.3; `02-architecture.md` §7).
+//! router.
 //!
-//! The host does the four jobs providers never do (§7): routes a query to
+//! The host does the four jobs providers never do: routes a query to
 //! capability-matching providers, gates consent so nothing reaches an
 //! unconsented egress provider, enforces per-provider timeouts, and audits
 //! budget honesty — a provider that returns frames summing above the query
@@ -63,7 +63,7 @@ impl Host {
     }
 
     /// Spawn and register a child-process provider over stdio, completing the
-    /// handshake (`06-context-protocol.md` §3.2).
+    /// handshake.
     pub async fn add_stdio(
         &mut self,
         id: impl Into<String>,
@@ -87,7 +87,7 @@ impl Host {
     }
 
     /// Record consent for a provider, unlocking an egress provider for
-    /// querying (§3.5).
+    /// querying.
     pub fn record_consent(&mut self, record: ConsentRecord) {
         self.consent.record(record);
     }
@@ -211,7 +211,7 @@ impl Host {
             };
 
         // Budget honesty: frames that sum above the query budget are a lie
-        // about `token_cost`. Drop them, report loudly (§3.3).
+        // about `token_cost`. Drop them, report loudly.
         if !result.respects_budget(query.max_tokens) {
             return ProviderOutcome {
                 provider_id: id,
@@ -280,7 +280,7 @@ impl FanOut {
     }
 
     /// Providers whose frames were dropped for exceeding the query budget —
-    /// the loud report the host must surface, never swallow (§3.3).
+    /// the loud report the host must surface, never swallow.
     pub fn budget_liars(&self) -> impl Iterator<Item = &ProviderOutcome> {
         self.outcomes
             .iter()
@@ -302,14 +302,14 @@ pub enum ProviderResult {
     /// Frames the host accepted: passed consent, timeout, and budget honesty.
     Frames(ContextQueryResult),
     /// The provider's frames summed above the query budget — a `token_cost`
-    /// lie. Dropped and reported (§3.3).
+    /// lie. Dropped and reported.
     BudgetLie {
         claimed_tokens: u64,
         max_tokens: u32,
         dropped_frames: usize,
     },
     /// Skipped: an egress provider without recorded consent. The query
-    /// payload was **not** transmitted (§3.5).
+    /// payload was **not** transmitted.
     ConsentRequired(DataFlow),
     /// The provider errored, timed out, or crashed mid-query.
     Failed(HostError),

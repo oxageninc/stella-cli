@@ -1,13 +1,13 @@
 //! Role → model resolver + per-provider circuit breaker
-//! (`docs/specs/stella-rust-cli/03-plan.md` Phase 2 item 2;
-//! `07-model-matrix.md` §1 roles, §2 provider adapters, §5 default role
+//! ( Phase 2 item 2;
+//! roles, §2 provider adapters, §5 default role
 //! assignments by scenario — the authoritative precedence this module
 //! implements).
 //!
 //! `stella-core` cannot see the concrete model catalog — that's
 //! `stella-model`, a downstream crate that depends on `stella-protocol`
 //! (dependency direction: adapters depend on the engine's ports, never the
-//! reverse, `02-architecture.md` §1.3). The router therefore resolves roles
+//! reverse). The router therefore resolves roles
 //! over a caller-supplied abstraction (`ProviderProfile`) instead of any
 //! concrete catalog type, and has no I/O of its own: `resolve` is a plain
 //! synchronous function over owned data. It returns *data* describing what
@@ -34,7 +34,7 @@ use crate::ports::Clock;
 // ---------------------------------------------------------------------
 
 /// A caller-supplied description of one configured (BYOK key present)
-/// provider (`07-model-matrix.md` §2). `stella-core` never sees the real
+/// provider. `stella-core` never sees the real
 /// model catalog (`stella-model`, downstream); this is the entire interface
 /// it needs to route roles to models.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub struct ProviderProfile {
     /// `ProviderProfile::new` when the caller has no finer concept.
     pub family: String,
     /// Strongest available model for main coding/execution steps — the
-    /// `worker`/`plan` default (§1, §5).
+    /// `worker`/`plan` default.
     pub worker_model: ModelRef,
     /// Cheap/fast tier used for triage classification. May equal
     /// `worker_model` when the provider has no separate fast tier — that's
@@ -59,7 +59,7 @@ pub struct ProviderProfile {
     /// concern.
     pub triage_model: ModelRef,
     /// Model used when this provider is chosen as judge: "never the same
-    /// instance as worker" (§1) — a fresh, separate call even when it
+    /// instance as worker" — a fresh, separate call even when it
     /// shares a slug with `worker_model`.
     pub judge_model: ModelRef,
 }
@@ -103,7 +103,7 @@ impl ProviderProfile {
 /// production only ever builds `RoleTable::new()`; flags/slash commands for
 /// pinning are planned but not implemented. Absence of a pin for a role is
 /// `None`, never a magic sentinel (L-M3) — the router falls through to
-/// scenario defaults (`07-model-matrix.md` §5) when a role isn't in this
+/// scenario defaults when a role isn't in this
 /// table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleTable {
@@ -148,7 +148,7 @@ impl RoleTable {
 /// recorded outcome plus the clock — never stored directly, so time only
 /// moves when the caller's injected `Clock` says it does (this crate never
 /// sleeps for real; `ports::Clock` exists precisely so breaker cooldowns
-/// are testable without it, `02-architecture.md` §1.3).
+/// are testable without it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakerStatus {
     /// Healthy — routes normally.
@@ -170,7 +170,7 @@ struct BreakerEntry {
     opened_at_ms: Option<u64>,
 }
 
-/// Per-provider circuit breaker (`07-model-matrix.md` §2 "a per-provider
+/// Per-provider circuit breaker ( "a per-provider
 /// circuit breaker", §7 reliability rules; L-M7: "every adapter carries a
 /// breaker … no silent mid-turn family switches"). One `CircuitBreaker`
 /// instance tracks every provider's state, keyed by provider id.
@@ -321,7 +321,7 @@ impl RouterDecision {
 
 /// Router resolution failures — always a loud, named error, never a silent
 /// guess (mirrors the catalog's "unknown slug is a hard error" rule,
-/// `07-model-matrix.md` §3, at the routing layer).
+///, at the routing layer).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RouterError {
     /// No `ProviderProfile`s were supplied at all — the router-level
@@ -355,7 +355,7 @@ pub enum RouterError {
 // ---------------------------------------------------------------------
 
 /// Resolves a `Role` to a `ModelRef`, applying (in order, per
-/// `07-model-matrix.md` §1 "Resolution: explicit pin > per-role config >
+/// "Resolution: explicit pin > per-role config >
 /// scenario defaults"):
 ///
 /// 1. An explicit `RoleTable` pin — wins unconditionally, no breaker check.
@@ -369,7 +369,7 @@ pub struct Router {
     role_table: RoleTable,
     /// Configured providers in preference order — first = most preferred,
     /// mirroring `stella-cli::config::PROVIDERS`'s existing preference
-    /// ordering (`03-plan.md` Phase 2 item 2).
+    /// ordering ( Phase 2 item 2).
     profiles: Vec<ProviderProfile>,
     breaker: CircuitBreaker,
 }
@@ -515,7 +515,7 @@ impl Router {
             format!(
                 "judge running on the same provider/family as worker (`{}`) — no distinct-family \
                  provider is currently healthy; cross-family bias-resistant judging is degraded \
-                 until a second family is configured or its breaker recovers (07-model-matrix.md §1, L-M8)",
+                 until a second family is configured or its breaker recovers (L-M8)",
                 chosen.id
             )
         });

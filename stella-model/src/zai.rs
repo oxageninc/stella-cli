@@ -1,8 +1,8 @@
 //! Z.ai adapter — OpenAI-compatible chat completions + SSE streaming, GLM
 //! 5.2's tool-call dialect (`openai-json`: an accumulating `tool_calls`
 //! array keyed by index, arguments streamed as string fragments). This is
-//! the *other* Phase 0 spike (`03-plan.md` step 3) and the default suite
-//! per `07-model-matrix.md` — it must work first, not last.
+//! the *other* Phase 0 spike ( step 3) and the default suite
+//! — it must work first, not last.
 
 use std::collections::BTreeMap;
 
@@ -22,7 +22,7 @@ use crate::sse::SseDecoder;
 
 /// International endpoint. `open.bigmodel.cn` (mainland) is the same wire
 /// shape behind a different base URL — `with_base_url` covers both without
-/// a second adapter (`07-model-matrix.md` §2 note).
+/// a second adapter ( note).
 ///
 /// When the `ZAI_GLM_CODING_PLAN` environment variable is set to `1`, the
 /// coding plan endpoint (`/api/coding/paas/v4`) is used instead of the

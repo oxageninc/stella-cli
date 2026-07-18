@@ -1,11 +1,11 @@
-//! Vendor media adapters (`08-multimodal.md` §2). Each implements
+//! Vendor media adapters. Each implements
 //! [`crate::provider::MediaProvider`] for one vendor endpoint and owns its
 //! wire types; error classification routes through the shared
 //! [`crate::http`] policy so a 401 means the same thing everywhere.
 //!
 //! Deliberate architecture deviation (documented at the crate root): these
 //! vendor HTTP clients live in `stella-media`, not `stella-model` where
-//! `02-architecture.md` §2 nominally places them, so this Phase-5 workstream
+//! nominally places them, so this Phase-5 workstream
 //! stays self-contained. Folding them into `stella-model`'s provider set is a
 //! recorded follow-up.
 //!

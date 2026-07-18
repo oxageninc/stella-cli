@@ -1,5 +1,5 @@
-//! Consent gating for egress providers (`06-context-protocol.md` §3.5;
-//! `02-architecture.md` §7 point 4).
+//! Consent gating for egress providers (
+//! point 4).
 //!
 //! The security-critical rule: a provider that declares `egress` — anything
 //! that could send workspace content off the local machine — MUST NOT be
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 /// A recorded consent decision for one provider. `granted_scope` is the
 /// human-readable description of what data flows out, shown to the user at
-/// consent time and retained as the audit of what they agreed to (§3.5).
+/// consent time and retained as the audit of what they agreed to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConsentRecord {
     /// The provider id this consent applies to (the host's routing key).
@@ -79,7 +79,7 @@ impl ConsentStore {
     }
 
     /// Whether a provider needs consent before any query: only egress
-    /// providers do (§3.5). A read/write-only provider is always permitted —
+    /// providers do. A read/write-only provider is always permitted —
     /// nothing it can do leaves the machine.
     pub fn requires_consent(info: &ProviderInfo) -> bool {
         info.data_flow.egress

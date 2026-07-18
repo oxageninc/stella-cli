@@ -1,16 +1,16 @@
 //! The `MediaProvider` port and its request/response types
-//! (`02-architecture.md` §3). One trait, many vendor adapters behind it —
+//!. One trait, many vendor adapters behind it —
 //! the same ports-not-concretions discipline the chat `Provider` uses.
 //!
 //! `generate_image` is sync-ish (one HTTP round trip, bytes back);
 //! `generate_video` submits an async job and returns a [`MediaJob`] handle
-//! that `poll_video` reconciles against the provider (`08-multimodal.md`
+//! that `poll_video` reconciles against the provider (
 //! §3–§6). Neither method touches the filesystem: they return in-memory
 //! [`MediaArtifact`] bytes, and the caller persists through
 //! [`crate::artifact::ArtifactStore`] — so the artifact-root jail
-//! (`02-architecture.md` §8) is enforced in exactly one place.
+//! is enforced in exactly one place.
 //!
-//! Audio/3D are explicitly future (`08-multimodal.md` §8): the trait reserves
+//! Audio/3D are explicitly future : the trait reserves
 //! that method-space by contract but ships no v1 stub, to avoid churning the
 //! port surface before there's a real adapter.
 
@@ -71,7 +71,7 @@ impl FromStr for ImageSize {
 }
 
 /// A per-job cost estimate drawn from the provider's rate card
-/// (`08-multimodal.md` §6). `detail` is the human explanation the cost gate
+///. `detail` is the human explanation the cost gate
 /// shows before charging money.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CostEstimate {
@@ -81,7 +81,7 @@ pub struct CostEstimate {
     pub detail: String,
 }
 
-/// What a provider can do and what it charges (`08-multimodal.md` §2). Per
+/// What a provider can do and what it charges. Per
 /// the spec these are catalog data refreshed from the vendor, never truly
 /// hard-coded; until the catalog layer lands, each adapter fills this with
 /// documented default rates the CLI/catalog can override.
@@ -129,7 +129,7 @@ impl MediaCapabilities {
     }
 }
 
-/// An image generation request (`08-multimodal.md` §3).
+/// An image generation request.
 #[derive(Clone, Debug)]
 pub struct ImageRequest {
     pub prompt: String,
@@ -159,7 +159,7 @@ impl ImageRequest {
     }
 }
 
-/// A video generation request (`08-multimodal.md` §3, cost-gated §6).
+/// A video generation request (cost-gated §6).
 #[derive(Clone, Debug)]
 pub struct VideoRequest {
     pub prompt: String,
@@ -207,7 +207,7 @@ fn default_label(prompt: &str) -> String {
 
 /// Freshly generated media, in memory, not yet on disk. The caller writes it
 /// through [`crate::artifact::ArtifactStore::save_artifact`], which is the
-/// only code allowed to touch `.stella/artifacts/` (`02-architecture.md` §8).
+/// only code allowed to touch `.stella/artifacts/`.
 /// `Debug` shows the byte length, never the bytes.
 #[derive(Clone)]
 pub struct MediaArtifact {
@@ -233,7 +233,7 @@ impl fmt::Debug for MediaArtifact {
     }
 }
 
-/// A handle to a submitted async video job (`08-multimodal.md` §6). Persisted
+/// A handle to a submitted async video job. Persisted
 /// to the job store so a dropped terminal never orphans a dollar-cost job;
 /// `poll_video`/resume reconcile it live against the provider (L-V3).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -278,7 +278,7 @@ impl MediaJobStatus {
     }
 }
 
-/// The media generation port (`02-architecture.md` §3). Every vendor adapter
+/// The media generation port. Every vendor adapter
 /// implements it; the engine/CLI drives through `&dyn MediaProvider`.
 #[async_trait]
 pub trait MediaProvider: Send + Sync {
@@ -286,14 +286,14 @@ pub trait MediaProvider: Send + Sync {
     /// and error messages.
     fn id(&self) -> &str;
 
-    /// What this provider can do and what it charges (`08-multimodal.md` §2).
+    /// What this provider can do and what it charges.
     fn capabilities(&self) -> MediaCapabilities;
 
-    /// Generate an image (`08-multimodal.md` §3). One HTTP round trip;
+    /// Generate an image. One HTTP round trip;
     /// returns bytes in memory for the caller to persist.
     async fn generate_image(&self, req: ImageRequest) -> Result<MediaArtifact, MediaError>;
 
-    /// Submit an async video job (`08-multimodal.md` §6). Returns a handle to
+    /// Submit an async video job. Returns a handle to
     /// persist and poll; does not wait for completion.
     async fn generate_video(&self, req: VideoRequest) -> Result<MediaJob, MediaError>;
 

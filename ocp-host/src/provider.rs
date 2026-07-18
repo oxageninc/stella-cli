@@ -4,9 +4,9 @@
 //! stdio, or a remote HTTP endpoint — reaches the host through one trait,
 //! [`ContextProvider`]. Its shape mirrors the two OCP methods a host always
 //! needs: capability negotiation (cached from the handshake, §3.2) and
-//! `context/query` (§3.3). `stella-context` and any other Rust agent drive
+//! `context/query`. `stella-context` and any other Rust agent drive
 //! all three provider kinds through this single interface
-//! (`02-architecture.md` §2 — "usable by any other Rust agent that wants OCP
+//! ("usable by any other Rust agent that wants OCP
 //! support").
 
 use async_trait::async_trait;
@@ -21,14 +21,14 @@ use crate::error::HostError;
 #[async_trait]
 pub trait ContextProvider: Send + Sync {
     /// The provider's host-facing id — its routing key and its consent key
-    /// (`06-context-protocol.md` §3.5).
+    ///.
     fn id(&self) -> &str;
 
     /// Identity + declared data-flow direction, surfaced at consent time
     /// (§3.2, §3.5).
     fn info(&self) -> &ProviderInfo;
 
-    /// Capabilities negotiated at the handshake (§3.2) — which frame kinds
+    /// Capabilities negotiated at the handshake — which frame kinds
     /// and filters this provider serves, whether it upserts, does graph, is
     /// an embedder, or supports subscriptions.
     fn capabilities(&self) -> &Capabilities;

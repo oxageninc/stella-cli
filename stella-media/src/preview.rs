@@ -1,4 +1,4 @@
-//! Terminal preview ladder (`08-multimodal.md` §5). A protocol ladder,
+//! Terminal preview ladder. A protocol ladder,
 //! feature-detected once per session: kitty graphics protocol → iTerm2 inline
 //! images → a plain file-path line. Never assume a capability; never emit raw
 //! escape sequences to a terminal that did not advertise them (L-T*: degrade
@@ -29,7 +29,7 @@ pub enum PreviewRung {
 /// lookup (rather than reading `std::env` directly) keeps detection pure and
 /// testable. Precedence: kitty (most capable) → iTerm2 → plain.
 ///
-/// Signals (`08-multimodal.md` §5):
+/// Signals :
 /// * kitty: `KITTY_WINDOW_ID` set, or `TERM` contains `kitty`.
 /// * iTerm2: `TERM_PROGRAM` is `iTerm.app`, or `WezTerm` (which implements the
 ///   iTerm2 inline-image protocol).
@@ -98,7 +98,7 @@ pub fn iterm2_image(bytes: &[u8], name: Option<&str>) -> String {
 
 /// The plain-path fallback rung: a single human line pointing at the on-disk
 /// artifact. Previews are always additive to the artifact, never a substitute
-/// (`08-multimodal.md` §5), so this is the safe floor for `--no-preview`, CI,
+///, so this is the safe floor for `--no-preview`, CI,
 /// and unknown terminals.
 pub fn plain_line(path: &str) -> String {
     format!("[image] saved to {path}")

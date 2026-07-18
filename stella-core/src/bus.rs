@@ -54,7 +54,7 @@
 //! [`is_sensitive_path`] back the `secret.detected` /
 //! `sensitive_operation.detected` emissions.
 //!
-//! # No I/O in this module (`02-architecture.md` §1.3)
+//! # No I/O in this module
 //!
 //! The bus is plain synchronous logic over owned data: registration lists,
 //! an atomic sequence counter, and inline dispatch. Timestamping reads the

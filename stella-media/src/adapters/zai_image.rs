@@ -1,4 +1,4 @@
-//! Z.ai CogView image adapter (`08-multimodal.md` §2 — Z.ai is the default
+//! Z.ai CogView image adapter (Z.ai is the default
 //! family). Same `api.z.ai/api/paas/v4` base-URL convention as the chat
 //! adapter (`stella-model::zai`). CogView's `POST /images/generations` returns
 //! a URL (or inline base64) for the generated image; this adapter downloads
@@ -28,7 +28,7 @@ const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 /// Default CogView slug used when the caller doesn't pin one.
 pub const DEFAULT_MODEL: &str = "cogview-4";
 /// Documented default rate — real pricing comes from the catalog once wired
-/// (`08-multimodal.md` §2: costs are catalog data, never truly hard-coded).
+/// (: costs are catalog data, never truly hard-coded).
 const DEFAULT_IMAGE_USD_EACH: f64 = 0.06;
 
 /// A CogView image provider.

@@ -1,4 +1,4 @@
-//! The typed conformance report (`06-context-protocol.md` §3.6). Each check
+//! The typed conformance report. Each check
 //! carries a pass/fail/skip status and an evidence string, so "not
 //! conformant" always says *why*. Serde-derivable so `ocp-inspect --json`
 //! and CI can consume it.
@@ -70,7 +70,7 @@ pub struct ConformanceReport {
 
 impl ConformanceReport {
     /// True when no check failed (skips don't fail a run). This is the
-    /// "OCP conformant for your declared capability set" verdict (§3.6).
+    /// "OCP conformant for your declared capability set" verdict.
     pub fn passed(&self) -> bool {
         !self
             .checks

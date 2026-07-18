@@ -1,7 +1,7 @@
 //! End-to-end indexing over real fixture files in tempdirs: symbol extraction
 //! per language, plus the two import-resolution cases the spec calls out —
 //! Python relative imports (`from . import x`, `from ..pkg import y`) and TS
-//! `index.ts` resolution (`03-plan.md` Phase 3 item 3).
+//! `index.ts` resolution ( Phase 3 item 3).
 
 use std::fs;
 use std::path::Path;

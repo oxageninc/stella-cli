@@ -1,4 +1,4 @@
-//! Write-back: memory flowing the other way (`06-context-protocol.md` §3.6).
+//! Write-back: memory flowing the other way.
 //! [`ContextStore::upsert`] persists episode summaries, indexed content nodes,
 //! and fact assertions with **bi-temporal supersession** — a correction closes
 //! the prior belief's intervals and links the new edge with `SUPERSEDES`, so
@@ -298,7 +298,7 @@ impl ContextDelta {
     }
 }
 
-/// What a write-back did — a typed, inspectable receipt (`02-architecture.md`
+/// What a write-back did — a typed, inspectable receipt (
 /// §1: typed outputs). `embeddings_reused` is the byte-compat skip count that
 /// makes re-indexing cheap (`L-C2`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

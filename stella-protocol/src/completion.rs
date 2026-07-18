@@ -2,7 +2,7 @@
 //! every provider adapter (Z.ai, Anthropic, OpenAI, Gemini, xAI, Bedrock,
 //! Vertex, OpenRouter, local). Mirrors the TS runtime's
 //! `apps/cli/src/runtime/types.ts` `CompletionRequest`/`CompletionResult`,
-//! per `docs/specs/stella-rust-cli/02-architecture.md` §3 port map.
+//! port map.
 
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +22,7 @@ pub enum MessageRole {
 
 /// Reasoning effort forwarded to models with a thinking/extended-reasoning
 /// mode. One enum, mapped per-adapter to the provider's own parameter name
-/// (`07-model-matrix.md` §2 "reasoning_param").
+/// ( "reasoning_param").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
@@ -93,13 +93,13 @@ pub struct CompletionRequest {
     pub effort: Option<ReasoningEffort>,
     /// Tool schemas the model may call, in the engine's one internal shape
     /// (`crate::tool::ToolSchema`); each adapter translates to its own
-    /// dialect (`docs/specs/stella-rust-cli/07-model-matrix.md` §4).
+    /// dialect.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<crate::tool::ToolSchema>,
 }
 
 /// Token accounting for a single completion, normalized across providers
-/// into one envelope per `07-model-matrix.md` §6 (the AI-SDK-v7
+/// into one envelope (the AI-SDK-v7
 /// usage-shape-breakage lesson: normalization lives in the adapter, not the
 /// caller).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]

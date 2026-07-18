@@ -4,7 +4,7 @@
 //!
 //! The capture lands on disk and the tool returns its path + size. Vision
 //! (attaching the image bytes to a model call) arrives with multimodal
-//! message support (spec `08-multimodal.md`); until then the artifact is
+//! message support; until then the artifact is
 //! still valuable — humans open it, and agents cite it as evidence.
 
 use async_trait::async_trait;

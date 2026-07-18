@@ -1,5 +1,5 @@
 //! `ocp-conformance` — the public Open Context Protocol conformance suite
-//! (`06-context-protocol.md` §3.6).
+//!.
 //!
 //! "OCP conformant" means *green on this suite for your declared capability
 //! set* — a checkable claim, which is what makes third-party adoption safe.
@@ -10,13 +10,13 @@
 //! The checks (all against the frozen `ocp-types` contracts):
 //!
 //! - **handshake** — the provider completes the handshake and reports a
-//!   non-empty identity + capabilities (§3.2).
+//!   non-empty identity + capabilities.
 //! - **frame-validity** — queried frames pass `ocp-types` validation: score
 //!   in `[0, 1]`, a non-empty title, a non-empty `citation_label` (§3.4 —
 //!   "NEVER a bare uuid").
 //! - **budget-honesty** — returned frames' summed `token_cost` never exceeds
 //!   the query budget (§3.3 — "never lies about cost").
-//! - **shutdown-clean** — the provider tears down without error (§3.2).
+//! - **shutdown-clean** — the provider tears down without error.
 //! - **malformed-input-tolerance** — a garbage line is ignored-or-errored,
 //!   never crashing the host (§3.5, task deliverable). Wire-level, so it
 //!   applies to stdio providers.
@@ -235,7 +235,7 @@ async fn run_query_and_shutdown_checks(host: Host, id: &str, checks: &mut Vec<Ch
 /// Wire-level probe: complete the handshake on a fresh connection, inject a
 /// malformed line, then send a valid query. A conforming provider ignores or
 /// cleanly errors on the garbage and stays alive to answer the query; a
-/// provider that dies on one bad line fails (§3.5).
+/// provider that dies on one bad line fails.
 async fn malformed_stdio_probe(program: &str, args: &[String]) -> CheckResult {
     let mut conn = match RawStdioConnection::spawn(program, args).await {
         Ok(conn) => conn,
@@ -297,7 +297,7 @@ async fn malformed_stdio_probe(program: &str, args: &[String]) -> CheckResult {
 }
 
 /// The query the suite probes every provider with — no `kinds` filter, so any
-/// provider is asked for its best frames (§3.3).
+/// provider is asked for its best frames.
 pub fn sample_query() -> ContextQuery {
     ContextQuery {
         goal: "conformance probe: return your most relevant frames".into(),

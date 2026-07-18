@@ -58,7 +58,7 @@ pub(crate) fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Opti
 /// on 429s. The content-policy detection is a documented heuristic: a 400 /
 /// 422 whose body mentions safety/policy/moderation is surfaced as
 /// [`MediaError::ContentPolicy`] (a refusal the user can act on) rather than
-/// a generic terminal error (`08-multimodal.md` §7).
+/// a generic terminal error.
 pub(crate) fn classify_http_error(
     provider: &str,
     status: reqwest::StatusCode,

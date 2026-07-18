@@ -1,6 +1,6 @@
 //! A time source for the context plane, injectable for deterministic tests.
 //!
-//! Bi-temporal storage (`06-context-protocol.md` §2.2) needs timestamps that
+//! Bi-temporal storage needs timestamps that
 //! are **lexicographically comparable** so "what did we believe at T1" is a
 //! plain string range scan in SQLite. Rather than pull in a date-time crate
 //! (`ocp-types` is zero-dep by charter; this crate stays lean too), we format

@@ -1,4 +1,4 @@
-//! The step-driver: `Engine::run_turn` (`02-architecture.md` §2, §5). One
+//! The step-driver: `Engine::run_turn`. One
 //! model call per step, message accumulation, `AgentEvent` emission at
 //! every boundary, retry+backoff, compaction, tool-output budget checks,
 //! loop detection, and (a first, structural cut of) malformed-call repair —
@@ -6,7 +6,7 @@
 //!
 //! `Engine` drives through `&dyn Provider` (`stella_protocol`) and
 //! `&dyn ToolExecutor` (`crate::ports`) — no adapter-specific code, no
-//! filesystem call, lives here (`02-architecture.md` §1.1). Everything
+//! filesystem call, lives here. Everything
 //! *inside* one step (compaction, loop detection, budget evaluation) is the
 //! plain synchronous logic from the other modules in this crate; `run_turn`
 //! is the one place that sequences them against real I/O.
@@ -48,7 +48,7 @@
 //! tool that expects an object, it short-circuits to a named
 //! `ToolOutput::Error` telling the model its own JSON was malformed, so the
 //! model can retry with corrected syntax on the next step. This is a real,
-//! if first-cut, repair — dialect-specific tuning (`07-model-matrix.md`
+//! if first-cut, repair — dialect-specific tuning (
 //! §4.2: "malformed-call repair tuned to the failure shapes GLM actually
 //! produces") is a documented follow-up, not faked here.
 
@@ -94,7 +94,7 @@ pub struct EngineConfig {
     /// Working directory reported to lifecycle hooks (`crate::hooks`) as the
     /// `cwd` of every [`HookPayload`]. Kept here — rather than sniffed via
     /// `std::env::current_dir()` inside the engine — so `stella-core`
-    /// performs no I/O of its own (`02-architecture.md` §1.3): the caller
+    /// performs no I/O of its own : the caller
     /// (which already knows the workspace root) supplies the real path, and
     /// the `"."` default keeps hook-free turns unaffected. Only read when
     /// hooks are actually configured.
@@ -1333,7 +1333,7 @@ mod tests {
         );
     }
 
-    /// Exit criterion (`03-plan.md` Phase 2): "synthetic 200-step turn
+    /// Exit criterion ( Phase 2): "synthetic 200-step turn
     /// (scripted provider incl. 429s, stream drop, context pressure)
     /// survives across three dialects (GLM 5.2, Anthropic, OpenAI
     /// shapes)". "Dialect" at this layer (`stella-core`, which never

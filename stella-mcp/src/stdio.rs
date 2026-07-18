@@ -3,7 +3,7 @@
 //!
 //! Two properties are load-bearing:
 //!
-//! 1. **Scrubbed environment (`02-architecture.md` §8).** The child is spawned
+//! 1. **Scrubbed environment.** The child is spawned
 //!    with [`Command::env_clear`] and receives *only* the keys explicitly
 //!    listed in the server's config `env`. No parent-shell credential
 //!    (`ANTHROPIC_API_KEY`, `AWS_*`, …) is ever inherited by an MCP
@@ -77,7 +77,7 @@ impl StdioTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::null()) // keep server logs off the JSON-RPC stream.
             .kill_on_drop(true);
-        // The environment is fully scrubbed by design (§8) — PATH included, so
+        // The environment is fully scrubbed by design — PATH included, so
         // nothing ambient (credentials or otherwise) leaks into a server. A
         // server invoked by a bare command name (`npx`, `node`, `uvx`, …) will
         // therefore fail to resolve unless the config either gives an absolute

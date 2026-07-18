@@ -226,7 +226,7 @@ fn conjoined_imperative(lower: &str) -> bool {
 
 /// The system+user prompt handed to the Role::Triage model to classify a
 /// goal. A tiny, fixed instruction (the triage model is a cheap/fast tier,
-/// `07-model-matrix.md`): it must answer with exactly one bare token.
+///): it must answer with exactly one bare token.
 pub fn triage_prompt(goal: &str) -> String {
     format!(
         "Classify the following software task by how much orchestration it needs. \

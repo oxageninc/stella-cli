@@ -1,4 +1,4 @@
-//! The engine's port boundary (`02-architecture.md` §3). `stella-core`
+//! The engine's port boundary. `stella-core`
 //! never imports a provider SDK, a filesystem call, or a terminal library —
 //! it drives through these traits, mirroring the TS engine's `ports.ts`.
 

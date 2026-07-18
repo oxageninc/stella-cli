@@ -3,7 +3,7 @@
 //! compaction earlier, the safe direction. Provider-reported usage flows
 //! through `AgentEvent::StepUsage` for telemetry AND back into the
 //! estimator: [`Calibration`] tracks the observed actual/estimated
-//! input-token ratio per model (`07-model-matrix.md` §4.3) and corrects the
+//! input-token ratio per model and corrects the
 //! heuristic with a bounded factor, so the estimate converges on what the
 //! provider's tokenizer actually reports over a session. The uncalibrated
 //! functions remain the char-heuristic baseline; the correction is applied

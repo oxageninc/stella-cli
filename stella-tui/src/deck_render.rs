@@ -25,7 +25,7 @@ const REVEAL_MS: u32 = 350;
 /// How long the amber sweep plays over the content pane on a tab change.
 const TAB_SWITCH_MS: u32 = 180;
 
-/// The gold prompt prefix on every composer row (§4). Chrome, not content — it
+/// The gold prompt prefix on every composer row. Chrome, not content — it
 /// is never part of the submitted string and the caret cannot enter it.
 const PROMPT_PREFIX: &str = ">>> ";
 /// Display width of [`PROMPT_PREFIX`].
@@ -396,7 +396,7 @@ fn render_right(spans: Vec<Span<'static>>, area: Rect, buf: &mut Buffer) {
 }
 
 /// The quiet keybind + line-counter row directly under the composer and above
-/// the statline (§4/§5). Keybind glyphs are violet; the right end carries the
+/// the statline. Keybind glyphs are violet; the right end carries the
 /// live line counter and the queue status.
 fn render_composer_footer(
     model: &WorkspaceModel,
@@ -470,7 +470,7 @@ fn render_composer_footer(
 }
 
 /// The statline: labeled cells (dim micro-label over bright value) separated by
-/// hairlines, with the brand pinned left and the ethos chip pinned right (§5).
+/// hairlines, with the brand pinned left and the ethos chip pinned right.
 /// Two rows tall; the context/token meter is kept prominent.
 fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut Buffer) {
     if area.height == 0 {
@@ -539,7 +539,7 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
 
     // (label, value, priority) in SVG order. Higher priority survives a narrow
     // row longer; STAGE and CONTEXT are must-keep (`MUST_KEEP`) because the
-    // stage and the token meter are the load-bearing cells (§5).
+    // stage and the token meter are the load-bearing cells.
     const MUST_KEEP: u8 = 9;
     let cells: Vec<(&str, Vec<Span<'static>>, u8)> = vec![
         (
@@ -919,7 +919,7 @@ mod tests {
                     "deck @{w}×{h} missing ethos chip:\n{text}"
                 );
             }
-            // The killed rocket/garble leave no trace (§2).
+            // The killed rocket/garble leave no trace.
             assert!(
                 !text.contains("}=>"),
                 "rocket sprite still rendered:\n{text}"

@@ -1,5 +1,5 @@
 //! Workspace skills engine — filesystem-first reusable knowledge
-//! (`02-architecture.md` §6: `<workspace>/.stella/skills/`, "skill.md files
+//! (: `<workspace>/.stella/skills/`, "skill.md files
 //! (ADR-008 filesystem-first)").
 //!
 //! A **skill** is a reusable procedure, convention, or learned preference —
@@ -25,7 +25,7 @@
 //!      and domains).
 //!   3. **Rendering** ([`render_skills_section`]) — the volatile context
 //!      block the CLI injects **after** the byte-stable system prefix, so
-//!      prompt-cache hits on the prefix are preserved (`09-lessons-learned.md`
+//! prompt-cache hits on the prefix are preserved (
 //!      L-E8: recalled context is a live query at turn start that rides as a
 //!      volatile message after the stable system block, never a cached prompt
 //!      block).
@@ -37,7 +37,7 @@
 //!      — the typed shape the registry-search/install glue and a future TUI
 //!      speak, so both sides agree on one contract.
 //!
-//! # No I/O in this module (`02-architecture.md` §1.3)
+//! # No I/O in this module
 //!
 //! Discovering skill files means reading directories and file contents — real
 //! I/O, which `stella-core` never performs directly. [`SkillSource`] is the
@@ -48,7 +48,7 @@
 //! is plain synchronous logic over owned data, unit-tested below against a
 //! fake `SkillSource`, no real files required.
 //!
-//! Built-in/seed skills the CLI ships are, per `09-lessons-learned.md` L-L2,
+//! Built-in/seed skills the CLI ships are, L-L2,
 //! embedded as `include_str!` compile-time data on the CLI side — nothing here
 //! resolves anything relative to the binary's install path. This module
 //! operates purely on already-loaded content regardless of where it came from.
@@ -120,7 +120,7 @@ pub struct SkillFile {
     pub content: String,
 }
 
-/// The filesystem discovery port for skill files (`02-architecture.md`
+/// The filesystem discovery port for skill files (
 /// §1.3), mirroring [`crate::rules::RuleSource`]. A real implementation
 /// (owned by `stella-cli`/`stella-tools`) walks each directory in `roots`, in
 /// the given order, and returns every skill file's contents — discovering
@@ -521,7 +521,7 @@ fn truncate_to_tokens(text: &str, budget: u64) -> String {
 /// Render the selected skills into the markdown block the CLI injects as a
 /// **volatile context message after the byte-stable system prefix** — never
 /// baked into the cached system block, so prompt-cache hits on the prefix are
-/// preserved (`09-lessons-learned.md` L-E8). Each skill contributes its name,
+/// preserved ( L-E8). Each skill contributes its name,
 /// description, and body; bodies over [`SKILL_BODY_TOKEN_BUDGET`] are
 /// truncated with a marker, and once the running total exceeds
 /// [`SKILLS_SECTION_TOKEN_BUDGET`] the remaining (lower-ranked) skills are

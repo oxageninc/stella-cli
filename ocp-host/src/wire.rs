@@ -1,21 +1,21 @@
 //! The OCP wire envelope and its framing.
 //!
-//! `06-context-protocol.md` §1/§3.1 states OCP "rides MCP's transport and
+//! /§3.1 states OCP "rides MCP's transport and
 //! lifecycle conventions (JSON-RPC 2.0, stdio + streamable HTTP,
 //! initialize/capabilities handshake)". The spec leaves the concrete
 //! reference-host framing to the binding; this host frames every message as
 //! **newline-delimited JSON (NDJSON) — exactly one `serde_json` value per
 //! line** — because it is the simplest thing that is unambiguous over a pipe
 //! and trivially reimplementable in the TS/Python provider kits
-//! (`06-context-protocol.md` §3.6). The `type`-tagged variants below are the
+//!. The `type`-tagged variants below are the
 //! OCP method vocabulary the spec calls "the delta": `handshake` ↔
 //! `initialize`, `query` ↔ `context/query`, `frames` ↔ its response,
-//! `shutdown` ↔ lifecycle teardown (§3.2, §3.3). HTTP providers receive the
+//! `shutdown` ↔ lifecycle teardown. HTTP providers receive the
 //! same envelope as a JSON request body and reply with one as the response
 //! body (§3.2 "streamable HTTP").
 //!
 //! The envelope is **versioned**: the handshake exchange negotiates the
-//! protocol family up front (§3.2), and a mismatch is a named error, never a
+//! protocol family up front, and a mismatch is a named error, never a
 //! hang.
 
 use ocp_types::{Capabilities, ContextQuery, ContextQueryResult, ProviderInfo};
@@ -25,7 +25,7 @@ use crate::error::HostError;
 
 /// One OCP message. Every variant is a small, versioned, `type`-tagged JSON
 /// object; the host writes exactly one per line (NDJSON) over stdio and one
-/// per HTTP body (`06-context-protocol.md` §3.1-§3.3).
+/// per HTTP body (-§3.3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Envelope {
@@ -33,7 +33,7 @@ pub enum Envelope {
     /// speaks (§3.2 `initialize`).
     Handshake { protocol_version: String },
     /// Provider hello-back: its protocol version, identity + declared
-    /// data-flow direction, and negotiated capabilities (§3.2). The host
+    /// data-flow direction, and negotiated capabilities. The host
     /// checks the version and surfaces `provider.data_flow` at consent time.
     HandshakeAck {
         protocol_version: String,
@@ -44,7 +44,7 @@ pub enum Envelope {
     Query { query: ContextQuery },
     /// Provider → host budgeted, provenance-carrying frames (§3.3 response).
     Frames { result: ContextQueryResult },
-    /// Lifecycle teardown; the provider should exit cleanly (§3.2).
+    /// Lifecycle teardown; the provider should exit cleanly.
     Shutdown,
     /// Provider-reported failure — lets a provider report a bad request
     /// without dying (§3.5 "fail loud"). The host maps this to
@@ -83,7 +83,7 @@ pub fn decode_line(line: &str) -> Result<Envelope, HostError> {
 /// family** — the substring up to the first `.`. So `ocp/1.0-draft` and
 /// `ocp/1.0` interoperate (both `ocp/1`), while `ocp/2.0` does not. This is
 /// what lets the public v1.0 freeze drop the `-draft` suffix without a flag
-/// day (`06-context-protocol.md` §3).
+/// day.
 pub fn versions_compatible(a: &str, b: &str) -> bool {
     protocol_family(a) == protocol_family(b)
 }

@@ -1,4 +1,4 @@
-//! Lifecycle hooks engine (`03-plan.md` Phase 2 item 5; ported from
+//! Lifecycle hooks engine ( Phase 2 item 5; ported from
 //! `apps/cli/src/settings/hooks.ts`).
 //!
 //! Hooks are shell commands declared in workspace settings that fire on
@@ -18,7 +18,7 @@
 //! Matchers are globs over the tool name for `PreToolUse`/`PostToolUse`;
 //! `SessionStart` ignores the matcher and runs every action.
 //!
-//! # No I/O in this module (`02-architecture.md` §1.3)
+//! # No I/O in this module
 //!
 //! Actually spawning a hook command (process creation, stdin/stdout
 //! piping, timeout + `SIGKILL`, signal-based abort) is real I/O, which

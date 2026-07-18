@@ -1,4 +1,4 @@
-//! Z.ai CogVideoX video adapter (`08-multimodal.md` §2, §6). Video is async:
+//! Z.ai CogVideoX video adapter. Video is async:
 //! `POST /videos/generations` submits and returns a job id; `GET
 //! /async-result/{id}` polls until the job succeeds (with a downloadable
 //! video URL) or fails.
@@ -29,7 +29,7 @@ use crate::provider::{
 const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 /// Default CogVideoX slug used when the caller doesn't pin one.
 pub const DEFAULT_MODEL: &str = "cogvideox-3";
-/// Documented default rate — catalog data once wired (`08-multimodal.md` §2).
+/// Documented default rate — catalog data once wired.
 const DEFAULT_VIDEO_USD_PER_SECOND: f64 = 0.20;
 
 /// A CogVideoX video provider.

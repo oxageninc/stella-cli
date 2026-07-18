@@ -3,7 +3,7 @@
 //! request/response envelopes.
 //!
 //! Zero logic, zero I/O. This is the stability contract of the whole
-//! workspace (`docs/specs/stella-rust-cli/02-architecture.md` §1.4, §2) — any
+//! workspace — any
 //! type here that crosses a process/protocol boundary must round-trip through
 //! `serde_json` byte-for-byte (see the `roundtrip` tests in each module).
 
