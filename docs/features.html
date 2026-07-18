@@ -36,7 +36,7 @@ body{
 a{color:var(--gold);text-decoration:none}
 a:hover{color:var(--hl);text-decoration:underline;text-underline-offset:3px}
 :focus-visible{outline:2px solid var(--gold);outline-offset:3px;border-radius:2px}
-.wrap{max-width:1100px;margin:0 auto;padding:0 24px}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
 
 /* ---- deck tab nav ---- */
 .tabbar{
@@ -67,7 +67,7 @@ a:hover{color:var(--hl);text-decoration:underline;text-underline-offset:3px}
     linear-gradient(180deg,#151007,var(--night));
   border-bottom:1px solid var(--line-soft);
 }
-.hero .wrap{padding:88px 24px 64px;text-align:center}
+.hero .wrap{max-width:1100px;padding:88px 24px 64px;text-align:center}
 .prompt{
   font-family:var(--mono);font-size:13px;letter-spacing:.28em;
   color:var(--amb);text-transform:uppercase;font-weight:600;
@@ -116,8 +116,14 @@ h1 em{font-style:normal;color:var(--gold)}
     linear-gradient(90deg,#FFD97A 0%,#F5B33C 30%,#E08A20 52%,rgba(251,247,239,.09) 52.001%);
 }
 
-/* ---- sections ---- */
-section.feature{border-bottom:1px solid var(--line-soft);padding:72px 0}
+/* ---- feature sections ---- */
+section.feature{border-bottom:1px solid var(--line-soft);padding:84px 0}
+section.feature .wrap{
+  display:grid;
+  grid-template-columns:minmax(0,5fr) minmax(0,7fr);
+  gap:60px;align-items:center;
+}
+section.feature.flip .shot{order:-1}
 .chip{
   display:inline-block;font-family:var(--mono);font-size:11.5px;
   letter-spacing:.18em;color:var(--gold);font-weight:700;
@@ -125,29 +131,40 @@ section.feature{border-bottom:1px solid var(--line-soft);padding:72px 0}
 }
 h2{
   font-family:var(--mono);
-  font-size:clamp(24px,3.2vw,34px);
-  line-height:1.2;letter-spacing:-.015em;font-weight:700;
-  max-width:26ch;
+  font-size:clamp(22px,2.5vw,30px);
+  line-height:1.25;letter-spacing:-.015em;font-weight:700;
 }
-section.feature > .wrap > p{color:var(--muted);max-width:66ch;margin-top:16px}
-section.feature strong{color:var(--paper);font-weight:600}
+.copy p{color:var(--muted);margin-top:16px;font-size:16.5px}
+.copy strong{color:var(--paper);font-weight:600}
 .stats{
-  display:flex;flex-wrap:wrap;gap:10px 26px;
-  margin-top:22px;font-family:var(--mono);font-size:12.5px;color:var(--dim);
+  display:flex;flex-wrap:wrap;gap:8px 22px;
+  margin-top:20px;font-family:var(--mono);font-size:12px;color:var(--dim);
 }
 .stats span::before{content:"· ";color:var(--amb)}
-.shot{margin-top:36px}
-.shot figure{margin:0}
-.shot img{
-  display:block;width:100%;height:auto;
+
+/* ---- macOS terminal window ---- */
+.term{
   border:1px solid rgba(255,217,122,.16);border-radius:10px;
-  background:#000;
-  box-shadow:0 24px 80px rgba(0,0,0,.5), 0 0 64px rgba(245,179,60,.06);
+  background:#000;overflow:hidden;
+  box-shadow:0 24px 80px rgba(0,0,0,.55), 0 0 64px rgba(245,179,60,.06);
 }
-.shot figcaption{
-  font-family:var(--mono);font-size:12.5px;color:var(--dim);
-  margin-top:14px;text-align:center;
+.term-bar{
+  display:grid;grid-template-columns:56px 1fr 56px;align-items:center;
+  padding:10px 14px;background:#1A150E;
+  border-bottom:1px solid var(--line-soft);
 }
+.term-dots{display:flex;gap:8px}
+.term-dots i{width:12px;height:12px;border-radius:50%}
+.term-dots i:nth-child(1){background:#FF5F57}
+.term-dots i:nth-child(2){background:#FEBC2E}
+.term-dots i:nth-child(3){background:#28C840}
+.term-title{
+  text-align:center;font-family:var(--mono);font-size:11.5px;
+  color:var(--dim);letter-spacing:.08em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.term a.zoom{display:block}
+.term img{display:block;width:100%;height:auto}
 @media (prefers-reduced-motion: no-preference){
   @supports ((animation-timeline: view()) and (animation-range: entry)){
     .shot{
@@ -160,6 +177,7 @@ section.feature strong{color:var(--paper);font-weight:600}
 }
 
 /* ---- status bar section ---- */
+section.feature.chrome .wrap{display:block;max-width:1100px}
 .statusbar{
   display:flex;align-items:stretch;
   margin-top:36px;border:1px solid var(--line);border-radius:6px;
@@ -184,6 +202,11 @@ footer .fine{
   margin-top:26px;font-family:var(--mono);font-size:12.5px;color:var(--dim);
 }
 footer .fine a{color:var(--muted)}
+
+@media (max-width:940px){
+  section.feature .wrap{grid-template-columns:1fr;gap:36px}
+  section.feature.flip .shot{order:0}
+}
 @media (max-width:640px){
   .hero .wrap{padding:64px 20px 48px}
   section.feature{padding:56px 0}
@@ -229,84 +252,104 @@ footer .fine a{color:var(--muted)}
 
 <section class="feature" id="agents">
   <div class="wrap">
-    <span class="chip">▸ AGENTS</span>
-    <h2>Every agent, every toolbelt, in plain sight.</h2>
-    <p>Subagents usually run on faith: you find out what tools they had after something breaks. The Agents tab lists all <strong>15 installed agents</strong> with their scope, their pinned version, and the <strong>exact toolbelt</strong> each one is allowed to use. A reviewer gets Read, Grep, Glob, and Bash. A break-fix agent gets Edit and Write too. Editing an agent creates a new pinned version, so a prompt never changes under you.</p>
-    <div class="stats"><span>15 agents on disk</span><span>pinned versions</span><span>per-agent toolbelts</span></div>
+    <div class="copy">
+      <span class="chip">▸ AGENTS</span>
+      <h2>Every agent, every toolbelt, in plain sight.</h2>
+      <p>Subagents usually run on faith: you find out what tools they had after something breaks. The Agents tab lists all <strong>15 installed agents</strong> with their scope, their pinned version, and the <strong>exact toolbelt</strong> each one is allowed to use. A reviewer gets Read, Grep, Glob, and Bash. A break-fix agent gets Edit and Write too. Editing an agent creates a new pinned version, so a prompt never changes under you.</p>
+      <div class="stats"><span>15 agents on disk</span><span>pinned versions</span><span>per-agent toolbelts</span></div>
+    </div>
     <div class="shot">
-      <figure>
-        <img src="assets/deck/deck-agents.png" alt="The Agents tab of the Stella Command Deck listing 15 installed agents, each with scope, version, description, and its allowed toolbelt." width="2000" height="1299" fetchpriority="high" decoding="async">
-        <figcaption>The Agents tab: an architect, a break-fix agent, a code reviewer, and 12 more, each with its own toolbelt.</figcaption>
-      </figure>
+      <div class="term">
+        <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">stella · deck · agents</span><span></span></div>
+        <a class="zoom" href="assets/deck/deck-agents.png" title="Open full-size screenshot">
+          <img src="assets/deck/deck-agents.png" alt="The Agents tab of the Stella Command Deck listing 15 installed agents, each with scope, version, description, and its allowed toolbelt." width="2000" height="1103" fetchpriority="high" decoding="async">
+        </a>
+      </div>
     </div>
   </div>
 </section>
 
-<section class="feature" id="traces">
+<section class="feature flip" id="traces">
   <div class="wrap">
-    <span class="chip">▸ TRACES</span>
-    <h2>Every model call priced. Every tool call timed.</h2>
-    <p>An AI bill should not be a monthly surprise. Traces streams the run as it happens: 96 events in this session, each model call with its own cost, down to <strong>$0.0065</strong>, and each tool result with its wall time, down to the millisecond. The running total and the cache hit rate, <strong>81% here</strong>, sit at the bottom of the screen the whole time. It all lands in a local SQLite file you can open with any client.</p>
-    <div class="stats"><span>per-call spend</span><span>millisecond tool timings</span><span>local-only telemetry</span></div>
+    <div class="copy">
+      <span class="chip">▸ TRACES</span>
+      <h2>Every model call priced. Every tool call timed.</h2>
+      <p>An AI bill should not be a monthly surprise. Traces streams the run as it happens: 96 events in this session, each model call with its own cost, down to <strong>$0.0065</strong>, and each tool result with its wall time, down to the millisecond. The running total and the cache hit rate, <strong>81% here</strong>, sit at the bottom of the screen the whole time. It all lands in a local SQLite file you can open with any client.</p>
+      <div class="stats"><span>per-call spend</span><span>millisecond tool timings</span><span>local-only telemetry</span></div>
+    </div>
     <div class="shot">
-      <figure>
-        <img src="assets/deck/deck-traces.png" alt="The Traces tab streaming 96 live events: model calls with per-call dollar cost, text events, and tool calls with millisecond durations." width="2000" height="1293" loading="lazy" decoding="async">
-        <figcaption>The Traces tab following a live run: spend, text, and tool events interleaved in order.</figcaption>
-      </figure>
+      <div class="term">
+        <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">stella · deck · traces</span><span></span></div>
+        <a class="zoom" href="assets/deck/deck-traces.png" title="Open full-size screenshot">
+          <img src="assets/deck/deck-traces.png" alt="The Traces tab streaming 96 live events: model calls with per-call dollar cost, text events, and tool calls with millisecond durations." width="2000" height="1124" loading="lazy" decoding="async">
+        </a>
+      </div>
     </div>
   </div>
 </section>
 
 <section class="feature" id="graph">
   <div class="wrap">
-    <span class="chip">▸ GRAPH</span>
-    <h2>It queries a code graph instead of grepping.</h2>
-    <p>Grep tells you where a string appears. The graph tells you what a file defines and what depends on it. Stella parses your repo with tree-sitter into an <strong>offline code graph</strong>: no embeddings, no API key, and no network. This one file resolves to <strong>176 nodes and 175 relations</strong>, with an ASCII map of the neighborhood rendered right in the terminal.</p>
-    <div class="stats"><span>tree-sitter, fully offline</span><span>Rust, TS, JS, Python, SQL</span><span>0 network calls</span></div>
+    <div class="copy">
+      <span class="chip">▸ GRAPH</span>
+      <h2>It queries a code graph instead of grepping.</h2>
+      <p>Grep tells you where a string appears. The graph tells you what a file defines and what depends on it. Stella parses your repo with tree-sitter into an <strong>offline code graph</strong>: no embeddings, no API key, and no network. This one file resolves to <strong>176 nodes and 175 relations</strong>, with an ASCII map of the neighborhood rendered right in the terminal.</p>
+      <div class="stats"><span>tree-sitter, fully offline</span><span>Rust, TS, JS, Python, SQL</span><span>0 network calls</span></div>
+    </div>
     <div class="shot">
-      <figure>
-        <img src="assets/deck/deck-graph.png" alt="The Graph tab showing 176 nodes for stella-tui/src/deck_ui.rs, its 175 defines relations, and an ASCII neighborhood map." width="2000" height="1299" loading="lazy" decoding="async">
-        <figcaption>The Graph tab on stella-tui/src/deck_ui.rs: nodes, relations, and the neighborhood render.</figcaption>
-      </figure>
+      <div class="term">
+        <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">stella · deck · graph</span><span></span></div>
+        <a class="zoom" href="assets/deck/deck-graph.png" title="Open full-size screenshot">
+          <img src="assets/deck/deck-graph.png" alt="The Graph tab showing 176 nodes for stella-tui/src/deck_ui.rs, its 175 defines relations, and an ASCII neighborhood map." width="2000" height="1125" loading="lazy" decoding="async">
+        </a>
+      </div>
     </div>
   </div>
 </section>
 
-<section class="feature" id="skills">
+<section class="feature flip" id="skills">
   <div class="wrap">
-    <span class="chip">▸ SKILLS</span>
-    <h2>Skills install like packages, not pasted prompts.</h2>
-    <p>A folder of prompts does not survive a second machine. Stella treats skills as scoped, versioned packages: <strong>17 installed here</strong> across user and project scope, toggled with a keypress. Search the registry without leaving the deck, preview a skill before it lands, and install it in place. The top result carries <strong>482.6K installs</strong>, so you can see what the rest of the ecosystem actually uses.</p>
-    <div class="stats"><span>user + project scope</span><span>registry search</span><span>preview before install</span></div>
+    <div class="copy">
+      <span class="chip">▸ SKILLS</span>
+      <h2>Skills install like packages, not pasted prompts.</h2>
+      <p>A folder of prompts does not survive a second machine. Stella treats skills as scoped, versioned packages: <strong>17 installed here</strong> across user and project scope, toggled with a keypress. Search the registry without leaving the deck, preview a skill before it lands, and install it in place. The top result carries <strong>482.6K installs</strong>, so you can see what the rest of the ecosystem actually uses.</p>
+      <div class="stats"><span>user + project scope</span><span>registry search</span><span>preview before install</span></div>
+    </div>
     <div class="shot">
-      <figure>
-        <img src="assets/deck/deck-skills.png" alt="The Skills tab with 17 installed skills on the left and a live registry search on the right showing install counts up to 482.6K." width="2000" height="1299" loading="lazy" decoding="async">
-        <figcaption>The Skills tab: the installed list on the left, live registry search with install counts on the right.</figcaption>
-      </figure>
+      <div class="term">
+        <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">stella · deck · skills</span><span></span></div>
+        <a class="zoom" href="assets/deck/deck-skills.png" title="Open full-size screenshot">
+          <img src="assets/deck/deck-skills.png" alt="The Skills tab with 17 installed skills on the left and a live registry search on the right showing install counts up to 482.6K." width="2000" height="1103" loading="lazy" decoding="async">
+        </a>
+      </div>
     </div>
   </div>
 </section>
 
 <section class="feature" id="mcp">
   <div class="wrap">
-    <span class="chip">▸ MCP</span>
-    <h2>MCP servers, found and connected from the deck.</h2>
-    <p>Adding an MCP server usually means hand-editing JSON and restarting. The MCP tab searches the registry live: <strong>remote, npm, and pypi</strong> servers alike, each with a plain description of what it does. One search for Stripe returns ten servers, from the official remote to billing, analytics, and checkout bridges. Pick one, press enter, and it joins the tool registry in place.</p>
-    <div class="stats"><span>live registry search</span><span>remote, npm, and pypi</span><span>install in place</span></div>
+    <div class="copy">
+      <span class="chip">▸ MCP</span>
+      <h2>MCP servers, found and connected from the deck.</h2>
+      <p>Adding an MCP server usually means hand-editing JSON and restarting. The MCP tab searches the registry live: <strong>remote, npm, and pypi</strong> servers alike, each with a plain description of what it does. One search for Stripe returns ten servers, from the official remote to billing, analytics, and checkout bridges. Pick one, press enter, and it joins the tool registry in place.</p>
+      <div class="stats"><span>live registry search</span><span>remote, npm, and pypi</span><span>install in place</span></div>
+    </div>
     <div class="shot">
-      <figure>
-        <img src="assets/deck/deck-mcp.png" alt="The MCP tab searching the registry for Stripe: ten servers listed with their source, transport, and a one-line description each." width="2000" height="1299" loading="lazy" decoding="async">
-        <figcaption>The MCP tab searching for Stripe servers: ten results, each with its source and a plain description.</figcaption>
-      </figure>
+      <div class="term">
+        <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">stella · deck · mcp</span><span></span></div>
+        <a class="zoom" href="assets/deck/deck-mcp.png" title="Open full-size screenshot">
+          <img src="assets/deck/deck-mcp.png" alt="The MCP tab searching the registry for Stripe: ten servers listed with their source, transport, and a one-line description each." width="2000" height="656" loading="lazy" decoding="async">
+        </a>
+      </div>
     </div>
   </div>
 </section>
 
-<section class="feature" id="deck">
+<section class="feature chrome" id="deck">
   <div class="wrap">
     <span class="chip">▸ ALWAYS ON</span>
     <h2>The meter never leaves the screen.</h2>
-    <p>Every tab shares one bottom line: agent, stage, model, CPU, context, spend, cache hit rate, and active agents. Above it, the run moves through <strong>plan, execute, and verify</strong>, and verify is a stage, not a promise: a change must fail on the old code and pass on the new before Stella calls it done. The prompt queue never blocks, and <strong>!</strong> drops you into a shell. Stella calls this deterministic-first, and prints it in the corner to hold itself to it.</p>
+    <p style="color:var(--muted);max-width:66ch;margin-top:16px">Every tab shares one bottom line: agent, stage, model, CPU, context, spend, cache hit rate, and active agents. Above it, the run moves through <strong style="color:var(--paper)">plan, execute, and verify</strong>, and verify is a stage, not a promise: a change must fail on the old code and pass on the new before Stella calls it done. The prompt queue never blocks, and <strong style="color:var(--paper)">!</strong> drops you into a shell. Stella calls this deterministic-first, and prints it in the corner to hold itself to it.</p>
     <div class="stats"><span>plan · execute · verify</span><span>queue never blocks</span><span>hard budget caps</span></div>
     <div class="statusbar" role="img" aria-label="The Stella status bar: agent lead, stage execute, model glm-5.2, spend $0.19, cache 85 percent, 1 active agent, deterministic-first.">
       <div class="cell"><span class="k">&nbsp;</span><span class="v gold">✦ stella</span></div>
