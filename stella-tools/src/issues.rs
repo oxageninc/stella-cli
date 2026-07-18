@@ -615,8 +615,21 @@ impl Tool for StartWorkOnIssue {
                     "git checkout -b {b} 2>/dev/null || git checkout {b}",
                     b = quote(&branch)
                 );
-                if let Err(e) = exec::run(&checkout, root, 30).await {
-                    return ToolOutput::Error { message: e };
+                // `exec::run` returns Ok((exit_code, _)) on any completion, so
+                // checking only its Err (spawn/timeout) let a FAILED checkout
+                // (non-zero exit — dirty tree, protected branch) slip through
+                // and still move the issue to in-progress. Gate on the code.
+                match exec::run(&checkout, root, 30).await {
+                    Ok((0, _)) => {}
+                    Ok((code, output)) => {
+                        return ToolOutput::Error {
+                            message: format!(
+                                "git checkout of `{branch}` failed (exit {code}) — \
+                                 issue left unchanged: {output}"
+                            ),
+                        };
+                    }
+                    Err(e) => return ToolOutput::Error { message: e },
                 }
                 let state = match linear_state_id(api_key, &team, "started").await {
                     Ok(state) => state,

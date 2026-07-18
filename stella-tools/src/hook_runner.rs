@@ -39,13 +39,21 @@ impl HookRunner for ShellHookRunner {
                 message: e.to_string(),
             })?;
 
-        // Feed the payload and close stdin so a hook reading to EOF (`cat`,
-        // `jq`) terminates. A hook that never reads stdin is fine too — the
-        // write may fail with EPIPE once the child exits, which is not an
-        // error of ours.
+        // Feed the payload on a DETACHED task and let the timeout-bounded
+        // `wait_with_output` below drain stdout concurrently. Writing inline
+        // before the wait was a hang: a hook that never reads stdin blocks the
+        // write once the payload exceeds the OS pipe buffer (~64 KiB), so the
+        // session hung forever, before the timeout window even opened. Writing
+        // concurrently — and dropping stdin to signal EOF for hooks that DO
+        // read (`cat`, `jq`) — means a non-reading hook is instead bounded by
+        // the timeout; a timed-out kill drops the pipe and the write EPIPEs
+        // and the task ends (no leak). `kill_on_drop` reaps the child.
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(payload_json.as_bytes()).await;
-            drop(stdin);
+            let payload = payload_json.to_string(); // owned: the task outlives the borrow
+            tokio::spawn(async move {
+                let _ = stdin.write_all(payload.as_bytes()).await;
+                // `stdin` drops here → EOF for a hook reading to end-of-input.
+            });
         }
 
         let timeout_ms = action.effective_timeout_ms();
@@ -156,5 +164,27 @@ mod tests {
             .expect("hook runs");
         assert_eq!(out.exit_code, 0);
         assert!(out.stdout.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn a_non_reading_hook_with_a_large_payload_times_out_not_hangs() {
+        // `sleep 30` never reads stdin. With a payload larger than the OS
+        // pipe buffer (~64 KiB), the old inline `write_all` blocked forever
+        // BEFORE the timeout window opened — the session hung. The write is
+        // now detached, so the timeout still bounds the run.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut hung = action("sleep 30");
+        hung.timeout_ms = Some(150);
+        let big_payload = format!("{{\"blob\":\"{}\"}}", "x".repeat(256 * 1024));
+        let started = std::time::Instant::now();
+        let err = ShellHookRunner
+            .run(&hung, &big_payload, &dir.path().display().to_string())
+            .await
+            .expect_err("must time out, not hang on the stdin write");
+        assert!(matches!(err, HookExecError::TimedOut { .. }));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "timeout must still be enforced despite the unread large payload"
+        );
     }
 }

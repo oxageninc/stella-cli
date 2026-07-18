@@ -80,11 +80,21 @@ impl Tool for CiStatus {
             };
         }
 
-        // Optionally block on the newest in-progress run, then re-list.
+        // The `gh run list` scope shared by the wait-watch and the
+        // failure-log attach below, so both report on the SAME target the
+        // top-level query resolved — an unscoped sub-query used to watch or
+        // attach logs from an UNRELATED branch's most-recent run.
+        let scope = gh_run_scope(input);
+
+        // Optionally block on the newest in-progress run for THIS target,
+        // then re-list.
         if wait {
             let _ = exec::run(
-                "id=$(gh run list --limit 1 --json databaseId --jq '.[0].databaseId'); \
-                 [ -n \"$id\" ] && gh run watch \"$id\" --exit-status >/dev/null 2>&1; true",
+                &format!(
+                    "id=$(gh run list {scope} --limit 1 --json databaseId --jq '.[0].databaseId'); \
+                     [ -n \"$id\" ] && [ \"$id\" != \"null\" ] && \
+                     gh run watch \"$id\" --exit-status >/dev/null 2>&1; true"
+                ),
                 root,
                 timeout_secs,
             )
@@ -94,13 +104,15 @@ impl Tool for CiStatus {
             }
         }
 
-        // Attach failure logs for the most recent failed run, if any.
+        // Attach failure logs for THIS target's most recent failed run, if any.
         let (_, failed_logs) = exec::run(
-            "id=$(gh run list --limit 15 --json databaseId,conclusion \
-             --jq '[.[] | select(.conclusion==\"failure\")][0].databaseId'); \
-             if [ -n \"$id\" ] && [ \"$id\" != \"null\" ]; then \
-               echo \"--- failure logs (run $id) ---\"; gh run view \"$id\" --log-failed 2>&1 | tail -120; \
-             fi",
+            &format!(
+                "id=$(gh run list {scope} --limit 15 --json databaseId,conclusion \
+                 --jq '[.[] | select(.conclusion==\"failure\")][0].databaseId'); \
+                 if [ -n \"$id\" ] && [ \"$id\" != \"null\" ]; then \
+                   echo \"--- failure logs (run $id) ---\"; gh run view \"$id\" --log-failed 2>&1 | tail -120; \
+                 fi"
+            ),
             root,
             timeout_secs,
         )
@@ -122,6 +134,25 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// The `gh run list` filter flag that scopes a sub-query to the same target
+/// (`--branch` / `--commit`, or a PR's resolved head branch) the top-level
+/// `ci_status` query used — so the wait-watch and failure-log sub-queries can
+/// never report on an unrelated branch's runs.
+fn gh_run_scope(input: &Value) -> String {
+    if let Some(pr) = input.get("pr").and_then(|v| v.as_u64()) {
+        // Resolve the PR's head branch at run time (gh has no run-list-by-PR).
+        format!("--branch \"$(gh pr view {pr} --json headRefName --jq .headRefName 2>/dev/null)\"")
+    } else if let Some(commit) = input.get("commit").and_then(|v| v.as_str()) {
+        format!("--commit {}", shell_quote(commit))
+    } else {
+        let branch = input
+            .get("branch")
+            .and_then(|v| v.as_str())
+            .unwrap_or("main");
+        format!("--branch {}", shell_quote(branch))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +160,27 @@ mod tests {
     #[test]
     fn schema_is_read_only_for_judge_use() {
         assert!(CiStatus.schema().read_only);
+    }
+
+    #[test]
+    fn sub_queries_are_scoped_to_the_requested_target() {
+        // A branch request scopes by that branch…
+        assert_eq!(
+            gh_run_scope(&serde_json::json!({ "branch": "feat/x" })),
+            "--branch 'feat/x'"
+        );
+        // …a commit request by that commit…
+        assert_eq!(
+            gh_run_scope(&serde_json::json!({ "commit": "abc123" })),
+            "--commit 'abc123'"
+        );
+        // …a PR by its resolved head branch (never an unscoped list)…
+        assert!(
+            gh_run_scope(&serde_json::json!({ "pr": 42 })).contains("gh pr view 42"),
+            "PR scope must resolve the head branch"
+        );
+        // …and an empty request defaults to main, still scoped (not global).
+        assert_eq!(gh_run_scope(&serde_json::json!({})), "--branch 'main'");
     }
 
     #[test]

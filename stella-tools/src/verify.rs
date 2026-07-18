@@ -142,18 +142,38 @@ impl Tool for VerifyDone {
                 };
             }
         };
+        // The shadow worktree mirrors the git TOPLEVEL, not the workspace root
+        // — which may be a subdirectory of the repo. So test-file destinations
+        // must be relative to the toplevel, and the shadow test must run in the
+        // subdirectory that corresponds to the workspace root. Assuming
+        // root == toplevel produced a false verdict (a false WITNESS CONFIRMED
+        // or false VACUOUS) whenever verify_done ran from a repo subdirectory.
+        let canon_toplevel = match run("git rev-parse --show-toplevel", root, 30).await {
+            Ok((0, out)) => {
+                let p = std::path::PathBuf::from(out.trim());
+                p.canonicalize().unwrap_or(p)
+            }
+            // Not a git repo (or older git): the HEAD check below reports it.
+            _ => canon_root.clone(),
+        };
+        let root_rel = canon_root
+            .strip_prefix(&canon_toplevel)
+            .unwrap_or(std::path::Path::new(""))
+            .to_path_buf();
         // Every test file must resolve inside the workspace and exist. Each
-        // entry is `(display_name, canonical_src, root_relative_dst)`.
+        // entry is `(display_name, canonical_src, toplevel_relative_dst)` — the
+        // destination is relative to the git TOPLEVEL so `shadow.join(dst)`
+        // lands at the file's real position in the repo tree.
         let mut resolved: Vec<(String, std::path::PathBuf, std::path::PathBuf)> = Vec::new();
         for file in &test_files {
             match crate::resolve_within_root(root, file) {
                 Some(path) if path.is_file() => {
-                    let relpath = match path.strip_prefix(&canon_root) {
+                    let relpath = match path.strip_prefix(&canon_toplevel) {
                         Ok(r) => r.to_path_buf(),
                         Err(_) => {
                             return ToolOutput::Error {
                                 message: format!(
-                                    "test file `{file}` resolved outside the workspace root"
+                                    "test file `{file}` resolved outside the git repository"
                                 ),
                             };
                         }
@@ -253,7 +273,11 @@ impl Tool for VerifyDone {
             }
         }
 
-        let shadow_run = run(test_cmd, &shadow, timeout_secs).await;
+        // Run in the shadow subdirectory matching the workspace root, so a
+        // relative `test_cmd` (e.g. `cargo test`) resolves the same package it
+        // would in the real working tree — not the repo toplevel.
+        let shadow_cwd = shadow.join(&root_rel);
+        let shadow_run = run(test_cmd, &shadow_cwd, timeout_secs).await;
         cleanup_shadow(root, &shadow).await;
         let (old_exit, old_output) = match shadow_run {
             Ok(pair) => pair,
