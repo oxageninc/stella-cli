@@ -67,18 +67,43 @@ pub fn resolve_within_root(root: &std::path::Path, path: &str) -> Option<std::pa
         };
     }
 
-    // File doesn't exist yet (write/edit).  Walk up to the deepest existing
-    // ancestor, canonicalise it, then re-append the non-existent tail.
-    // This resolves any `..` components in the existing portion of the path.
+    // The path doesn't fully resolve (write/edit creating a new file, or a
+    // component is missing). Walk up to the deepest *existing* component —
+    // detected with `symlink_metadata` (lstat), NOT `exists()`. `exists()`
+    // follows symlinks and so returns `false` for a DANGLING symlink, which
+    // would let this loop treat the link's own name as a brand-new file
+    // inside root and hand it back — the OS then follows the link on write
+    // and escapes the workspace. lstat stops at the link itself so we can
+    // resolve or reject it.
     let mut existing = joined.clone();
     let mut tail: Vec<std::path::PathBuf> = Vec::new();
-    while !existing.exists() {
-        let parent = existing.parent()?;
-        let name = existing.file_name()?;
-        tail.push(std::path::PathBuf::from(name));
-        existing = parent.to_path_buf();
-        if existing == canon_root || existing == std::path::Path::new("/") {
-            break;
+    loop {
+        match existing.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                // A symlink is the deepest existing component. Resolve its
+                // target: if it dangles or points outside root, reject; if
+                // it stays inside, continue resolving from the target so any
+                // remaining tail is appended to the real in-root location.
+                let target = existing.canonicalize().ok()?;
+                if !target.starts_with(&canon_root) {
+                    return None;
+                }
+                existing = target;
+                break;
+            }
+            // Ordinary existing dir/file — deepest real ancestor found.
+            Ok(_) => break,
+            // This component doesn't exist yet: peel it into the tail and
+            // keep walking up.
+            Err(_) => {
+                let parent = existing.parent()?;
+                let name = existing.file_name()?;
+                tail.push(std::path::PathBuf::from(name));
+                existing = parent.to_path_buf();
+                if existing == canon_root || existing == std::path::Path::new("/") {
+                    break;
+                }
+            }
         }
     }
 
@@ -128,5 +153,72 @@ mod tests {
         assert!(safe.is_some());
 
         std::fs::remove_dir_all(&subdir).ok();
+    }
+
+    /// A DANGLING symlink inside the root must not be a valid write target:
+    /// the OS follows it on write and escapes the workspace. `exists()`
+    /// returns false for a dangling link, so the old walk handed back
+    /// `root/link` — this is the witness that it no longer does.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_within_root_rejects_write_through_a_dangling_symlink() {
+        let dir = std::env::temp_dir();
+        let root = dir.join(format!("stella_resolve_dangling_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // `link` -> a target that does not exist (yet). Writing "link"
+        // would create that outside-the-root target via symlink follow.
+        let outside = dir.join(format!("stella_resolve_outside_{}", std::process::id()));
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        assert_eq!(
+            resolve_within_root(&root, "link"),
+            None,
+            "writing through a dangling symlink must be rejected"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// A symlink pointing at an existing directory OUTSIDE the root must not
+    /// launder a nested path back inside the confinement check.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_within_root_rejects_write_through_a_symlink_to_outside_dir() {
+        let dir = std::env::temp_dir();
+        let root = dir.join(format!(
+            "stella_resolve_outlink_root_{}",
+            std::process::id()
+        ));
+        let outside = dir.join(format!("stella_resolve_outlink_out_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("out")).unwrap();
+
+        assert_eq!(
+            resolve_within_root(&root, "out/evil.txt"),
+            None,
+            "a nested path through an outward symlink must be rejected"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// An in-root symlink is fine: writes through it stay confined.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_within_root_allows_write_through_an_in_root_symlink() {
+        let dir = std::env::temp_dir();
+        let root = dir.join(format!("stella_resolve_inlink_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+
+        let resolved =
+            resolve_within_root(&root, "alias/new.txt").expect("in-root symlink write allowed");
+        assert!(resolved.starts_with(root.canonicalize().unwrap()));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
