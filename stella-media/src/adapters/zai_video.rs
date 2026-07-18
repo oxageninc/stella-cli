@@ -60,6 +60,11 @@ impl ZaiVideoProvider {
 struct VideoGenRequest<'a> {
     model: &'a str,
     prompt: &'a str,
+    /// Requested clip length in seconds. Load-bearing: the cost gate prices
+    /// the job by this duration, so it must actually reach the provider —
+    /// otherwise the approved estimate is for a duration the wire never
+    /// carried, and the provider bills its own default length.
+    duration: u32,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +117,7 @@ impl MediaProvider for ZaiVideoProvider {
         let body = VideoGenRequest {
             model: &self.model,
             prompt: &req.prompt,
+            duration: req.duration_secs,
         };
         let response = self
             .client
@@ -300,6 +306,35 @@ mod tests {
         assert_eq!(job.kind, MediaKind::Video);
         assert!(job.estimated_cost_usd > 0.0);
         assert_eq!(job.artifact_id, artifact_id_for("job-42"));
+    }
+
+    /// The cost gate prices the job by `duration_secs`, so that duration must
+    /// actually reach the provider — otherwise the approved estimate is for a
+    /// length the wire request never carried.
+    #[tokio::test]
+    async fn the_requested_duration_reaches_the_provider() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/videos/generations"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "id": "job-7", "task_status": "PROCESSING" }),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        provider(&server.uri())
+            .generate_video(VideoRequest::new("a 4s ember loop", 4))
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            body.contains("\"duration\":4"),
+            "the wire request must carry the requested duration, got: {body}"
+        );
     }
 
     #[tokio::test]

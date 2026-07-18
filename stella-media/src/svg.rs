@@ -81,6 +81,51 @@ pub enum SvgError {
     /// The repair loop ran out of attempts without producing valid SVG.
     #[error("SVG repair exhausted after {attempts} attempt(s); last error: {last}")]
     RepairExhausted { attempts: u32, last: String },
+    /// The element tree is nested deeper than [`MAX_NESTING_DEPTH`]. Rejected
+    /// before sanitization because the recursive serializer would otherwise
+    /// overflow the stack and abort the process on hostile model output.
+    #[error("SVG nested too deeply (> {MAX_NESTING_DEPTH} levels)")]
+    TooDeeplyNested,
+}
+
+/// Maximum element nesting depth accepted. Real SVG art is a few dozen levels
+/// at most; anything past this is either broken or an attempt to overflow the
+/// recursive serializer. Kept well below the stack budget of a worker thread.
+pub const MAX_NESTING_DEPTH: usize = 256;
+
+/// A cheap, allocation-free upper bound on element nesting read straight from
+/// the raw text — used to reject a hostile document BEFORE it is parsed.
+/// Both the parser and the recursive serializer descend per nesting level, so
+/// a deep-enough tree overflows the stack; this textual scan runs first so
+/// neither is ever reached with an over-deep document.
+///
+/// It tracks depth on element open/close transitions: `<tag>` increments,
+/// `</tag>` and a self-closing `/>` decrement, and comment/CDATA/PI/decl
+/// openers (`<!`, `<?`) don't count. In well-formed XML a raw `<` only ever
+/// starts markup (`<` in text/attribute values must be escaped), so this is a
+/// sound bound; malformed input is rejected at parse anyway.
+fn raw_element_depth_exceeds(text: &str, max: usize) -> bool {
+    let b = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'<' => match b.get(i + 1) {
+                Some(b'/') => depth = depth.saturating_sub(1),
+                Some(b'!') | Some(b'?') => {}
+                _ => {
+                    depth += 1;
+                    if depth > max {
+                        return true;
+                    }
+                }
+            },
+            b'/' if b.get(i + 1) == Some(&b'>') => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// The result of processing: the sanitized, optimized SVG text and a
@@ -109,6 +154,12 @@ impl SvgPipeline {
     /// deterministic; the core of L-V2. Never emits an artifact that did not
     /// parse.
     pub fn process(svg_text: &str) -> Result<ProcessedSvg, SvgError> {
+        // Reject a pathologically deep document BEFORE parsing: both roxmltree's
+        // parser and the recursive serializer descend per nesting level, so an
+        // over-deep tree would overflow the stack and abort the process.
+        if raw_element_depth_exceeds(svg_text, MAX_NESTING_DEPTH) {
+            return Err(SvgError::TooDeeplyNested);
+        }
         let doc = Document::parse(svg_text).map_err(|e| {
             let pos = e.pos();
             SvgError::Parse {
@@ -581,5 +632,28 @@ mod tests {
         // max_attempts = 0 must still make exactly one attempt.
         let err = SvgPipeline::generate(&generator, "x", 0).await.unwrap_err();
         assert!(matches!(err, SvgError::RepairExhausted { attempts: 1, .. }));
+    }
+
+    #[test]
+    fn a_pathologically_deep_svg_is_rejected_not_a_stack_overflow() {
+        // roxmltree parses into a flat arena (no overflow parsing), but the
+        // recursive serializer would blow the stack — so `process` must reject
+        // an over-deep tree with a typed error instead of aborting the process.
+        let depth = MAX_NESTING_DEPTH + 500;
+        let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\">");
+        svg.push_str(&"<g>".repeat(depth));
+        svg.push_str(&"</g>".repeat(depth));
+        svg.push_str("</svg>");
+
+        let err = SvgPipeline::process(&svg).expect_err("deep tree must be rejected");
+        assert!(
+            matches!(err, SvgError::TooDeeplyNested),
+            "expected TooDeeplyNested, got {err:?}"
+        );
+
+        // A shallow tree still processes normally.
+        let ok =
+            SvgPipeline::process("<svg xmlns=\"http://www.w3.org/2000/svg\"><g><rect/></g></svg>");
+        assert!(ok.is_ok(), "a normal SVG must still process: {ok:?}");
     }
 }
