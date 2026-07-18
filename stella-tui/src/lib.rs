@@ -27,6 +27,8 @@
 //! (L-T6), the panel panic boundary (L-T7, [`render`]), and the debug channel
 //! (L-T8, [`DebugLog`]).
 
+pub mod attach;
+pub mod clipboard;
 pub mod composer;
 pub mod input;
 pub mod model;
@@ -57,8 +59,11 @@ pub mod splash;
 pub mod theme;
 pub mod views;
 
+pub use attach::probe_path_attachment;
+pub use clipboard::{ClipboardPaste, default_attachments_dir};
 pub use composer::{
     Composer, ComposerEntry, DEFAULT_PASTE_LINE_THRESHOLD, SlashCommand, SlashKind, SlashMenu,
+    Submission,
 };
 pub use input::{ScopeDecision, UserInput};
 pub use model::{FileState, Hud, SessionModel, TranscriptEntry};

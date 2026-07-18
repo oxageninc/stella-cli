@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::attachment::Attachment;
 use crate::tool::{ToolCall, ToolResult};
 
 /// Who authored one message in the conversation. Tool results are
@@ -44,6 +45,13 @@ pub struct CompletionMessage {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_results: Vec<ToolResult>,
+    /// Multimodal inputs (images, documents, audio, video) accompanying a
+    /// user message. `serde(default)` + skip-when-empty so envelopes
+    /// serialized before this field existed still parse and text-only
+    /// messages serialize byte-for-byte as they always have (the prompt-cache
+    /// stability contract).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 impl CompletionMessage {
@@ -53,6 +61,7 @@ impl CompletionMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -62,6 +71,15 @@ impl CompletionMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// A user message carrying multimodal attachments alongside its text.
+    pub fn user_with_attachments(content: impl Into<String>, attachments: Vec<Attachment>) -> Self {
+        Self {
+            attachments,
+            ..Self::user(content)
         }
     }
 
@@ -73,6 +91,7 @@ impl CompletionMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 }

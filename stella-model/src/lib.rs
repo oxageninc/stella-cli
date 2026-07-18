@@ -4,6 +4,7 @@
 //! (generateContent, enterprise auth), and Amazon Bedrock (Converse,
 //! SigV4-signed).
 pub mod anthropic;
+pub(crate) mod attachment;
 pub mod bedrock;
 pub mod catalog;
 pub mod credential;

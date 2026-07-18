@@ -4,12 +4,19 @@
 //! pure key-handling layer ([`crate::ui`]) and the interactive shell
 //! ([`crate::shell`]) can depend on it without a cycle.
 
+use stella_protocol::Attachment;
+
 /// A message from the user to the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserInput {
     /// A prompt to run. `text` is the fully-expanded message — paste chips
-    /// have already been expanded to their payloads (L-T3).
-    Prompt { text: String },
+    /// have already been expanded to their payloads (L-T3). `attachments`
+    /// carries any multimodal inputs (pasted images, attached files) the
+    /// composer collected alongside the text.
+    Prompt {
+        text: String,
+        attachments: Vec<Attachment>,
+    },
     /// The user's answer to a pending scope-review gate (L-E5).
     ScopeDecision(ScopeDecision),
     /// The user's answer to a pending `ask_user` question. `id` correlates it

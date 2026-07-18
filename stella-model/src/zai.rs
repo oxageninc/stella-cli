@@ -104,11 +104,89 @@ struct ZaiRequest<'a> {
 #[derive(Serialize)]
 struct ZaiMessage {
     role: &'static str,
-    content: String,
+    content: ZaiContent,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<ZaiOutboundToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+}
+
+/// Message content in the OpenAI-compatible chat dialect: a plain string for
+/// text-only turns (byte-stable with what this adapter has always sent —
+/// the prompt-cache contract), or a part array when a user turn carries
+/// attachments.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(untagged)]
+enum ZaiContent {
+    Text(String),
+    Parts(Vec<ZaiContentPart>),
+}
+
+impl ZaiContent {
+    /// The plain-text form, for assertions and logging; a parts array is not
+    /// plain text and yields `""`.
+    #[cfg(test)]
+    fn as_text(&self) -> &str {
+        match self {
+            ZaiContent::Text(text) => text,
+            ZaiContent::Parts(_) => "",
+        }
+    }
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ZaiContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ZaiImageUrl },
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct ZaiImageUrl {
+    /// A `data:` URI carrying the base64 payload.
+    url: String,
+}
+
+/// GLM vision models ingest images via `image_url` parts; PDFs, audio, and
+/// video degrade to descriptive text notes in this dialect.
+const ZAI_CAPS: crate::attachment::DialectCaps = crate::attachment::DialectCaps {
+    images: true,
+    pdfs: false,
+    audio: false,
+    video: false,
+};
+
+/// Content for a user turn: a plain string when there are no attachments,
+/// otherwise a parts array with media before text.
+fn user_content(message: &CompletionMessage) -> ZaiContent {
+    if message.attachments.is_empty() {
+        return ZaiContent::Text(message.content.clone());
+    }
+    let mut parts: Vec<ZaiContentPart> =
+        crate::attachment::wire_parts(&message.attachments, ZAI_CAPS)
+            .into_iter()
+            .map(|part| match part {
+                crate::attachment::WirePart::Image { media_type, base64 } => {
+                    ZaiContentPart::ImageUrl {
+                        image_url: ZaiImageUrl {
+                            url: format!("data:{media_type};base64,{base64}"),
+                        },
+                    }
+                }
+                crate::attachment::WirePart::Text { text } => ZaiContentPart::Text { text },
+                crate::attachment::WirePart::Pdf { .. }
+                | crate::attachment::WirePart::Audio { .. }
+                | crate::attachment::WirePart::Video { .. } => {
+                    unreachable!("caps exclude pdf/audio/video")
+                }
+            })
+            .collect();
+    if !message.content.is_empty() {
+        parts.push(ZaiContentPart::Text {
+            text: message.content.clone(),
+        });
+    }
+    ZaiContent::Parts(parts)
 }
 
 /// An assistant-authored tool call echoed back in conversation history
@@ -339,19 +417,19 @@ fn to_zai_messages(messages: &[CompletionMessage]) -> Vec<ZaiMessage> {
         match message.role {
             MessageRole::System => out.push(ZaiMessage {
                 role: "system",
-                content: message.content.clone(),
+                content: ZaiContent::Text(message.content.clone()),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }),
             MessageRole::User => out.push(ZaiMessage {
                 role: "user",
-                content: message.content.clone(),
+                content: user_content(message),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }),
             MessageRole::Assistant => out.push(ZaiMessage {
                 role: "assistant",
-                content: message.content.clone(),
+                content: ZaiContent::Text(message.content.clone()),
                 tool_calls: message
                     .tool_calls
                     .iter()
@@ -378,7 +456,7 @@ fn to_zai_messages(messages: &[CompletionMessage]) -> Vec<ZaiMessage> {
                     };
                     out.push(ZaiMessage {
                         role: "tool",
-                        content,
+                        content: ZaiContent::Text(content),
                         tool_calls: Vec::new(),
                         tool_call_id: Some(result.call_id.clone()),
                     });
@@ -667,6 +745,7 @@ mod tests {
                     input: serde_json::json!({"path": "a.rs"}),
                 }],
                 tool_results: vec![],
+                attachments: Vec::new(),
             },
             CompletionMessage {
                 role: MessageRole::Tool,
@@ -678,6 +757,7 @@ mod tests {
                         content: "fn main(){}".into(),
                     },
                 }],
+                attachments: Vec::new(),
             },
         ];
         let mapped = to_zai_messages(&messages);
@@ -686,7 +766,43 @@ mod tests {
         assert_eq!(mapped[0].tool_calls.len(), 1);
         assert_eq!(mapped[1].role, "tool");
         assert_eq!(mapped[1].tool_call_id.as_deref(), Some("call_9"));
-        assert_eq!(mapped[1].content, "fn main(){}");
+        assert_eq!(mapped[1].content.as_text(), "fn main(){}");
+    }
+
+    #[test]
+    fn user_attachments_widen_content_to_parts_with_data_uri_images() {
+        use stella_protocol::{Attachment, AttachmentSource};
+        let att = |name: &str, mime: &str, b64: &str| Attachment {
+            name: name.into(),
+            media_type: mime.into(),
+            byte_len: 3,
+            source: AttachmentSource::Data { base64: b64.into() },
+        };
+        let messages = vec![
+            CompletionMessage::user("plain"),
+            CompletionMessage::user_with_attachments(
+                "look",
+                vec![
+                    att("a.png", "image/png", "aW1n"),
+                    att("b.pdf", "application/pdf", "cGRm"),
+                ],
+            ),
+        ];
+        let mapped = to_zai_messages(&messages);
+        // A text-only user turn stays a plain string — byte-stable with the
+        // pre-attachment wire format.
+        let plain = serde_json::to_value(&mapped[0]).unwrap();
+        assert_eq!(plain["content"], "plain");
+        let multi = serde_json::to_value(&mapped[1]).unwrap();
+        let parts = multi["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3, "{multi}");
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,aW1n");
+        // PDF degrades to a note on this dialect.
+        assert_eq!(parts[1]["type"], "text");
+        assert!(parts[1]["text"].as_str().unwrap().contains("b.pdf"));
+        assert_eq!(parts[2]["type"], "text");
+        assert_eq!(parts[2]["text"], "look");
     }
 
     #[test]
@@ -702,10 +818,11 @@ mod tests {
                     message: "no such file".into(),
                 },
             }],
+            attachments: Vec::new(),
         }];
         let mapped = to_zai_messages(&messages);
         assert_eq!(mapped.len(), 1);
-        assert!(mapped[0].content.starts_with("ERROR:"));
+        assert!(mapped[0].content.as_text().starts_with("ERROR:"));
     }
 
     #[tokio::test]

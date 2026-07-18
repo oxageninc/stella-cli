@@ -128,12 +128,61 @@ pub(crate) struct GeminiContent {
 pub(crate) struct GeminiOutboundPart {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) text: Option<String>,
+    /// A user attachment's payload (`inlineData` on the wire) — Gemini
+    /// ingests images, PDFs, audio, and video through this one field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) inline_data: Option<GeminiInlineData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) function_call: Option<GeminiFunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) function_response: Option<GeminiFunctionResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) thought_signature: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GeminiInlineData {
+    pub(crate) mime_type: String,
+    pub(crate) data: String,
+}
+
+/// Gemini's generateContent ingests every kind Stella models — images,
+/// PDFs, audio, and video — as `inlineData` parts.
+const GEMINI_CAPS: crate::attachment::DialectCaps = crate::attachment::DialectCaps {
+    images: true,
+    pdfs: true,
+    audio: true,
+    video: true,
+};
+
+/// Map a user message's attachments to outbound parts (media before text).
+fn attachment_parts(message: &CompletionMessage) -> Vec<GeminiOutboundPart> {
+    crate::attachment::wire_parts(&message.attachments, GEMINI_CAPS)
+        .into_iter()
+        .map(|part| match part {
+            crate::attachment::WirePart::Text { text } => GeminiOutboundPart {
+                text: Some(text),
+                ..Default::default()
+            },
+            crate::attachment::WirePart::Image { media_type, base64 }
+            | crate::attachment::WirePart::Audio { media_type, base64 }
+            | crate::attachment::WirePart::Video { media_type, base64 } => GeminiOutboundPart {
+                inline_data: Some(GeminiInlineData {
+                    mime_type: media_type,
+                    data: base64,
+                }),
+                ..Default::default()
+            },
+            crate::attachment::WirePart::Pdf { base64, .. } => GeminiOutboundPart {
+                inline_data: Some(GeminiInlineData {
+                    mime_type: "application/pdf".into(),
+                    data: base64,
+                }),
+                ..Default::default()
+            },
+        })
+        .collect()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -324,13 +373,19 @@ pub(crate) fn to_gemini_request_parts(
     for message in messages {
         match message.role {
             MessageRole::System => system.push(message.content.clone()),
-            MessageRole::User => contents.push(GeminiContent {
-                role: "user",
-                parts: vec![GeminiOutboundPart {
-                    text: Some(message.content.clone()),
-                    ..Default::default()
-                }],
-            }),
+            MessageRole::User => {
+                let mut parts = attachment_parts(message);
+                if !message.content.is_empty() || parts.is_empty() {
+                    parts.push(GeminiOutboundPart {
+                        text: Some(message.content.clone()),
+                        ..Default::default()
+                    });
+                }
+                contents.push(GeminiContent {
+                    role: "user",
+                    parts,
+                });
+            }
             MessageRole::Assistant => {
                 let mut parts = Vec::new();
                 if !message.content.is_empty() {
@@ -590,6 +645,41 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
+    fn user_attachments_map_to_inline_data_parts_of_every_kind() {
+        use stella_protocol::{Attachment, AttachmentSource};
+        let att = |name: &str, mime: &str, b64: &str| Attachment {
+            name: name.into(),
+            media_type: mime.into(),
+            byte_len: 3,
+            source: AttachmentSource::Data { base64: b64.into() },
+        };
+        let messages = vec![CompletionMessage::user_with_attachments(
+            "look",
+            vec![
+                att("a.png", "image/png", "aW1n"),
+                att("b.pdf", "application/pdf", "cGRm"),
+                att("c.mp3", "audio/mpeg", "YXVk"),
+                att("d.mp4", "video/mp4", "dmlk"),
+            ],
+        )];
+        let (_, contents) = to_gemini_request_parts(&messages);
+        assert_eq!(contents.len(), 1);
+        let json = serde_json::to_value(&contents[0]).unwrap();
+        let parts = json["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 5, "{json}");
+        for (idx, mime) in [
+            (0, "image/png"),
+            (1, "application/pdf"),
+            (2, "audio/mpeg"),
+            (3, "video/mp4"),
+        ] {
+            assert_eq!(parts[idx]["inlineData"]["mimeType"], mime, "{json}");
+            assert!(parts[idx]["inlineData"]["data"].is_string());
+        }
+        assert_eq!(parts[4]["text"], "look");
+    }
+
+    #[test]
     fn to_gemini_request_parts_hoists_system_and_maps_roles() {
         let messages = vec![
             CompletionMessage::system("You are a coding agent."),
@@ -619,6 +709,7 @@ mod tests {
                     input: serde_json::json!({"path": "a.rs"}),
                 }],
                 tool_results: vec![],
+                attachments: Vec::new(),
             },
             CompletionMessage {
                 role: MessageRole::Tool,
@@ -630,6 +721,7 @@ mod tests {
                         content: "fn main(){}".into(),
                     },
                 }],
+                attachments: Vec::new(),
             },
         ];
         let (_, contents) = to_gemini_request_parts(&messages);
@@ -658,6 +750,7 @@ mod tests {
                     message: "no such file".into(),
                 },
             }],
+            attachments: Vec::new(),
         }];
         let (_, contents) = to_gemini_request_parts(&messages);
         let response = contents[0].parts[0].function_response.as_ref().unwrap();
@@ -682,6 +775,7 @@ mod tests {
                 input: serde_json::json!({"command": "ls"}),
             }],
             tool_results: vec![],
+            attachments: Vec::new(),
         }];
         let (_, contents) = to_gemini_request_parts(&messages);
         let part = &contents[0].parts[0];

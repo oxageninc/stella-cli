@@ -1867,12 +1867,12 @@ fn handle_focused_gates(
                 if classify_enter(&key) == EnterAction::Submit
                     && !ui.composer.buffer().trim_start().starts_with('!') =>
             {
-                if let Some(answer) = ui.composer.take_submission() {
+                if let Some(submission) = ui.composer.take_submission() {
                     return Some(DeckAction::Send(WorkspaceInput::ToAgent {
                         agent: agent.clone(),
                         input: UserInput::AskUserAnswer {
                             id: prompt.id.clone(),
-                            answer,
+                            answer: submission.text,
                         },
                     }));
                 }
@@ -2472,7 +2472,10 @@ fn handle_session_key(
 /// entirely; any other prompt ALWAYS enqueues — never blocks on a busy agent,
 /// though a held dispatch (see [`submit_prompt`]) jumps it to the front.
 fn dispatch_submission(ui: &mut DeckUi) -> DeckAction {
-    match ui.composer.take_submission() {
+    // The deck queue is text-shaped: attachments enter deck prompts as
+    // pasted payload *paths* (extracted at dispatch by the driver), so the
+    // submission's text is the whole content here.
+    match ui.composer.take_submission().map(|s| s.text) {
         Some(text) if text.trim_start().starts_with('!') => {
             // Strip only the single leading `!` dispatch marker — not
             // every leading `!` — so a command whose own text starts
@@ -2515,7 +2518,7 @@ fn handle_composer_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
         EnterAction::NotEnter => {}
     }
     match key.code {
-        KeyCode::Enter => match ui.composer.take_submission() {
+        KeyCode::Enter => match ui.composer.take_submission().map(|s| s.text) {
             // A `!`-prefixed line is a shell command: it executes IMMEDIATELY,
             // bypassing the prompt queue and any busy agent entirely.
             Some(text) if text.trim_start().starts_with('!') => {

@@ -737,6 +737,7 @@ pub fn inject_recall_block(messages: &mut Vec<CompletionMessage>, block: Option<
                 content,
                 tool_calls: vec![],
                 tool_results: vec![],
+                attachments: Vec::new(),
             };
             if messages.len() > 1 && is_marker(&messages[1]) {
                 messages[1] = message;
@@ -928,6 +929,7 @@ mod tests {
             content: content.into(),
             tool_calls: vec![],
             tool_results: vec![],
+            attachments: Vec::new(),
         }
     }
 

@@ -349,6 +349,34 @@ pub async fn run_deck(
             }
             maybe_key = key_rx.recv() => {
                 match maybe_key {
+                    // `⌃V`: explicit clipboard pull — the only way a *bitmap*
+                    // (a copied screenshot) reaches the deck, since bracketed
+                    // paste never carries one. The image payload is stored
+                    // under `.stella/attachments/` and its path is pasted as
+                    // text: the deck's prompt queue is text-shaped, and the
+                    // driver extracts media paths into attachments at
+                    // dispatch. Clipboard text falls back to a normal paste.
+                    Some(Event::Key(key))
+                        if key.kind != KeyEventKind::Release
+                            && key.code == crossterm::event::KeyCode::Char('v')
+                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        match crate::clipboard::capture(
+                            &crate::clipboard::default_attachments_dir(),
+                        ) {
+                            Ok(crate::clipboard::ClipboardPaste::Image(att)) => {
+                                debug.note(&format!("clipboard image stored: {}", att.label()));
+                                if let stella_protocol::AttachmentSource::Path { path } =
+                                    &att.source
+                                {
+                                    ui.paste(&format!("{path} "));
+                                }
+                            }
+                            Ok(crate::clipboard::ClipboardPaste::Text(text)) => ui.paste(&text),
+                            Ok(crate::clipboard::ClipboardPaste::Empty) => {}
+                            Err(err) => debug.note(&err),
+                        }
+                    }
                     Some(Event::Key(key)) if key.kind != KeyEventKind::Release => {
                         match handle_deck_key(key, &model, &mut ui) {
                             DeckAction::Quit => {

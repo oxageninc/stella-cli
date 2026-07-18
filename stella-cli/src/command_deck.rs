@@ -444,7 +444,7 @@ pub async fn run_deck_session(
                 Some(WorkspaceInput::Enqueue { text })
                 | Some(WorkspaceInput::EnqueueFront { text })
                 | Some(WorkspaceInput::ToAgent {
-                    input: UserInput::Prompt { text },
+                    input: UserInput::Prompt { text, .. },
                     ..
                 }) => {
                     dispatch.release();
@@ -595,7 +595,9 @@ pub async fn run_deck_session(
         }
         let turn_base = messages.len();
         if !pipeline_on {
-            messages.push(CompletionMessage::user(&prompt));
+            // Attach any media files the prompt names (including `⌃V`
+            // clipboard images, which arrive as their stored payload path).
+            messages.push(crate::attachments::user_message(&prompt));
         }
         let reflect_start = messages.len();
 
@@ -676,7 +678,7 @@ pub async fn run_deck_session(
                         None | Some(WorkspaceInput::Quit) => break TurnEnd::Quit,
                         Some(WorkspaceInput::Enqueue { text })
                         | Some(WorkspaceInput::ToAgent {
-                            input: UserInput::Prompt { text }, ..
+                            input: UserInput::Prompt { text, .. }, ..
                         }) => queue.push_back(text),
                         // An explicit front-insert stays a front-insert even
                         // if a turn started before it arrived — the deck's

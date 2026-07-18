@@ -161,11 +161,155 @@ struct BedrockContentBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<BedrockMediaBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document: Option<BedrockDocumentBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video: Option<BedrockMediaBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_use: Option<BedrockToolUse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_result: Option<BedrockToolResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_point: Option<BedrockCachePoint>,
+}
+
+/// An image or video block: a Converse format token plus base64 bytes.
+#[derive(Serialize, Debug)]
+struct BedrockMediaBlock {
+    format: &'static str,
+    source: BedrockMediaSource,
+}
+
+#[derive(Serialize, Debug)]
+struct BedrockDocumentBlock {
+    format: &'static str,
+    /// Converse restricts document names to alphanumerics, whitespace,
+    /// hyphens, parentheses, and square brackets — see
+    /// [`sanitize_document_name`].
+    name: String,
+    source: BedrockMediaSource,
+}
+
+#[derive(Serialize, Debug)]
+struct BedrockMediaSource {
+    /// Base64 in the HTTP JSON encoding of the Converse API.
+    bytes: String,
+}
+
+/// Converse ingests images, PDFs, and video natively; audio degrades to a
+/// descriptive text note.
+const BEDROCK_CAPS: crate::attachment::DialectCaps = crate::attachment::DialectCaps {
+    images: true,
+    pdfs: true,
+    audio: false,
+    video: true,
+};
+
+/// Converse image `format` token for a MIME type — only the documented set;
+/// anything else degrades rather than being rejected by the API.
+fn bedrock_image_format(media_type: &str) -> Option<&'static str> {
+    match media_type {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpeg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+/// Converse video `format` token for a MIME type (documented set only).
+fn bedrock_video_format(media_type: &str) -> Option<&'static str> {
+    match media_type {
+        "video/mp4" => Some("mp4"),
+        "video/quicktime" => Some("mov"),
+        "video/webm" => Some("webm"),
+        "video/x-matroska" => Some("mkv"),
+        "video/mpeg" => Some("mpeg"),
+        "video/3gpp" => Some("three_gp"),
+        "video/x-ms-wmv" => Some("wmv"),
+        "video/x-flv" => Some("flv"),
+        _ => None,
+    }
+}
+
+/// Clamp a document name to Converse's allowed character set.
+fn sanitize_document_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || " -()[]".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.trim().is_empty() {
+        "document".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Map a user message's attachments to Converse blocks (media before text).
+/// A media type outside Converse's format allowlists degrades to a note
+/// instead of a hard API rejection.
+fn attachment_blocks(message: &CompletionMessage) -> Vec<BedrockContentBlock> {
+    crate::attachment::wire_parts(&message.attachments, BEDROCK_CAPS)
+        .into_iter()
+        .map(|part| match part {
+            crate::attachment::WirePart::Text { text } => BedrockContentBlock {
+                text: Some(text),
+                ..Default::default()
+            },
+            crate::attachment::WirePart::Image { media_type, base64 } => {
+                match bedrock_image_format(&media_type) {
+                    Some(format) => BedrockContentBlock {
+                        image: Some(BedrockMediaBlock {
+                            format,
+                            source: BedrockMediaSource { bytes: base64 },
+                        }),
+                        ..Default::default()
+                    },
+                    None => unsupported_format_note("image", &media_type),
+                }
+            }
+            crate::attachment::WirePart::Video { media_type, base64 } => {
+                match bedrock_video_format(&media_type) {
+                    Some(format) => BedrockContentBlock {
+                        video: Some(BedrockMediaBlock {
+                            format,
+                            source: BedrockMediaSource { bytes: base64 },
+                        }),
+                        ..Default::default()
+                    },
+                    None => unsupported_format_note("video", &media_type),
+                }
+            }
+            crate::attachment::WirePart::Pdf { name, base64 } => BedrockContentBlock {
+                document: Some(BedrockDocumentBlock {
+                    format: "pdf",
+                    name: sanitize_document_name(&name),
+                    source: BedrockMediaSource { bytes: base64 },
+                }),
+                ..Default::default()
+            },
+            crate::attachment::WirePart::Audio { .. } => {
+                unreachable!("caps exclude audio")
+            }
+        })
+        .collect()
+}
+
+fn unsupported_format_note(kind: &str, media_type: &str) -> BedrockContentBlock {
+    BedrockContentBlock {
+        text: Some(format!(
+            "[the user attached a {kind} of type {media_type}, which Bedrock's Converse API \
+             does not accept; acknowledge it and suggest a supported format]"
+        )),
+        ..Default::default()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -283,13 +427,19 @@ fn to_bedrock_messages(
             MessageRole::System => system.push(BedrockTextBlock {
                 text: message.content.clone(),
             }),
-            MessageRole::User => out.push(BedrockMessage {
-                role: "user",
-                content: vec![BedrockContentBlock {
-                    text: Some(message.content.clone()),
-                    ..Default::default()
-                }],
-            }),
+            MessageRole::User => {
+                let mut content = attachment_blocks(message);
+                if !message.content.is_empty() || content.is_empty() {
+                    content.push(BedrockContentBlock {
+                        text: Some(message.content.clone()),
+                        ..Default::default()
+                    });
+                }
+                out.push(BedrockMessage {
+                    role: "user",
+                    content,
+                });
+            }
             MessageRole::Assistant => {
                 let mut content = Vec::new();
                 if !message.content.is_empty() {
@@ -869,6 +1019,44 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
+    fn user_attachments_map_to_converse_blocks_with_format_allowlists() {
+        use stella_protocol::{Attachment, AttachmentSource};
+        let att = |name: &str, mime: &str, b64: &str| Attachment {
+            name: name.into(),
+            media_type: mime.into(),
+            byte_len: 3,
+            source: AttachmentSource::Data { base64: b64.into() },
+        };
+        let messages = vec![CompletionMessage::user_with_attachments(
+            "look",
+            vec![
+                att("a.png", "image/png", "aW1n"),
+                att("spec v2.pdf", "application/pdf", "cGRm"),
+                att("d.mov", "video/quicktime", "dmlk"),
+                att("weird.tiff", "image/tiff", "dGlm"),
+            ],
+        )];
+        let (_, mapped) = to_bedrock_messages(&messages);
+        assert_eq!(mapped.len(), 1);
+        let json = serde_json::to_value(&mapped[0]).unwrap();
+        let content = json["content"].as_array().unwrap();
+        assert_eq!(content.len(), 5, "{json}");
+        assert_eq!(content[0]["image"]["format"], "png");
+        assert_eq!(content[0]["image"]["source"]["bytes"], "aW1n");
+        // Document name sanitized to Converse's allowed character set
+        // (the period is not allowed).
+        assert_eq!(content[1]["document"]["format"], "pdf");
+        assert_eq!(content[1]["document"]["name"], "spec v2-pdf");
+        assert_eq!(content[2]["video"]["format"], "mov");
+        // TIFF is outside the Converse image allowlist: degrade note.
+        assert!(
+            content[3]["text"].as_str().unwrap().contains("image/tiff"),
+            "{json}"
+        );
+        assert_eq!(content[4]["text"], "look");
+    }
+
+    #[test]
     fn cache_points_are_gated_to_supporting_model_families() {
         assert!(supports_cache_points(
             "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
@@ -902,6 +1090,7 @@ mod tests {
                     input: serde_json::json!({"path": "a.rs"}),
                 }],
                 tool_results: vec![],
+                attachments: Vec::new(),
             },
             CompletionMessage {
                 role: MessageRole::Tool,
@@ -913,6 +1102,7 @@ mod tests {
                         content: "fn main(){}".into(),
                     },
                 }],
+                attachments: Vec::new(),
             },
         ];
         let (system, mapped) = to_bedrock_messages(&messages);
@@ -941,6 +1131,7 @@ mod tests {
                     message: "no such file".into(),
                 },
             }],
+            attachments: Vec::new(),
         }];
         let (_, mapped) = to_bedrock_messages(&messages);
         let tool_result = mapped[0].content[0].tool_result.as_ref().unwrap();

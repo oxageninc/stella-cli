@@ -24,8 +24,8 @@ pub(crate) const CHARS_PER_TOKEN: f64 = 3.5;
 /// Fixed per-message framing overhead (role tags, separators) in tokens.
 const PER_MESSAGE_OVERHEAD: u64 = 4;
 
-/// Estimate the token cost of one message, including any tool calls and
-/// tool results it carries.
+/// Estimate the token cost of one message, including any tool calls, tool
+/// results, and multimodal attachments it carries.
 pub fn estimate_message_tokens(message: &CompletionMessage) -> u64 {
     let mut chars = message.content.len();
     for call in &message.tool_calls {
@@ -39,7 +39,23 @@ pub fn estimate_message_tokens(message: &CompletionMessage) -> u64 {
             stella_protocol::ToolOutput::Error { message } => message.len(),
         };
     }
-    (chars as f64 / CHARS_PER_TOKEN).ceil() as u64 + PER_MESSAGE_OVERHEAD
+    let attachment_tokens: u64 = message
+        .attachments
+        .iter()
+        .map(estimate_attachment_tokens)
+        .sum();
+    (chars as f64 / CHARS_PER_TOKEN).ceil() as u64 + attachment_tokens + PER_MESSAGE_OVERHEAD
+}
+
+/// Rough token cost of an attachment payload. Providers price media by their
+/// own units (image tiles, PDF pages, audio seconds), but the request itself
+/// carries the payload as base64 — `bytes × 4/3 ÷ CHARS_PER_TOKEN` tracks
+/// the request-size pressure that budgeting and compaction care about, and
+/// deliberately overestimates in the safe direction for media whose billed
+/// token cost is lower.
+fn estimate_attachment_tokens(attachment: &stella_protocol::Attachment) -> u64 {
+    let base64_chars = attachment.byte_len.saturating_mul(4) / 3;
+    (base64_chars as f64 / CHARS_PER_TOKEN).ceil() as u64
 }
 
 /// Estimate the total token cost of a conversation.
@@ -243,8 +259,26 @@ mod tests {
             content: String::new(),
             tool_calls: vec![],
             tool_results: vec![],
+            attachments: Vec::new(),
         };
         assert_eq!(estimate_message_tokens(&m), PER_MESSAGE_OVERHEAD);
+    }
+
+    #[test]
+    fn attachments_add_base64_scaled_tokens() {
+        let plain = CompletionMessage::user("hi");
+        let with_media = CompletionMessage::user_with_attachments(
+            "hi",
+            vec![stella_protocol::Attachment::from_path(
+                "shot.png",
+                "image/png",
+                350_000,
+                "/tmp/shot.png",
+            )],
+        );
+        let delta = estimate_message_tokens(&with_media) - estimate_message_tokens(&plain);
+        // 350 KB payload → ~466k base64 chars → ~133k estimated tokens.
+        assert!(delta > 100_000, "attachment must weigh in: {delta}");
     }
 
     #[test]
@@ -263,6 +297,7 @@ mod tests {
             content: String::new(),
             tool_calls: vec![],
             tool_results: vec![],
+            attachments: Vec::new(),
         };
         let loaded = CompletionMessage {
             role: MessageRole::Tool,
@@ -274,6 +309,7 @@ mod tests {
                     content: "x".repeat(7000),
                 },
             }],
+            attachments: Vec::new(),
         };
         assert!(estimate_message_tokens(&loaded) > estimate_message_tokens(&bare) + 1900);
     }

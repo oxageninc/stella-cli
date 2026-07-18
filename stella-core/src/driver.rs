@@ -544,6 +544,7 @@ impl<'a> Engine<'a> {
             content: result.text.clone(),
             tool_calls: result.tool_calls.clone(),
             tool_results: Vec::new(),
+            attachments: Vec::new(),
         });
         // The assistant message above may carry `tool_calls` that never
         // ran (we abort before dispatching them). A recorded `tool_use`
@@ -568,6 +569,7 @@ impl<'a> Engine<'a> {
                 content: String::new(),
                 tool_calls: Vec::new(),
                 tool_results,
+                attachments: Vec::new(),
             });
         }
         let reason = format!(
@@ -648,6 +650,7 @@ impl<'a> Engine<'a> {
                 content: result.text.clone(),
                 tool_calls: Vec::new(),
                 tool_results: Vec::new(),
+                attachments: Vec::new(),
             });
             let _ = events.send(AgentEvent::Stage {
                 name: StageKind::Complete,
@@ -667,6 +670,7 @@ impl<'a> Engine<'a> {
             content: result.text.clone(),
             tool_calls: result.tool_calls.clone(),
             tool_results: Vec::new(),
+            attachments: Vec::new(),
         });
 
         let tool_results = self
@@ -678,6 +682,7 @@ impl<'a> Engine<'a> {
             content: String::new(),
             tool_calls: Vec::new(),
             tool_results,
+            attachments: Vec::new(),
         });
 
         None
@@ -1786,6 +1791,7 @@ mod tests {
                 call_id: call_id.into(),
                 output: ToolOutput::Ok { content },
             }],
+            attachments: Vec::new(),
         };
         let assistant_with_call = |call_id: &str| CompletionMessage {
             role: MessageRole::Assistant,
@@ -1796,6 +1802,7 @@ mod tests {
                 input: serde_json::json!({"cmd": call_id}),
             }],
             tool_results: vec![],
+            attachments: Vec::new(),
         };
         vec![
             CompletionMessage::system("sys"),
