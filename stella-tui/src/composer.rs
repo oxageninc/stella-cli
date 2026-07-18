@@ -28,6 +28,7 @@
 //! **bare** `⏎` always submits (never blocks) — see [`classify_enter`].
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use stella_protocol::{Attachment, AttachmentKind};
 use unicode_width::UnicodeWidthChar;
 
 /// Below this many lines a paste is inserted inline; at or above it, the
@@ -41,7 +42,8 @@ pub const DEFAULT_PASTE_LINE_THRESHOLD: usize = 6;
 /// chipping to protect the model context. This sits well past the visible cap.
 pub const DECK_PASTE_LINE_THRESHOLD: usize = 48;
 
-/// One piece of composer content: either typed text or a collapsed paste.
+/// One piece of composer content: typed text, a collapsed paste, or a
+/// multimodal attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerEntry {
     /// Literal typed text.
@@ -52,6 +54,10 @@ pub enum ComposerEntry {
         full_text: String,
         line_count: usize,
     },
+    /// A multimodal attachment (pasted image, attached media/document file).
+    /// Displays as a chip; the payload rides the submission's attachment
+    /// list, not its text.
+    Attachment(Attachment),
 }
 
 impl ComposerEntry {
@@ -61,16 +67,38 @@ impl ComposerEntry {
         match self {
             ComposerEntry::Text(t) => t.clone(),
             ComposerEntry::Chip { line_count, .. } => format!("[pasted: {line_count} lines]"),
+            ComposerEntry::Attachment(att) => {
+                let noun = match att.kind() {
+                    AttachmentKind::Image => "image",
+                    AttachmentKind::Audio => "audio",
+                    AttachmentKind::Video => "video",
+                    AttachmentKind::Pdf => "pdf",
+                    AttachmentKind::Text => "file",
+                    AttachmentKind::Binary => "file",
+                };
+                format!("[{noun}: {}]", att.label())
+            }
         }
     }
 
-    /// The text the model receives — chips expand to their full payload.
+    /// The text the model receives — paste chips expand to their full
+    /// payload; attachments contribute no text (their payload rides the
+    /// attachment list).
     pub fn expanded(&self) -> &str {
         match self {
             ComposerEntry::Text(t) => t,
             ComposerEntry::Chip { full_text, .. } => full_text,
+            ComposerEntry::Attachment(_) => "",
         }
     }
+}
+
+/// A completed composer submission: the expanded prompt text plus any
+/// attachments collected while composing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submission {
+    pub text: String,
+    pub attachments: Vec<Attachment>,
 }
 
 /// Where a slash command comes from — decides the glyph the menu row shows.
@@ -316,24 +344,51 @@ impl Composer {
         parts.join(" ")
     }
 
+    /// Attach a multimodal input as a chip ahead of the live buffer. Text
+    /// typed before the attach point is committed first so ordering is
+    /// preserved on submit, mirroring [`Composer::paste`]'s chip path.
+    pub fn attach(&mut self, attachment: Attachment) {
+        let before = self.buffer[..self.cursor].to_string();
+        let after = self.buffer[self.cursor..].to_string();
+        if !before.is_empty() {
+            self.chips.push(ComposerEntry::Text(before));
+        }
+        self.chips.push(ComposerEntry::Attachment(attachment));
+        self.buffer = after;
+        self.cursor = 0;
+    }
+
+    /// The attachments currently pending in the composer, in order.
+    pub fn attachments(&self) -> impl Iterator<Item = &Attachment> {
+        self.chips.iter().filter_map(|chip| match chip {
+            ComposerEntry::Attachment(att) => Some(att),
+            _ => None,
+        })
+    }
+
     /// Assemble the full message the model receives — chips expanded to their
-    /// payloads, typed line breaks preserved verbatim — and clear the
-    /// composer. Returns `None` when empty.
-    pub fn take_submission(&mut self) -> Option<String> {
+    /// payloads, typed line breaks preserved verbatim, attachments collected
+    /// alongside — and clear the composer. Returns `None` when empty.
+    pub fn take_submission(&mut self) -> Option<Submission> {
         if self.is_empty() {
             return None;
         }
+        let attachments: Vec<Attachment> = self.attachments().cloned().collect();
         let mut parts: Vec<String> = self
             .chips
             .iter()
             .map(|c| c.expanded().to_string())
+            .filter(|part| !part.is_empty())
             .collect();
         if !self.buffer.is_empty() {
             parts.push(std::mem::take(&mut self.buffer));
         }
         self.chips.clear();
         self.cursor = 0;
-        Some(parts.join("\n"))
+        Some(Submission {
+            text: parts.join("\n"),
+            attachments,
+        })
     }
 
     /// Clear the composer without submitting.
@@ -670,7 +725,7 @@ mod tests {
         assert_eq!(c.chips().len(), 1);
         assert_eq!(c.display_line(), "[pasted: 5 lines]");
         // The full payload survives to submission.
-        let msg = c.take_submission().unwrap();
+        let msg = c.take_submission().unwrap().text;
         assert_eq!(msg, payload);
     }
 
@@ -684,7 +739,7 @@ mod tests {
         for ch in " thanks".chars() {
             c.insert_char(ch);
         }
-        let msg = c.take_submission().unwrap();
+        let msg = c.take_submission().unwrap().text;
         assert_eq!(msg, "review this: \nx\ny\nz\nw\n thanks");
         assert!(c.is_empty(), "submission clears the composer");
     }
@@ -698,6 +753,47 @@ mod tests {
             !shown.contains("secret"),
             "chip must hide the payload: {shown}"
         );
+    }
+
+    fn test_attachment(name: &str) -> Attachment {
+        Attachment::from_path(name, "image/png", 1024, format!("/tmp/{name}"))
+    }
+
+    #[test]
+    fn attachments_ride_the_submission_not_its_text() {
+        let mut c = Composer::new();
+        for ch in "see ".chars() {
+            c.insert_char(ch);
+        }
+        c.attach(test_attachment("shot.png"));
+        for ch in "what broke?".chars() {
+            c.insert_char(ch);
+        }
+        let shown = c.display_line();
+        assert!(shown.contains("[image: shot.png"), "{shown}");
+        let submission = c.take_submission().unwrap();
+        assert_eq!(submission.text, "see \nwhat broke?");
+        assert_eq!(submission.attachments.len(), 1);
+        assert_eq!(submission.attachments[0].name, "shot.png");
+        assert!(c.is_empty(), "submission clears attachments too");
+    }
+
+    #[test]
+    fn attachment_only_submission_is_submittable() {
+        let mut c = Composer::new();
+        c.attach(test_attachment("clip.png"));
+        assert!(!c.is_empty());
+        let submission = c.take_submission().unwrap();
+        assert_eq!(submission.text, "");
+        assert_eq!(submission.attachments.len(), 1);
+    }
+
+    #[test]
+    fn backspace_pops_an_attachment_chip_when_the_buffer_is_empty() {
+        let mut c = Composer::new();
+        c.attach(test_attachment("oops.png"));
+        c.backspace();
+        assert!(c.is_blank(), "backspace removes the pending attachment");
     }
 
     #[test]
@@ -780,7 +876,7 @@ mod tests {
         for ch in "second line".chars() {
             c.insert_char(ch);
         }
-        assert_eq!(c.take_submission().unwrap(), "first line\nsecond line");
+        assert_eq!(c.take_submission().unwrap().text, "first line\nsecond line");
     }
 
     #[test]
@@ -850,7 +946,7 @@ mod tests {
             c.move_left(); // cursor between "head" and "tail"
         }
         c.paste("x\ny\nz");
-        let msg = c.take_submission().unwrap();
+        let msg = c.take_submission().unwrap().text;
         assert_eq!(msg, "head\nx\ny\nz\ntail", "order: before, chip, after");
     }
 

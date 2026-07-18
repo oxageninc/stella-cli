@@ -617,11 +617,13 @@ pub(crate) struct GitRepoStructure {
 #[async_trait::async_trait]
 impl RepoStructurePort for GitRepoStructure {
     async fn structure_summary(&self) -> String {
-        let output = tokio::process::Command::new("git")
-            .args(["ls-files"])
-            .current_dir(&self.root)
-            .output()
-            .await;
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args(["ls-files"]).current_dir(&self.root);
+        // Hook-exported GIT_* vars must not re-target this at another repo.
+        for var in stella_tools::exec::GIT_REPO_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        let output = cmd.output().await;
         match output {
             Ok(out) if out.status.success() => {
                 render_file_tree(&String::from_utf8_lossy(&out.stdout), 200)
@@ -647,18 +649,21 @@ impl RepoStatusPort for GitRepoStatus {
         let mut out = std::collections::HashMap::new();
         // `-z` NUL-delimits paths (robust to spaces/newlines); quotePath off
         // keeps non-ASCII literal. Full stdout is read — never truncated.
-        let output = tokio::process::Command::new("git")
-            .args([
-                "-c",
-                "core.quotePath=false",
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "-z",
-            ])
-            .current_dir(&self.root)
-            .output()
-            .await;
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args([
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .current_dir(&self.root);
+        // Hook-exported GIT_* vars must not re-target this at another repo.
+        for var in stella_tools::exec::GIT_REPO_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        let output = cmd.output().await;
         let Ok(listing) = output else {
             return out;
         };
@@ -847,7 +852,7 @@ async fn run_raw_one_shot(
         CompletionMessage::system(
             with_session_hook_context(build_system_prompt(&cfg.workspace_root), cfg).await,
         ),
-        CompletionMessage::user(prompt),
+        crate::attachments::user_message(prompt),
     ];
 
     // The self-improvement loop (memory.rs): recall relevant memories +
@@ -1272,7 +1277,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         };
         let input = expanded.as_deref().unwrap_or(input);
 
-        messages.push(CompletionMessage::user(input));
+        messages.push(crate::attachments::user_message(input));
         println!();
 
         if let Some(m) = &mut memory {

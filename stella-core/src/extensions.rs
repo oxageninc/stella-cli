@@ -231,19 +231,34 @@ pub fn command_from_file(path: &str, raw: &str) -> Result<CommandDef, ExtensionD
 }
 
 /// Parse a frontmatter `tools:` value into the toolbelt grant. `None` means
-/// "all tools": no key, an empty value, or the explicit wildcard forms
-/// (`*` / `all`). Anything else is the comma-separated grant list.
+/// "all tools": no key, an empty value or list, or the explicit wildcard
+/// forms (`*` / `all` / `all tools`). Anything else is the grant list.
+///
+/// Authors write this field in every shape the ecosystem has taught them:
+/// a bare comma list (`Read, Grep`), a JSON/YAML flow array
+/// (`["Read", "Grep"]`, `[Read, Grep]`), per-item quotes without brackets,
+/// trailing commas, torn brackets, or a block sequence (already flattened
+/// to a comma list by [`parse_frontmatter`]). Brackets and quotes are list
+/// punctuation, never part of a tool's name — every shape normalizes to
+/// the same clean names, and duplicates collapse to the first occurrence.
 pub fn parse_toolbelt(value: Option<&str>) -> Option<Vec<String>> {
-    let value = value?.trim();
-    if value.is_empty() || value == "*" || value.eq_ignore_ascii_case("all") {
+    let value = value?;
+    let mut tools: Vec<String> = Vec::new();
+    for item in value.split(',') {
+        let item =
+            item.trim_matches(|c: char| c.is_whitespace() || matches!(c, '[' | ']' | '"' | '\''));
+        if item.is_empty() || tools.iter().any(|t| t == item) {
+            continue;
+        }
+        tools.push(item.to_string());
+    }
+    let wildcard = tools.iter().any(|t| t == "*")
+        || (tools.len() == 1
+            && (tools[0].eq_ignore_ascii_case("all")
+                || tools[0].eq_ignore_ascii_case("all tools")));
+    if wildcard {
         return None;
     }
-    let tools: Vec<String> = value
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .collect();
     (!tools.is_empty()).then_some(tools)
 }
 
@@ -565,6 +580,82 @@ mod tests {
         assert_eq!(
             parse_toolbelt(Some("Read,  Grep , Bash")),
             Some(vec!["Read".into(), "Grep".into(), "Bash".into()])
+        );
+    }
+
+    #[test]
+    fn toolbelt_flow_arrays_normalize_to_clean_names() {
+        // The JSON-style array an author pastes when a comma list would do.
+        assert_eq!(
+            parse_toolbelt(Some(r#"["Read", "Grep", "Glob", "Write"]"#)),
+            Some(vec![
+                "Read".into(),
+                "Grep".into(),
+                "Glob".into(),
+                "Write".into()
+            ])
+        );
+        // Single quotes, unquoted flow items, trailing comma, torn bracket.
+        assert_eq!(
+            parse_toolbelt(Some("['Read', 'Edit']")),
+            Some(vec!["Read".into(), "Edit".into()])
+        );
+        assert_eq!(
+            parse_toolbelt(Some("[Read, Grep,]")),
+            Some(vec!["Read".into(), "Grep".into()])
+        );
+        assert_eq!(
+            parse_toolbelt(Some(r#"["Read", "Grep""#)),
+            Some(vec!["Read".into(), "Grep".into()]),
+            "a torn bracket still yields the names"
+        );
+        // Quoted items without brackets, and MCP-style names untouched.
+        assert_eq!(
+            parse_toolbelt(Some(r#""Read", "mcp__github__get_me""#)),
+            Some(vec!["Read".into(), "mcp__github__get_me".into()])
+        );
+    }
+
+    #[test]
+    fn toolbelt_wildcard_lists_and_duplicates() {
+        assert_eq!(
+            parse_toolbelt(Some("[]")),
+            None,
+            "an empty array restricts nothing"
+        );
+        assert_eq!(parse_toolbelt(Some(r#"["*"]"#)), None);
+        assert_eq!(parse_toolbelt(Some("all tools")), None);
+        assert_eq!(
+            parse_toolbelt(Some("Read, Read, Grep")),
+            Some(vec!["Read".into(), "Grep".into()]),
+            "duplicates collapse to the first occurrence"
+        );
+    }
+
+    #[test]
+    fn agent_flow_array_tools_parse_as_clean_names() {
+        let raw = "---\nname: maker\ndescription: d\ntools: [\"Read\", \"Grep\", \"Glob\", \"Write\"]\n---\nBody.";
+        let agent = agent_from_file("/x/maker.md", raw).unwrap();
+        assert_eq!(
+            agent.tools,
+            Some(vec![
+                "Read".to_string(),
+                "Grep".to_string(),
+                "Glob".to_string(),
+                "Write".to_string()
+            ]),
+            "array brackets are punctuation, not tool names"
+        );
+    }
+
+    #[test]
+    fn agent_block_sequence_tools_parse_as_the_grant_list() {
+        let raw = "---\nname: reviewer\ndescription: d\ntools:\n  - Read\n  - \"Grep\"\n---\nBody.";
+        let agent = agent_from_file("/x/reviewer.md", raw).unwrap();
+        assert_eq!(
+            agent.tools,
+            Some(vec!["Read".to_string(), "Grep".to_string()]),
+            "a YAML block sequence is a restriction, never silently all tools"
         );
     }
 

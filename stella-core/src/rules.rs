@@ -159,10 +159,25 @@ pub struct Frontmatter {
     pub body: String,
 }
 
+/// Strip one pair of matching surrounding quotes (`"…"` or `'…'`).
+pub(crate) fn strip_matched_quotes(value: &str) -> &str {
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
 /// Split `---\n…\n---\nbody` into single-line key/value frontmatter plus
 /// body text. No frontmatter fence ⇒ the whole (trimmed) input is the body
 /// with empty data. Ports `parseFrontmatter` in `markdown-registry.ts`
-/// exactly, including the leading-BOM strip and quote-stripping on values.
+/// (leading-BOM strip, quote-stripping on values), and additionally
+/// flattens a YAML block sequence — a key with an empty scalar followed by
+/// `- item` lines — onto that key as a comma-separated value, so list-typed
+/// fields reach consumers in one shape no matter how the author wrote them.
 pub fn parse_frontmatter(raw: &str) -> Frontmatter {
     let text = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     if !text.starts_with("---") {
@@ -188,24 +203,39 @@ pub fn parse_frontmatter(raw: &str) -> Frontmatter {
         .to_string();
 
     let mut data = HashMap::new();
+    // The key whose scalar value was empty on its own line — the head of a
+    // possible YAML block sequence (`tools:` followed by `- Read` lines).
+    let mut pending_list_key: Option<String> = None;
     for line in header.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // A `- item` line under an empty-valued key is a block-sequence
+        // element: flatten it onto that key. Without a pending key the
+        // line falls through to the scalar path (and is skipped when it
+        // has no colon), exactly as before.
+        if let Some(item) = trimmed.strip_prefix("- ")
+            && let Some(key) = &pending_list_key
+        {
+            let item = strip_matched_quotes(item.trim());
+            if !item.is_empty() {
+                let entry: &mut String = data.entry(key.clone()).or_default();
+                if !entry.is_empty() {
+                    entry.push_str(", ");
+                }
+                entry.push_str(item);
+            }
             continue;
         }
         let Some(colon) = trimmed.find(':') else {
             continue;
         };
         let key = trimmed[..colon].trim();
-        let mut value = trimmed[colon + 1..].trim();
-        let quoted = value.len() >= 2
-            && ((value.starts_with('"') && value.ends_with('"'))
-                || (value.starts_with('\'') && value.ends_with('\'')));
-        if quoted {
-            value = &value[1..value.len() - 1];
-        }
+        let value = strip_matched_quotes(trimmed[colon + 1..].trim());
         if !key.is_empty() {
             data.insert(key.to_string(), value.to_string());
+            pending_list_key = value.is_empty().then(|| key.to_string());
         }
     }
     Frontmatter { data, body }
@@ -817,6 +847,26 @@ mod tests {
     #[test]
     fn ignores_comment_and_blank_frontmatter_lines() {
         let fm = parse_frontmatter("---\n# a comment\n\ndescription: d\n---\nbody");
+        assert_eq!(fm.data.len(), 1);
+        assert_eq!(fm.data.get("description").unwrap(), "d");
+    }
+
+    #[test]
+    fn flattens_block_sequences_onto_their_key() {
+        let fm = parse_frontmatter(
+            "---\ntools:\n  - Read\n  - 'Grep'\n  - \"Web Search\"\ndescription: d\n---\nbody",
+        );
+        assert_eq!(fm.data.get("tools").unwrap(), "Read, Grep, Web Search");
+        assert_eq!(
+            fm.data.get("description").unwrap(),
+            "d",
+            "the key after the sequence parses normally"
+        );
+    }
+
+    #[test]
+    fn dash_lines_without_a_pending_list_key_stay_ignored() {
+        let fm = parse_frontmatter("---\ndescription: d\n- stray item\n---\nbody");
         assert_eq!(fm.data.len(), 1);
         assert_eq!(fm.data.get("description").unwrap(), "d");
     }

@@ -26,6 +26,14 @@ fi
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
+# Git exports GIT_DIR (and friends) to hook processes. The gate runs the full
+# test suite, and fleet tests spawn real `git` in temp repos — an inherited
+# GIT_DIR redirects those writes into THIS repo (core.bare flip, "Fleet Test"
+# committer identity, seed commits, fleet/* branches). Pushes from linked
+# worktrees are the worst case: there GIT_DIR is absolute, so it follows the
+# tests into every temp cwd. Scrub the env so the suite sees a clean world.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR GIT_PREFIX
+
 printf '\033[36m▸ pre-push gate — make gate (fmt-check · clippy -D warnings · test)\033[0m\n' >&2
 if make gate; then
   printf '\033[32m✔ gate green — pushing\033[0m\n' >&2

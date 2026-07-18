@@ -72,7 +72,7 @@ use stella_tools::custom::{CustomTool, CustomToolSet};
 use stella_tools::hook_runner::ShellHookRunner;
 use stella_tui::{
     AgentMeta, AgentScope, AgentStatus, DeckOptions, Inbound, SkillOp, SkillScope, SkillSearchHit,
-    SkillsView, SlashCommand, UserInput, WorkspaceInput, run_deck,
+    SkillsView, SlashCommand, SplashCue, UserInput, WorkspaceInput, run_deck,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -309,6 +309,24 @@ pub async fn run_deck_session(
     // never waits on the driver (and vice versa).
     let deck = tokio::spawn(run_deck(opts, in_rx, sub_tx));
 
+    // The launch cinematic: hold the splash's battle loop open over session
+    // init and release it once BOTH async legs — the background code-graph
+    // build below and the MCP connect after it — have finished, so the movie
+    // covers however long a first launch's indexing takes instead of handing
+    // off to a deck that is still visibly assembling itself. Any key still
+    // skips; `--no-anim` sessions ignore the cue entirely.
+    let _ = in_tx.send(Inbound::Splash(SplashCue::Replay));
+    let init_pending = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+    let release_splash = {
+        let tx = in_tx.clone();
+        move || {
+            if init_pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+                let _ = tx.send(Inbound::Splash(SplashCue::Release));
+            }
+        }
+    };
+    let release_on_graph_ready = release_splash.clone();
+
     // Auto-build the code-graph index in the background (a cheap incremental
     // refresh if it already exists) and keep it fresh via the live watcher, so
     // `graph_query` is available this session — and the Graph tab populates —
@@ -339,6 +357,8 @@ pub async fn run_deck_session(
                 agent: LEAD.to_string(),
                 status: AgentStatus::WaitingInput,
             });
+            // One of the two init legs the launch splash waits on.
+            release_on_graph_ready();
         }),
     );
 
@@ -408,6 +428,9 @@ pub async fn run_deck_session(
     };
     // Seed the MCP tab with the configured servers and their live state.
     send_mcp_snapshot(cfg, &mcp, &mcp_disabled, &in_tx).await;
+    // MCP connect settled (or there was nothing to connect) — the other init
+    // leg the launch splash waits on.
+    release_splash();
 
     // ── The driver loop ─────────────────────────────────────────────────────
     let mut queue: VecDeque<String> = VecDeque::new();
@@ -444,7 +467,7 @@ pub async fn run_deck_session(
                 Some(WorkspaceInput::Enqueue { text })
                 | Some(WorkspaceInput::EnqueueFront { text })
                 | Some(WorkspaceInput::ToAgent {
-                    input: UserInput::Prompt { text },
+                    input: UserInput::Prompt { text, .. },
                     ..
                 }) => {
                     dispatch.release();
@@ -595,7 +618,9 @@ pub async fn run_deck_session(
         }
         let turn_base = messages.len();
         if !pipeline_on {
-            messages.push(CompletionMessage::user(&prompt));
+            // Attach any media files the prompt names (including `⌃V`
+            // clipboard images, which arrive as their stored payload path).
+            messages.push(crate::attachments::user_message(&prompt));
         }
         let reflect_start = messages.len();
 
@@ -676,7 +701,7 @@ pub async fn run_deck_session(
                         None | Some(WorkspaceInput::Quit) => break TurnEnd::Quit,
                         Some(WorkspaceInput::Enqueue { text })
                         | Some(WorkspaceInput::ToAgent {
-                            input: UserInput::Prompt { text }, ..
+                            input: UserInput::Prompt { text, .. }, ..
                         }) => queue.push_back(text),
                         // An explicit front-insert stays a front-insert even
                         // if a turn started before it arrived — the deck's
@@ -1126,6 +1151,7 @@ const DECK_BUILTINS: &[(&str, &str)] = &[
     ("/graph", "open the code-graph tab"),
     ("/skills", "open the SKILLS tab: manage · search · create"),
     ("/mcp", "open the MCP servers tab"),
+    ("/mcp-search", "search the MCP registry & install servers"),
     ("/donate", "support stella — become a GitHub Sponsor"),
 ];
 
@@ -1797,8 +1823,18 @@ async fn run_deck_command(
             });
         }
         "/init" => {
+            // Replay the launch cinematic over the reindex: the battle loops
+            // for as long as init runs, then the wordmark reveal hands the
+            // frame back to the deck. The progress lines still land in the
+            // transcript behind the splash (and any key skips straight to
+            // them). Released on BOTH outcomes — a failed init must never
+            // strand a held splash.
+            let _ = in_tx.send(Inbound::Splash(SplashCue::Replay));
             let mut emit = |line: String| say(line);
-            match agent::init_workspace(Some(provider), &cfg.workspace_root, &mut emit).await {
+            let outcome =
+                agent::init_workspace(Some(provider), &cfg.workspace_root, &mut emit).await;
+            let _ = in_tx.send(Inbound::Splash(SplashCue::Release));
+            match outcome {
                 Ok(_) => {
                     // A fresh index may name tables/types the schema gate
                     // should know about this session, not just the next one.
@@ -1849,7 +1885,7 @@ async fn run_deck_command(
         // tab, `/skills` and `/mcp` opening their tabs) are normally consumed
         // TUI-side, but a queued one reaches here — accept it as handled (a
         // no-op) rather than calling it "unknown".
-        "/files" | "/diff" | "/graph" | "/agents" | "/skills" | "/mcp" => {}
+        "/files" | "/diff" | "/graph" | "/agents" | "/skills" | "/mcp" | "/mcp-search" => {}
         _ => {
             // A custom command/skill/agent (⚡): expand its template —
             // arguments and all — into the prompt the model turn runs.
@@ -2261,11 +2297,13 @@ impl AskUserIo for DeckAskUserIo {
 // ── FileChange synthesis ────────────────────────────────────────────────────
 
 /// A [`ToolExecutor`] wrapper that emits `AgentEvent::FileChange` when a
-/// file-mutating built-in succeeds, so the deck's Files tab / diff panel and
+/// file-touching built-in succeeds, so the deck's Files tab / diff panel and
 /// ledger are live during the turn. The diff is synthesized from the tool's
 /// own input (`edit_file` carries old/new verbatim; `write_file` the full
 /// content; `delete_file` reads the file before executing) — an honest
 /// approximation until the tool layer emits real diffs on the event path.
+/// Successful `read_file` calls emit too (kind `Read`, no diff) — the Files
+/// tab counts reads per file, matching the registry ledger's `R` events.
 struct FileChangeTap<'a> {
     inner: &'a dyn ToolExecutor,
     events: UnboundedSender<AgentEvent>,
@@ -2309,9 +2347,9 @@ impl ToolExecutor for FileChangeTap<'_> {
     }
 }
 
-/// The `(kind, pseudo-diff)` for one successful mutating tool call, or `None`
-/// for tools that don't change files. `pre` is `(existed_before, old_content)`
-/// as captured by the tap.
+/// The `(kind, pseudo-diff)` for one successful file-touching tool call, or
+/// `None` for tools that don't touch files. `pre` is
+/// `(existed_before, old_content)` as captured by the tap.
 fn file_change_of(
     name: &str,
     input: &Value,
@@ -2319,6 +2357,7 @@ fn file_change_of(
 ) -> Option<(FileChangeKind, Option<String>)> {
     let text = |key: &str| input.get(key).and_then(Value::as_str);
     match name {
+        "read_file" => Some((FileChangeKind::Read, None)),
         "write_file" => {
             let existed = pre.map(|(existed, _)| existed).unwrap_or(false);
             let kind = if existed {
@@ -2636,12 +2675,49 @@ mod tests {
             events: tx,
             root: dir.path().to_path_buf(),
         };
-        tap.execute("read_file", &serde_json::json!({ "path": "x" }))
+        tap.execute("grep", &serde_json::json!({ "pattern": "x" }))
             .await;
         assert!(
             recv_file_change(&mut rx).is_none(),
-            "read-only tools emit nothing"
+            "non-file read-only tools emit nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn tap_emits_a_diffless_read_event_for_successful_reads_only() {
+        // A successful read rides the FileChange path (kind Read, no diff) so
+        // the Files tab counts reads; a failed read stays silent.
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let inner = FakeInner { error: false };
+        let tap = FileChangeTap {
+            inner: &inner,
+            events: tx,
+            root: dir.path().to_path_buf(),
+        };
+        tap.execute("read_file", &serde_json::json!({ "path": "src/lib.rs" }))
+            .await;
+        match recv_file_change(&mut rx) {
+            Some(AgentEvent::FileChange { path, kind, diff }) => {
+                assert_eq!(path, "src/lib.rs");
+                assert_eq!(kind, FileChangeKind::Read);
+                assert_eq!(diff, None, "reads never carry a diff");
+            }
+            other => panic!("expected FileChange, got {other:?}"),
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let failing = FakeInner { error: true };
+        let tap = FileChangeTap {
+            inner: &failing,
+            events: tx,
+            root: dir.path().to_path_buf(),
+        };
+        let out = tap
+            .execute("read_file", &serde_json::json!({ "path": "ghost.rs" }))
+            .await;
+        assert!(out.is_error());
+        assert!(recv_file_change(&mut rx).is_none(), "no event on error");
     }
 
     #[test]

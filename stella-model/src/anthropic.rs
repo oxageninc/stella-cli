@@ -122,6 +122,14 @@ enum AnthropicContentBlock {
     Text {
         text: String,
     },
+    /// A user-attached image (`{"type":"image","source":{...}}`).
+    Image {
+        source: AnthropicMediaSource,
+    },
+    /// A user-attached PDF (`{"type":"document","source":{...}}`).
+    Document {
+        source: AnthropicMediaSource,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -133,6 +141,59 @@ enum AnthropicContentBlock {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
+}
+
+/// The base64 payload envelope shared by image and document blocks.
+#[derive(Serialize, Debug)]
+struct AnthropicMediaSource {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: String,
+    data: String,
+}
+
+impl AnthropicMediaSource {
+    fn base64(media_type: impl Into<String>, data: String) -> Self {
+        Self {
+            kind: "base64",
+            media_type: media_type.into(),
+            data,
+        }
+    }
+}
+
+/// The Messages API ingests images and PDFs natively; audio, video, and
+/// arbitrary binaries degrade to descriptive text notes.
+const ANTHROPIC_CAPS: crate::attachment::DialectCaps = crate::attachment::DialectCaps {
+    images: true,
+    pdfs: true,
+    audio: false,
+    video: false,
+};
+
+/// Map a user message's attachments to Anthropic content blocks. Media
+/// blocks precede text (the documented preferred ordering for vision).
+fn attachment_blocks(message: &CompletionMessage) -> Vec<AnthropicContentBlock> {
+    crate::attachment::wire_parts(&message.attachments, ANTHROPIC_CAPS)
+        .into_iter()
+        .map(|part| match part {
+            crate::attachment::WirePart::Image { media_type, base64 } => {
+                AnthropicContentBlock::Image {
+                    source: AnthropicMediaSource::base64(media_type, base64),
+                }
+            }
+            crate::attachment::WirePart::Pdf { base64, .. } => AnthropicContentBlock::Document {
+                source: AnthropicMediaSource::base64("application/pdf", base64),
+            },
+            crate::attachment::WirePart::Text { text } => AnthropicContentBlock::Text { text },
+            // Audio/video are switched off in ANTHROPIC_CAPS, so wire_parts
+            // has already degraded them to Text notes.
+            crate::attachment::WirePart::Audio { .. }
+            | crate::attachment::WirePart::Video { .. } => {
+                unreachable!("caps exclude audio/video")
+            }
+        })
+        .collect()
 }
 
 /// Streamed SSE payloads from the Messages API's `content_block_delta`
@@ -295,14 +356,19 @@ fn to_anthropic_messages(
             // the session permanently (every retry re-sends it). So a text
             // block is emitted only when it carries non-whitespace content,
             // and a message that ends up with zero blocks is dropped rather
-            // than padded with an empty block.
+            // than padded with an empty block. Attachment blocks (images,
+            // documents, inlined files) precede the typed text.
             MessageRole::User => {
+                let mut content = attachment_blocks(message);
                 if !message.content.trim().is_empty() {
+                    content.push(AnthropicContentBlock::Text {
+                        text: message.content.clone(),
+                    });
+                }
+                if !content.is_empty() {
                     out.push(AnthropicMessage {
                         role: "user",
-                        content: vec![AnthropicContentBlock::Text {
-                            text: message.content.clone(),
-                        }],
+                        content,
                     });
                 }
             }
@@ -658,6 +724,81 @@ mod tests {
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[test]
+    fn user_attachments_map_to_image_and_document_blocks_before_text() {
+        use stella_protocol::{Attachment, AttachmentSource};
+        let attachments = vec![
+            Attachment {
+                name: "shot.png".into(),
+                media_type: "image/png".into(),
+                byte_len: 3,
+                source: AttachmentSource::Data {
+                    base64: "aW1n".into(), // "img"
+                },
+            },
+            Attachment {
+                name: "spec.pdf".into(),
+                media_type: "application/pdf".into(),
+                byte_len: 3,
+                source: AttachmentSource::Data {
+                    base64: "cGRm".into(), // "pdf"
+                },
+            },
+            Attachment {
+                name: "clip.mp4".into(),
+                media_type: "video/mp4".into(),
+                byte_len: 3,
+                source: AttachmentSource::Data {
+                    base64: "dmlk".into(), // "vid"
+                },
+            },
+        ];
+        let messages = vec![CompletionMessage::user_with_attachments(
+            "what do you see?",
+            attachments,
+        )];
+        let (_, mapped) = to_anthropic_messages(&messages);
+        assert_eq!(mapped.len(), 1);
+        let json = serde_json::to_value(&mapped[0]).unwrap();
+        let blocks = json["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 4, "{json}");
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["type"], "base64");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[0]["source"]["data"], "aW1n");
+        assert_eq!(blocks[1]["type"], "document");
+        assert_eq!(blocks[1]["source"]["media_type"], "application/pdf");
+        // Video is not natively ingestible on this dialect: degrade note.
+        assert_eq!(blocks[2]["type"], "text");
+        let note = blocks[2]["text"].as_str().unwrap();
+        assert!(note.contains("clip.mp4"), "{note}");
+        // The typed text comes after the media blocks.
+        assert_eq!(blocks[3]["type"], "text");
+        assert_eq!(blocks[3]["text"], "what do you see?");
+    }
+
+    #[test]
+    fn attachment_only_user_message_survives_without_text() {
+        use stella_protocol::{Attachment, AttachmentSource};
+        let messages = vec![CompletionMessage::user_with_attachments(
+            "",
+            vec![Attachment {
+                name: "shot.png".into(),
+                media_type: "image/png".into(),
+                byte_len: 3,
+                source: AttachmentSource::Data {
+                    base64: "aW1n".into(),
+                },
+            }],
+        )];
+        let (_, mapped) = to_anthropic_messages(&messages);
+        assert_eq!(mapped.len(), 1, "attachment-only message must not drop");
+        let json = serde_json::to_value(&mapped[0]).unwrap();
+        let blocks = json["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "image");
+    }
+
     /// The reported failure's happy path: a multi-kilobyte `write_file` tool
     /// call whose argument JSON is split across HUNDREDS of `input_json_delta`
     /// fragments (and thus many SSE events / network chunks) must reassemble
@@ -943,6 +1084,7 @@ mod tests {
                     input: serde_json::json!({"path": "a"}),
                 }],
                 tool_results: vec![],
+                attachments: Vec::new(),
             },
             // A fully content-less assistant turn — must vanish entirely,
             // NOT become an empty text block.
@@ -951,6 +1093,7 @@ mod tests {
                 content: String::new(),
                 tool_calls: vec![],
                 tool_results: vec![],
+                attachments: Vec::new(),
             },
             // An empty user turn — dropped, never an empty text block.
             CompletionMessage {
@@ -958,6 +1101,7 @@ mod tests {
                 content: "  ".into(),
                 tool_calls: vec![],
                 tool_results: vec![],
+                attachments: Vec::new(),
             },
         ];
         let (_, mapped) = to_anthropic_messages(&messages);
@@ -1279,6 +1423,7 @@ mod tests {
                     input: serde_json::json!({"command": "ls"}),
                 }],
                 tool_results: vec![],
+                attachments: Vec::new(),
             },
             CompletionMessage {
                 role: MessageRole::Tool,
@@ -1290,6 +1435,7 @@ mod tests {
                         message: "command failed".into(),
                     },
                 }],
+                attachments: Vec::new(),
             },
         ];
         let (_, mapped) = to_anthropic_messages(&messages);
@@ -1328,6 +1474,7 @@ mod tests {
                 content: "hi".into(),
                 tool_calls: vec![],
                 tool_results: vec![],
+                attachments: Vec::new(),
             }],
             max_output_tokens: None,
             temperature: None,
@@ -1363,6 +1510,7 @@ mod tests {
                 content: "hi".into(),
                 tool_calls: vec![],
                 tool_results: vec![],
+                attachments: Vec::new(),
             }],
             max_output_tokens: None,
             temperature: None,
@@ -1397,6 +1545,7 @@ mod tests {
                 content: "hi".into(),
                 tool_calls: vec![],
                 tool_results: vec![],
+                attachments: Vec::new(),
             }],
             max_output_tokens: None,
             temperature: None,

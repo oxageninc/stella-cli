@@ -207,6 +207,7 @@ pub async fn infer_domains(provider: &dyn Provider, root: &Path) -> Domains {
                         content: result.text.clone(),
                         tool_calls: vec![],
                         tool_results: vec![],
+                        attachments: Vec::new(),
                     });
                     messages.push(CompletionMessage::user(
                         "That was not a valid non-empty JSON array of domains. Respond with \

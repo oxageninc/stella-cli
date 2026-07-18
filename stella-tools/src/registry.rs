@@ -129,7 +129,7 @@ impl ToolRegistry {
         let mcp_usage: stella_core::mcp_usage::McpUsageLedger = Arc::default();
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         let mut entries: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(crate::read::ReadFile),
+            Arc::new(crate::read::ReadFile::default()),
             Arc::new(crate::write::WriteFile),
             Arc::new(crate::edit::EditFile),
             Arc::new(crate::delete::DeleteFile),

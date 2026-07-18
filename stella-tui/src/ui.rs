@@ -301,11 +301,11 @@ fn handle_ask_user_key(
         }
         KeyCode::Enter => match classify_enter(&key) {
             EnterAction::Submit => match ui.composer.take_submission() {
-                Some(answer) => {
+                Some(submission) => {
                     ui.ask_answered = true;
                     Some(ShellAction::Submit(UserInput::AskUserAnswer {
                         id: prompt.id.clone(),
-                        answer,
+                        answer: submission.text,
                     }))
                 }
                 // An empty submit while a question is pending: force an
@@ -342,7 +342,10 @@ fn handle_composer_key(key: KeyEvent, ui: &mut UiState) -> ShellAction {
     {
         return match outcome {
             SlashPopupOutcome::Handled => ShellAction::Handled,
-            SlashPopupOutcome::Submit(text) => ShellAction::Submit(UserInput::Prompt { text }),
+            SlashPopupOutcome::Submit(text) => ShellAction::Submit(UserInput::Prompt {
+                text,
+                attachments: Vec::new(),
+            }),
         };
     }
     // Enter is a textarea key: plain `⏎` breaks the line (preserved verbatim
@@ -351,7 +354,10 @@ fn handle_composer_key(key: KeyEvent, ui: &mut UiState) -> ShellAction {
     match classify_enter(&key) {
         EnterAction::Submit => {
             return match ui.composer.take_submission() {
-                Some(text) => ShellAction::Submit(UserInput::Prompt { text }),
+                Some(submission) => ShellAction::Submit(UserInput::Prompt {
+                    text: submission.text,
+                    attachments: submission.attachments,
+                }),
                 None => ShellAction::Ignored,
             };
         }
@@ -538,7 +544,8 @@ mod tests {
         assert_eq!(
             action,
             ShellAction::Submit(UserInput::Prompt {
-                text: "hello".into()
+                text: "hello".into(),
+                attachments: Vec::new(),
             })
         );
     }
@@ -562,7 +569,8 @@ mod tests {
         assert_eq!(
             action,
             ShellAction::Submit(UserInput::Prompt {
-                text: "line one\nline two".into()
+                text: "line one\nline two".into(),
+                attachments: Vec::new(),
             }),
             "the typed line break survives into the submitted prompt"
         );
@@ -616,7 +624,8 @@ mod tests {
         assert_eq!(
             action,
             ShellAction::Submit(UserInput::Prompt {
-                text: "hi\n".into()
+                text: "hi\n".into(),
+                attachments: Vec::new(),
             }),
             "bare ⏎ submits (never blocks)"
         );
@@ -883,7 +892,8 @@ mod tests {
         assert_eq!(
             action,
             ShellAction::Submit(UserInput::Prompt {
-                text: "/diff".into()
+                text: "/diff".into(),
+                attachments: Vec::new(),
             })
         );
         assert!(ui.composer.is_empty(), "running a command clears the line");

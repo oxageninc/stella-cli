@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 stella-protocol = { path = "../stella-protocol" }
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -25,3 +26,4 @@ sha2.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 wiremock.workspace = true
+tempfile.workspace = true

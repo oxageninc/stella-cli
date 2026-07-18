@@ -244,15 +244,20 @@ pub struct InlineDiffRef {
 }
 
 /// The state of one file in the files-touched panel. `latest_diff` is
-/// literally the diff carried by the most recent `FileChange` for this path
-/// — the single event-borne data path (L-T5).
+/// literally the diff carried by the most recent *mutating* `FileChange` for
+/// this path — the single event-borne data path (L-T5). Reads never touch
+/// `kind`/`latest_diff`/`changes` (the latter doubles as the inline-diff
+/// freshness tag, so a read bumping it would hide a still-current diff);
+/// they only grow `reads`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileState {
     pub path: String,
     pub kind: FileChangeKind,
     pub latest_diff: Option<String>,
-    /// How many `FileChange` events have touched this path.
+    /// How many mutating `FileChange` events have touched this path.
     pub changes: u32,
+    /// How many times this path has been read.
+    pub reads: u32,
 }
 
 /// Live HUD numbers, all folded from the event stream.
@@ -639,17 +644,26 @@ impl SessionModel {
     }
 
     /// Record a file touch, retaining the latest diff for the path (L-T5).
+    /// A read on an already-tracked path only grows its read count — the
+    /// mutation kind, diff, and `changes` (the inline-diff freshness tag)
+    /// stay exactly as the last mutation left them.
     fn touch_file(&mut self, path: &str, kind: FileChangeKind, diff: &Option<String>) {
         if let Some(existing) = self.files.iter_mut().find(|f| f.path == path) {
-            existing.kind = kind;
-            existing.latest_diff = diff.clone();
-            existing.changes += 1;
+            if kind.is_mutation() {
+                existing.kind = kind;
+                existing.latest_diff = diff.clone();
+                existing.changes += 1;
+            } else {
+                existing.reads += 1;
+            }
         } else {
+            let mutation = kind.is_mutation();
             self.files.push(FileState {
                 path: path.to_string(),
                 kind,
                 latest_diff: diff.clone(),
-                changes: 1,
+                changes: mutation as u32,
+                reads: !mutation as u32,
             });
         }
     }
@@ -918,6 +932,43 @@ mod tests {
         assert_eq!(f.changes, 2);
         assert_eq!(f.kind, FileChangeKind::Modified);
         assert_eq!(f.latest_diff.as_deref(), Some("+second"));
+    }
+
+    #[test]
+    fn reads_count_without_clobbering_mutation_state() {
+        let mut model = SessionModel::new();
+        // First touch is a read: the file appears in the panel as read-only.
+        model.apply(&AgentEvent::FileChange {
+            path: "src/a.rs".into(),
+            kind: FileChangeKind::Read,
+            diff: None,
+        });
+        assert_eq!(model.files.len(), 1, "reads appear in the files panel");
+        let f = &model.files[0];
+        assert_eq!(f.kind, FileChangeKind::Read);
+        assert_eq!((f.changes, f.reads), (0, 1));
+
+        // A mutation takes over kind/diff; a later re-read only grows the
+        // read count — `changes` is the inline-diff freshness tag and must
+        // not move on reads.
+        model.apply(&AgentEvent::FileChange {
+            path: "src/a.rs".into(),
+            kind: FileChangeKind::Modified,
+            diff: Some("+x".into()),
+        });
+        model.apply(&AgentEvent::FileChange {
+            path: "src/a.rs".into(),
+            kind: FileChangeKind::Read,
+            diff: None,
+        });
+        let f = &model.files[0];
+        assert_eq!(
+            f.kind,
+            FileChangeKind::Modified,
+            "a re-read never regresses the badge"
+        );
+        assert_eq!(f.latest_diff.as_deref(), Some("+x"));
+        assert_eq!((f.changes, f.reads), (1, 2));
     }
 
     #[test]

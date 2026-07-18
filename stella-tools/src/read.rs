@@ -4,6 +4,17 @@
 //! file can't flood the context. Note this bounds displayed lines, not bytes:
 //! the file is read into memory first, so a single pathologically long line is
 //! still read in full.
+//!
+//! The tool also keeps the session's per-file read tally: every successful
+//! read increments a counter keyed by the file's normalized
+//! workspace-relative path (so `src/./a.rs` and `src/a.rs` count as one
+//! file), and the running count is reported in the tool output. One
+//! [`ReadFile`] instance lives per registry, so the tally is per session by
+//! construction; the audit-grade equivalent (one `R` event per read) lands in
+//! the registry's file-touch ledger.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -13,7 +24,39 @@ use crate::registry::Tool;
 
 const MAX_LINES: usize = 2000;
 
-pub struct ReadFile;
+#[derive(Default)]
+pub struct ReadFile {
+    /// Per-session read counts by normalized workspace-relative path.
+    counts: Mutex<HashMap<String, u64>>,
+}
+
+impl ReadFile {
+    /// How many times `path` (under any workspace-relative spelling) has been
+    /// successfully read this session.
+    pub fn read_count(&self, root: &std::path::Path, path: &str) -> u64 {
+        self.counts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&normalized_key(root, path))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Record one successful read of `path`, returning the new total.
+    fn tally(&self, root: &std::path::Path, path: &str) -> u64 {
+        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        let count = counts.entry(normalized_key(root, path)).or_insert(0);
+        *count += 1;
+        *count
+    }
+}
+
+/// The aggregation key for a read: the same normalized workspace-relative
+/// path the file-touch ledger uses, falling back to the raw spelling when
+/// normalization fails (it can't for a path that resolved and read OK).
+fn normalized_key(root: &std::path::Path, path: &str) -> String {
+    crate::file_touch::normalize_workspace_path(root, path).unwrap_or_else(|| path.to_string())
+}
 
 #[async_trait]
 impl Tool for ReadFile {
@@ -66,6 +109,10 @@ impl Tool for ReadFile {
 
         match tokio::fs::read_to_string(&full_path).await {
             Ok(content) => {
+                // Count every successful read — including a past-end offset,
+                // which still read the file — so the tally matches the
+                // ledger's one-R-event-per-successful-read rule.
+                let reads = self.tally(root, path);
                 let lines: Vec<&str> = content.lines().collect();
                 let start = offset.unwrap_or(1).saturating_sub(1);
                 let end = (start + limit).min(lines.len());
@@ -86,7 +133,9 @@ impl Tool for ReadFile {
                 }
                 let total = lines.len();
                 let shown = end - start;
-                numbered.push_str(&format!("\n({shown}/{total} lines shown)"));
+                numbered.push_str(&format!(
+                    "\n({shown}/{total} lines shown · read {reads}× this session)"
+                ));
                 ToolOutput::Ok { content: numbered }
             }
             Err(e) => ToolOutput::Error {
@@ -109,7 +158,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = ReadFile
+        let result = ReadFile::default()
             .execute(&serde_json::json!({"path": path}), &dir)
             .await;
         match result {
@@ -130,7 +179,7 @@ mod tests {
         let full = dir.join(&path);
         tokio::fs::write(&full, "a\nb\nc\nd\ne\n").await.unwrap();
 
-        let result = ReadFile
+        let result = ReadFile::default()
             .execute(
                 &serde_json::json!({"path": path, "offset": 2, "limit": 2}),
                 &dir,
@@ -149,9 +198,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn counts_reads_per_file_and_reports_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "one\n").unwrap();
+        let tool = ReadFile::default();
+
+        // Two reads of the same file under different spellings aggregate.
+        for spelling in ["src/a.rs", "src/./a.rs"] {
+            let out = tool
+                .execute(&serde_json::json!({"path": spelling}), dir.path())
+                .await;
+            assert!(!out.is_error(), "{out:?}");
+        }
+        let third = tool
+            .execute(&serde_json::json!({"path": "src/a.rs"}), dir.path())
+            .await;
+        match third {
+            ToolOutput::Ok { content } => {
+                assert!(
+                    content.contains("read 3× this session"),
+                    "third read reports its count: {content}"
+                );
+            }
+            ToolOutput::Error { message } => panic!("expected ok, got: {message}"),
+        }
+        assert_eq!(tool.read_count(dir.path(), "src/a.rs"), 3);
+        assert_eq!(tool.read_count(dir.path(), "src/./a.rs"), 3);
+
+        // Other files and failed reads don't inflate the tally.
+        let other = tool
+            .execute(&serde_json::json!({"path": "b.rs"}), dir.path())
+            .await;
+        assert!(!other.is_error());
+        assert_eq!(tool.read_count(dir.path(), "b.rs"), 1);
+        let missing = tool
+            .execute(&serde_json::json!({"path": "ghost.rs"}), dir.path())
+            .await;
+        assert!(missing.is_error());
+        assert_eq!(tool.read_count(dir.path(), "ghost.rs"), 0);
+    }
+
+    #[tokio::test]
     async fn missing_file_returns_error() {
         let dir = std::env::temp_dir();
-        let result = ReadFile
+        let result = ReadFile::default()
             .execute(
                 &serde_json::json!({"path": "nonexistent_xyz_123.txt"}),
                 &dir,
@@ -163,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn path_escape_returns_error() {
         let dir = std::env::temp_dir();
-        let result = ReadFile
+        let result = ReadFile::default()
             .execute(&serde_json::json!({"path": "../../etc/passwd"}), &dir)
             .await;
         assert!(result.is_error());
@@ -172,7 +264,9 @@ mod tests {
     #[tokio::test]
     async fn missing_path_field_returns_error() {
         let dir = std::env::temp_dir();
-        let result = ReadFile.execute(&serde_json::json!({}), &dir).await;
+        let result = ReadFile::default()
+            .execute(&serde_json::json!({}), &dir)
+            .await;
         assert!(result.is_error());
     }
 }

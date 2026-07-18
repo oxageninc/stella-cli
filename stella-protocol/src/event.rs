@@ -159,11 +159,13 @@ pub enum AgentEvent {
         to: String,
         reason: String,
     },
-    /// A file was created/modified/deleted by the agent, carrying the diff
-    /// so the TUI's files-touched panel renders per-edit diffs without a
+    /// A file was read/created/modified/deleted by the agent, carrying the
+    /// diff so the TUI's files-touched panel renders per-edit diffs without a
     /// second data path (L-T5: in TS, the `onFileEdit` callback had to be
     /// patched into two pipeline switches — here there is one emission
-    /// point by construction).
+    /// point by construction). Reads carry no diff; consumers that only care
+    /// about mutations (the pipeline's zero-diff guard, inline transcript
+    /// diffs) filter on the kind.
     FileChange {
         path: String,
         kind: FileChangeKind,
@@ -250,9 +252,22 @@ pub enum AgentEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileChangeKind {
+    /// Content was successfully read — no mutation, never a diff. Rides the
+    /// same event so the files-touched panel sees reads without a second
+    /// data path.
+    Read,
     Created,
     Modified,
     Deleted,
+}
+
+impl FileChangeKind {
+    /// Whether this kind mutated the file — what the pipeline's zero-diff
+    /// guard and inline transcript diffs key on. Reads are observability,
+    /// not change.
+    pub fn is_mutation(self) -> bool {
+        !matches!(self, FileChangeKind::Read)
+    }
 }
 
 /// A context frame as cited in a `ContextRecall` event. `citation_label`
@@ -472,6 +487,24 @@ mod tests {
                 assert!(diff.is_some());
             }
             other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_kind_serializes_and_is_the_only_non_mutation() {
+        assert_eq!(
+            serde_json::to_string(&FileChangeKind::Read).unwrap(),
+            "\"read\""
+        );
+        let back: FileChangeKind = serde_json::from_str("\"read\"").unwrap();
+        assert_eq!(back, FileChangeKind::Read);
+        assert!(!FileChangeKind::Read.is_mutation());
+        for kind in [
+            FileChangeKind::Created,
+            FileChangeKind::Modified,
+            FileChangeKind::Deleted,
+        ] {
+            assert!(kind.is_mutation(), "{kind:?} is a mutation");
         }
     }
 

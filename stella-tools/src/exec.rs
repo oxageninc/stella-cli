@@ -8,6 +8,24 @@ use tokio::process::Command;
 
 pub(crate) const MAX_OUTPUT_BYTES: usize = 30_000;
 
+/// Environment variables that re-target git at a specific repository. Tool
+/// subprocesses always run against their explicit working dir; when Stella
+/// itself was spawned from inside a git hook (which exports `GIT_DIR` et
+/// al.), letting them leak through would silently aim every git invocation
+/// at the OUTER repo instead — `git init` in a scratch dir re-initing the
+/// host repo, `verify_done` diffing against the wrong HEAD. Scrub these from
+/// every subprocess that shells out with an explicit dir.
+pub const GIT_REPO_ENV_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
 /// Run `command` via `bash -c` in `dir`. Returns `(exit_code, combined
 /// stdout+stderr)`; `Err` is spawn failure or timeout (the process group is
 /// killed on timeout so nothing lingers).
@@ -19,6 +37,9 @@ pub(crate) async fn run(
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(command);
     cmd.current_dir(dir);
+    for var in GIT_REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     #[cfg(unix)]

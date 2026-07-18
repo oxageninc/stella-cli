@@ -208,6 +208,32 @@ pub async fn run(
             }
             maybe_key = key_rx.recv() => {
                 match maybe_key {
+                    // `⌃V`: explicit clipboard pull — the only way a *bitmap*
+                    // (a copied screenshot) can enter the composer, since
+                    // bracketed paste never carries one. An image becomes an
+                    // attachment chip; text falls back to a normal paste.
+                    Some(Event::Key(key))
+                        if key.kind != KeyEventKind::Release
+                            && key.code == crossterm::event::KeyCode::Char('v')
+                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            && model.pending_scope_review.is_none()
+                            && model.pending_ask_user.is_none() =>
+                    {
+                        match crate::clipboard::capture(&crate::clipboard::default_attachments_dir()) {
+                            Ok(crate::clipboard::ClipboardPaste::Image(att)) => {
+                                debug.note(&format!("clipboard image attached: {}", att.label()));
+                                ui.composer.attach(att);
+                            }
+                            Ok(crate::clipboard::ClipboardPaste::Text(text)) => {
+                                match crate::attach::probe_path_attachment(&text) {
+                                    Some(att) => ui.composer.attach(att),
+                                    None => ui.composer.paste(&text),
+                                }
+                            }
+                            Ok(crate::clipboard::ClipboardPaste::Empty) => {}
+                            Err(err) => debug.note(&err),
+                        }
+                    }
                     Some(Event::Key(key)) if key.kind != KeyEventKind::Release => {
                         match handle_key(key, &model, &mut ui) {
                             ShellAction::Quit => {
@@ -230,7 +256,13 @@ pub async fn run(
                         // input — never queue text into the hidden composer.
                         if model.pending_scope_review.is_none() && model.pending_ask_user.is_none()
                         {
-                            ui.composer.paste(&text);
+                            // A paste that names a media file on disk (drag &
+                            // drop) attaches the file itself; anything else
+                            // stays literal text.
+                            match crate::attach::probe_path_attachment(&text) {
+                                Some(att) => ui.composer.attach(att),
+                                None => ui.composer.paste(&text),
+                            }
                         }
                     }
                     // Resize/other events: the next draw picks them up.
@@ -280,7 +312,10 @@ mod tests {
         log.event(&AgentEvent::Stage {
             name: stella_protocol::StageKind::Execute,
         });
-        log.input(&UserInput::Prompt { text: "hi".into() });
+        log.input(&UserInput::Prompt {
+            text: "hi".into(),
+            attachments: Vec::new(),
+        });
         log.note("done");
 
         let contents = std::fs::read_to_string(&path).unwrap();

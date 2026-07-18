@@ -380,7 +380,8 @@ impl WorkspaceModel {
             | Inbound::SkillPreview { .. }
             | Inbound::McpServers(_)
             | Inbound::McpSearchResults(_)
-            | Inbound::ShowHelp => {}
+            | Inbound::ShowHelp
+            | Inbound::Splash(_) => {}
         }
     }
 
@@ -492,11 +493,17 @@ impl WorkspaceModel {
 pub struct FileRecord {
     pub agent: AgentId,
     pub path: String,
+    /// The latest *mutation* kind — a read only sets this on a file that has
+    /// never been mutated, so an edited file's badge never regresses to `R`
+    /// when the agent re-reads it.
     pub kind: FileChangeKind,
     pub added: u32,
     pub removed: u32,
-    /// How many `FileChange` events have touched this (agent, path).
+    /// How many *mutating* `FileChange` events have touched this
+    /// (agent, path).
     pub changes: u32,
+    /// How many times this (agent, path) has been read.
+    pub reads: u32,
 }
 
 /// Every file touched this session, with CRUD op and line +/- parsed from the
@@ -515,18 +522,24 @@ impl FileLedger {
             .iter_mut()
             .find(|r| r.agent == agent && r.path == path)
         {
-            rec.kind = kind;
-            rec.added += added;
-            rec.removed += removed;
-            rec.changes += 1;
+            if kind.is_mutation() {
+                rec.kind = kind;
+                rec.added += added;
+                rec.removed += removed;
+                rec.changes += 1;
+            } else {
+                rec.reads += 1;
+            }
         } else {
+            let mutation = kind.is_mutation();
             self.records.push(FileRecord {
                 agent: agent.to_string(),
                 path: path.to_string(),
                 kind,
                 added,
                 removed,
-                changes: 1,
+                changes: mutation as u32,
+                reads: !mutation as u32,
             });
         }
     }
@@ -539,6 +552,9 @@ impl FileLedger {
     }
     pub fn file_count(&self) -> usize {
         self.records.len()
+    }
+    pub fn total_reads(&self) -> u32 {
+        self.records.iter().map(|r| r.reads).sum()
     }
 }
 
@@ -1148,6 +1164,46 @@ mod tests {
         assert_eq!(w.ledger.total_removed(), 1);
         assert_eq!(w.ledger.file_count(), 1);
         assert_eq!(w.latest_model(), Some("glm-5.2"));
+    }
+
+    #[test]
+    fn ledger_counts_reads_without_regressing_the_mutation_badge() {
+        let mut w = WorkspaceModel::new();
+        w.apply_inbound(&reg("lead"));
+        let read = |path: &str| {
+            ev(
+                "lead",
+                AgentEvent::FileChange {
+                    path: path.into(),
+                    kind: FileChangeKind::Read,
+                    diff: None,
+                },
+            )
+        };
+        // A read-only file shows up with an R badge and a read count.
+        w.apply_inbound(&read("src/a.rs"));
+        w.apply_inbound(&read("src/a.rs"));
+        let rec = &w.ledger.records[0];
+        assert_eq!(rec.kind, FileChangeKind::Read);
+        assert_eq!((rec.changes, rec.reads), (0, 2));
+
+        // A mutation owns the badge and ± totals; a later re-read only
+        // counts.
+        w.apply_inbound(&ev(
+            "lead",
+            AgentEvent::FileChange {
+                path: "src/a.rs".into(),
+                kind: FileChangeKind::Modified,
+                diff: Some("+one\n".into()),
+            },
+        ));
+        w.apply_inbound(&read("src/a.rs"));
+        let rec = &w.ledger.records[0];
+        assert_eq!(rec.kind, FileChangeKind::Modified);
+        assert_eq!((rec.changes, rec.reads), (1, 3));
+        assert_eq!(w.ledger.total_reads(), 3);
+        assert_eq!(w.ledger.total_added(), 1);
+        assert_eq!(w.ledger.file_count(), 1);
     }
 
     #[test]

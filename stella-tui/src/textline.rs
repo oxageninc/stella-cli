@@ -502,6 +502,7 @@ pub fn media_state_label(state: &MediaJobState) -> String {
 /// Past-tense verb for a `FileChange` transcript line.
 pub fn file_change_verb(kind: FileChangeKind) -> &'static str {
     match kind {
+        FileChangeKind::Read => "read",
         FileChangeKind::Created => "created",
         FileChangeKind::Modified => "modified",
         FileChangeKind::Deleted => "deleted",
@@ -509,10 +510,10 @@ pub fn file_change_verb(kind: FileChangeKind) -> &'static str {
 }
 
 /// The CRUD badge letter for a file-change kind — the vocabulary the
-/// files-touched panels share (the plain CLI's registry ledger additionally
-/// mints `R` for reads, which never rides a `FileChange` event).
+/// files-touched panels share with the plain CLI's registry ledger.
 pub fn crud_letter(kind: FileChangeKind) -> &'static str {
     match kind {
+        FileChangeKind::Read => "R",
         FileChangeKind::Created => "C",
         FileChangeKind::Modified => "U",
         FileChangeKind::Deleted => "D",

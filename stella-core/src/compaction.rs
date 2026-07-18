@@ -148,6 +148,7 @@ mod tests {
                 call_id: call_id.into(),
                 output: ToolOutput::Ok { content },
             }],
+            attachments: Vec::new(),
         }
     }
 
@@ -161,6 +162,7 @@ mod tests {
                 input: serde_json::json!({"path": "x"}),
             }],
             tool_results: vec![],
+            attachments: Vec::new(),
         }
     }
 
@@ -286,6 +288,7 @@ mod tests {
                         message: "diagnostic that matters".into(),
                     },
                 }],
+                attachments: Vec::new(),
             },
             assistant_with_call("c2"),
             tool_msg("c2", "filler ".repeat(2000)),

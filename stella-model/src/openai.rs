@@ -150,8 +150,55 @@ enum OpenAiInputItem {
 #[derive(Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OpenAiContentPart {
-    InputText { text: String },
-    OutputText { text: String },
+    InputText {
+        text: String,
+    },
+    OutputText {
+        text: String,
+    },
+    /// A user-attached image. The Responses API takes the payload as a data
+    /// URI in a plain string `image_url` (unlike Chat Completions' object).
+    InputImage {
+        image_url: String,
+    },
+    /// A user-attached PDF, inlined as a `file_data` data URI.
+    InputFile {
+        filename: String,
+        file_data: String,
+    },
+}
+
+/// The Responses API ingests images and PDFs; audio and video degrade to
+/// descriptive text notes (audio input rides separate model families and
+/// endpoints, not the Responses text path).
+const OPENAI_CAPS: crate::attachment::DialectCaps = crate::attachment::DialectCaps {
+    images: true,
+    pdfs: true,
+    audio: false,
+    video: false,
+};
+
+/// Map a user message's attachments to input parts (media before text).
+fn attachment_parts(message: &CompletionMessage) -> Vec<OpenAiContentPart> {
+    crate::attachment::wire_parts(&message.attachments, OPENAI_CAPS)
+        .into_iter()
+        .map(|part| match part {
+            crate::attachment::WirePart::Image { media_type, base64 } => {
+                OpenAiContentPart::InputImage {
+                    image_url: format!("data:{media_type};base64,{base64}"),
+                }
+            }
+            crate::attachment::WirePart::Pdf { name, base64 } => OpenAiContentPart::InputFile {
+                filename: name,
+                file_data: format!("data:application/pdf;base64,{base64}"),
+            },
+            crate::attachment::WirePart::Text { text } => OpenAiContentPart::InputText { text },
+            crate::attachment::WirePart::Audio { .. }
+            | crate::attachment::WirePart::Video { .. } => {
+                unreachable!("caps exclude audio/video")
+            }
+        })
+        .collect()
 }
 
 /// Streamed SSE payloads from the Responses API. Unlike Chat Completions'
@@ -323,12 +370,18 @@ fn to_openai_input(messages: &[CompletionMessage]) -> (Option<String>, Vec<OpenA
     for message in messages {
         match message.role {
             MessageRole::System => instructions.push(message.content.clone()),
-            MessageRole::User => out.push(OpenAiInputItem::Message {
-                role: "user",
-                content: vec![OpenAiContentPart::InputText {
-                    text: message.content.clone(),
-                }],
-            }),
+            MessageRole::User => {
+                let mut content = attachment_parts(message);
+                if !message.content.is_empty() || content.is_empty() {
+                    content.push(OpenAiContentPart::InputText {
+                        text: message.content.clone(),
+                    });
+                }
+                out.push(OpenAiInputItem::Message {
+                    role: "user",
+                    content,
+                });
+            }
             MessageRole::Assistant => {
                 if !message.content.is_empty() {
                     out.push(OpenAiInputItem::Message {
@@ -564,6 +617,43 @@ mod tests {
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[test]
+    fn user_attachments_map_to_input_image_and_input_file_parts() {
+        use stella_protocol::{Attachment, AttachmentSource};
+        let att = |name: &str, mime: &str, b64: &str| Attachment {
+            name: name.into(),
+            media_type: mime.into(),
+            byte_len: 3,
+            source: AttachmentSource::Data { base64: b64.into() },
+        };
+        let messages = vec![CompletionMessage::user_with_attachments(
+            "look",
+            vec![
+                att("a.png", "image/png", "aW1n"),
+                att("b.pdf", "application/pdf", "cGRm"),
+                att("c.mp3", "audio/mpeg", "YXVk"),
+            ],
+        )];
+        let (_, input) = to_openai_input(&messages);
+        assert_eq!(input.len(), 1);
+        let json = serde_json::to_value(&input[0]).unwrap();
+        let content = json["content"].as_array().unwrap();
+        assert_eq!(content.len(), 4, "{json}");
+        assert_eq!(content[0]["type"], "input_image");
+        assert_eq!(content[0]["image_url"], "data:image/png;base64,aW1n");
+        assert_eq!(content[1]["type"], "input_file");
+        assert_eq!(content[1]["filename"], "b.pdf");
+        assert_eq!(content[1]["file_data"], "data:application/pdf;base64,cGRm");
+        // Audio degrades to a note on this dialect.
+        assert_eq!(content[2]["type"], "input_text");
+        assert!(
+            content[2]["text"].as_str().unwrap().contains("c.mp3"),
+            "{json}"
+        );
+        assert_eq!(content[3]["type"], "input_text");
+        assert_eq!(content[3]["text"], "look");
+    }
+
     /// Every request carries the session-stable `prompt_cache_key` so
     /// OpenAI's implicit cache routes all of a session's prefix-sharing
     /// turns to the same shard.
@@ -678,6 +768,7 @@ mod tests {
                     input: serde_json::json!({"path": "a.rs"}),
                 }],
                 tool_results: vec![],
+                attachments: Vec::new(),
             },
             CompletionMessage {
                 role: MessageRole::Tool,
@@ -689,6 +780,7 @@ mod tests {
                         content: "fn main(){}".into(),
                     },
                 }],
+                attachments: Vec::new(),
             },
         ];
         let (_, mapped) = to_openai_input(&messages);
@@ -722,6 +814,7 @@ mod tests {
                     message: "no such file".into(),
                 },
             }],
+            attachments: Vec::new(),
         }];
         let (_, mapped) = to_openai_input(&messages);
         assert_eq!(mapped.len(), 1);

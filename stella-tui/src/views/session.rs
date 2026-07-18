@@ -36,7 +36,7 @@ use crate::theme;
 /// longer grows with session length.
 #[derive(Debug, Clone, Default)]
 pub struct SessionFold {
-    key: Option<(String, bool, u64, usize, usize)>,
+    key: Option<(String, bool, bool, u64, usize, usize)>,
     settled: usize,
     prefix: Vec<Line<'static>>,
     entry_rows: Vec<Range<usize>>,
@@ -44,13 +44,18 @@ pub struct SessionFold {
 }
 
 impl SessionFold {
-    /// Bring the cache up to date for this frame.
+    /// Bring the cache up to date for this frame. `expand_all` is the
+    /// no-selection ctrl+o overlay: every expandable entry folds as if
+    /// individually expanded (it participates in the cache key, so toggling
+    /// it invalidates exactly once).
+    #[allow(clippy::too_many_arguments)]
     fn refresh(
         &mut self,
         agent: &str,
         transcript: &[TranscriptEntry],
         thinking: bool,
         expanded: &HashSet<usize>,
+        expand_all: bool,
         expanded_rev: u64,
         width: usize,
     ) {
@@ -63,7 +68,14 @@ impl SessionFold {
             Some(TranscriptEntry::Evicted { count }) => *count,
             _ => 0,
         };
-        let key = (agent.to_string(), thinking, expanded_rev, width, evicted);
+        let key = (
+            agent.to_string(),
+            thinking,
+            expand_all,
+            expanded_rev,
+            width,
+            evicted,
+        );
         if self.key.as_ref() != Some(&key) || self.settled > transcript.len().saturating_sub(1) {
             self.key = Some(key);
             self.settled = 0;
@@ -77,7 +89,7 @@ impl SessionFold {
             entry_lines(
                 &transcript[i],
                 thinking,
-                expanded.contains(&i),
+                expand_all || expanded.contains(&i),
                 width,
                 &mut self.prefix,
             );
@@ -89,7 +101,7 @@ impl SessionFold {
             entry_lines(
                 last,
                 thinking,
-                expanded.contains(&target),
+                expand_all || expanded.contains(&target),
                 width,
                 &mut self.tail,
             );
@@ -175,6 +187,7 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
         &sm.transcript,
         ui.thinking_expanded,
         expanded_set,
+        ui.transcript_expand_all,
         ui.expanded_rev,
         width,
     );
@@ -213,11 +226,23 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
             }
         }
     }
+    // Contextual help, keyed to the transcript's interaction state: every
+    // mode advertises its own way out (ctrl+o/Esc collapse the expand-all
+    // overlay, Esc clears a highlight) and the resting state teaches the
+    // scroll verbs (↑ scrolls; ⌘/⌃ ] and ⌘/⌃ [ jump to the ends).
+    let hint = if ui.transcript_expand_all {
+        "all expanded · ⌃O or Esc collapses"
+    } else if ui.session_selected.is_some() {
+        "⌃O expand/collapse · Esc clears · ↑ ↓ move"
+    } else {
+        "↑ scroll · ⌘/⌃ ] end · ⌘/⌃ [ start · ⌃O expand all"
+    };
     render_transcript_window(
         visible,
         window,
         total,
         ui.session_scroll.follow,
+        Some(hint),
         bands[4],
         buf,
     );
@@ -353,15 +378,15 @@ mod tests {
             model.apply(&retry(i));
         }
         let mut fold = SessionFold::default();
-        fold.refresh("lead", &model.transcript, false, &expanded, 0, 80);
+        fold.refresh("lead", &model.transcript, false, &expanded, false, 0, 80);
         for i in 1_000..(MAX_TRANSCRIPT_ENTRIES + 50) {
             model.apply(&retry(i));
         }
         assert!(model.evicted_entries() > 0, "an eviction pass occurred");
-        fold.refresh("lead", &model.transcript, false, &expanded, 0, 80);
+        fold.refresh("lead", &model.transcript, false, &expanded, false, 0, 80);
 
         let mut fresh = SessionFold::default();
-        fresh.refresh("lead", &model.transcript, false, &expanded, 0, 80);
+        fresh.refresh("lead", &model.transcript, false, &expanded, false, 0, 80);
         assert_eq!(fold.total(), fresh.total());
         assert_eq!(
             fold.window_lines(0..fold.total()),

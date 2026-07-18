@@ -19,6 +19,7 @@
 
 mod agent;
 mod agents_installed;
+mod attachments;
 mod command_deck;
 mod config;
 mod domains;

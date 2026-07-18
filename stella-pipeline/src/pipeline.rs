@@ -1373,8 +1373,13 @@ impl<'a> Pipeline<'a> {
                     // and the terminal Complete — drop the engine's per-turn
                     // copies.
                     AgentEvent::Stage { .. } | AgentEvent::Complete { .. } => false,
-                    AgentEvent::FileChange { .. } => {
-                        seen_file_changes += 1;
+                    AgentEvent::FileChange { kind, .. } => {
+                        // Reads ride the same event for the files panel but
+                        // are not changes — counting them would defeat the
+                        // zero-diff guard on read-only turns.
+                        if kind.is_mutation() {
+                            seen_file_changes += 1;
+                        }
                         true
                     }
                     _ => true,

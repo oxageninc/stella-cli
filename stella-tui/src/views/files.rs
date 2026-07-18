@@ -26,6 +26,7 @@ const AGENT_W: usize = 13;
 const OP_W: usize = 4;
 const ADD_W: usize = 8;
 const REM_W: usize = 8;
+const READS_W: usize = 7;
 const CHANGES_W: usize = 5;
 /// Floor on the path column so a narrow terminal still shows *something*
 /// legible rather than collapsing to zero.
@@ -150,6 +151,8 @@ fn render_footer(ledger: &FileLedger, area: Rect, buf: &mut Buffer) {
             format!("-{}", ledger.total_removed()),
             Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
         ),
+        Span::raw("  "),
+        Span::styled(format!("{} reads", ledger.total_reads()), theme::muted()),
     ]);
     Paragraph::new(line).render(area, buf);
 }
@@ -160,7 +163,7 @@ fn render_footer(ledger: &FileLedger, area: Rect, buf: &mut Buffer) {
 /// columns the path (the row's most meaningful cell) still fits and only the
 /// tail columns clip, instead of the path column alone overflowing the pane.
 fn path_width(total_width: usize) -> usize {
-    let fixed = AGENT_W + OP_W + ADD_W + REM_W + CHANGES_W;
+    let fixed = AGENT_W + OP_W + ADD_W + REM_W + READS_W + CHANGES_W;
     total_width
         .saturating_sub(fixed)
         .max(MIN_PATH_W)
@@ -170,18 +173,20 @@ fn path_width(total_width: usize) -> usize {
 fn header_line(width: usize) -> Line<'static> {
     let pw = path_width(width);
     let text = format!(
-        "{:<pw$}{:<aw$}{:^ow$}{:>dw$}{:>rw$}{:>cw$}",
+        "{:<pw$}{:<aw$}{:^ow$}{:>dw$}{:>rw$}{:>sw$}{:>cw$}",
         "File",
         "Agent",
         "Op",
         "+",
         "-",
+        "reads",
         "×",
         pw = pw,
         aw = AGENT_W,
         ow = OP_W,
         dw = ADD_W,
         rw = REM_W,
+        sw = READS_W,
         cw = CHANGES_W,
     );
     Line::from(Span::styled(text, theme::muted()))
@@ -211,7 +216,11 @@ fn record_line(rec: &FileRecord, width: usize, selected: bool) -> Line<'static> 
             format!("-{:<w$}", rec.removed, w = REM_W.saturating_sub(1)),
             Style::default().fg(theme::BAD),
         ),
-        Span::styled(format!("×{}", rec.changes), theme::muted()),
+        Span::styled(format!("{:>w$}", rec.reads, w = READS_W), theme::muted()),
+        Span::styled(
+            format!("{:>w$}", format!("×{}", rec.changes), w = CHANGES_W),
+            theme::muted(),
+        ),
     ];
 
     if selected {
@@ -228,6 +237,7 @@ fn record_line(rec: &FileRecord, width: usize, selected: bool) -> Line<'static> 
 /// rendering surfaces — issue #66); only the palette is this view's.
 fn op_style(kind: FileChangeKind) -> (&'static str, ratatui::style::Color) {
     let color = match kind {
+        FileChangeKind::Read => theme::MUTED,
         FileChangeKind::Created => theme::OK,
         FileChangeKind::Modified => theme::WARN,
         FileChangeKind::Deleted => theme::BAD,
@@ -439,6 +449,32 @@ mod tests {
     }
 
     #[test]
+    fn read_only_files_render_with_a_read_count() {
+        let mut m = WorkspaceModel::new();
+        m.apply_inbound(&Inbound::Register(AgentMeta::new("lead", "goal", 0)));
+        for _ in 0..2 {
+            m.apply_inbound(&Inbound::Event {
+                agent: "lead".into(),
+                event: AgentEvent::FileChange {
+                    path: "src/read_me.rs".into(),
+                    kind: FileChangeKind::Read,
+                    diff: None,
+                },
+            });
+        }
+        let mut ui = DeckUi::default();
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        render(&m, &mut ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("read_me.rs"),
+            "read files appear in the tab:\n{text}"
+        );
+        assert!(text.contains("2 reads"), "footer totals the reads:\n{text}");
+    }
+
+    #[test]
     fn empty_ledger_shows_hint_without_panicking() {
         let model = WorkspaceModel::new();
         let mut ui = DeckUi::default();
@@ -451,7 +487,7 @@ mod tests {
 
     #[test]
     fn path_width_never_exceeds_the_available_row_width() {
-        let fixed = AGENT_W + OP_W + ADD_W + REM_W + CHANGES_W;
+        let fixed = AGENT_W + OP_W + ADD_W + REM_W + READS_W + CHANGES_W;
         assert_eq!(
             path_width(120),
             120 - fixed,
