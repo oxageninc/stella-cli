@@ -1,8 +1,11 @@
-//! The self-improvement loop (user requirement): after every chat turn the
-//! agent reflects on its own performance and records improvement memories;
-//! before every turn, relevant memories and skills are recalled into
-//! context; and when a lesson recurs enough times it is automatically
-//! promoted to a durable skill (`.stella/skills/<slug>/SKILL.md`).
+//! The self-improvement loop (user requirement): after every turn that did
+//! real work — chat, `run`, `goal`, and the Command Deck alike, on success
+//! AND on failure — the agent reflects on its own performance and records
+//! improvement memories; before every turn, relevant memories and skills are
+//! recalled into context; and when a lesson recurs enough times it is
+//! automatically promoted to a durable skill (`.stella/skills/<slug>/SKILL.md`).
+//! A failed turn is the highest-value learning signal, so it gets a
+//! root-cause "why did this fail" reflection prompt (see [`reflect_on_turn`]).
 //!
 //! Data flow per turn:
 //!
@@ -55,6 +58,24 @@ pub struct ReflectionLesson {
     pub occurred_at: u64,
 }
 
+/// The outcome of a post-turn reflection, so the caller can surface it per
+/// output format instead of it vanishing. Reflection is best-effort and must
+/// never fail the turn, but "the reflection model call errored" and "the
+/// model correctly found nothing worth recording" are different facts a
+/// headless/CI consumer needs to tell apart — previously both were an
+/// indistinguishable silent zero. `model_error` is `Some` only when the
+/// reflection provider call itself failed (never for an empty-but-successful
+/// reflection).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReflectionReport {
+    /// Lessons that reached the context store this turn (0 when the model
+    /// found nothing, when the store write failed, or when the call errored).
+    pub recorded: usize,
+    /// The reflection model call's error, when it failed. Best-effort surfacing
+    /// only — the turn already succeeded/failed on its own merits.
+    pub model_error: Option<String>,
+}
+
 /// Session-scoped memory state: the context store, the OCP host that
 /// routes every recall (workspace memory + code graph as in-process OCP
 /// providers — see `crate::ocp`), the domain taxonomy, and the skills
@@ -73,8 +94,12 @@ pub struct SessionMemory {
     quarantined_ids: std::collections::HashSet<String>,
     /// A/B recall control (Proposal 4): when true, recall is suppressed
     /// entirely on this turn so the outcome can be compared against recalled
-    /// turns. Set by `ab_suppress_recall()` with a deterministic seed.
+    /// turns. Set by `maybe_suppress_recall()` from the turn counter below.
     ab_suppressed: bool,
+    /// Count of turns that have consulted the A/B control, used to make
+    /// every `rate`-th turn a deterministic control turn (see
+    /// [`SessionMemory::maybe_suppress_recall`]).
+    ab_turn: u32,
 }
 
 /// Filesystem-backed [`SkillSource`] reading the workspace + user-global
@@ -204,6 +229,7 @@ impl SessionMemory {
                     skills_created: 0,
                     quarantined_ids,
                     ab_suppressed: false,
+                    ab_turn: 0,
                 })
             }
             Err(e) => {
@@ -285,24 +311,26 @@ impl SessionMemory {
         }
     }
 
-    /// A/B recall control (Proposal 4): suppress recall for this turn with a
-    /// deterministic `1/rate` coin flip, returning whether recall was
+    /// A/B recall control (Proposal 4): suppress recall for this turn on a
+    /// deterministic `1/rate` schedule, returning whether recall was
     /// suppressed. A rate of 0 (or 1) never suppresses. The caller records
     /// the outcome alongside this flag so `stella memory ab-report` can
     /// compare recalled vs control turns.
+    ///
+    /// Suppression is driven by a per-session **turn counter**, not a wall
+    /// clock. A previous implementation seeded off `SystemTime` nanoseconds
+    /// and tested `ns % rate == 0`; on any host whose realtime clock is
+    /// coarser than nanoseconds (macOS keeps it in microseconds, so `ns` is
+    /// always a multiple of 1000) that predicate is true on *every* turn for
+    /// any `rate` dividing 1000 — silently disabling recall entirely. A plain
+    /// counter makes exactly every `rate`-th turn a control turn, on every OS.
     pub fn maybe_suppress_recall(&mut self, rate: u32) -> bool {
         if rate == 0 || rate == 1 {
             self.ab_suppressed = false;
             return false;
         }
-        // Deterministic from the turn count (avoids a crypto dependency):
-        // every `rate`-th turn is a control turn. Using nanosecond seed for
-        // unpredictability across sessions.
-        let ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        self.ab_suppressed = ns.is_multiple_of(rate as u64);
+        self.ab_turn = self.ab_turn.wrapping_add(1);
+        self.ab_suppressed = ab_control_turn(self.ab_turn, rate);
         self.ab_suppressed
     }
 
@@ -310,7 +338,17 @@ impl SessionMemory {
     pub fn recall_was_suppressed(&self) -> bool {
         self.ab_suppressed
     }
+}
 
+/// Is the `turn`-th turn (1-based) an A/B control turn at the given `rate`?
+/// Every `rate`-th turn is a control turn; `rate` of 0 or 1 never controls.
+/// Pure so the schedule is property-testable independent of the (heavy)
+/// [`SessionMemory`] it lives on.
+fn ab_control_turn(turn: u32, rate: u32) -> bool {
+    rate > 1 && turn.is_multiple_of(rate)
+}
+
+impl SessionMemory {
     /// The skills recall would inject for `prompt`, as `(name, reason)` pairs
     /// for skill-version usage telemetry — `reason` is the matched
     /// domains/terms that selected it. Same enabled-filtered load + selection
@@ -452,9 +490,11 @@ impl SessionMemory {
     /// Post-turn self-reflection: one cheap model call producing 0-3
     /// durable lessons, stored as domain-tagged reflection memories AND
     /// appended to the skill-mining log; recurring lessons auto-promote to
-    /// SKILL.md files. Best-effort throughout — returns how many lessons
-    /// were recorded, and any failure degrades to 0 silently (a failed
-    /// reflection must never fail the turn that just succeeded).
+    /// SKILL.md files. Best-effort throughout — a failed reflection must never
+    /// fail the turn it describes. Returns a [`ReflectionReport`] so the caller
+    /// can surface the outcome (a model-call error, or how many lessons landed)
+    /// in whichever output format it speaks; the report distinguishes a genuine
+    /// model-call failure from the common, correct "nothing worth recording."
     ///
     /// `succeeded` controls the reflection prompt template (Proposal 1):
     /// a failed turn gets a failure-analysis prompt that asks the model to
@@ -466,10 +506,23 @@ impl SessionMemory {
         transcript: &[CompletionMessage],
         quiet: bool,
         succeeded: bool,
-    ) -> usize {
-        let lessons = reflect_on_turn(provider, transcript, &self.domains.names(), succeeded).await;
+    ) -> ReflectionReport {
+        let lessons =
+            match reflect_on_turn(provider, transcript, &self.domains.names(), succeeded).await {
+                Ok(lessons) => lessons,
+                // The single reflection model call errored. Report it up so the
+                // caller can warn (text) or emit an event (stream-json) — this
+                // is the fix for the previously-silent reflection failure. Never
+                // fatal: the turn already stands on its own.
+                Err(model_error) => {
+                    return ReflectionReport {
+                        recorded: 0,
+                        model_error: Some(model_error),
+                    };
+                }
+            };
         if lessons.is_empty() {
-            return 0;
+            return ReflectionReport::default();
         }
 
         // 1. Store as recallable, domain-tagged reflection memories. Still
@@ -530,7 +583,10 @@ impl SessionMemory {
                 );
             }
         }
-        if stored { lessons.len() } else { 0 }
+        ReflectionReport {
+            recorded: if stored { lessons.len() } else { 0 },
+            model_error: None,
+        }
     }
 
     /// Mine the whole reflection log for recurring lessons and auto-create
@@ -726,10 +782,15 @@ pub fn turn_warrants_reflection(turn_messages: &[CompletionMessage]) -> bool {
     turn_messages.iter().any(|m| !m.tool_calls.is_empty())
 }
 
-/// One cheap reflection call (triage-tier discipline: single attempt, any
-/// failure -> empty). The model critiques the completed turn and returns
-/// 0-3 short forward-looking lessons tagged with domains FROM THE SUPPLIED
-/// LIST only — invented domain names are dropped.
+/// One cheap reflection call (triage-tier discipline: single attempt). The
+/// model critiques the completed turn and returns 0-3 short forward-looking
+/// lessons tagged with domains FROM THE SUPPLIED LIST only — invented domain
+/// names are dropped.
+///
+/// Returns `Err` only when the provider call itself fails; `Ok(vec![])` is the
+/// common, correct "nothing worth recording." Separating these two is what
+/// lets the caller warn on a real failure instead of swallowing it as a
+/// silent zero (the reflection blind spot this replaces).
 ///
 /// `succeeded` selects the prompt template (Proposal 1): on failure the model
 /// is asked to identify the root cause and what to do differently — the
@@ -740,7 +801,7 @@ pub async fn reflect_on_turn(
     transcript: &[CompletionMessage],
     domain_names: &[String],
     succeeded: bool,
-) -> Vec<ReflectionLesson> {
+) -> Result<Vec<ReflectionLesson>, String> {
     // Bounded transcript digest: last 12 messages, 300 chars each.
     let digest: String = transcript
         .iter()
@@ -811,10 +872,8 @@ pub async fn reflect_on_turn(
         tools: vec![],
     };
 
-    let Ok(result) = provider.complete(req).await else {
-        return Vec::new();
-    };
-    parse_lessons(&result.text, domain_names)
+    let result = provider.complete(req).await.map_err(|e| e.to_string())?;
+    Ok(parse_lessons(&result.text, domain_names))
 }
 
 /// Extract the first JSON array from model output; drop invented domains;
@@ -869,6 +928,38 @@ mod tests {
             content: content.into(),
             tool_calls: vec![],
             tool_results: vec![],
+        }
+    }
+
+    #[test]
+    fn ab_control_fires_exactly_once_per_rate_not_every_turn() {
+        // The witness for the wall-clock bug: on a microsecond-resolution
+        // realtime clock the old `ns % rate == 0` predicate was true on EVERY
+        // turn, silently disabling recall. The turn-counter schedule must
+        // suppress exactly turns rate, 2*rate, 3*rate — and no others.
+        let rate = 10;
+        let suppressed: Vec<u32> = (1..=30).filter(|&t| ab_control_turn(t, rate)).collect();
+        assert_eq!(
+            suppressed,
+            vec![10, 20, 30],
+            "exactly 1-in-{rate} turns is a control turn"
+        );
+        // The old bug would have suppressed all 30; guard against a regression
+        // back to "always on".
+        assert_eq!(
+            (1..=30).filter(|&t| ab_control_turn(t, rate)).count(),
+            3,
+            "recall must be live on the other 27 of 30 turns"
+        );
+    }
+
+    #[test]
+    fn ab_control_disabled_for_rate_zero_and_one() {
+        for rate in [0, 1] {
+            assert!(
+                (1..=50).all(|t| !ab_control_turn(t, rate)),
+                "rate {rate} must never suppress"
+            );
         }
     }
 

@@ -280,15 +280,26 @@ fn to_anthropic_messages(
             MessageRole::System => {
                 system = Some(message.content.clone());
             }
-            MessageRole::User => out.push(AnthropicMessage {
-                role: "user",
-                content: vec![AnthropicContentBlock::Text {
-                    text: message.content.clone(),
-                }],
-            }),
+            // The Anthropic API rejects a text content block whose text is
+            // empty or whitespace-only with a 400 — and because the whole
+            // conversation is replayed on every turn, one such block bricks
+            // the session permanently (every retry re-sends it). So a text
+            // block is emitted only when it carries non-whitespace content,
+            // and a message that ends up with zero blocks is dropped rather
+            // than padded with an empty block.
+            MessageRole::User => {
+                if !message.content.trim().is_empty() {
+                    out.push(AnthropicMessage {
+                        role: "user",
+                        content: vec![AnthropicContentBlock::Text {
+                            text: message.content.clone(),
+                        }],
+                    });
+                }
+            }
             MessageRole::Assistant => {
                 let mut content = Vec::new();
-                if !message.content.is_empty() {
+                if !message.content.trim().is_empty() {
                     content.push(AnthropicContentBlock::Text {
                         text: message.content.clone(),
                     });
@@ -300,15 +311,15 @@ fn to_anthropic_messages(
                         input: call.input.clone(),
                     });
                 }
-                if content.is_empty() {
-                    content.push(AnthropicContentBlock::Text {
-                        text: String::new(),
+                // A content-less assistant turn (no text, no tool calls) is
+                // dropped, not sent as an empty text block: it carries no
+                // information and there is no tool_use to orphan.
+                if !content.is_empty() {
+                    out.push(AnthropicMessage {
+                        role: "assistant",
+                        content,
                     });
                 }
-                out.push(AnthropicMessage {
-                    role: "assistant",
-                    content,
-                });
             }
             // Anthropic dialect: tool results are content blocks inside a
             // `user` message, each keyed by `tool_use_id`.
@@ -849,6 +860,80 @@ mod tests {
         assert_eq!(system, Some("You are a coding agent.".to_string()));
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].role, "user");
+    }
+
+    /// The Anthropic API rejects empty / whitespace-only text blocks with a
+    /// 400, and since history is replayed every turn, one such block bricks
+    /// the session forever. `to_anthropic_messages` must never emit one, and
+    /// a message that would carry only such a block is dropped rather than
+    /// padded.
+    #[test]
+    fn empty_and_whitespace_text_blocks_are_never_emitted() {
+        use stella_protocol::ToolCall;
+        let messages = vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("real question"),
+            // Assistant turn with only whitespace text plus a tool call:
+            // the whitespace text must be dropped, the tool_use kept.
+            CompletionMessage {
+                role: MessageRole::Assistant,
+                content: "   \n\t ".into(),
+                tool_calls: vec![ToolCall {
+                    call_id: "toolu_1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "a"}),
+                }],
+                tool_results: vec![],
+            },
+            // A fully content-less assistant turn — must vanish entirely,
+            // NOT become an empty text block.
+            CompletionMessage {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                tool_calls: vec![],
+                tool_results: vec![],
+            },
+            // An empty user turn — dropped, never an empty text block.
+            CompletionMessage {
+                role: MessageRole::User,
+                content: "  ".into(),
+                tool_calls: vec![],
+                tool_results: vec![],
+            },
+        ];
+        let (_, mapped) = to_anthropic_messages(&messages);
+
+        // Not one emitted text block is empty or whitespace-only.
+        for m in &mapped {
+            for block in &m.content {
+                if let AnthropicContentBlock::Text { text } = block {
+                    assert!(
+                        !text.trim().is_empty(),
+                        "emitted an empty/whitespace text block: {text:?}"
+                    );
+                }
+            }
+        }
+        // The whitespace-plus-tool assistant turn kept exactly its tool_use.
+        let assistant = mapped
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("the tool-calling assistant turn survives");
+        assert_eq!(assistant.content.len(), 1);
+        assert!(matches!(
+            assistant.content[0],
+            AnthropicContentBlock::ToolUse { .. }
+        ));
+        // The content-less assistant turn and the empty user turn are gone.
+        assert_eq!(
+            mapped.iter().filter(|m| m.role == "assistant").count(),
+            1,
+            "the content-less assistant turn is dropped, not padded"
+        );
+        // Only the real user question survives among user-role messages.
+        let user_texts: Vec<&AnthropicMessage> =
+            mapped.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(user_texts.len(), 1);
     }
 
     /// Prompt caching is opt-in per request: the serialized body must carry
