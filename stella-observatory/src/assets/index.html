@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stella — Observatory</title>
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+<style>
+/* ── Brand tokens (assets/stella-logo.html is the source of truth) ────── */
+:root{
+  --night:#0B0A08; --ink:#15120C; --surface:#14100B; --raised:#1C1610;
+  --hairline:rgba(245,179,60,.13); --hairline-dim:rgba(245,179,60,.07);
+  --paper:#FBF7EF; --text:#F2EDE3; --text-2:#B7AD98; --text-3:#8D8474;
+  --gold:#F5B33C; --gold-hi:#FFD97A; --amber:#E08A20;
+  /* Data-mark palette — validated (dataviz six checks, dark surface) */
+  --c1:#C68524; --c2:#8F70E8; --c3:#E8654B; --c4:#D14E7C;
+  /* Status — always paired with a label, never color alone */
+  --ok:#3FD69B; --warn:#F4B24A; --bad:#E5537B;
+  --mono:"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Arial,sans-serif;
+}
+*{margin:0;box-sizing:border-box}
+html{color-scheme:dark}
+body{
+  font-family:var(--sans); color:var(--text); background:var(--night);
+  background-image:
+    radial-gradient(60% 42% at 50% -6%, rgba(245,179,60,.14), rgba(0,0,0,0) 64%),
+    radial-gradient(1px 1px at 12% 18%, rgba(255,217,122,.35) 0 1px, transparent 1px),
+    radial-gradient(1px 1px at 78% 9%,  rgba(255,217,122,.28) 0 1px, transparent 1px),
+    radial-gradient(1px 1px at 33% 6%,  rgba(251,247,239,.20) 0 1px, transparent 1px),
+    radial-gradient(1px 1px at 61% 22%, rgba(251,247,239,.16) 0 1px, transparent 1px),
+    radial-gradient(1px 1px at 90% 30%, rgba(255,217,122,.20) 0 1px, transparent 1px);
+  background-repeat:no-repeat,repeat,repeat,repeat,repeat,repeat;
+  min-height:100vh; line-height:1.5;
+}
+.wrap{max-width:1280px;margin:0 auto;padding:0 24px 80px}
+
+/* ── Header ───────────────────────────────────────────────────────────── */
+header{display:flex;align-items:center;gap:14px;padding:26px 0 22px}
+header img{width:44px;height:auto}
+.title{display:flex;flex-direction:column}
+.title b{font-size:19px;letter-spacing:.14em;font-family:var(--mono)}
+.title b em{color:var(--gold);font-style:normal}
+.title span{font:11px var(--mono);letter-spacing:.3em;text-transform:uppercase;color:var(--amber)}
+.headmeta{margin-left:auto;display:flex;align-items:center;gap:16px;font:12px var(--mono);color:var(--text-3)}
+.live{display:inline-flex;align-items:center;gap:7px;color:var(--text-2)}
+.live i{width:7px;height:7px;border-radius:50%;background:var(--ok);animation:pulse 2.4s infinite}
+.live.paused i{background:var(--text-3);animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+/* ── Cards & grid ─────────────────────────────────────────────────────── */
+.grid{display:grid;gap:14px}
+.kpis{grid-template-columns:repeat(6,1fr);margin-bottom:14px}
+.cols-2{grid-template-columns:3fr 2fr;margin-bottom:14px}
+.cols-2b{grid-template-columns:2fr 3fr;margin-bottom:14px}
+@media(max-width:980px){.kpis{grid-template-columns:repeat(3,1fr)}.cols-2,.cols-2b{grid-template-columns:1fr}}
+.card{
+  background:linear-gradient(180deg,var(--raised),var(--surface));
+  border:1px solid var(--hairline); border-radius:14px; padding:18px 20px;
+}
+.kick{font:10px var(--mono);letter-spacing:.28em;text-transform:uppercase;color:var(--amber);margin-bottom:10px}
+.card h2{font-size:14px;letter-spacing:-.01em;margin-bottom:2px}
+
+/* ── Stat tiles ───────────────────────────────────────────────────────── */
+.tile .v{font:600 26px/1.15 var(--mono);letter-spacing:-.02em;margin-top:2px}
+.tile .v small{font-size:14px;color:var(--text-3)}
+.tile .k{font:10px var(--mono);letter-spacing:.22em;text-transform:uppercase;color:var(--text-3)}
+.tile .sub{font:11px var(--mono);color:var(--text-2);margin-top:4px}
+.tile .v.gold{color:var(--gold)}
+
+/* ── Tables ───────────────────────────────────────────────────────────── */
+table{width:100%;border-collapse:collapse;font:12px var(--mono)}
+th{font:10px var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--text-3);
+   text-align:left;padding:7px 10px;border-bottom:1px solid var(--hairline)}
+td{padding:7px 10px;border-bottom:1px solid var(--hairline-dim);color:var(--text-2);white-space:nowrap}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+td.main{color:var(--text)}
+tr.click{cursor:pointer}
+tr.click:hover td{background:rgba(245,179,60,.05)}
+.scroll-x{overflow-x:auto}
+.scroll-y{max-height:340px;overflow-y:auto}
+
+/* ── Badges ───────────────────────────────────────────────────────────── */
+.badge{display:inline-flex;align-items:center;gap:5px;padding:1px 8px;border-radius:999px;
+       font:11px var(--mono);border:1px solid}
+.badge.ok{color:var(--ok);border-color:rgba(63,214,155,.4)}
+.badge.bad{color:var(--bad);border-color:rgba(229,83,123,.4)}
+.badge.warn{color:var(--warn);border-color:rgba(244,178,74,.4)}
+.badge.dim{color:var(--text-3);border-color:var(--hairline)}
+
+/* ── Charts ───────────────────────────────────────────────────────────── */
+svg text{font:10px var(--mono);fill:var(--text-3)}
+svg .lbl{fill:var(--text-2)}
+.legend{display:flex;gap:16px;font:11px var(--mono);color:var(--text-2);margin:6px 0 2px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+.hbar{display:grid;grid-template-columns:120px 1fr 84px;align-items:center;gap:10px;
+      font:12px var(--mono);color:var(--text-2);padding:4px 0}
+.hbar .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.hbar .track{height:14px;border-radius:0 4px 4px 0;background:var(--c1);min-width:2px}
+.hbar .val{text-align:right;color:var(--text-3)}
+
+/* ── Tooltip ──────────────────────────────────────────────────────────── */
+#tip{position:fixed;pointer-events:none;z-index:50;display:none;background:var(--ink);
+     border:1px solid var(--hairline);border-radius:8px;padding:8px 11px;
+     font:11px var(--mono);color:var(--text-2);max-width:320px;box-shadow:0 8px 28px rgba(0,0,0,.5)}
+#tip b{color:var(--text);display:block;margin-bottom:2px}
+
+/* ── Drawer ───────────────────────────────────────────────────────────── */
+#drawer{position:fixed;inset:0 0 0 auto;width:min(680px,94vw);background:var(--ink);
+        border-left:1px solid var(--hairline);transform:translateX(102%);
+        transition:transform .28s cubic-bezier(.2,.8,.2,1);z-index:40;overflow-y:auto;padding:24px}
+#drawer.open{transform:none}
+#scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);opacity:0;pointer-events:none;
+       transition:opacity .28s;z-index:30}
+#scrim.open{opacity:1;pointer-events:auto}
+#drawer .close{position:absolute;top:18px;right:18px;background:none;border:1px solid var(--hairline);
+               border-radius:8px;color:var(--text-2);font:14px var(--mono);padding:4px 10px;cursor:pointer}
+#drawer .close:hover{color:var(--gold)}
+#drawer h3{font:600 15px var(--sans);margin:4px 0 2px;max-width:85%}
+#drawer .sect{margin-top:20px}
+.step-row{display:grid;grid-template-columns:34px 1fr 150px;gap:10px;align-items:center;
+          font:11px var(--mono);color:var(--text-3);padding:3px 0}
+.tokbar{display:flex;height:12px;border-radius:0 3px 3px 0;overflow:hidden;gap:2px}
+.tokbar i{display:block;height:100%}
+.empty{padding:34px 10px;text-align:center;color:var(--text-3);font:13px var(--mono)}
+.empty code{color:var(--gold);background:rgba(245,179,60,.08);padding:2px 8px;border-radius:6px}
+.section-gap{margin-bottom:14px}
+footer{margin-top:26px;font:11px var(--mono);color:var(--text-3);display:flex;gap:8px;align-items:center}
+footer b{color:var(--text-2)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <img src="/assets/mark.svg" alt="Stella mark">
+    <div class="title">
+      <b>S T E L L A <em>·</em> OBSERVATORY</b>
+      <span>local telemetry · reads .stella only · nothing leaves this machine</span>
+    </div>
+    <div class="headmeta">
+      <span id="ws" title="workspace root"></span>
+      <span class="live" id="live"><i></i><span>LIVE</span></span>
+    </div>
+  </header>
+
+  <div class="grid kpis" id="kpis"></div>
+
+  <div class="grid cols-2">
+    <div class="card">
+      <div class="kick">Spend &amp; volume</div>
+      <h2>Tokens per run</h2>
+      <div class="legend"><span><i style="background:var(--c1)"></i>input</span>
+        <span><i style="background:var(--c2)"></i>output</span></div>
+      <div id="timeline"></div>
+    </div>
+    <div class="card">
+      <div class="kick">$ / resolved task</div>
+      <h2>Models</h2>
+      <div class="scroll-x" id="models"></div>
+    </div>
+  </div>
+
+  <div class="grid cols-2b">
+    <div class="card">
+      <div class="kick">Tool traffic</div>
+      <h2>Tool calls</h2>
+      <div id="tools"></div>
+    </div>
+    <div class="card">
+      <div class="kick">Self-improvement</div>
+      <h2>Memory · reflections · skills</h2>
+      <div id="memory"></div>
+    </div>
+  </div>
+
+  <div class="grid cols-2">
+    <div class="card">
+      <div class="kick">Blast radius</div>
+      <h2>Files touched</h2>
+      <div id="files"></div>
+    </div>
+    <div class="card">
+      <div class="kick">Fan-out &amp; MCP</div>
+      <h2>Fleet runs · MCP traffic</h2>
+      <div id="fleetmcp"></div>
+    </div>
+  </div>
+
+  <div class="card section-gap">
+    <div class="kick">Every run, receipted</div>
+    <h2>Executions</h2>
+    <div class="scroll-x scroll-y" id="executions"></div>
+  </div>
+
+  <footer><b>stella</b> · verified done, not claimed done · dashboard refreshes every 5s while visible</footer>
+</div>
+
+<div id="scrim"></div>
+<aside id="drawer" aria-label="execution detail"></aside>
+<div id="tip"></div>
+
+<script>
+"use strict";
+/* ── helpers ─────────────────────────────────────────────────────────── */
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtUsd = (v) => v >= 100 ? "$" + v.toFixed(0) : v >= 1 ? "$" + v.toFixed(2) : "$" + (v ?? 0).toFixed(4);
+const fmtTok = (v) => v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "k" : String(v ?? 0);
+const fmtMs = (v) => v >= 60000 ? (v / 60000).toFixed(1) + "m" : v >= 1000 ? (v / 1000).toFixed(1) + "s" : (v ?? 0) + "ms";
+const pct = (v) => (100 * (v ?? 0)).toFixed(0) + "%";
+const utc = (s) => s ? new Date(s.replace(" ", "T") + "Z") : null;
+const ago = (s) => {
+  const d = utc(s); if (!d) return "—";
+  const sec = Math.max(0, (Date.now() - d.getTime()) / 1000);
+  if (sec < 90) return Math.round(sec) + "s ago";
+  if (sec < 5400) return Math.round(sec / 60) + "m ago";
+  if (sec < 129600) return Math.round(sec / 3600) + "h ago";
+  return Math.round(sec / 86400) + "d ago";
+};
+const OUTCOME = {
+  completed: ["ok", "✓ completed"], resolved: ["ok", "✓ resolved"],
+  aborted: ["bad", "✕ aborted"], error: ["bad", "✕ error"],
+  goal_unmet: ["warn", "◌ goal unmet"],
+};
+const badge = (o) => {
+  const [cls, label] = OUTCOME[o] ?? ["dim", o ?? "· running"];
+  return `<span class="badge ${cls}">${esc(label)}</span>`;
+};
+const tip = $("tip");
+function showTip(ev, html) {
+  tip.innerHTML = html; tip.style.display = "block";
+  const x = Math.min(ev.clientX + 14, innerWidth - tip.offsetWidth - 12);
+  const y = Math.min(ev.clientY + 14, innerHeight - tip.offsetHeight - 12);
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+function hideTip() { tip.style.display = "none"; }
+
+/* ── stat tiles ──────────────────────────────────────────────────────── */
+function tile(k, v, sub, gold) {
+  return `<div class="card tile"><div class="k">${k}</div>
+    <div class="v${gold ? " gold" : ""}">${v}</div>
+    ${sub ? `<div class="sub">${sub}</div>` : ""}</div>`;
+}
+function renderKpis(o) {
+  const runs = o.runs ?? 0, resolved = o.resolved ?? 0;
+  const cacheDen = (o.cache_read_tokens ?? 0) + (o.cache_miss_tokens ?? 0);
+  const cacheHit = cacheDen ? (o.cache_read_tokens / cacheDen) : null;
+  const avgStep = o.steps ? o.model_ms / o.steps : 0;
+  $("kpis").innerHTML =
+    tile("runs", String(runs), resolved + " resolved") +
+    tile("resolve rate", runs ? pct(resolved / runs) : "—",
+         "outcome = completed") +
+    tile("total spend", fmtUsd(o.cost_usd ?? 0),
+         resolved ? fmtUsd((o.cost_usd ?? 0) / resolved) + " / resolved" : "&nbsp;", true) +
+    tile("tokens in", fmtTok(o.input_tokens ?? 0),
+         fmtTok(o.output_tokens ?? 0) + " out") +
+    tile("cache hits", cacheHit === null ? "—" : pct(cacheHit),
+         fmtTok(o.cache_read_tokens ?? 0) + " read") +
+    tile("model time", fmtMs(o.model_ms ?? 0),
+         o.steps ? fmtMs(avgStep) + " avg / step" : "&nbsp;");
+}
+
+/* ── timeline chart (grouped thin bars, input+output per run) ─────────── */
+function renderTimeline(o) {
+  const t = o.timeline ?? [];
+  if (!t.length) {
+    $("timeline").innerHTML =
+      `<div class="empty">no runs yet — try <code>stella run "fix the failing test"</code></div>`;
+    return;
+  }
+  const W = 640, H = 190, padL = 44, padB = 26, padT = 12;
+  const n = t.length;
+  const innerW = W - padL - 8, innerH = H - padT - padB;
+  const max = Math.max(...t.map(r => Math.max(r.input_tokens, r.output_tokens)), 1);
+  const group = innerW / n;
+  const bw = Math.min(16, Math.max(3, group / 2.6));
+  let bars = "", labels = "";
+  t.forEach((r, i) => {
+    const x0 = padL + i * group + group / 2;
+    const hIn = innerH * r.input_tokens / max, hOut = innerH * r.output_tokens / max;
+    const yIn = padT + innerH - hIn, yOut = padT + innerH - hOut;
+    bars += `<g class="bar" data-i="${i}">
+      <rect x="${(x0 - bw - 1).toFixed(1)}" y="${yIn.toFixed(1)}" width="${bw}" height="${Math.max(hIn, 1).toFixed(1)}" rx="2" fill="var(--c1)"/>
+      <rect x="${(x0 + 1).toFixed(1)}" y="${yOut.toFixed(1)}" width="${bw}" height="${Math.max(hOut, 1).toFixed(1)}" rx="2" fill="var(--c2)"/>
+      <rect x="${(x0 - group / 2).toFixed(1)}" y="0" width="${group.toFixed(1)}" height="${H}" fill="transparent"/>
+    </g>`;
+    if (n <= 14 || i % Math.ceil(n / 14) === 0)
+      labels += `<text x="${x0.toFixed(1)}" y="${H - 8}" text-anchor="middle">#${r.id}</text>`;
+  });
+  const grid = [0, .5, 1].map(f => {
+    const y = padT + innerH * (1 - f);
+    return `<line x1="${padL}" y1="${y}" x2="${W - 8}" y2="${y}" stroke="var(--hairline-dim)"/>
+      <text x="${padL - 6}" y="${y + 3}" text-anchor="end">${fmtTok(max * f)}</text>`;
+  }).join("");
+  $("timeline").innerHTML =
+    `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto" role="img"
+       aria-label="input and output tokens per execution">${grid}${bars}${labels}</svg>`;
+  $("timeline").querySelectorAll("g.bar").forEach(g => {
+    const r = t[+g.dataset.i];
+    g.addEventListener("mousemove", ev => showTip(ev,
+      `<b>#${r.id} · ${esc(r.kind)} · ${esc(r.model)}</b>` +
+      `${fmtTok(r.input_tokens)} in · ${fmtTok(r.output_tokens)} out<br>` +
+      `${fmtUsd(r.cost_usd)} · ${fmtMs(r.model_ms)} · ${esc(r.outcome ?? "running")}`));
+    g.addEventListener("mouseleave", hideTip);
+    g.addEventListener("click", () => openDrawer(r.id));
+    g.style.cursor = "pointer";
+  });
+}
+
+/* ── models table ────────────────────────────────────────────────────── */
+function renderModels(rows) {
+  if (!rows.length) {
+    $("models").innerHTML = `<div class="empty">no model traffic yet</div>`; return;
+  }
+  $("models").innerHTML = `<table><thead><tr>
+    <th>model</th><th class="num">runs</th><th class="num">rate</th>
+    <th class="num">cost</th><th class="num">$/resolved</th>
+    <th class="num">in</th><th class="num">out</th></tr></thead><tbody>` +
+    rows.map(r => `<tr>
+      <td class="main" title="${esc(r.provider)}/${esc(r.model)}${r.division !== "-" ? " · " + esc(r.division) : ""}">
+        ${esc(r.provider)}/${esc(r.model)}${r.division !== "-" ? ` <span class="badge dim">${esc(r.division)}</span>` : ""}</td>
+      <td class="num">${r.runs}</td><td class="num">${pct(r.resolve_rate)}</td>
+      <td class="num">${fmtUsd(r.total_cost_usd)}</td>
+      <td class="num">${r.cost_per_resolved_usd == null ? "—" : fmtUsd(r.cost_per_resolved_usd)}</td>
+      <td class="num">${fmtTok(r.input_tokens)}</td>
+      <td class="num">${fmtTok(r.output_tokens)}</td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
+/* ── horizontal bars (tools / files) ─────────────────────────────────── */
+function hbars(rows, name, value, valueLabel, tipHtml) {
+  const max = Math.max(...rows.map(value), 1);
+  return rows.map((r, i) => `<div class="hbar" data-i="${i}">
+      <span class="name" title="${esc(name(r))}">${esc(name(r))}</span>
+      <span><span class="track" style="width:${(100 * value(r) / max).toFixed(1)}%"></span></span>
+      <span class="val">${valueLabel(r)}</span>
+    </div>`).join("");
+}
+function renderTools(rows) {
+  if (!rows.length) { $("tools").innerHTML = `<div class="empty">no tool calls yet</div>`; return; }
+  $("tools").innerHTML = hbars(rows.slice(0, 12),
+    r => r.name, r => r.calls,
+    r => `${r.calls}× · ${fmtMs(r.p50_ms)}` +
+         (r.errors ? ` · <span style="color:var(--bad)">${r.errors} err</span>` : ""));
+  $("tools").querySelectorAll(".hbar").forEach((el, i) => {
+    const r = rows[i];
+    el.addEventListener("mousemove", ev => showTip(ev,
+      `<b>${esc(r.name)}</b>${r.calls} calls · ${r.errors} errors<br>` +
+      `p50 ${fmtMs(r.p50_ms)} · max ${fmtMs(r.max_ms)} · ${fmtTok(r.bytes_out)}B returned`));
+    el.addEventListener("mouseleave", hideTip);
+  });
+}
+function renderFiles(rows) {
+  if (!rows.length) { $("files").innerHTML = `<div class="empty">no files touched yet</div>`; return; }
+  $("files").innerHTML = hbars(rows.slice(0, 12),
+    r => r.path.split("/").pop(), r => r.executions,
+    r => `${r.executions}× · <span style="color:var(--ok)">+${r.lines_added}</span>` +
+         `/<span style="color:var(--bad)">−${r.lines_removed}</span>`);
+  $("files").querySelectorAll(".hbar").forEach((el, i) => {
+    const r = rows[i];
+    el.addEventListener("mousemove", ev => showTip(ev,
+      `<b>${esc(r.path)}</b>touched in ${r.executions} runs · +${r.lines_added} −${r.lines_removed}`));
+    el.addEventListener("mouseleave", hideTip);
+  });
+}
+
+/* ── memory / self-improvement ───────────────────────────────────────── */
+function renderMemory(m) {
+  const cites = m.citations ?? [], refl = m.reflections ?? [];
+  const rules = m.rules ?? [], skills = m.skills ?? [];
+  if (!cites.length && !refl.length && !rules.length && !skills.length) {
+    $("memory").innerHTML =
+      `<div class="empty">the self-improvement loop hasn't recorded anything here yet —<br>
+       memories, citations, reflections and promoted rules will appear as stella works</div>`;
+    return;
+  }
+  let html = "";
+  if (cites.length) {
+    html += `<table><thead><tr><th>memory</th><th class="num">cites</th>
+      <th class="num">useful</th><th class="num">truthful</th></tr></thead><tbody>` +
+      cites.slice(0, 6).map(c => `<tr>
+        <td class="main" title="${esc(c.memory_id)}">${esc(c.memory_id)}</td>
+        <td class="num">${c.citations}</td>
+        <td class="num">${(c.avg_useful ?? 0).toFixed(1)}</td>
+        <td class="num">${pct(c.truthful_rate)}</td></tr>`).join("") + `</tbody></table>`;
+  }
+  if (skills.length) {
+    html += `<div class="kick" style="margin-top:14px">skills exercised</div>` +
+      skills.slice(0, 5).map(s =>
+        `<div class="hbar"><span class="name">${esc(s.skill)}</span>
+         <span></span><span class="val">${s.uses}× · v${s.version}</span></div>`).join("");
+  }
+  if (refl.length) {
+    html += `<div class="kick" style="margin-top:14px">latest reflections</div>` +
+      refl.slice(0, 3).map(r =>
+        `<div style="font:11px var(--mono);color:var(--text-2);padding:4px 0;border-bottom:1px solid var(--hairline-dim)">
+         <span class="badge dim">${esc(r.kind)}</span> ${esc(r.content.slice(0, 130))}${r.content.length > 130 ? "…" : ""}</div>`).join("");
+  }
+  if (rules.length) {
+    html += `<div class="kick" style="margin-top:14px">promoted rules</div>` +
+      rules.slice(0, 3).map(r =>
+        `<div style="font:11px var(--mono);color:var(--text-2);padding:3px 0">
+         <span style="color:var(--gold)">§</span> ${esc(r.rule_id)}</div>`).join("");
+  }
+  $("memory").innerHTML = html;
+}
+
+/* ── fleet + mcp ─────────────────────────────────────────────────────── */
+function renderFleetMcp(fleet, mcp) {
+  let html = "";
+  if (fleet.length) {
+    html += `<table><thead><tr><th>fleet run</th><th class="num">tasks</th>
+      <th class="num">attempts</th><th class="num">ok</th><th class="num">commits</th></tr></thead><tbody>` +
+      fleet.slice(0, 5).map(f => `<tr>
+        <td class="main" title="${esc(f.run_id)}">${esc(f.run_id.slice(0, 22))}…</td>
+        <td class="num">${f.tasks}</td><td class="num">${f.attempts}</td>
+        <td class="num">${f.succeeded}</td><td class="num">${f.commits}</td></tr>`).join("") +
+      `</tbody></table>`;
+  }
+  if (mcp.length) {
+    html += `<div class="kick" style="margin-top:${fleet.length ? 14 : 0}px">mcp calls</div>` +
+      mcp.slice(0, 6).map(r =>
+        `<div class="hbar"><span class="name" title="${esc(r.server)}/${esc(r.tool)}">${esc(r.server)}/${esc(r.tool)}</span>
+         <span></span><span class="val">${r.calls}×</span></div>`).join("");
+  }
+  $("fleetmcp").innerHTML = html ||
+    `<div class="empty">no fleet fan-outs or MCP traffic yet —<br>
+     <code>stella fleet "task a" "task b"</code> records its ledger here</div>`;
+}
+
+/* ── executions table ────────────────────────────────────────────────── */
+function renderExecutions(rows) {
+  if (!rows.length) {
+    $("executions").innerHTML = `<div class="empty">nothing recorded yet — every
+      <code>stella run</code>, <code>goal</code>, chat turn and pipeline lands here</div>`;
+    return;
+  }
+  $("executions").innerHTML = `<table><thead><tr>
+    <th>#</th><th>kind</th><th>prompt</th><th>model</th><th>outcome</th>
+    <th class="num">steps</th><th class="num">tools</th><th class="num">files</th>
+    <th class="num">in</th><th class="num">out</th><th class="num">cost</th><th class="num">when</th>
+    </tr></thead><tbody>` +
+    rows.map(r => `<tr class="click" data-id="${r.id}">
+      <td>${r.id}</td><td>${esc(r.kind)}</td>
+      <td class="main" style="max-width:340px;overflow:hidden;text-overflow:ellipsis"
+          title="${esc(r.prompt)}">${esc(r.prompt)}</td>
+      <td title="${esc(r.provider)}/${esc(r.model)}">${esc(r.model)}</td>
+      <td>${badge(r.outcome)}</td>
+      <td class="num">${r.steps}</td><td class="num">${r.tool_calls}</td>
+      <td class="num">${r.files_touched}</td>
+      <td class="num">${fmtTok(r.input_tokens)}</td><td class="num">${fmtTok(r.output_tokens)}</td>
+      <td class="num">${fmtUsd(r.cost_usd)}</td>
+      <td class="num" title="${esc(r.started_at)} UTC">${ago(r.started_at)}</td></tr>`).join("") +
+    `</tbody></table>`;
+  $("executions").querySelectorAll("tr.click").forEach(tr =>
+    tr.addEventListener("click", () => openDrawer(+tr.dataset.id)));
+}
+
+/* ── drawer ──────────────────────────────────────────────────────────── */
+async function openDrawer(id) {
+  const d = await fetch(`/api/execution?id=${id}`).then(r => r.json()).catch(() => null);
+  if (!d) return;
+  const maxTok = Math.max(...(d.steps ?? []).map(s => s.input_tokens + s.output_tokens), 1);
+  const steps = (d.steps ?? []).map(s => {
+    const w = 100 * (s.input_tokens + s.output_tokens) / maxTok;
+    const inW = s.input_tokens + s.output_tokens
+      ? 100 * s.input_tokens / (s.input_tokens + s.output_tokens) : 0;
+    return `<div class="step-row"><span>${s.step}</span>
+      <span class="tokbar" style="width:${w.toFixed(1)}%">
+        <i style="background:var(--c1);width:${inW.toFixed(1)}%"></i>
+        <i style="background:var(--c2);flex:1"></i></span>
+      <span>${fmtTok(s.input_tokens)}·${fmtTok(s.output_tokens)} · ${fmtMs(s.duration_ms)}${s.retries ? ` · <span style="color:var(--warn)">${s.retries}r</span>` : ""}</span>
+    </div>`;
+  }).join("");
+  const tools = (d.tools ?? []).map(t => `<div class="step-row">
+      <span>${t.seq}</span>
+      <span class="name" style="color:${t.ok ? "var(--text)" : "var(--bad)"}">
+        ${esc(t.name)}${t.surface !== "native" ? ` <span class="badge dim">${esc(t.surface)}</span>` : ""}
+        ${t.ok ? "" : " ✕ " + esc(t.error.slice(0, 60))}</span>
+      <span>${fmtMs(t.duration_ms)} · ${fmtTok(t.bytes_out)}B</span></div>`).join("");
+  const files = (d.files ?? []).map(f => `<div class="step-row">
+      <span>${esc(f.ops)}</span><span class="name">${esc(f.path)}</span>
+      <span><span style="color:var(--ok)">+${f.lines_added}</span> <span style="color:var(--bad)">−${f.lines_removed}</span></span>
+    </div>`).join("");
+  const refl = d.reflection ? `<div class="sect"><div class="kick">self-reflection</div>
+      <div style="font:12px var(--mono);color:var(--text-2)">
+        ${d.reflection.self_rating != null ? `rated ${d.reflection.self_rating}/10 · ` : ""}
+        ${d.reflection.delivered != null ? (d.reflection.delivered ? "delivered" : "not delivered") : ""}
+        ${d.reflection.what_to_improve ? `<br>improve: ${esc(d.reflection.what_to_improve)}` : ""}
+      </div></div>` : "";
+  $("drawer").innerHTML = `
+    <button class="close" aria-label="close">esc</button>
+    <div class="kick">execution #${d.id} · ${esc(d.kind)} · ${esc(d.provider)}/${esc(d.model)}</div>
+    <h3>${esc(d.prompt)}</h3>
+    <div style="margin:8px 0 0">${badge(d.outcome)}
+      <span style="font:11px var(--mono);color:var(--text-3)"> · ${fmtUsd(d.cost_usd)} · ${esc(d.started_at)} UTC</span></div>
+    ${steps ? `<div class="sect"><div class="kick">per-step tokens (in·out) &amp; latency</div>${steps}</div>` : ""}
+    ${tools ? `<div class="sect"><div class="kick">tool calls</div>${tools}</div>` : ""}
+    ${files ? `<div class="sect"><div class="kick">files touched</div>${files}</div>` : ""}
+    ${refl}`;
+  $("drawer").querySelector(".close").addEventListener("click", closeDrawer);
+  $("drawer").classList.add("open"); $("scrim").classList.add("open");
+}
+function closeDrawer() {
+  $("drawer").classList.remove("open"); $("scrim").classList.remove("open");
+}
+$("scrim").addEventListener("click", closeDrawer);
+addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+
+/* ── refresh loop ────────────────────────────────────────────────────── */
+async function refresh() {
+  try {
+    const [meta, o, ex, models, tools, files, memory, mcp, fleet] = await Promise.all([
+      "/api/meta", "/api/overview", "/api/executions", "/api/models", "/api/tools",
+      "/api/files", "/api/memory", "/api/mcp", "/api/fleet",
+    ].map(u => fetch(u).then(r => r.json())));
+    $("ws").textContent = meta.workspace.split("/").slice(-2).join("/");
+    $("ws").title = meta.workspace;
+    renderKpis(o); renderTimeline(o); renderModels(models); renderTools(tools);
+    renderFiles(files); renderMemory(memory); renderFleetMcp(fleet, mcp);
+    renderExecutions(ex);
+    $("live").classList.remove("paused");
+  } catch {
+    $("live").classList.add("paused");
+  }
+}
+refresh();
+setInterval(() => { if (!document.hidden) refresh(); }, 5000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+</script>
+</body>
+</html>

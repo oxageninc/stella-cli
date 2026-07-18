@@ -1,0 +1,23 @@
+[package]
+name = "stella-core"
+description = "The step-driver: one model call per step, retry+backoff, compaction, budget, loop detection. No I/O of its own — drives through traits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+stella-protocol = { path = "../stella-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+proptest = { workspace = true }

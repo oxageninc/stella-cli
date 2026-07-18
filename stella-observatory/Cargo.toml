@@ -1,0 +1,19 @@
+[package]
+name = "stella-observatory"
+description = "Local telemetry dashboard: a loopback-only web view over the workspace's .stella SQLite stores (executions, tokens, cost, tools, memory, fleet). Read-only; serves embedded assets; no outbound traffic ever."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+
+[dev-dependencies]
+tempfile.workspace = true

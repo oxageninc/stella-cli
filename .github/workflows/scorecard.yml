@@ -1,0 +1,37 @@
+# OpenSSF Scorecard — measures the repo's security posture (branch protection,
+# pinned actions, token permissions, etc.) and publishes results to the
+# Security tab. The de-facto supply-chain health check for popular OSS repos.
+# https://github.com/ossf/scorecard-action
+name: scorecard
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload SARIF to code scanning
+      id-token: write # publish results to the OpenSSF API
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run analysis
+        uses: ossf/scorecard-action@v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif

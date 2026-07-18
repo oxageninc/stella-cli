@@ -1,0 +1,92 @@
+[workspace]
+resolver = "3"
+members = [
+  "stella-protocol",
+  "stella-core",
+  "stella-model",
+  "stella-store",
+  "stella-tools",
+  "stella-context",
+  "stella-graph",
+  "stella-pipeline",
+  "stella-mcp",
+  "stella-media",
+  "stella-fleet",
+  "stella-observatory",
+  "stella-tui",
+  "stella-cli",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/macanderson/stella"
+homepage = "https://stella.oxagen.sh"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "fs", "io-util", "sync"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+colored = "3"
+libc = "0.2"
+rand = "0.10"
+proptest = "1"
+toml = "1.1"
+rpassword = "7"
+base64 = "0.22"
+crossterm = "0.29"
+notify = "8"
+ratatui = "0.30"
+unicode-width = "0.2"
+roxmltree = "0.21"
+rusqlite = { version = "0.40", features = ["bundled"] }
+hmac = "0.13"
+sha2 = "0.11"
+tempfile = "3"
+tree-sitter = "0.26"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-sequel = "0.3"
+
+ratatui-comfy-tabs = "0.5.12"
+tachyonfx = "0.25.1"
+sysinfo = "0.38.4"
+tui-big-text = "0.8.8"
+wiremock = "0.6"
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The installers to generate for each app
+installers = ["shell", "homebrew"]
+# A GitHub repo to push Homebrew formulas to
+tap = "macanderson/homebrew-tap"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

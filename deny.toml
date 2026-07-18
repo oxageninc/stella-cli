@@ -1,0 +1,33 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+#
+# CI runs `cargo deny check advisories bans sources` as a REAL gate (no
+# `|| true`). We intentionally do NOT gate on `licenses` here: the workspace is
+# MIT OR Apache-2.0 and every dependency is a permissive OSS crate, but pinning
+# an exhaustive license allow-list is churn we track separately — advisories,
+# bans, and source provenance are the checks that catch supply-chain problems.
+#
+# Only version-stable lint-level keys are set here so the config parses across
+# cargo-deny releases; `cargo audit` (a separate CI step) is the primary
+# advisory gate, and defaults already fail the build on a known vulnerability.
+
+[advisories]
+# A yanked dependency is a warning, not a hard failure.
+yanked = "warn"
+# Benign advisories to tolerate (real vulnerabilities still fail the gate):
+# - RUSTSEC-2024-0436: `paste` is archived/unmaintained but has no known
+#   vulnerability — a compile-time macro helper pulled in transitively
+#   (ratatui et al.). Not a security issue, so it must not block CI.
+ignore = ["RUSTSEC-2024-0436"]
+
+[bans]
+# Multiple versions of the same crate is a warning, not a failure — the bundled
+# C deps (rusqlite, tree-sitter grammars) legitimately pull duplicate minor
+# versions. Tighten to "deny" here if the tree ever needs to be pinned flat.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Every dependency must come from a known registry (crates.io by default). An
+# unknown registry or an unvetted git source fails the build.
+unknown-registry = "deny"
+unknown-git = "deny"

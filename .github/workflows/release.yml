@@ -1,0 +1,323 @@
+name: release
+
+# Cut a release by pushing a tag, e.g.
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# This builds the `stella` binary for every target in the matrix, packages a
+# `stella-<version>-<target>.tar.gz` (binary + licenses + README), and — on a
+# tag push — publishes a GitHub Release with all tarballs and a SHA256SUMS.
+#
+# This is a hand-rolled matrix workflow: it does NOT require cargo-dist to be
+# installed on the runner. A future maintainer can migrate to cargo-dist using
+# the `[workspace.metadata.dist]` section already declared in Cargo.toml.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # Release builds use full LTO + codegen-units=1 (see [profile.release] in
+    # Cargo.toml) and compile bundled C/C++ deps (rusqlite, tree-sitter), so
+    # give each build room on a cold cache.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          # Cross-compiled from the Apple Silicon runner: Apple's clang/ld is a
+          # universal toolchain, so `rustup target add x86_64-apple-darwin`
+          # (via the `targets:` input below) builds the x86_64 slice — bundled
+          # C deps included — without needing a (now-retired) Intel runner.
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # Built natively on GitHub's arm64 runner (free for public repos).
+          # Cross-compiling this target via `cross` fails: its default docker
+          # image ships g++ 5, far too old for libduckdb-sys's bundled C++.
+          # The native runner uses the same modern toolchain that already
+          # builds duckdb fine on x86_64 ubuntu-latest.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # rust-toolchain.toml pins the repo to a concrete toolchain (e.g. 1.97.0),
+      # and the build runs on *that*, not `stable`. dtolnay's `targets:` above
+      # installs the target for `stable`, so a genuine cross-target (x86_64 on
+      # the arm64 macOS runner) fails with E0463 "can't find crate for `core`".
+      # Add the target to the pinned toolchain — this runs in the checkout, so
+      # rustup honors rust-toolchain.toml (auto-installing the pin on first use).
+      - name: Add the cross target to the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+
+      # Stamp the release version (from the tag) into the workspace manifest so
+      # the compiled binary reports it — `stella --version` == the release tag.
+      # No commit lands on main; this edit is ephemeral to the build runner.
+      # `--locked` is dropped because bumping the workspace-member version would
+      # otherwise be rejected as a stale lockfile; registry deps stay pinned by
+      # the existing Cargo.lock (cargo only rewrites the workspace entries).
+      - name: Stamp release version
+        if: ${{ github.ref_type == 'tag' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # Stamp the single [workspace.package] version line. Uses perl, not
+          # `sed -i "0,/re/"`: that address form is GNU-only and SILENTLY
+          # no-ops on the macOS runners (BSD sed), which would ship macOS
+          # binaries reporting the placeholder 0.1.0 version.
+          perl -pi -e "s/^version = \"[^\"]*\"/version = \"${version}\"/" Cargo.toml
+          echo "workspace version set to ${version}"
+          grep -m1 '^version = ' Cargo.toml | grep -q "\"${version}\"" \
+            || { echo "::error::version stamp did not take"; exit 1; }
+
+      - name: Build stella
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release \
+              --target ${{ matrix.target }} \
+              --package stella-cli --bin stella
+          else
+            cargo build --release \
+              --target ${{ matrix.target }} \
+              --package stella-cli --bin stella
+          fi
+
+      - name: Package tarball
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            # workflow_dispatch (no tag): fall back to the workspace version.
+            version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
+          target="${{ matrix.target }}"
+          stem="stella-${version}-${target}"
+          bin="target/${target}/release/stella"
+
+          mkdir -p "dist/${stem}"
+          cp "${bin}" "dist/${stem}/stella"
+          cp LICENSE-MIT LICENSE-APACHE README.md "dist/${stem}/"
+          tar -C dist -czf "${stem}.tar.gz" "${stem}"
+
+          echo "asset=${stem}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: stella-${{ matrix.target }}
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      # Full history + tags so the notes step can diff against the prior tag.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: stella-*
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum stella-*.tar.gz > SHA256SUMS
+          echo "----- SHA256SUMS -----"
+          cat SHA256SUMS
+
+      # Draft the release notes from the diff since the previous tag using the
+      # AI Gateway. Falls back to a plain commit list if the key is unset or the
+      # call fails, so a release is never blocked on note generation.
+      - name: Generate release notes
+        shell: bash
+        env:
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+          RELEASE_NOTES_MODEL: ${{ vars.RELEASE_NOTES_MODEL || 'anthropic/claude-sonnet-5' }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          prev="$(git tag -l 'v*' --sort=-v:refname | grep -vx "${tag}" | head -n1 || true)"
+          echo "notes range: ${prev:-<start>}..${tag}"
+
+          commits="$(git log --no-merges --pretty='- %s' ${prev:+${prev}..HEAD} | head -n 300)"
+          {
+            echo "## Commits"; echo "$commits";
+            echo; echo "## Files changed";
+            git diff --stat ${prev:+${prev}..HEAD} | tail -n 80;
+          } > ctx.txt
+          git diff ${prev:+${prev}..HEAD} 2>/dev/null | head -c 120000 > diff.txt || true
+
+          notes=""
+          if [ -n "${AI_GATEWAY_API_KEY:-}" ]; then
+            prompt="$(printf 'Write the GitHub release notes for the "stella" coding-agent CLI %s, in clean Markdown. Start with a one-line summary, then grouped bullet sections (Features, Fixes, Performance, Docs, Internal) — omit any empty section. Be concrete and user-facing; no preamble, no headings above the summary. Base it strictly on the commits and diff below.\n\n%s\n\n## Diff (truncated)\n```diff\n%s\n```\n' "$version" "$(cat ctx.txt)" "$(cat diff.txt)")"
+            payload="$(jq -n --arg m "$RELEASE_NOTES_MODEL" --arg c "$prompt" '{model:$m,messages:[{role:"user",content:$c}],temperature:0.2}')"
+            resp="$(curl -sS --max-time 150 \
+              -H "Authorization: Bearer ${AI_GATEWAY_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "$payload" \
+              https://ai-gateway.vercel.sh/v1/chat/completions || true)"
+            notes="$(printf '%s' "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)"
+            [ -z "$notes" ] && echo "::warning::AI note generation returned nothing; using the commit list."
+          else
+            echo "::warning::AI_GATEWAY_API_KEY not available; using the commit list."
+          fi
+          [ -z "$notes" ] && notes="$(printf '## What changed\n\n%s' "$commits")"
+
+          {
+            printf '%s\n\n' "$notes"
+            [ -n "$prev" ] && printf '**Full changelog**: https://github.com/%s/compare/%s...%s\n' "$GITHUB_REPOSITORY" "$prev" "$tag"
+          } > notes.md
+          echo "----- notes.md -----"; cat notes.md
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            artifacts/stella-*.tar.gz
+            artifacts/SHA256SUMS
+          fail_on_unmatched_files: true
+          body_path: notes.md
+
+  # Renders .github/homebrew/stella.rb.tmpl with the real version + per-target
+  # SHA-256 sums and commits it as Formula/stella.rb to the tap repo
+  # (macanderson/homebrew-tap). Runs only after the GitHub Release exists, so
+  # the formula's release-asset URLs resolve. Auth: HOMEBREW_TAP_DEPLOY_KEY
+  # (an SSH deploy key with write access to the tap repo — scoped to exactly
+  # that one repo, unlike a PAT), with HOMEBREW_TAP_TOKEN (https) honored as a
+  # fallback. Skips gracefully when neither is set so a release is never
+  # blocked on the tap being wired.
+  homebrew:
+    name: publish Homebrew formula
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout (for the formula template)
+        uses: actions/checkout@v7
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: stella-*
+          merge-multiple: true
+
+      - name: Render formula and push to tap
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HOMEBREW_TAP_DEPLOY_KEY:-}" ] && [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::warning::neither HOMEBREW_TAP_DEPLOY_KEY nor HOMEBREW_TAP_TOKEN is set — skipping Homebrew tap publish."
+            echo "One-time setup (create the tap repo + add the credential) is documented in RELEASING.md."
+            exit 0
+          fi
+
+          version="${GITHUB_REF_NAME#v}"
+
+          # SHA-256 of a given target's release tarball (same bytes uploaded to
+          # the GitHub Release in the `release` job).
+          sha_for() {
+            local target="$1"
+            local f="artifacts/stella-${version}-${target}.tar.gz"
+            if [ ! -f "$f" ]; then
+              echo "::error::expected release asset not found: ${f}" >&2
+              exit 1
+            fi
+            sha256sum "$f" | awk '{ print $1 }'
+          }
+
+          sha_aarch64_darwin="$(sha_for aarch64-apple-darwin)"
+          sha_x86_64_darwin="$(sha_for x86_64-apple-darwin)"
+          sha_aarch64_linux="$(sha_for aarch64-unknown-linux-gnu)"
+          sha_x86_64_linux="$(sha_for x86_64-unknown-linux-gnu)"
+
+          mkdir -p rendered
+          sed \
+            -e "s/@VERSION@/${version}/g" \
+            -e "s/@SHA_AARCH64_DARWIN@/${sha_aarch64_darwin}/g" \
+            -e "s/@SHA_X86_64_DARWIN@/${sha_x86_64_darwin}/g" \
+            -e "s/@SHA_AARCH64_LINUX@/${sha_aarch64_linux}/g" \
+            -e "s/@SHA_X86_64_LINUX@/${sha_x86_64_linux}/g" \
+            .github/homebrew/stella.rb.tmpl > rendered/stella.rb
+
+          echo "----- rendered Formula/stella.rb -----"
+          cat rendered/stella.rb
+
+          if [ -n "${HOMEBREW_TAP_DEPLOY_KEY:-}" ]; then
+            # SSH with the tap-scoped deploy key. The key file lives outside
+            # the workspace and is chmod 600, as ssh requires.
+            keyfile="${RUNNER_TEMP}/tap_deploy_key"
+            printf '%s\n' "${HOMEBREW_TAP_DEPLOY_KEY}" > "${keyfile}"
+            chmod 600 "${keyfile}"
+            export GIT_SSH_COMMAND="ssh -i ${keyfile} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+            git clone --depth 1 "git@github.com:macanderson/homebrew-tap.git" tap
+          else
+            git clone --depth 1 \
+              "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/macanderson/homebrew-tap.git" tap
+          fi
+
+          mkdir -p tap/Formula
+          cp rendered/stella.rb tap/Formula/stella.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/stella.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date for ${version}; nothing to commit."
+            exit 0
+          fi
+          git commit -m "stella ${version}"
+          git push origin HEAD

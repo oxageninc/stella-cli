@@ -1,0 +1,27 @@
+[package]
+name = "stella-model"
+description = "Provider trait + adapters (Z.ai/GLM 5.2, Anthropic, OpenAI, Gemini direct, Vertex, Bedrock, OpenAI-compatible gateways). Owns per-vendor SSE parsing, tool-call dialect translation, request signing, credential resolution, and model-catalog lookups."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+stella-protocol = { path = "../stella-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+toml.workspace = true
+rpassword.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock.workspace = true

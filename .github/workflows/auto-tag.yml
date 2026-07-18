@@ -1,0 +1,99 @@
+name: auto-tag
+
+# Every merge to main cuts a release. This job computes the next semantic
+# version from the latest tag and the merge commit's message, creates the tag,
+# and kicks off `release.yml` (build + GitHub Release + Homebrew) for it.
+#
+#   (default)            patch bump    0.1.3 -> 0.1.4
+#   'release.minor: …'   minor bump    0.1.3 -> 0.2.0   (patch reset to 0)
+#   'release:major …'    major bump    0.1.3 -> 1.0.0   (minor + patch reset)
+#
+# Put the prefix at the start of the PR title — a squash-merge uses the PR
+# title as the commit subject. `release.minor`/`release:minor` and
+# `release:major`/`release.major` are both accepted. Add `[skip release]` to
+# the title to land a change without cutting a release (docs/chore merges).
+#
+# No commit is pushed back to main — the tag is the source of truth, so this
+# never fights branch protection. release.yml injects the tag's version into
+# the build so `stella --version` is correct.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  # Serialize so rapid merges compute their version off the previous tag.
+  group: auto-tag
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the tag
+  actions: write # dispatch release.yml
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute next version and create the tag
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          msg="$(git log -1 --pretty=%B)"
+          printf 'HEAD commit message:\n%s\n\n' "$msg"
+
+          if printf '%s' "$msg" | grep -qiE '\[skip (release|ci)\]'; then
+            echo "skip marker present — not cutting a release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Base off the newest v-prefixed tag; if there is none yet, off the
+          # workspace version in Cargo.toml.
+          last="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+          if [ -z "$last" ]; then
+            base="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+            base="${base:-0.0.0}"
+          else
+            base="${last#v}"
+          fi
+          IFS=. read -r major minor patch <<< "$base"
+          major=${major:-0}; minor=${minor:-0}; patch=${patch:-0}
+
+          if printf '%s' "$msg" | grep -qiE '(^|[^[:alnum:]])release[.:]major'; then
+            major=$((major + 1)); minor=0; patch=0; kind="major"
+          elif printf '%s' "$msg" | grep -qiE '(^|[^[:alnum:]])release[.:]minor'; then
+            minor=$((minor + 1)); patch=0; kind="minor"
+          else
+            patch=$((patch + 1)); kind="patch"
+          fi
+          version="${major}.${minor}.${patch}"
+          tag="v${version}"
+          echo "Next release: ${tag} (${kind} bump from ${base})"
+
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::error::tag ${tag} already exists — aborting to avoid clobbering a release."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${tag}" -m "stella ${version}"
+          git push origin "${tag}"
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger the release build for the new tag
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A tag pushed with GITHUB_TOKEN does not itself trigger `on: push:
+        # tags`, so dispatch release.yml explicitly at the tag ref.
+        run: gh workflow run release.yml --ref "${{ steps.ver.outputs.tag }}"

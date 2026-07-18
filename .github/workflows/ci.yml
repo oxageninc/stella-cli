@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    # DuckDB (stella-store, bundled) is a heavy C++ compile on a cold
+    # cache; rust-cache keeps warm runs fast.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo build (release smoke, thin LTO)
+        run: cargo build --workspace --release --config 'profile.release.lto="thin"' --config 'profile.release.codegen-units=16'
+
+  supply-chain:
+    name: cargo deny + cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny + cargo-audit
+        run: cargo install --locked cargo-deny cargo-audit
+
+      # Real gate (no `|| true`): advisories + dependency bans + source
+      # provenance, configured in deny.toml. License checking is deliberately
+      # left to a separate track (see deny.toml).
+      - name: cargo deny check
+        run: cargo deny check advisories bans sources
+
+      - name: cargo audit
+        run: cargo audit

@@ -1,0 +1,32 @@
+# Automated dependency + security updates.
+# https://docs.github.com/code-security/dependabot
+version: 2
+updates:
+  # Rust workspace.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo:
+        update-types: [minor, patch]
+
+  # GitHub Actions pinned in workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Python benchmark harness + Harbor adapter.
+  - package-ecosystem: pip
+    directory: /bench
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /bench/harbor_adapter
+    schedule:
+      interval: weekly

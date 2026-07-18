@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Documentation
+    url: https://docs.oxagen.sh/stella
+    about: Quickstart, provider setup, and the full manual — check here first.
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/macanderson/stella/security/advisories/new
+    about: Please use private vulnerability reporting — never a public issue.
+  - name: 💬 Questions & ideas
+    url: https://github.com/macanderson/stella/discussions
+    about: Not a bug, not yet a feature request? Start a discussion.

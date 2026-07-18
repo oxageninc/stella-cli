@@ -1,0 +1,13 @@
+{"type":"stage","name":"triage"}
+{"type":"budget_tick","spent_usd":0.0001,"limit_usd":null,"mode":"observed"}
+{"type":"stage","name":"context_recall"}
+{"type":"stage","name":"execute"}
+{"type":"tool_start","call":{"call_id":"call_1","name":"edit_file","input":{"path":"src/lib.rs"}}}
+{"type":"tool_result","call_id":"call_1","output":{"ok":{"content":"edited"}},"duration_ms":8}
+{"type":"file_change","path":"src/lib.rs","kind":"modified","diff":"@@ -1 +1 @@\n-off_by_one\n+fixed"}
+{"type":"text","delta":"Fixed the off-by-one error in the range check."}
+{"type":"budget_tick","spent_usd":0.0013,"limit_usd":null,"mode":"observed"}
+{"type":"stage","name":"verify"}
+{"type":"judge_verdict","passed":true,"evidence":{"summary":"flip oracle: fail→pass of `cargo test -p stella-core budget`; touched tests green; diff 12 lines within budget","deterministic":true}}
+{"type":"stage","name":"complete"}
+{"type":"complete","model":"zai/glm-5.2","cost_usd":0.0013}

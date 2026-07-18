@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#
+# Stella pre-push gate.
+#
+# Runs the exact fmt + clippy + test gate CI would run — locally, on every
+# push — because the org's GitHub Actions is billing-locked: every required
+# check (`fmt + clippy + test`, `cargo deny + cargo audit`) fast-fails in
+# seconds without ever executing, and `enforce_admins` is off, so gate-failing
+# code otherwise reaches `main` through admin/auto merges (exactly how the
+# clippy errors and the E0061 compile break landed and had to be hand-repaired).
+#
+# This is the enforcement point that still works while Actions is down: it
+# catches the break on the author's push, before the PR is merged. It is
+# advisory, not a server-side guarantee — it must be installed per clone and is
+# bypassable — but it makes the gate run automatically again.
+#
+#   Install once per clone:  make hooks           (sets core.hooksPath=.githooks)
+#   Bypass (emergencies):    SKIP_GATE=1 git push     or     git push --no-verify
+#
+set -uo pipefail
+
+if [ "${SKIP_GATE:-}" = "1" ]; then
+  printf '\033[33m⚠ SKIP_GATE=1 — skipping the pre-push gate\033[0m\n' >&2
+  exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+printf '\033[36m▸ pre-push gate — make gate (fmt-check · clippy -D warnings · test)\033[0m\n' >&2
+if make gate; then
+  printf '\033[32m✔ gate green — pushing\033[0m\n' >&2
+  exit 0
+fi
+
+printf '\033[31m✖ gate failed — push aborted.\033[0m\n' >&2
+printf '  Fix the errors above, or bypass in an emergency: SKIP_GATE=1 git push (or git push --no-verify).\n' >&2
+exit 1

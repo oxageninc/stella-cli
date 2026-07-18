@@ -1,0 +1,56 @@
+name: "✨ Feature request"
+description: "Propose an improvement — tell us the problem, not just the feature."
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The best feature requests describe **what you were trying to do** when
+        Stella fell short — the problem often has a better solution than the
+        first feature that comes to mind.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What were you trying to do, and where did Stella get in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Your idea for fixing it. CLI sketches, example sessions, and prior art from other tools all welcome.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of Stella?
+      options:
+        - The agent engine (planning, budget, compaction)
+        - A model provider / BYOK
+        - Built-in tools (incl. verify_done)
+        - CLI / TUI experience
+        - Context plane (graph, memory, retrieval)
+        - MCP integration
+        - The Arena / bench harness
+        - OCP (Open Context Protocol)
+        - Docs
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Workarounds you're using today, or designs you rejected.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Ground rules check
+      description: Stella has hard invariants — worth a look before proposing.
+      options:
+        - label: This doesn't require Stella to phone home or add non-provider network calls.
+          required: true
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true

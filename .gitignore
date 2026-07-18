@@ -1,0 +1,122 @@
+# Rust
+/target/
+# Cargo.lock IS tracked — Stella ships a binary and install.sh / release.yml
+# build with `--locked`, so the lockfile must be committed and reproducible.
+**/*.rs.bk
+*.pdb
+
+# Cargo
+.cargo/config
+.cargo/config.toml
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+build/
+.dependency/
+*.iml
+
+# Editors
+*.bak
+*.tmp
+.*.sw?
+.*.pw?
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.lnk
+
+# Environment & Secrets
+.env
+.env.*
+.env.local
+.env.*.local
+!.env.example
+
+# Stella-specific
+.stella/
+.oxagen/
+
+# Claude/Agents
+.claude/
+.agents/
+.agents.d/
+
+# Testing
+*.profraw
+*.profdata
+coverage/
+*.prof*
+
+# Logs
+*.log
+logs/
+
+# Temporary
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Build artifacts
+dist/
+build/
+out/
+
+# Package manager
+node_modules/
+
+# Python (for bench/harbor_adapter)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist-python/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+*.cover
+
+# Benchmark results
+bench/results*/
+bench/warm-memory/
+
+# Release artifacts
+*.tar.gz
+*.zip
+
+# Debug symbols
+*.dSYM/
+*.su
+*.idb
+*.idb[0-9][0-9]
+*.sbn
+
+# Backup files
+*.bak
+*.backup
+*~
+.#*
+
+# Local configuration (but commit example)
+*.local
+!.config.example
+
+# Rust analyzer
+rust-project.json
+deck-snapshots.txt

@@ -1,0 +1,75 @@
+name: "🐛 Bug report"
+description: "Something is broken — help us reproduce it and it gets fixed."
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! A reproducible bug is one of the most valuable
+        contributions there is. **Reminder:** Stella keeps everything local —
+        please double-check pasted logs for API keys before submitting.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what did Stella do instead?
+      placeholder: |
+        Ran `stella run "fix the failing test"` and it …
+        I expected …
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest sequence of commands that triggers it. If it only happens in one repo, describe that repo's shape (language, size, toolchain).
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Stella version
+      description: Output of `stella --version` (or the commit SHA if built from source).
+      placeholder: stella 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How did you install Stella?
+      options:
+        - curl | sh (install.sh)
+        - Homebrew
+        - cargo install
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / architecture
+      placeholder: macOS 15.5 arm64 · Ubuntu 24.04 x86_64
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Provider / model
+      description: Which `provider/model` were you running? (Local server? Say which one.)
+      placeholder: anthropic/claude-fable-5 · local/llama3.3 via Ollama
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Terminal output, or the tail of the relevant execution from your local telemetry. **Redact any keys.**
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+        - label: I checked the pasted output for API keys and secrets.
+          required: true

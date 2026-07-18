@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stella · Command Deck</title>
+<meta name="description" content="Stella is a terminal coding agent that proves its own work. The Command Deck shows agents, traces, the code graph, skills, and MCP servers in one screen.">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<style>
+:root{
+  --night:#0B0A08;
+  --ink:#15120C;
+  --panel:#171310;
+  --paper:#FBF7EF;
+  --muted:#B7AD98;
+  --dim:#7E7460;
+  --hl:#FFD97A;
+  --gold:#F5B33C;
+  --amb:#E08A20;
+  --line:rgba(251,247,239,.12);
+  --line-soft:rgba(251,247,239,.07);
+  --mono:ui-monospace,"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Arial,sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:72px}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+body{
+  background:var(--night);
+  color:var(--paper);
+  font-family:var(--sans);
+  font-size:17px;
+  line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
+a{color:var(--gold);text-decoration:none}
+a:hover{color:var(--hl);text-decoration:underline;text-underline-offset:3px}
+:focus-visible{outline:2px solid var(--gold);outline-offset:3px;border-radius:2px}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+
+/* ---- deck tab nav ---- */
+.tabbar{
+  position:sticky;top:0;z-index:10;
+  background:rgba(11,10,8,.86);
+  backdrop-filter:blur(10px);
+  -webkit-backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--line-soft);
+}
+.tabbar .wrap{display:flex;align-items:center;gap:14px;height:56px}
+.brand{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-weight:700;font-size:15px;color:var(--paper);letter-spacing:.02em}
+.brand:hover{text-decoration:none;color:var(--hl)}
+.brand svg{display:block}
+.tabs{display:flex;gap:6px;margin-left:auto;overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{
+  font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;
+  color:var(--muted);border:1px solid var(--line-soft);
+  padding:7px 13px;white-space:nowrap;
+}
+.tab:hover{color:var(--hl);border-color:var(--gold);text-decoration:none}
+.tab:hover::before{content:"▸ ";color:var(--gold)}
+
+/* ---- hero ---- */
+.hero{
+  background:
+    radial-gradient(70% 60% at 50% 28%, rgba(245,179,60,.14), rgba(0,0,0,0) 62%),
+    linear-gradient(180deg,#151007,var(--night));
+  border-bottom:1px solid var(--line-soft);
+}
+.hero .wrap{max-width:1100px;padding:88px 24px 64px;text-align:center}
+.prompt{
+  font-family:var(--mono);font-size:13px;letter-spacing:.28em;
+  color:var(--amb);text-transform:uppercase;font-weight:600;
+}
+.prompt .cursor{
+  display:inline-block;width:.6em;height:1em;vertical-align:-.15em;
+  background:var(--gold);margin-left:.4em;
+}
+@media (prefers-reduced-motion: no-preference){
+  .prompt .cursor{animation:blink 1.1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+}
+h1{
+  font-family:var(--mono);
+  font-size:clamp(27px,5.4vw,56px);
+  line-height:1.12;letter-spacing:-.02em;font-weight:700;
+  max-width:19ch;margin:22px auto 0;
+}
+h1 em{font-style:normal;color:var(--gold)}
+.hero p.lead{
+  color:var(--muted);max-width:62ch;margin:22px auto 0;font-size:18px;
+}
+.install{
+  display:inline-flex;align-items:center;gap:12px;
+  margin-top:34px;padding:13px 18px;
+  font-family:var(--mono);font-size:13.5px;color:var(--hl);
+  background:rgba(21,18,12,.85);border:1px solid var(--line);border-radius:6px;
+  overflow-x:auto;max-width:100%;white-space:nowrap;
+}
+.install .ch{color:var(--dim);user-select:none}
+.hero-links{margin-top:18px;font-family:var(--mono);font-size:13px;color:var(--dim)}
+.hero-links a{margin:0 10px}
+
+/* ---- pipeline strip ---- */
+.pipeline{max-width:760px;margin:52px auto 0;text-align:left}
+.pipeline .stages{
+  display:flex;justify-content:space-between;align-items:baseline;
+  font-family:var(--mono);font-size:12.5px;color:var(--dim);margin-bottom:8px;
+}
+.pipeline .stages .on{color:var(--gold);font-weight:700}
+.pipeline .stages .done{color:var(--muted)}
+.heat{
+  height:12px;border-radius:2px;
+  background:
+    repeating-linear-gradient(90deg, rgba(0,0,0,0) 0 8px, var(--night) 8px 10px),
+    linear-gradient(90deg,#FFD97A 0%,#F5B33C 30%,#E08A20 52%,rgba(251,247,239,.09) 52.001%);
+}
+
+/* ---- feature sections ---- */
+section.feature{border-bottom:1px solid var(--line-soft);padding:84px 0}
+section.feature .wrap{
+  display:grid;
+  grid-template-columns:minmax(0,5fr) minmax(0,7fr);
+  gap:60px;align-items:center;
+}
+section.feature.flip .shot{order:-1}
+.chip{
+  display:inline-block;font-family:var(--mono);font-size:11.5px;
+  letter-spacing:.18em;color:var(--gold);font-weight:700;
+  border:1px solid rgba(245,179,60,.35);padding:6px 12px;margin-bottom:18px;
+}
+h2{
+  font-family:var(--mono);
+  font-size:clamp(22px,2.5vw,30px);
+  line-height:1.25;letter-spacing:-.015em;font-weight:700;
+}
+.copy p{color:var(--muted);margin-top:16px;font-size:16.5px}
+.copy strong{color:var(--paper);font-weight:600}
+.stats{
+  display:flex;flex-wrap:wrap;gap:8px 22px;
+  margin-top:20px;font-family:var(--mono);font-size:12px;color:var(--dim);
+}
+.stats span::before{content:"· ";color:var(--amb)}
+
+/* ---- macOS terminal window ---- */
+.term{
+  border:1px solid rgba(255,217,122,.16);border-radius:10px;
+  background:#000;overflow:hidden;
+  box-shadow:0 24px 80px rgba(0,0,0,.55), 0 0 64px rgba(245,179,60,.06);
+}
+.term-bar{
+  display:grid;grid-template-columns:56px 1fr 56px;align-items:center;
+  padding:10px 14px;background:#1A150E;
+  border-bottom:1px solid var(--line-soft);
+}
+.term-dots{display:flex;gap:8px}
+.term-dots i{width:12px;height:12px;border-radius:50%}
+.term-dots i:nth-child(1){background:#FF5F57}
+.term-dots i:nth-child(2){background:#FEBC2E}
+.term-dots i:nth-child(3){background:#28C840}
+.term-title{
+  text-align:center;font-family:var(--mono);font-size:11.5px;
+  color:var(--dim);letter-spacing:.08em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.term a.zoom{display:block}
+.term img{display:block;width:100%;height:auto}
+@media (prefers-reduced-motion: no-preference){
+  @supports ((animation-timeline: view()) and (animation-range: entry)){
+    .shot{
+      animation:rise auto linear backwards;
+      animation-timeline:view();
+      animation-range:entry 5% entry 38%;
+    }
+    @keyframes rise{from{opacity:0;transform:translateY(26px)}}
+  }
+}
+
+/* ---- status bar section ---- */
+section.feature.chrome .wrap{display:block;max-width:1100px}
+.statusbar{
+  display:flex;align-items:stretch;
+  margin-top:36px;border:1px solid var(--line);border-radius:6px;
+  background:var(--ink);
+  font-family:var(--mono);overflow-x:auto;
+}
+.cell{
+  padding:12px 18px;border-right:1px solid var(--line-soft);
+  white-space:nowrap;
+}
+.cell:last-child{border-right:0;margin-left:auto}
+.cell .k{display:block;font-size:10px;letter-spacing:.16em;color:var(--dim);text-transform:uppercase}
+.cell .v{display:block;font-size:13.5px;color:var(--paper);margin-top:3px}
+.cell .v.gold{color:var(--gold)}
+.cell .v.ok{color:#8FD08F}
+.det{color:var(--amb);font-weight:700}
+
+/* ---- footer ---- */
+footer{padding:64px 0 80px;text-align:center}
+footer .install{margin-top:0}
+footer .fine{
+  margin-top:26px;font-family:var(--mono);font-size:12.5px;color:var(--dim);
+}
+footer .fine a{color:var(--muted)}
+
+@media (max-width:940px){
+  section.feature .wrap{grid-template-columns:1fr;gap:36px}
+  section.feature.flip .shot{order:0}
+}
+@media (max-width:640px){
+  .hero .wrap{padding:64px 20px 48px}
+  section.feature{padding:56px 0}
+  body{font-size:16px}
+  .install{display:flex;width:100%;justify-content:flex-start}
+}
+</style>
+</head>
+<body>
+
+<nav class="tabbar" aria-label="Deck tabs">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="Stella home">
+      <svg width="34" height="22" viewBox="17.5 11.5 114.7 73.0" aria-hidden="true"><defs><linearGradient id="g" x1="24" y1="18" x2="120" y2="80" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FFD97A"/><stop offset=".5" stop-color="#F5B33C"/><stop offset="1" stop-color="#E08A20"/></linearGradient></defs><path d="M30 24 L54 48 L30 72" fill="none" stroke="url(#g)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/><circle cx="78" cy="28" r="6.2" fill="url(#g)"/><circle cx="78" cy="48" r="6.2" fill="url(#g)"/><circle cx="78" cy="68" r="6.2" fill="url(#g)"/><circle cx="98" cy="28" r="6.2" fill="url(#g)"/><circle cx="98" cy="48" r="6.2" fill="url(#g)"/><circle cx="98" cy="68" r="6.2" fill="url(#g)"/><circle cx="118" cy="28" r="6.2" fill="url(#g)"/><circle cx="118" cy="48" r="6.2" fill="url(#g)"/><circle cx="118" cy="68" r="6.2" fill="url(#g)"/></svg>
+      stella
+    </a>
+    <div class="tabs">
+      <a class="tab" href="#agents">AGENTS</a>
+      <a class="tab" href="#traces">TRACES</a>
+      <a class="tab" href="#graph">GRAPH</a>
+      <a class="tab" href="#skills">SKILLS</a>
+      <a class="tab" href="#mcp">MCP</a>
+      <a class="tab" href="#deck">DECK</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <p class="prompt">&gt;&gt;&gt; stella · command deck<span class="cursor" aria-hidden="true"></span></p>
+    <h1>Stop trusting your coding agent. <em>Watch it work.</em></h1>
+    <p class="lead">Stella is an open-source coding agent that runs in your terminal: one Rust binary, no SaaS, your own API keys. Its Command Deck puts the agents, the live traces, the code graph, the skills, and the MCP servers on one screen. Every model call priced, every tool call timed, and all of it stored on your disk.</p>
+    <code class="install"><span class="ch">$</span>curl -fsSL https://raw.githubusercontent.com/macanderson/stella/main/install.sh | sh</code>
+    <p class="hero-links"><a href="https://github.com/macanderson/stella">github.com/macanderson/stella</a> · <a href="why-stella.md">why stella</a></p>
+    <div class="pipeline" aria-hidden="true">
+      <div class="stages"><span class="done">√ plan</span><span class="on">▸ execute</span><span>· verify</span><span>50% · 2 tok/s</span></div>
+      <div class="heat"></div>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<section class="feature" id="agents">
+  <div class="wrap">
+    <div class="copy">
+      <span class="chip">▸ AGENTS</span>
+      <h2>Every agent, every toolbelt, in plain sight.</h2>
+      <p>Subagents usually run on faith: you find out what tools they had after something breaks. The Agents tab lists all <strong>15 installed agents</strong> with their scope, their pinned version, and the <strong>exact toolbelt</strong> each one is allowed to use. A reviewer gets Read, Grep, Glob, and Bash. A break-fix agent gets Edit and Write too. Editing an agent creates a new pinned version, so a prompt never changes under you.</p>
+      <div class="stats"><span>15 agents on disk</span><span>pinned versions</span><span>per-agent toolbelts</span></div>
+    </div>
+    <div class="shot">
+      <div class="term">
+        <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">stella · deck · agents</span><span></span></div>
+        <a class="zoom" href="assets/deck/deck-agents.png" title="Open full-size screenshot">
+          <img src="assets/deck/deck-agents.png" alt="The Agents tab of the Stella Command Deck listing 15 installed agents, each with scope, version, description, and its allowed toolbelt." width="2000" height="1103" fetchpriority="high" decoding="async">
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="feature flip" id="traces">
+  <div class="wrap">
+    <div class="copy">
+      <span class="chip">▸ TRACES</span>
+      <h2>Every model call priced. Every tool call timed.</h2>
+      <p>An AI bill should not be a monthly surprise. Traces streams the run as it happens: 96 events in this session, each model call with its own cost, down to <strong>$0.0065</strong>, and each tool result with its wall time, down to the millisecond. The running total and the cache hit rate, <strong>81% here</strong>, sit at the bottom of the screen the whole time. It all lands in a local SQLite file you can open with any client.</p>
+      <div class="stats"><span>per-call spend</span><span>millisecond tool timings</span><span>local-only telemetry</span></div>
+    </div>
+    <div class="shot">
+      <div class="term">
+        <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">stella · deck · traces</span><span></span></div>
+        <a class="zoom" href="assets/deck/deck-traces.png" title="Open full-size screenshot">
+          <img src="assets/deck/deck-traces.png" alt="The Traces tab streaming 96 live events: model calls with per-call dollar cost, text events, and tool calls with millisecond durations." width="2000" height="1124" loading="lazy" decoding="async">
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="feature" id="graph">
+  <div class="wrap">
+    <div class="copy">
+      <span class="chip">▸ GRAPH</span>
+      <h2>It queries a code graph instead of grepping.</h2>
+      <p>Grep tells you where a string appears. The graph tells you what a file defines and what depends on it. Stella parses your repo with tree-sitter into an <strong>offline code graph</strong>: no embeddings, no API key, and no network. This one file resolves to <strong>176 nodes and 175 relations</strong>, with an ASCII map of the neighborhood rendered right in the terminal.</p>
+      <div class="stats"><span>tree-sitter, fully offline</span><span>Rust, TS, JS, Python, SQL</span><span>0 network calls</span></div>
+    </div>
+    <div class="shot">
+      <div class="term">
+        <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">stella · deck · graph</span><span></span></div>
+        <a class="zoom" href="assets/deck/deck-graph.png" title="Open full-size screenshot">
+          <img src="assets/deck/deck-graph.png" alt="The Graph tab showing 176 nodes for stella-tui/src/deck_ui.rs, its 175 defines relations, and an ASCII neighborhood map." width="2000" height="1125" loading="lazy" decoding="async">
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="feature flip" id="skills">
+  <div class="wrap">
+    <div class="copy">
+      <span class="chip">▸ SKILLS</span>
+      <h2>Skills install like packages, not pasted prompts.</h2>
+      <p>A folder of prompts does not survive a second machine. Stella treats skills as scoped, versioned packages: <strong>17 installed here</strong> across user and project scope, toggled with a keypress. Search the registry without leaving the deck, preview a skill before it lands, and install it in place. The top result carries <strong>482.6K installs</strong>, so you can see what the rest of the ecosystem actually uses.</p>
+      <div class="stats"><span>user + project scope</span><span>registry search</span><span>preview before install</span></div>
+    </div>
+    <div class="shot">
+      <div class="term">
+        <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">stella · deck · skills</span><span></span></div>
+        <a class="zoom" href="assets/deck/deck-skills.png" title="Open full-size screenshot">
+          <img src="assets/deck/deck-skills.png" alt="The Skills tab with 17 installed skills on the left and a live registry search on the right showing install counts up to 482.6K." width="2000" height="1103" loading="lazy" decoding="async">
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="feature" id="mcp">
+  <div class="wrap">
+    <div class="copy">
+      <span class="chip">▸ MCP</span>
+      <h2>MCP servers, found and connected from the deck.</h2>
+      <p>Adding an MCP server usually means hand-editing JSON and restarting. The MCP tab searches the registry live: <strong>remote, npm, and pypi</strong> servers alike, each with a plain description of what it does. One search for Stripe returns ten servers, from the official remote to billing, analytics, and checkout bridges. Pick one, press enter, and it joins the tool registry in place.</p>
+      <div class="stats"><span>live registry search</span><span>remote, npm, and pypi</span><span>install in place</span></div>
+    </div>
+    <div class="shot">
+      <div class="term">
+        <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">stella · deck · mcp</span><span></span></div>
+        <a class="zoom" href="assets/deck/deck-mcp.png" title="Open full-size screenshot">
+          <img src="assets/deck/deck-mcp.png" alt="The MCP tab searching the registry for Stripe: ten servers listed with their source, transport, and a one-line description each." width="2000" height="656" loading="lazy" decoding="async">
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="feature chrome" id="deck">
+  <div class="wrap">
+    <span class="chip">▸ ALWAYS ON</span>
+    <h2>The meter never leaves the screen.</h2>
+    <p style="color:var(--muted);max-width:66ch;margin-top:16px">Every tab shares one bottom line: agent, stage, model, CPU, context, spend, cache hit rate, and active agents. Above it, the run moves through <strong style="color:var(--paper)">plan, execute, and verify</strong>, and verify is a stage, not a promise: a change must fail on the old code and pass on the new before Stella calls it done. The prompt queue never blocks, and <strong style="color:var(--paper)">!</strong> drops you into a shell. Stella calls this deterministic-first, and prints it in the corner to hold itself to it.</p>
+    <div class="stats"><span>plan · execute · verify</span><span>queue never blocks</span><span>hard budget caps</span></div>
+    <div class="statusbar" role="img" aria-label="The Stella status bar: agent lead, stage execute, model glm-5.2, spend $0.19, cache 85 percent, 1 active agent, deterministic-first.">
+      <div class="cell"><span class="k">&nbsp;</span><span class="v gold">✦ stella</span></div>
+      <div class="cell"><span class="k">Agent</span><span class="v">lead</span></div>
+      <div class="cell"><span class="k">Stage</span><span class="v ok">● execute</span></div>
+      <div class="cell"><span class="k">Model</span><span class="v">glm-5.2</span></div>
+      <div class="cell"><span class="k">Spend</span><span class="v ok">$0.19</span></div>
+      <div class="cell"><span class="k">Cache</span><span class="v">85% <span style="color:var(--dim)">(839.7K/987.4K tokens)</span></span></div>
+      <div class="cell"><span class="k">Agents</span><span class="v">1 active</span></div>
+      <div class="cell"><span class="k">&nbsp;</span><span class="v det">⌁ deterministic-first</span></div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <code class="install"><span class="ch">$</span>curl -fsSL https://raw.githubusercontent.com/macanderson/stella/main/install.sh | sh</code>
+    <p class="fine">
+      <a href="https://github.com/macanderson/stella">GitHub</a> ·
+      <a href="why-stella.md">Why Stella</a> ·
+      <a href="design/pipeline.md">The pipeline</a><br><br>
+      Dual-licensed MIT OR Apache-2.0 · Built in Rust · Telemetry stays in <span style="color:var(--muted)">.stella/store.db</span> on your disk.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
