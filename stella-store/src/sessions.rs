@@ -237,10 +237,17 @@ impl SessionRegistry {
 fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
+        // `pid_t` is signed: a stored pid that doesn't fit (a corrupt
+        // record, or a sentinel like `u32::MAX`) must read as dead — an
+        // `as` cast would wrap it negative, and `kill(-N, 0)` probes
+        // process GROUP N, which can spuriously report alive.
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
         if pid == 0 {
             return false;
         }
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        let rc = unsafe { libc::kill(pid, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(not(unix))]

@@ -205,6 +205,12 @@ pub enum Inbound {
     /// [`crate::deck_ui::ingest_inbound`]. Out-of-band view state, ignored by
     /// the model fold — like [`Inbound::GraphSnapshot`].
     ShowHelp,
+    /// A launch-cinematic cue (see [`SplashCue`]): the driver replays the
+    /// splash held open over a running init (session startup, `/init`) and
+    /// releases it when init finishes. Out-of-band view state, applied
+    /// straight to `DeckUi::splash` by [`crate::deck_ui::ingest_inbound`],
+    /// ignored by the model fold — like [`Inbound::ShowHelp`].
+    Splash(SplashCue),
     /// A refreshed snapshot of the **cross-process session registry** for the
     /// SESSIONS overlay (empty-prompt `←`). Every running stella session on
     /// this machine, grouped by [`SessionPhase`]. Out-of-band view state like
@@ -295,12 +301,6 @@ pub struct NotificationInfo {
     pub source: String,
     pub created_ms: u64,
     pub read: bool,
-    /// A launch-cinematic cue (see [`SplashCue`]): the driver replays the
-    /// splash held open over a running init (session startup, `/init`) and
-    /// releases it when init finishes. Out-of-band view state, applied
-    /// straight to `DeckUi::splash` by [`crate::deck_ui::ingest_inbound`],
-    /// ignored by the model fold — like [`Inbound::ShowHelp`].
-    Splash(SplashCue),
 }
 
 /// Driver → deck cues for the launch cinematic ([`crate::splash`]).

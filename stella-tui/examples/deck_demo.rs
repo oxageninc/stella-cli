@@ -188,8 +188,7 @@ async fn main() -> std::io::Result<()> {
                 | WorkspaceInput::SessionDelete { .. } => {
                     let _ = react_tx.send(Inbound::Sessions(vec![]));
                 }
-                WorkspaceInput::NotificationRead { .. }
-                | WorkspaceInput::NotificationsReadAll => {
+                WorkspaceInput::NotificationRead { .. } | WorkspaceInput::NotificationsReadAll => {
                     let _ = react_tx.send(Inbound::Notifications(vec![]));
                 }
                 WorkspaceInput::Quit => break,

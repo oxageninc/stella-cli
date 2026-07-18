@@ -713,6 +713,9 @@ pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut De
         });
         if *outcome == Some(true) {
             ui.pending_inputs.push(WorkspaceInput::McpRefresh);
+        }
+        return;
+    }
     // Launch-cinematic cues: the driver replays the splash held open over a
     // running init (`/init`, session startup) and releases it when init
     // finishes. Out-of-band view state like `ShowHelp`. `--no-anim`

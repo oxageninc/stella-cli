@@ -89,7 +89,7 @@ pub use envelope::{
     AgentControl, AgentId, AgentMeta, AgentScope, AgentStatus, AgentVersionInfo, Inbound,
     InstalledAgentEntry, McpSearchItem, McpSearchOutcome, McpServerInfo, NotificationInfo, Secret,
     SessionInfo, SessionPhase, SkillOp, SkillRow, SkillScope, SkillSearchHit, SkillsView,
-    WorkspaceInput,
+    SplashCue, WorkspaceInput,
 };
 pub use graph::{GraphEdge, GraphNode, GraphSnapshot};
 pub use resource::ResourceMonitor;
