@@ -13,10 +13,11 @@ stella init [global flags]
 
 ## What it does
 
-`stella init` does two things:
+`stella init` does the following:
 
-1. **Infers the domain taxonomy** and writes it to `<workspace>/.stella/domains.toml`. This taxonomy is the tagging vocabulary for memories, reflections, and every code-graph node and edge.
-2. **Builds the code-graph index** at `<workspace>/.stella/context.db`.
+1. **Infers the domain taxonomy** and writes it to `<workspace>/.stella/domains.toml`. This taxonomy is the tagging vocabulary for memories, reflections, and every code-graph node and edge. It is also persisted into the context plane at `<workspace>/.stella/context.db`.
+2. **Builds the code-graph index** at `<workspace>/.stella/codegraph.db` — the database [`stella graph`](/docs/commands/graph) queries.
+3. **Syncs extensions** — adopts commands, skills, and agents from other agents' `.claude/` and `.agents/` directories (workspace and user scope) as symlinks under `.stella/`.
 
 It works **offline** using a heuristic fallback, so it never hard-fails on configuration — you can initialize a workspace even without a resolvable provider credential.
 
@@ -31,14 +32,16 @@ Run `stella init` once per workspace to prime Stella's understanding of your cod
 | Flag | Why it matters here |
 | --- | --- |
 | `--model <provider/model_id>` | Pin the model used for taxonomy inference. Omit it to rely on auto-detection or the offline heuristic fallback. |
-| `--budget <usd>` | Cap spend for the analysis pass. |
+
+The global `--budget` flag is accepted but not honored by `init` — the analysis makes at most a couple of token-capped inference calls and does not track a budget.
 
 ## Generated files
 
 | Path | Contents |
 | --- | --- |
 | `<workspace>/.stella/domains.toml` | The inferred domain taxonomy (tagging vocabulary). |
-| `<workspace>/.stella/context.db` | The code-graph index. |
+| `<workspace>/.stella/codegraph.db` | The code-graph index (queried by `stella graph`). |
+| `<workspace>/.stella/context.db` | The context plane — the domain taxonomy and context facts. |
 
 ## Examples
 
@@ -51,5 +54,5 @@ stella init
 Initialize using a specific model for taxonomy inference:
 
 ```bash
-stella init --model openai/gpt-5.5
+stella --model openai/gpt-5.5 init
 ```

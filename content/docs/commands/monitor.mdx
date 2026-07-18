@@ -15,12 +15,16 @@ The optional `target` is a branch or PR to watch. When omitted, it defaults to `
 
 ## What it does
 
-`stella monitor` uses the `ci_status` tool to watch the CI runs for the given `target`. It works iteratively — inspecting failures and applying fixes — and treats the job as a goal that is met **only when the latest CI run is all-green**.
+`stella monitor` uses the `ci_status` tool to watch the CI runs for the given `target`. It works iteratively — inspecting each failure, fixing its root cause, then **committing and pushing the fix** before re-checking — and treats the job as a goal that is met **only when the latest CI run is all-green**.
 
 Because it is goal-shaped, `monitor` keeps working across CI runs until the pipeline passes, then exits.
 
+<Callout type="warn">
+`monitor` commits and pushes its fixes to the target branch between CI runs. Because the default target is `main`, a bare `stella monitor` will push commits directly to `main` — pass a feature branch or PR as the `target` if that is not what you want.
+</Callout>
+
 <Callout type="info">
-`stella monitor` relies on the `ci` tool for CI status and logs. See [Tools](/docs/commands/tools) for the full built-in tool list.
+`stella monitor` relies on the `ci_status` tool, which reads CI state through the GitHub `gh` CLI — so `gh` must be installed and authenticated on your `PATH`. See [Tools](/docs/commands/tools) for the full built-in tool list.
 </Callout>
 
 ## Flags
@@ -31,7 +35,10 @@ Because it is goal-shaped, `monitor` keeps working across CI runs until the pipe
 | --- | --- |
 | `--model <provider/model_id>` | Pin the worker model used to diagnose and fix failures. |
 | `--budget <usd>` | Cap total spend while it works across CI runs. |
-| `--output-format <text\|json\|stream-json>` | Use `json` or `stream-json` for headless CI output. |
+
+<Callout type="info">
+`monitor` is an interactive mode and always renders human-readable text; it does **not** honor `--output-format`.
+</Callout>
 
 ## Examples
 
@@ -50,5 +57,5 @@ stella monitor feature/payments-refactor
 Watch a pull request and cap total spend:
 
 ```bash
-stella monitor "#128" --budget 5.00
+stella --budget 5.00 monitor "#128"
 ```

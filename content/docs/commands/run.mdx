@@ -8,12 +8,14 @@ Send a one-shot prompt and let the agent work to completion without any interact
 ## Synopsis
 
 ```bash
-stella run <prompt> [global flags]
+stella run <prompt> [--no-pipeline] [--test-command <CMD>] [global flags]
 ```
 
 ## What it does
 
-`stella run` runs the full agent step loop — the model proposes tool calls, the tools execute, results feed back, and the loop repeats until the task is done — then exits. There is no REPL and no prompt for further input. It is the non-interactive counterpart to [`stella chat`](/docs/commands/chat).
+By default `stella run` sends the prompt through the **staged pipeline** — triage, plan, execute, verify, judge — and exits when the task is done. There is no REPL and no prompt for further input; it is the non-interactive counterpart to [`stella chat`](/docs/commands/chat).
+
+Pass `--no-pipeline` to fall back to the raw step loop instead: the model proposes tool calls, the tools execute, results feed back, and the loop repeats until the model stops proposing actions.
 
 Because it is non-interactive, `stella run` is the natural place to combine `--output-format json` or `--output-format stream-json` for headless automation, and `--budget` for a hard spend cap.
 
@@ -23,12 +25,19 @@ Because it is non-interactive, `stella run` is the natural place to combine `--o
 
 ## Flags
 
-`stella run` takes only the [global flags](/docs/commands). The most relevant ones:
+`stella run` adds two command-specific flags on top of the [global flags](/docs/commands):
+
+| Flag | Meaning |
+| --- | --- |
+| `--no-pipeline` | Use the raw step loop instead of the staged pipeline (triage, plan, execute, verify, judge). |
+| `--test-command <CMD>` | The test command the pipeline's verify stage runs (e.g. `"cargo test -p my-crate"`). Arms the fail→pass flip oracle: a change that flips a failing test to passing can submit without a model-judge call. Omitted, verification always escalates to the judge. |
+
+The most relevant global flags here:
 
 | Flag | Why it matters here |
 | --- | --- |
 | `--model <provider/model_id>` | Pin the worker model instead of relying on auto-detection. |
-| `--output-format <text\|json\|stream-json>` | Use `json` or `stream-json` for machine-readable, headless output. |
+| `--output-format <text\|json\|stream-json>` | Use `json` or `stream-json` for machine-readable, headless output. Place it before the subcommand: `stella --output-format json run "…"`. |
 | `--budget <usd>` | Cap total spend for the run; work aborts cleanly once the cap is exceeded. |
 
 ## Examples
@@ -39,26 +48,23 @@ Run a simple one-shot task with the default (auto-detected) model:
 stella run "Add a docstring to every public function in src/utils.py"
 ```
 
-Pin a specific model and emit a single JSON object for a script to parse:
+Pin a specific model and emit a single JSON object for a script to parse. Global flags go **before** the `run` subcommand:
 
 ```bash
-stella run "Summarize the changes on this branch" \
-  --model anthropic/claude-fable-5 \
-  --output-format json
+stella --model anthropic/claude-fable-5 --output-format json \
+  run "Summarize the changes on this branch"
 ```
 
 Cap spend at two US dollars and stream events as they happen (useful in CI logs):
 
 ```bash
-stella run "Fix the failing unit tests in the payments module" \
-  --output-format stream-json \
-  --budget 2.00
+stella --output-format stream-json --budget 2.00 \
+  run "Fix the failing unit tests in the payments module"
 ```
 
 Point at a local OpenAI-compatible server:
 
 ```bash
-stella run "Explain what main.rs does" \
-  --model local/llama3.3 \
-  --base-url http://localhost:11434/v1
+stella --model local/llama3.3 --base-url http://localhost:11434/v1 \
+  run "Explain what main.rs does"
 ```

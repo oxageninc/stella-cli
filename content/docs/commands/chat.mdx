@@ -1,9 +1,11 @@
 ---
 title: stella chat
-description: Start an interactive REPL session with Stella — the default command.
+description: Start an interactive session with Stella — the Command Deck TUI by default, or a plain line REPL.
 ---
 
-Start an interactive REPL session. This is the **default** command: running `stella` with no subcommand is exactly the same as running `stella chat`.
+Start an interactive session. This is the **default** command: running `stella` with no subcommand is exactly the same as running `stella chat`.
+
+On a real terminal, `stella chat` opens the **Command Deck** — a tabbed terminal UI. Pass `--plain` (or set `STELLA_PLAIN=1`) for a plain line-based REPL instead; the deck also steps aside automatically when stdin or stdout is not a terminal.
 
 ## Synopsis
 
@@ -12,42 +14,69 @@ stella chat [global flags]
 
 # Equivalent — chat is the default
 stella [global flags]
+
+# Plain line-based REPL instead of the deck
+stella chat --plain
 ```
 
 ## What it does
 
-`stella chat` opens a conversational loop. You type a message, the agent runs its step loop — proposing tool calls, executing them, and feeding results back until the turn is done — and then hands the prompt back to you for the next message. Conversation history is retained across turns within the session.
+`stella chat` opens a conversational session. You type a message, the agent runs its step loop — proposing tool calls, executing them, and feeding results back until the turn is done — and then hands the prompt back to you. Conversation history is retained across turns within the session.
 
-Inside the REPL you also have a set of **slash commands** for inspecting state and controlling the session without leaving it.
+The default **Command Deck** presents the session as a set of tabs (transcript, files, diff, pipeline, graph, skills, MCP, agents) that you open with slash commands. The **plain REPL** (`--plain`) is a single scrolling line-based loop with a smaller command set — handy for narrow terminals, screen readers, and recordings.
 
 <Callout type="info">
-All [global flags](/docs/commands) apply. For example, `stella chat --model openai/gpt-5.5` pins the worker model for the whole session.
+All [global flags](/docs/commands) apply. Because they are top-level flags, put them before the subcommand — e.g. `stella --model openai/gpt-5.5 chat` pins the worker model for the whole session.
 </Callout>
 
 ## Flags
 
-`stella chat` takes only the [global flags](/docs/commands). Commonly used here:
+`stella chat` takes only the [global flags](/docs/commands). The ones that shape the chat surface:
 
 | Flag | Why it matters here |
 | --- | --- |
+| `--plain` | Use the plain line-based REPL instead of the Command Deck (env `STELLA_PLAIN=1`; also auto-selected on a non-TTY). |
+| `--no-anim` | Freeze deck animation (progress shimmer, caret blink) to a static frame — for recordings and CI (env `STELLA_NO_ANIM` / `NO_COLOR`). |
 | `--model <provider/model_id>` | Pin the worker model for the session. |
 | `--budget <usd>` | Apply a hard spend cap across the entire session. |
 | `--base-url <url>` | Required with `--model local/<model>`; an optional proxy override otherwise. |
 
-## REPL slash commands
+## Slash commands
 
-Type these at the REPL prompt inside a chat session:
+The available commands depend on the surface.
+
+### Command Deck (default)
+
+Open a tab or run an action:
 
 | Command | Description |
 | --- | --- |
 | `/help` | Show help. |
+| `/clear` | Clear the session / blank the transcript. |
 | `/models` | List providers and models (same output as `stella models`). |
+| `/init` | Run workspace initialization. |
+| `/pipeline` | Open the pipeline tab. |
+| `/agents` | Open the installed-agents tab. |
+| `/files` | Open the files-touched tab. |
+| `/diff` | Open the diff tab. |
+| `/graph` | Open the code-graph tab. |
+| `/skills` | Open the skills tab. |
+| `/mcp` | Open the MCP tab (enable/disable servers, enter credentials). |
+
+Press **Ctrl-C** to quit the deck.
+
+### Plain REPL (`--plain`)
+
+The line REPL has a smaller, different set:
+
+| Command | Description |
+| --- | --- |
+| `/help` | Show help. |
+| `/models` | List providers and models. |
 | `/config` | Show the current configuration. |
 | `/clear` | Clear the conversation history. |
-| `/files` | List the files changed this session. |
-| `/goal` | Switch into goal mode from chat. |
-| `/exit` | Leave Stella. |
-| `/quit` | Leave Stella (alias of `/exit`; the bare word `exit` also works). |
+| `/goal <goal>` | Run a goal-driven turn toward the stated goal. |
+| `exit` / `/exit` / `/quit` | Leave Stella. |
 
 ## Examples
 
@@ -63,8 +92,14 @@ Start a session by simply running the binary (chat is the default):
 stella
 ```
 
-Pin a model and cap session spend:
+Pin a model and cap session spend (global flags before the subcommand):
 
 ```bash
-stella chat --model zai/glm-5.2 --budget 5.00
+stella --model zai/glm-5.2 --budget 5.00 chat
+```
+
+Use the plain line REPL (e.g. for a screen reader or a narrow terminal):
+
+```bash
+stella chat --plain
 ```

@@ -60,7 +60,7 @@ is the complete map; each row links to its detail page.
 | A provider's API key | `--api-key` flag · provider env var · `settings.json` `api_key` · `credentials.toml` | `export ANTHROPIC_API_KEY=…` |
 | A provider's base URL | `--base-url` flag · `STELLA_BASE_URL` · `providers.<id>.base_url` | `providers.zai.base_url` → coding endpoint |
 | A provider's display name | `settings.json` `providers.<id>.name` | see [settings.json](/docs/configuration/settings) |
-| Output format (text/json/stream-json) | `--output-format` flag · `STELLA_OUTPUT_FORMAT` | `stella run --output-format json "…"` |
+| Output format (text/json/stream-json) | `--output-format` flag · `STELLA_OUTPUT_FORMAT` | `stella --output-format json run "…"` |
 | A hard USD spend cap | `--budget` flag · `STELLA_BUDGET` | `stella --budget 2.00 goal "…"` |
 | Shell commands on lifecycle events | `settings.json` `hooks` key | [Hooks](/docs/tools/hooks) |
 | Org-managed defaults for a fleet | `STELLA_MANAGED_SETTINGS` → a `settings.json` | [settings hierarchy](#the-settings-hierarchy) |
@@ -88,7 +88,7 @@ is the complete map; each row links to its detail page.
 
 ```bash
 STELLA_MODEL=anthropic/claude-fable-5 STELLA_BUDGET=5 \
-  stella run --output-format json "port the utils module to the new API"
+  stella --output-format json run "port the utils module to the new API"
 ```
 
 **Ship org-wide defaults every project inherits** (a gateway URL + team key), leaving

@@ -22,10 +22,10 @@ machine interface you can parse incrementally.
 
 ```bash
 # One final JSON object
-stella run "list the public API of the auth module" --output-format json
+stella --output-format json run "list the public API of the auth module"
 
 # Newline-delimited event stream, parsed as it arrives
-stella run "fix the failing test" --output-format stream-json | while IFS= read -r line; do
+stella --output-format stream-json run "fix the failing test" | while IFS= read -r line; do
   echo "$line" | jq -r '.type // "event"'
 done
 ```

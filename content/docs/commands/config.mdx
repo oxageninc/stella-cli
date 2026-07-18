@@ -15,7 +15,7 @@ stella config [global flags]
 
 `stella config` resolves every configuration source — global flags, environment variables, `settings.json` across all three scopes, and `credentials.toml` — and prints the **effective** result. It is the fastest way to confirm exactly which provider, model, and base URL a run will use, and that your key resolved without exposing it (the key is shown only as a redacted preview).
 
-The same output is available from inside an interactive session via the [`/config`](/docs/commands/chat) slash command.
+The same output is available from the plain line REPL (`stella chat --plain`) via the `/config` slash command. The default Command Deck TUI does not have a `/config` command — run `stella config` in a separate shell instead.
 
 <Callout type="info">
 `settings.json` is merged field-by-field across three scopes — project (`<workspace>/.stella/settings.json`), org-managed, and user (`~/.config/stella/settings.json`) — highest precedence first. `stella config` shows the merged, effective values.
@@ -23,7 +23,7 @@ The same output is available from inside an interactive session via the [`/confi
 
 ## Flags
 
-`stella config` takes the [global flags](/docs/commands). Passing `--model`, `--base-url`, or `--api-key` lets you preview how a specific override resolves before committing to a run.
+`stella config` takes the [global flags](/docs/commands). Passing `--model` or `--base-url` lets you preview how a specific override resolves before committing to a run. `--api-key` cannot be previewed on its own — it must be combined with `--model provider/model_id`, because a bare key doesn't say which provider it is for.
 
 ## Example
 
@@ -34,18 +34,22 @@ stella config
 Representative output (illustrative):
 
 ```text
-Provider:   zai
-Model:      glm-5.2
-API key:    sk-...a1b2  (redacted)
+Provider:   Z.ai (GLM 5.2)
+Model:      zai/glm-5.2
+API Key:    sk-abc…a1b2
 Base URL:   https://api.z.ai/api/paas/v4
 Workspace:  /Users/you/projects/acme
 Dialect:    OpenAI-compatible
 ```
 
-Preview how an explicit override resolves without starting a run:
+The `Provider` line shows the provider's display name; `Model` is printed as
+`<provider-id>/<model-id>`; and the key is a redacted preview (first six characters, an
+ellipsis, and the last four).
+
+Preview how an explicit override resolves without starting a run (global flags first):
 
 ```bash
-stella config --model anthropic/claude-fable-5
+stella --model anthropic/claude-fable-5 config
 ```
 
 <Callout type="warn">

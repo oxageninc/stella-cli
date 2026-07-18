@@ -13,7 +13,7 @@ stella goal <goal> [global flags]
 
 ## What it does
 
-`stella goal` runs the agent step loop in rounds. At the end of each round, a **judge model** assesses whether the goal is met based on the evidence produced that round. The loop ends only when the judge confirms success.
+`stella goal` runs the agent step loop in rounds. At the end of each round, a **judge model** independently assesses whether the goal is met — reading the changed files, tests, and CI with read-only tools, not just the worker's narration. The loop ends when the judge confirms success, or when a backstop trips: a hard round cap (default **8** rounds), the `--budget` limit, or a worker-turn abort. Reaching a backstop ends the run reporting the goal as **not met**.
 
 Crucially, the judge is routed **cross-family** — it is a different model family than the worker, to avoid same-model bias. If only one provider family is configured, the worker doubles as its own judge.
 
@@ -29,7 +29,10 @@ For the full explanation of judged rounds, the cross-family judge, and the defin
 | --- | --- |
 | `--model <provider/model_id>` | Pin the worker model. The judge is routed to a different family automatically when one is available. |
 | `--budget <usd>` | Cap total spend across all rounds; work aborts cleanly once the cap is exceeded. |
-| `--output-format <text\|json\|stream-json>` | Use `json` or `stream-json` for headless, machine-readable output. |
+
+<Callout type="info">
+`stella goal` is an interactive mode: it always renders human-readable text and does **not** honor `--output-format`. Use [`stella run`](/docs/commands/run) for headless `json` / `stream-json` output.
+</Callout>
 
 <Callout type="warn">
 Configure at least two provider families if you want a truly independent judge. With a single family configured, the worker model judges its own work.
@@ -43,19 +46,11 @@ Work toward a goal until the judge confirms it is met:
 stella goal "Migrate the config loader to use serde and add tests"
 ```
 
-Pin the worker model and cap spend across all rounds:
+Pin the worker model and cap spend across all rounds (global flags go before the subcommand):
 
 ```bash
-stella goal "Make the CLI exit with a non-zero code on invalid input" \
-  --model anthropic/claude-fable-5 \
-  --budget 10.00
+stella --model anthropic/claude-fable-5 --budget 10.00 \
+  goal "Make the CLI exit with a non-zero code on invalid input"
 ```
 
-Run headless and stream each round's events:
-
-```bash
-stella goal "Get the test suite to 100% pass rate" \
-  --output-format stream-json
-```
-
-You can also enter goal mode from an interactive session with the [`/goal`](/docs/commands/chat) slash command.
+You can also run a goal-driven turn from the plain line REPL (`stella chat --plain`) with the `/goal <goal>` command.

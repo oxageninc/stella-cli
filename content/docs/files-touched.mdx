@@ -95,11 +95,11 @@ showing each path with its compact CRUD string (e.g. `src/router.rs  RU`).
 
 ### In JSON output
 
-`stella run --output-format json` includes the full telemetry payload under `files_touched`, so a
+`stella --output-format json run` includes the full telemetry payload under `files_touched`, so a
 script can assert on exactly what a run changed:
 
 ```bash
-stella run --output-format json "add a --health flag and wire the readiness probe" \
+stella --output-format json run "add a --health flag and wire the readiness probe" \
   | jq '.files_touched[] | {path, crud_events, lines_added, lines_removed}'
 ```
 
@@ -120,14 +120,14 @@ it stays entirely on your machine.
 **Fail CI when a run edits files outside a directory.**
 
 ```bash
-touched=$(stella run --output-format json "$TASK" | jq -r '.files_touched[].path')
+touched=$(stella --output-format json run "$TASK" | jq -r '.files_touched[].path')
 echo "$touched" | grep -qv '^src/' && { echo "run touched files outside src/"; exit 1; }
 ```
 
 **Get a one-line change summary of a run.**
 
 ```bash
-stella run --output-format json "$TASK" \
+stella --output-format json run "$TASK" \
   | jq -r '.files_touched[] | "\(.crud_events|join("")) \(.path) (+\(.lines_added) -\(.lines_removed))"'
 # CU src/router.rs (+18 -4)
 # C  src/health.rs (+22 -0)
