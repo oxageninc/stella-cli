@@ -240,9 +240,15 @@ pub fn handle_key(key: KeyEvent, model: &SessionModel, ui: &mut UiState) -> Shel
         return ShellAction::Handled;
     }
 
-    // A pending, unanswered scope card is modal-ish: a/t/x/Esc decide it.
+    // A pending, unanswered scope card is modal-ish: a/t/x/Esc decide it — but
+    // only from an empty composer. The decision keys are ordinary prompt
+    // characters, so once the user starts typing a message (e.g. "add a table")
+    // the keys must build the prompt, not silently approve/trim/abort the gate.
+    // Mirrors the deck (`crate::deck_ui`) and the ask_user quick-pick's
+    // "only when nothing is typed" rule.
     if model.pending_scope_review.is_some()
         && !ui.scope_answered
+        && ui.composer.buffer().is_empty()
         && let Some(decision) = scope_decision_for(key.code)
     {
         ui.scope_answered = true;
@@ -686,6 +692,35 @@ mod tests {
                 ShellAction::Submit(UserInput::ScopeDecision(ScopeDecision::Abort))
             );
         }
+    }
+
+    #[test]
+    fn scope_card_keys_yield_to_a_prompt_being_typed() {
+        // THE scope-key P1: the decision keys (a/t/x) are ordinary prompt
+        // letters and used to fire even mid-prompt, so typing a message like
+        // "add a table" while a scope card was up silently approved/aborted the
+        // gate. They must defer to a non-empty composer — same rule the deck and
+        // the ask_user quick-pick already use.
+        let model = model_with_scope();
+        let mut ui = UiState::default();
+
+        // A leading non-decision char types and makes the composer non-empty.
+        assert_eq!(handle_key(ch('f'), &model, &mut ui), ShellAction::Handled);
+        assert!(!ui.scope_answered, "typing must not answer the gate");
+
+        // Now a/t/x build the prompt instead of deciding.
+        for c in "atx".chars() {
+            assert_eq!(handle_key(ch(c), &model, &mut ui), ShellAction::Handled);
+        }
+        assert!(!ui.scope_answered, "no decision submitted while a prompt is typed");
+        assert_eq!(ui.composer.buffer(), "fatx");
+
+        // From an empty composer the gate still decides on a single key.
+        ui.composer.clear();
+        assert_eq!(
+            handle_key(ch('a'), &model, &mut ui),
+            ShellAction::Submit(UserInput::ScopeDecision(ScopeDecision::Approve))
+        );
     }
 
     #[test]
