@@ -4,10 +4,12 @@
 //! Two properties are load-bearing:
 //!
 //! 1. **Scrubbed environment.** The child is spawned
-//!    with [`Command::env_clear`] and receives *only* the keys explicitly
-//!    listed in the server's config `env`. No parent-shell credential
-//!    (`ANTHROPIC_API_KEY`, `AWS_*`, …) is ever inherited by an MCP
-//!    subprocess.
+//!    with [`Command::env_clear`] and receives only the keys explicitly
+//!    listed in the server's config `env`, plus `PATH`. No parent-shell
+//!    credential (`ANTHROPIC_API_KEY`, `AWS_*`, …) is ever inherited by an
+//!    MCP subprocess. `PATH` is the sole exception — it is not a secret and
+//!    a bare runner command (`npx`, `uvx`, `docker`, …) cannot resolve
+//!    without it — and a config `env` may still override it.
 //! 2. **Concurrent in-flight requests.** Each request gets a monotonically
 //!    increasing id and a `oneshot` slot in a pending-map; a single reader
 //!    task demultiplexes responses back to the right waiter by id. Many
@@ -72,16 +74,24 @@ impl StdioTransport {
         let mut command = Command::new(cmd);
         command
             .args(args)
-            .env_clear() // SCRUB — no ambient inheritance (§8).
+            .env_clear() // SCRUB — no ambient inheritance.
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null()) // keep server logs off the JSON-RPC stream.
             .kill_on_drop(true);
-        // The environment is fully scrubbed by design — PATH included, so
-        // nothing ambient (credentials or otherwise) leaks into a server. A
-        // server invoked by a bare command name (`npx`, `node`, `uvx`, …) will
-        // therefore fail to resolve unless the config either gives an absolute
-        // `cmd` path or passes `PATH` explicitly through its `env` map below.
+        // The environment is scrubbed by design so no ambient *credential*
+        // (`ANTHROPIC_API_KEY`, `AWS_*`, …) ever leaks into an MCP subprocess.
+        // `PATH` is the one exception: it is not a secret, and without it a
+        // server invoked by a bare runner name — `npx`, `uvx`, `docker`,
+        // `dnx`, `node` — cannot be found at all, which is exactly how the
+        // registry installs npm/pypi/oci servers. So PATH is inherited from
+        // the parent unless the config pins its own; everything else stays
+        // scrubbed. (An absolute `cmd` path needs no PATH and is unaffected.)
+        if !env.contains_key("PATH")
+            && let Some(path) = std::env::var_os("PATH")
+        {
+            command.env("PATH", path);
+        }
         for (key, value) in env {
             command.env(key, value);
         }
@@ -252,5 +262,22 @@ mod tests {
         let result =
             StdioTransport::spawn("ghost", "definitely-not-a-real-binary-xyzzy", &[], &env).await;
         assert!(matches!(result, Err(McpError::Transport(_))));
+    }
+
+    /// A bare runner command (the shape the registry installs for
+    /// npm/pypi/oci servers — `npx`, `uvx`, `docker`) must resolve via an
+    /// inherited PATH even though the environment is otherwise scrubbed.
+    /// Without the PATH pass-through this failed to spawn — every
+    /// registry-installed stdio server was dead on arrival.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_bare_runner_command_resolves_via_inherited_path() {
+        // `cat` is a bare name that only resolves through PATH; with the
+        // scrub-everything-but-PATH policy it must still be found and spawned.
+        let env = BTreeMap::new();
+        let transport = StdioTransport::spawn("cat-server", "cat", &[], &env)
+            .await
+            .expect("a bare runner must resolve via the inherited PATH");
+        transport.close().await;
     }
 }
