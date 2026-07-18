@@ -749,7 +749,7 @@ fn fmt_tokens(n: u64) -> String {
 /// A centered help overlay listing the deck's keys.
 fn render_help(area: Rect, buf: &mut Buffer) {
     let w = area.width.min(62);
-    let h = area.height.min(27);
+    let h = area.height.min(29);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -790,11 +790,19 @@ fn render_help(area: Rect, buf: &mut Buffer) {
             theme::body(),
         )),
         Line::from(Span::styled(
+            "  ↑ / ⇞ ⇟      scroll the transcript (Session)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  ⌘/⌃ ] ⌘/⌃ [  jump to transcript end / start",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
             "  Ctrl-O       expand/collapse the selected message",
             theme::body(),
         )),
         Line::from(Span::styled(
-            "               (at the prompt: newest · ×2 = all thinking)",
+            "               (nothing selected: expand ALL · again/Esc closes)",
             theme::body(),
         )),
         Line::from(Span::styled(

@@ -1122,6 +1122,7 @@ const DECK_BUILTINS: &[(&str, &str)] = &[
     ("/graph", "open the code-graph tab"),
     ("/skills", "open the SKILLS tab: manage · search · create"),
     ("/mcp", "open the MCP servers tab"),
+    ("/mcp-search", "search the MCP registry & install servers"),
 ];
 
 /// The deck's reserved command names — see [`DECK_BUILTINS`].
@@ -1819,7 +1820,7 @@ async fn run_deck_command(
         // tab, `/skills` and `/mcp` opening their tabs) are normally consumed
         // TUI-side, but a queued one reaches here — accept it as handled (a
         // no-op) rather than calling it "unknown".
-        "/files" | "/diff" | "/graph" | "/agents" | "/skills" | "/mcp" => {}
+        "/files" | "/diff" | "/graph" | "/agents" | "/skills" | "/mcp" | "/mcp-search" => {}
         _ => {
             // A custom command/skill/agent (⚡): expand its template —
             // arguments and all — into the prompt the model turn runs.
