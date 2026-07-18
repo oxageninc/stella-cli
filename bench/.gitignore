@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+# Benchmark outputs (never commit run artifacts or predictions)
+predictions*.jsonl
+*.results.json
+.swebench_cache/
