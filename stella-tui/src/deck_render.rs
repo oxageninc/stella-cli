@@ -769,6 +769,107 @@ fn render_help(ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
         height: h,
     };
     Clear.render(popup, buf);
+    let lines = vec![
+        Line::from(Span::styled(" Command Deck — keys", theme::accent())),
+        Line::default(),
+        Line::from(Span::styled("  Tab / ⇧Tab   switch tabs", theme::body())),
+        Line::from(Span::styled(
+            "  ⌘⏎ / ⌃⏎      queue prompt (never blocks)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  ⏎            insert a line break (kept in the prompt)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  ⌥[ / ⌥]      cursor to start / end of the prompt",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  !cmd         run a shell command NOW (skips the queue)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  /            command popup · ↑/↓ · tab · enter",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Ctrl-T / ↑   queue editor (↑ when prompts are queued)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  ↑ ↓          select a message (Session) · Esc clears",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  ↑ / ⇞ ⇟      scroll the transcript (Session)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  ⌘/⌃ ] ⌘/⌃ [  jump to transcript end / start",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Ctrl-O       expand/collapse the selected message",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "               (nothing selected: expand ALL · again/Esc closes)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Ctrl-R       expand/collapse thinking",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  ↑ ↓          navigate the active tab",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Agents: s      stop the focused agent",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Traces: f      cycle agent filter",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Files:  Enter  open the diff",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Graph:  / or Enter  browse & filter indexed files",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  SKILLS: space on/off · ctrl+x×2 delete · ←/→ pane",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "          e edit · p pin · n new (LLM) · /skills opens",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Esc          stop the turn (next queued runs)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Esc Esc      stop & hold — type what runs next",
+            theme::body(),
+        )),
+        Line::from(Span::styled("  Ctrl-C       quit", theme::body())),
+        Line::default(),
+        Line::from(Span::styled("  any key closes this help", theme::muted())),
+    ];
+    Paragraph::new(lines)
+        .alignment(Alignment::Left)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::accent())
+                .title(" ? "),
+        )
+        .render(popup, buf);
 
     let title = " Command Deck — help · ↑/↓ scroll · esc close ";
     let block = Block::default()

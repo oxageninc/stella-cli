@@ -64,12 +64,13 @@ fn valid_slice(slice: &str) -> bool {
 }
 
 async fn git_head(root: &std::path::Path) -> Option<String> {
-    let output = tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(root)
-        .output()
-        .await
-        .ok()?;
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["rev-parse", "HEAD"]).current_dir(root);
+    // Hook-exported GIT_* vars must not re-target this at another repo.
+    for var in crate::exec::GIT_REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().await.ok()?;
     if !output.status.success() {
         return None;
     }

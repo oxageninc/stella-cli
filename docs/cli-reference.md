@@ -279,7 +279,9 @@ surface). These are keyboard actions, not slash commands.
 | Key | Description |
 |-----|-------------|
 | `↑` `↓` (Session tab) | Select a message. `Esc` clears the selection. |
-| `Ctrl-O` | Expand/collapse the selected message (tool args, tool output, or a thought). From the prompt: expands the newest; press ×2 = toggle **all** thinking. |
+| `Ctrl-O` | Expand/collapse the selected message (tool args, tool output, or a thought). With nothing selected (e.g. while typing a prompt): expand **ALL** messages at once; `Ctrl-O` again — or `Esc` — collapses them. |
+| `⌘]` / `Ctrl-]` | Jump to the **end** of the session transcript (re-arms tail-follow). |
+| `⌘[` / `Ctrl-[` | Jump to the **beginning** of the session transcript. (`Ctrl-[` needs a terminal with the kitty keyboard protocol; elsewhere it arrives as `Esc`.) |
 | `Ctrl-R` | Expand/collapse all chain-of-thought (thinking) globally. |
 
 ### Tabs
@@ -298,8 +300,8 @@ The tabs: **Session**, **Agents**, **Traces**, **Files**, **Graph**,
 Type `/` in the composer to open the command popup (↑/↓ select, Tab completes,
 Enter dispatches). The 🔒 commands are built-in; ⚡ commands are your custom
 extensions. Tab-switch commands (`/files`, `/diff`, `/graph`, `/agents`,
-`/skills`, `/mcp`) are consumed TUI-side; the rest are dispatched to the
-session driver and answered into the transcript.
+`/skills`, `/mcp`, `/mcp-search`) are consumed TUI-side; the rest are
+dispatched to the session driver and answered into the transcript.
 
 | Command | Arg hint | Description |
 |---------|----------|-------------|
@@ -316,6 +318,7 @@ session driver and answered into the transcript.
 | `/agents` | (none) | Open the **Agents** tab (Installed Agents pane) and refresh the list. |
 | `/skills` | (none) | Open the **SKILLS** tab and refresh the installed list. |
 | `/mcp` | (none) | Open the **MCP servers** tab. |
+| `/mcp-search` | (none) | Open the MCP tab straight into **registry search** (type a query, `⏎` searches, `⏎` again installs). |
 | `/<custom>` | `<args>` | A custom ⚡ command/skill/agent — expands its template into the prompt the model runs. |
 
 > A bare unknown `/word` (no arguments) is flagged as unknown rather than sent
@@ -398,7 +401,7 @@ Three sub-modes: **Browse**, **Search** (modal), **Auth** (modal).
 | `a` | Browse | Enter the auth (credential) prompt for the selected server. |
 | `x` | Browse | Remove the selected server from `mcp.toml`. |
 | `r` | Browse | Refresh the snapshot. |
-| `/` | Browse | Enter search mode. |
+| `s` | Browse | Enter registry-search mode (or `/mcp-search` from anywhere). |
 | (type) | Search | Enter a registry query. |
 | `⏎` | Search | Search, then `⏎` again installs the highlighted result. |
 | `Esc` | Search | Back to Browse. |
@@ -411,8 +414,9 @@ Three sub-modes: **Browse**, **Search** (modal), **Auth** (modal).
 | Key | Description |
 |-----|-------------|
 | `↑` `↓` | Select / navigate messages. |
-| `Esc` | Clear the selection. |
-| (scroll) `↑` `↓` `PageUp` `PageDown` `Home` `End` | Scroll the transcript. |
+| `Esc` | Clear the selection (then: collapse the `Ctrl-O` expand-all overlay, if on). |
+| (scroll) `↑` `↓` `PageUp` `PageDown` | Scroll the transcript. |
+| `⌘]`/`Ctrl-]` · `⌘[`/`Ctrl-[` | Jump to the transcript's end / beginning. |
 
 ---
 

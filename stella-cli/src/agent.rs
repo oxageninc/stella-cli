@@ -617,11 +617,13 @@ pub(crate) struct GitRepoStructure {
 #[async_trait::async_trait]
 impl RepoStructurePort for GitRepoStructure {
     async fn structure_summary(&self) -> String {
-        let output = tokio::process::Command::new("git")
-            .args(["ls-files"])
-            .current_dir(&self.root)
-            .output()
-            .await;
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args(["ls-files"]).current_dir(&self.root);
+        // Hook-exported GIT_* vars must not re-target this at another repo.
+        for var in stella_tools::exec::GIT_REPO_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        let output = cmd.output().await;
         match output {
             Ok(out) if out.status.success() => {
                 render_file_tree(&String::from_utf8_lossy(&out.stdout), 200)
@@ -647,18 +649,21 @@ impl RepoStatusPort for GitRepoStatus {
         let mut out = std::collections::HashMap::new();
         // `-z` NUL-delimits paths (robust to spaces/newlines); quotePath off
         // keeps non-ASCII literal. Full stdout is read — never truncated.
-        let output = tokio::process::Command::new("git")
-            .args([
-                "-c",
-                "core.quotePath=false",
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "-z",
-            ])
-            .current_dir(&self.root)
-            .output()
-            .await;
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args([
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .current_dir(&self.root);
+        // Hook-exported GIT_* vars must not re-target this at another repo.
+        for var in stella_tools::exec::GIT_REPO_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        let output = cmd.output().await;
         let Ok(listing) = output else {
             return out;
         };

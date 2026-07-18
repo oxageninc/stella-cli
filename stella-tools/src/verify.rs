@@ -62,21 +62,29 @@ fn tail(s: &str) -> &str {
     &s[idx..]
 }
 
+/// A `git` command aimed at `dir` and ONLY `dir`: repo-targeting env vars a
+/// surrounding git hook may have exported are scrubbed so they cannot
+/// redirect the invocation at the outer repository
+/// ([`crate::exec::GIT_REPO_ENV_VARS`]).
+fn git_in(dir: &std::path::Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir);
+    for var in crate::exec::GIT_REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// Best-effort removal of the shadow worktree — both the registration and
 /// the directory.
 async fn cleanup_shadow(root: &std::path::Path, shadow: &std::path::Path) {
-    let _ = Command::new("git")
+    let _ = git_in(root)
         .args(["worktree", "remove", "--force"])
         .arg(shadow)
-        .current_dir(root)
         .output()
         .await;
     let _ = tokio::fs::remove_dir_all(shadow).await;
-    let _ = Command::new("git")
-        .args(["worktree", "prune"])
-        .current_dir(root)
-        .output()
-        .await;
+    let _ = git_in(root).args(["worktree", "prune"]).output().await;
 }
 
 #[async_trait]
@@ -230,11 +238,10 @@ impl Tool for VerifyDone {
             std::process::id(),
             SHADOW_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        let added = Command::new("git")
+        let added = git_in(root)
             .args(["worktree", "add", "--detach"])
             .arg(&shadow)
             .arg(&head)
-            .current_dir(root)
             .output()
             .await;
         match added {
@@ -335,29 +342,31 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        for args in [
-            vec!["init", "-q"],
-            vec!["config", "user.email", "t@t.t"],
-            vec!["config", "user.name", "t"],
-        ] {
-            let out = std::process::Command::new("git")
-                .args(&args)
-                .current_dir(&root)
-                .output()
-                .unwrap();
+        // Scrub hook-exported GIT_* vars exactly like the production paths
+        // (`git_in`) — without this, running the suite from inside a git
+        // hook (the pre-push gate) re-targets `git init` at the HOST repo.
+        let scratch_git = |args: &[&str]| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args).current_dir(&root);
+            for var in crate::exec::GIT_REPO_ENV_VARS {
+                cmd.env_remove(var);
+            }
+            let out = cmd.output().unwrap();
             assert!(out.status.success(), "git {args:?} failed");
+        };
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "t@t.t"],
+            &["config", "user.name", "t"],
+        ] {
+            scratch_git(args);
         }
         std::fs::write(root.join("impl.txt"), "old behavior\n").unwrap();
         for args in [
-            vec!["add", "."],
-            vec!["commit", "-q", "-m", "previous version"],
+            &["add", "."][..],
+            &["commit", "-q", "-m", "previous version"],
         ] {
-            let out = std::process::Command::new("git")
-                .args(&args)
-                .current_dir(&root)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?} failed");
+            scratch_git(args);
         }
         root
     }
