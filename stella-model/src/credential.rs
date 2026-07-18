@@ -109,8 +109,19 @@ impl ApiKey {
         }
 
         if interactive && std::io::stdin().is_terminal() {
-            let value = prompt_for_key(provider_id, env_var)?;
-            return Ok((Self(value), CredentialSource::Interactive));
+            match prompt_for_key(provider_id, env_var) {
+                Ok(value) => return Ok((Self(value), CredentialSource::Interactive)),
+                // The prompt failed — most commonly because stdin reports as a
+                // terminal (`is_terminal()` == true) yet is not genuinely
+                // readable: the libtest pty, headless `cargo run` through a
+                // pipe, or a closed stdin all trigger an immediate IO error
+                // (e.g. `ENXIO`, "Device not configured") from the underlying
+                // password reader. Per the documented contract, an unusable
+                // stdin degrades to a clean [`CredentialError::NotFound`]
+                // rather than surfacing the opaque [`PromptFailed`] at this
+                // trust boundary — never hang, never leak an opaque error.
+                Err(_) => {} // fall through to NotFound
+            }
         }
 
         Err(CredentialError::NotFound {
