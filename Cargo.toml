@@ -25,7 +25,7 @@ edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/macanderson/stella"
-homepage = "https://docs.oxagen.sh/stella"
+homepage = "https://stella.oxagen.sh"
 publish = false
 
 [workspace.dependencies]

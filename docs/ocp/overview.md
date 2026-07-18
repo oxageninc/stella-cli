@@ -47,7 +47,7 @@ today: [`ocp-types`](https://crates.io/crates/ocp-types) (the wire types, zero
 dependencies beyond `serde`), [`ocp-host`](https://crates.io/crates/ocp-host)
 (the host runtime), and
 [`ocp-conformance`](https://crates.io/crates/ocp-conformance) (the machine-checked
-conformance suite). All three are MIT licensed.
+conformance suite). All three are dual-licensed MIT OR Apache-2.0.
 
 ---
 
@@ -57,15 +57,15 @@ OCP makes seven promises about every frame that enters a prompt. Each one is a
 type in `ocp-types` and an enforcement path in `ocp-host` or `ocp-conformance`,
 not a line in a style guide.
 
-| Guarantee | What you get | Enforced by |
-|---|---|---|
-| **Provenance** | Every frame carries its origin: URI, line range, cryptographic digest, method, and the agent that produced it | `ContextFrame.provenance` |
-| **Budget honesty** | A provider's frames never sum above the query's `max_tokens`. A provider that lies is detected and its frames are dropped, loudly | Host budget audit + `budget-honesty` conformance check |
-| **Consent enforcement** | A provider that sends data off-machine is never queried until you record named, revocable consent. The query payload is not transmitted first | `ConsentStore` gate in `ocp-host` |
-| **Conformance** | "OCP conformant" is a checkable claim, not a self-attestation. The suite is adversarial and ships a mode that trips every failure on purpose | `ocp-conformance`, 5 checks |
-| **Citation** | Every frame has a non-empty title and citation label. Raw ids are never the on-screen identifier | `frame-validity` conformance check |
-| **Version stability** | The protocol evolves inside a major family. The draft-to-stable freeze needs no flag day and breaks no deployed provider | `versions_compatible` in `ocp-host` |
-| **Temporal validity** | Facts carry `valid_from` and `valid_to` windows. A query can pin retrieval to a point in time with `as_of` | `ContextFrame` temporal fields |
+| Guarantee               | What you get                                                                                                                                  | Enforced by                                            |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| **Provenance**          | Every frame carries its origin: URI, line range, cryptographic digest, method, and the agent that produced it                                 | `ContextFrame.provenance`                              |
+| **Budget honesty**      | A provider's frames never sum above the query's `max_tokens`. A provider that lies is detected and its frames are dropped, loudly             | Host budget audit + `budget-honesty` conformance check |
+| **Consent enforcement** | A provider that sends data off-machine is never queried until you record named, revocable consent. The query payload is not transmitted first | `ConsentStore` gate in `ocp-host`                      |
+| **Conformance**         | "OCP conformant" is a checkable claim, not a self-attestation. The suite is adversarial and ships a mode that trips every failure on purpose  | `ocp-conformance`, 5 checks                            |
+| **Citation**            | Every frame has a non-empty title and citation label. Raw ids are never the on-screen identifier                                              | `frame-validity` conformance check                     |
+| **Version stability**   | The protocol evolves inside a major family. The draft-to-stable freeze needs no flag day and breaks no deployed provider                      | `versions_compatible` in `ocp-host`                    |
+| **Temporal validity**   | Facts carry `valid_from` and `valid_to` windows. A query can pin retrieval to a point in time with `as_of`                                    | `ContextFrame` temporal fields                         |
 
 The properties compose, and the combination is the point. Provenance without
 budget honesty means you can trace a frame but not control its cost. Budget

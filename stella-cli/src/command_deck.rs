@@ -298,9 +298,11 @@ pub async fn run_deck_session(
         slash_commands: deck_slash_commands(&custom),
         initial_graph: agent::graph_snapshot(&cfg.workspace_root),
         no_anim,
-        // The deck drives turns through the raw `Engine::run_turn` path (see
-        // `run_lead_turn`), not the staged pipeline, so PIPELINE reads OFF here.
-        pipeline: false,
+        // The deck drives turns through the staged pipeline by default (triage
+        // → recall → plan → scope → witness → execute → verify → judge), so
+        // PIPELINE reads ON here. `/pipeline` toggles back to the raw
+        // `Engine::run_turn` loop (`run_lead_turn`).
+        pipeline: true,
         ..Default::default()
     };
     // The deck owns its channel ends and runs on its own task so rendering
@@ -414,9 +416,9 @@ pub async fn run_deck_session(
     let mut dispatch = HoldState::new();
     // `/pipeline`: route lead turns through the staged pipeline (triage →
     // witness → execute → verify → judge) instead of the raw engine loop.
-    // Session-local, OFF at start — mirrored to the PIPELINE stat box via
-    // `Inbound::Pipeline`.
-    let mut pipeline_on = false;
+    // Session-local, ON at start (the deck loads with the pipeline active) —
+    // mirrored to the PIPELINE stat box via `Inbound::Pipeline`.
+    let mut pipeline_on = true;
     // An agent-creation request that arrived mid-turn: drafting needs the
     // provider (borrowed by the running turn), so it parks here and runs
     // right after the turn settles.

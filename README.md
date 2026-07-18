@@ -16,9 +16,9 @@
 </p>
 
 <p align="center">
-  <a href="https://docs.oxagen.sh/stella"><b>Website</b></a> ·
-  <a href="https://docs.oxagen.sh/docs/stella"><b>Docs</b></a> ·
-  <a href="https://docs.oxagen.sh/docs/stella/quickstart"><b>Quickstart</b></a>
+  <a href="https://stella.oxagen.sh"><b>Website</b></a> ·
+  <a href="https://stella.oxagen.sh/docs"><b>Docs</b></a> ·
+  <a href="https://stella.oxagen.sh/docs/quickstart"><b>Quickstart</b></a>
 </p>
 
 Stella is an open-source, bring-your-own-key (BYOK) coding agent that runs in
