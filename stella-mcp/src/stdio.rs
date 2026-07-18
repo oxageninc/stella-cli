@@ -278,6 +278,6 @@ mod tests {
         let transport = StdioTransport::spawn("cat-server", "cat", &[], &env)
             .await
             .expect("a bare runner must resolve via the inherited PATH");
-        transport.close().await;
+        let _ = transport.close().await;
     }
 }

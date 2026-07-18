@@ -25,8 +25,8 @@
 //!      and domains).
 //!   3. **Rendering** ([`render_skills_section`]) — the volatile context
 //!      block the CLI injects **after** the byte-stable system prefix, so
-//! prompt-cache hits on the prefix are preserved (
-//!      L-E8: recalled context is a live query at turn start that rides as a
+//!      prompt-cache hits on the prefix are preserved (L-E8: recalled context
+//!      is a live query at turn start that rides as a
 //!      volatile message after the stable system block, never a cached prompt
 //!      block).
 //!   4. **Auto-creation** ([`mine_skill_candidates`], [`decide_auto_creation`])

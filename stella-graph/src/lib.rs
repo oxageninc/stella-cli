@@ -12,16 +12,16 @@
 //! - **Indexes** Rust, TypeScript, TSX, JavaScript, and Python: symbols
 //!   (functions, methods, structs/classes/enums/traits/interfaces) and import
 //!   edges (`file → module/file`), via compile-time tree-sitter queries
-//! ( L-L2).
+//!   (L-L2).
 //! - **Resolves** Python relative imports (`from . import x`,
 //!   `from ..pkg import y`) and TS/JS relative specifiers (`./x`, `../y`,
 //!   `index.*`) to real files; bare package specifiers are recorded
-//! unresolved ( Phase 3 item 3).
+//!   unresolved (Phase 3 item 3).
 //! - **Warms at mount** and re-indexes live via an in-process `notify`
-//! watcher (L-C1).
+//!   watcher (L-C1).
 //! - **Skips byte-identical content** on re-index (L-C2).
 //! - **Answers queries as frames** with mandatory human citation labels and
-//! `code-graph` provenance (L-C4).
+//!   `code-graph` provenance (L-C4).
 //!
 //! # Example
 //!
