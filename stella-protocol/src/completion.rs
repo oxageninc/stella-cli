@@ -64,6 +64,17 @@ impl CompletionMessage {
             tool_results: Vec::new(),
         }
     }
+
+    /// An assistant text message with no tool calls — e.g. a final answer
+    /// replayed into a transcript for post-turn reflection.
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        }
+    }
 }
 
 /// A completion request — the same shape regardless of which provider

@@ -464,17 +464,40 @@ async fn run_pipeline_one_shot(
 
     // Reflect on turns that did real work — success AND failure. A failed
     // pipeline run is a high-value learning signal (root-cause prompt via
-    // `succeeded=false`); gating on `turn_warrants_reflection` alone (not
-    // `is_ok`) still skips the wasteful case — an abort with no tool work,
-    // where there is nothing to mine and the failure was almost certainly
-    // external (unreachable provider, budget floor).
-    if turn_warrants_reflection(&messages)
+    // `succeeded=false`).
+    //
+    // The gate is `did real work` = tool-calls in the transcript OR files
+    // changed on disk. On the pipeline path the worker's tool-calling turns
+    // are deliberately kept OUT of `messages` (planner context hygiene,
+    // L-E6), so `turn_warrants_reflection(&messages)` alone is always false
+    // there and the whole self-improvement loop never fired on `stella run`.
+    // Falling back to `!files.is_empty()` — mirroring the episode gate above
+    // — is what makes the primary surface actually learn. The reflector is
+    // then handed an enriched transcript (final answer + a note of what
+    // changed) so it has signal even when the tool turns aren't in `messages`.
+    if (turn_warrants_reflection(&messages) || !files.is_empty())
         && let Some(m) = &mut memory
     {
+        let mut reflect_transcript = messages.clone();
+        if let Ok(outcome) = &result
+            && !outcome.final_text.trim().is_empty()
+        {
+            reflect_transcript.push(CompletionMessage::assistant(&outcome.final_text));
+        }
+        if !files.is_empty() {
+            let changed = files
+                .iter()
+                .map(|(path, ops)| format!("{path} ({ops})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            reflect_transcript.push(CompletionMessage::user(format!(
+                "(files changed this turn: {changed})"
+            )));
+        }
         let report = m
             .reflect_and_record(
                 resolver.provider(),
-                &messages,
+                &reflect_transcript,
                 format != OutputFormat::Text,
                 result.is_ok(),
             )
