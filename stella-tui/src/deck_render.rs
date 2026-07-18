@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Widget};
@@ -120,7 +120,7 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
     }
 
     if ui.help_open {
-        render_help(area, buf);
+        render_help(ui, area, buf);
     }
 }
 
@@ -748,10 +748,20 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// A centered help overlay listing the deck's keys.
-fn render_help(area: Rect, buf: &mut Buffer) {
-    let w = area.width.min(62);
-    let h = area.height.min(27);
+/// The help-overlay markdown body — one source of truth for both the `?` key
+/// and the `/help` command. Categorized (controls, tabs, per-tab, commands) so
+/// a new user can scan for what they need, and a returning user can jump to
+/// the section they forgot. Kept here, next to the renderer, so the two never
+/// drift.
+const HELP_BODY: &str = include_str!("help.md");
+
+/// A large, scrollable, categorized help overlay — the single reference for
+/// every deck key and command. Opened by `?` (empty composer) or `/help`;
+/// scroll with ↑/↓/PageUp/PageDown/Home/End, close with `Esc`/`q`/`?`.
+fn render_help(ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
+    // A large panel: most of the frame, capped so the border always fits.
+    let w = area.width.min(74);
+    let h = area.height.min(area.height.saturating_sub(2).max(20));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -759,99 +769,35 @@ fn render_help(area: Rect, buf: &mut Buffer) {
         height: h,
     };
     Clear.render(popup, buf);
-    let lines = vec![
-        Line::from(Span::styled(" Command Deck — keys", theme::accent())),
-        Line::default(),
-        Line::from(Span::styled("  Tab / ⇧Tab   switch tabs", theme::body())),
-        Line::from(Span::styled(
-            "  ⌘⏎ / ⌃⏎      queue prompt (never blocks)",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  ⏎            insert a line break (kept in the prompt)",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  ⌥[ / ⌥]      cursor to start / end of the prompt",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  !cmd         run a shell command NOW (skips the queue)",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  /            command popup · ↑/↓ · tab · enter",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  Ctrl-T / ↑   queue editor (↑ when prompts are queued)",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  ↑ ↓          select a message (Session) · Esc clears",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  Ctrl-O       expand/collapse the selected message",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "               (at the prompt: newest · ×2 = all thinking)",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  Ctrl-R       expand/collapse thinking",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  ↑ ↓          navigate the active tab",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  Agents: s      stop the focused agent",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  Traces: f      cycle agent filter",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  Files:  Enter  open the diff",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  Graph:  / or Enter  browse & filter indexed files",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  SKILLS: space on/off · ctrl+x×2 delete · ←/→ pane",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "          e edit · p pin · n new (LLM) · /skills opens",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  Esc          stop the turn (next queued runs)",
-            theme::body(),
-        )),
-        Line::from(Span::styled(
-            "  Esc Esc      stop & hold — type what runs next",
-            theme::body(),
-        )),
-        Line::from(Span::styled("  Ctrl-C       quit", theme::body())),
-        Line::default(),
-        Line::from(Span::styled("  any key closes this help", theme::muted())),
-    ];
-    Paragraph::new(lines)
-        .alignment(Alignment::Left)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme::accent())
-                .title(" ? "),
-        )
-        .render(popup, buf);
+
+    let title = " Command Deck — help · ↑/↓ scroll · esc close ";
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::accent())
+        .title(title);
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Render the markdown through Stella's own renderer so the overlay stays
+    // inside the ember palette (headings, bold, code spans, rules — the same
+    // styling the transcript uses).
+    let text = ratatui::text::Text::from(crate::markdown::render(HELP_BODY));
+    let total = text.height();
+    let height = inner.height as usize;
+
+    // Record viewport metrics for the pure key handler (`handle_help_key`).
+    ui.metrics.help_total = total;
+    ui.metrics.help_height = height;
+
+    let window = ui.help_scroll.window(total, height);
+    // `Paragraph::scroll` takes an absolute line offset; the window's start is
+    // exactly that (clamped by `ScrollState::window` to a valid range).
+    Paragraph::new(text)
+        .scroll((window.start as u16, 0))
+        .render(inner, buf);
 }
 
 #[cfg(test)]

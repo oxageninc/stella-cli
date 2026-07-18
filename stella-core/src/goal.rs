@@ -89,13 +89,13 @@ pub enum GoalOutcome {
 /// What the judge model must return, as strict JSON. `reasoning` explains
 /// the verdict; `feedback` (only meaningful when `met == false`) is
 /// actionable course-correction handed to the worker verbatim.
-#[derive(Debug, Deserialize)]
-struct JudgeVerdict {
-    met: bool,
+#[derive(Debug, Deserialize, Clone)]
+pub struct GoalJudgeVerdict {
+    pub met: bool,
     #[serde(default)]
-    reasoning: String,
+    pub reasoning: String,
     #[serde(default)]
-    feedback: String,
+    pub feedback: String,
 }
 
 const JUDGE_SYSTEM_PROMPT: &str = "You are an impartial judge assessing whether a coding agent \
@@ -215,7 +215,7 @@ impl Engine<'_> {
     /// to mutate the workspace it is judging. Spend flows through the same
     /// `budget` as worker turns. `Err` carries the abort reason (provider
     /// failure or budget) after retries were exhausted.
-    async fn assess(
+    pub async fn assess(
         &self,
         judge: &dyn Provider,
         goal: &str,
@@ -223,7 +223,7 @@ impl Engine<'_> {
         budget: &mut BudgetGuard,
         events: &UnboundedSender<AgentEvent>,
         goal_config: &GoalConfig,
-    ) -> Result<(JudgeVerdict, f64), String> {
+    ) -> Result<(GoalJudgeVerdict, f64), String> {
         let transcript = render_transcript_tail(messages, goal_config.judge_transcript_chars);
         let mut judge_messages = vec![
             CompletionMessage::system(JUDGE_SYSTEM_PROMPT),
@@ -258,7 +258,7 @@ impl Engine<'_> {
             .await
         {
             TurnOutcome::Completed { text, cost_usd } => {
-                let verdict = parse_verdict(&text).unwrap_or_else(|| JudgeVerdict {
+                let verdict = parse_verdict(&text).unwrap_or_else(|| GoalJudgeVerdict {
                     met: false,
                     reasoning: "judge response was not parseable JSON — treated as not met".into(),
                     feedback: format!(
@@ -276,7 +276,7 @@ impl Engine<'_> {
 
 /// Extract the verdict from judge output that may wrap its JSON in prose or
 /// a code fence: parse the outermost `{ … }` span.
-fn parse_verdict(text: &str) -> Option<JudgeVerdict> {
+fn parse_verdict(text: &str) -> Option<GoalJudgeVerdict> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
     if end <= start {

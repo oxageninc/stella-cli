@@ -2,9 +2,6 @@
 resolver = "3"
 members = [
   "stella-protocol",
-  "ocp-types",
-  "ocp-host",
-  "ocp-conformance",
   "stella-core",
   "stella-model",
   "stella-store",

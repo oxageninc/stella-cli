@@ -40,7 +40,7 @@ pub use extensions::{
     PlannedLink, SyncEntry, SyncPlan, SyncSkip, SyncSkipReason, SyncSource, agent_from_file,
     command_from_file, expand_command, merge_by_name, plan_extension_sync,
 };
-pub use goal::{GoalConfig, GoalOutcome};
+pub use goal::{GoalConfig, GoalJudgeVerdict, GoalOutcome};
 pub use hooks::{HookEvent, HookPayload, HookRunOutcome, HookRunner, Hooks, run_hooks};
 pub use loop_detect::{LoopDetectionConfig, LoopVerdict, detect_loop};
 pub use mcp_usage::{McpUsageLedger, McpUsageRecord, drain_usage, push_usage};

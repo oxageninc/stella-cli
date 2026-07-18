@@ -23,8 +23,8 @@ formula = "stella"
 
 [dependencies]
 stella-protocol = { path = "../stella-protocol" }
-ocp-types = { path = "../ocp-types" }
-ocp-host = { path = "../ocp-host" }
+ocp-types = { git = "https://github.com/macanderson/opencontextprotocol", rev = "7912257c51c796083e4e137ff80a8d18c957f965" }
+ocp-host = { git = "https://github.com/macanderson/opencontextprotocol", rev = "7912257c51c796083e4e137ff80a8d18c957f965" }
 stella-core = { path = "../stella-core" }
 stella-model = { path = "../stella-model" }
 stella-tools = { path = "../stella-tools" }

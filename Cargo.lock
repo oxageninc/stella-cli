@@ -1629,22 +1629,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "ocp-conformance"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "clap",
- "colored",
- "ocp-host",
- "ocp-types",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "ocp-host"
-version = "0.3.0"
+version = "0.1.0"
+source = "git+https://github.com/macanderson/opencontextprotocol?rev=7912257c51c796083e4e137ff80a8d18c957f965#7912257c51c796083e4e137ff80a8d18c957f965"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1655,15 +1642,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "wiremock",
 ]
 
 [[package]]
 name = "ocp-types"
-version = "0.3.0"
+version = "0.1.0"
+source = "git+https://github.com/macanderson/opencontextprotocol?rev=7912257c51c796083e4e137ff80a8d18c957f965#7912257c51c796083e4e137ff80a8d18c957f965"
 dependencies = [
  "serde",
- "serde_json",
 ]
 
 [[package]]

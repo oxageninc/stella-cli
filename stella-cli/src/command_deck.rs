@@ -1117,11 +1117,16 @@ const DECK_BUILTINS: &[(&str, &str)] = &[
         "/pipeline",
         "toggle the staged pipeline (witness-verified turns)",
     ),
+    (
+        "/export",
+        "export session telemetry to a ZIP + HTML dashboard",
+    ),
     ("/files", "open the Files tab"),
     ("/diff", "open the diff viewer"),
     ("/graph", "open the code-graph tab"),
     ("/skills", "open the SKILLS tab: manage · search · create"),
     ("/mcp", "open the MCP servers tab"),
+    ("/donate", "support stella — become a GitHub Sponsor"),
 ];
 
 /// The deck's reserved command names — see [`DECK_BUILTINS`].
@@ -1755,18 +1760,10 @@ async fn run_deck_command(
     };
     match trimmed {
         "/help" => {
-            let mut help = "commands: /help · /clear (reset conversation) · /models (list \
-                 providers) · /init (index the workspace: domains + code graph) · /agents \
-                 (open the Agents tab: executions & installed agents) · /pipeline (toggle \
-                 witness-verified staged turns) · /files · /diff · /graph (switch tabs) — \
-                 anything else is a prompt. ctrl+t queue · ? overlay help"
-                .to_string();
-            let customs = custom.slash_entries(&[]);
-            if !customs.is_empty() {
-                let names: Vec<&str> = customs.iter().map(|c| c.name.as_str()).collect();
-                help.push_str(&format!("\ncustom (⚡): {}", names.join(" · ")));
-            }
-            say(help);
+            // Open the same rich, scrollable overlay the `?` key opens —
+            // every key, every tab, every slash command in one place. Far
+            // more useful (and readable) than a cramped one-line summary.
+            let _ = in_tx.send(Inbound::ShowHelp);
         }
         "/clear" => {
             // Reset the driver's own LLM history…
@@ -1815,6 +1812,39 @@ async fn run_deck_command(
                 Err(e) => say(format!("init failed: {e}")),
             }
         }
+        "/export" => {
+            // Export all session telemetry to a timestamped ZIP archive
+            // containing raw JSON dumps + a self-contained HTML dashboard.
+            match crate::export::export_session(&cfg.workspace_root) {
+                Ok(path) => {
+                    let display = path.display();
+                    say(format!(
+                        "Export Session Telemetry — archive written to {display}\n\
+                         The ZIP contains a `dashboard.html` (open in any browser) and raw \
+                         JSON dumps of every telemetry table. The timestamped folder name \
+                         matches the last log entry's timestamp."
+                    ));
+                }
+                Err(e) => say(format!("export failed: {e}")),
+            }
+        }
+        "/donate" => {
+            say("❤️  Support Stella\n\
+                 \n\
+                 Stella is free, open-source, and local-first — no server, no \
+                 account, no telemetry sent home. If it's saving you time or \
+                 money, consider becoming a GitHub Sponsor:\n\
+                 \n\
+                   → https://github.com/sponsors/macanderson\n\
+                 \n\
+                 Recurring sponsorships keep development sustainable. You'll \
+                 see the available tiers and perks (one-time and monthly) on \
+                 that page. Every pledge helps fund the next feature, the next \
+                 provider, and the next release.\n\
+                 \n\
+                 Thank you! 🙏"
+                .to_string());
+        }
         // Deck-local commands (tab switches, `/agents` opening the Agents
         // tab, `/skills` and `/mcp` opening their tabs) are normally consumed
         // TUI-side, but a queued one reaches here — accept it as handled (a
@@ -1838,7 +1868,7 @@ async fn run_deck_command(
                 return DeckCommand::Prompt;
             }
             say(format!(
-                "unknown command `{trimmed}` — try /help, /clear, /models, /init, /agents, /pipeline, /files, /diff, /graph"
+                "unknown command `{trimmed}` — try /help, /clear, /models, /init, /agents, /pipeline, /export, /donate, /files, /diff, /graph"
             ));
         }
     }

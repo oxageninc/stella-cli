@@ -31,3 +31,6 @@ wildcards = "warn"
 # unknown registry or an unvetted git source fails the build.
 unknown-registry = "deny"
 unknown-git = "deny"
+# Vetted git sources. The OCP crates (ocp-types, ocp-host) live in their own
+# repo and are consumed at a pinned rev until they are published to crates.io.
+allow-git = ["https://github.com/macanderson/opencontextprotocol"]

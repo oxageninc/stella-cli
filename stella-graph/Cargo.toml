@@ -9,7 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-ocp-types = { path = "../ocp-types" }
+ocp-types = { git = "https://github.com/macanderson/opencontextprotocol", rev = "7912257c51c796083e4e137ff80a8d18c957f965" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

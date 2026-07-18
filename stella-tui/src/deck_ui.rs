@@ -54,6 +54,10 @@ pub struct DeckMetrics {
     pub trace_total: usize,
     pub files_diff_height: usize,
     pub files_diff_total: usize,
+    /// Help-overlay viewport metrics, recorded each frame so the pure key
+    /// handler can clamp/scroll — same contract as `session_total`/`_height`.
+    pub help_height: usize,
+    pub help_total: usize,
 }
 
 /// Which pane the AGENTS tab shows — its secondary nav, switched with ←/→
@@ -266,6 +270,10 @@ pub struct DeckUi {
     pub composer: Composer,
     pub splash: SplashState,
     pub help_open: bool,
+    /// Vertical scroll for the help overlay (↑/↓, PageUp/Down, Home/End). Kept
+    /// separate from the transcript scroll since the overlay is a different
+    /// viewport. Reset to the top whenever the overlay opens.
+    pub help_scroll: ScrollState,
     /// Focused agent index (the Agents-tab highlight and the Session-tab target).
     pub focused: usize,
     pub session_scroll: ScrollState,
@@ -372,6 +380,7 @@ impl Default for DeckUi {
             composer: Composer::with_paste_threshold(crate::composer::DECK_PASTE_LINE_THRESHOLD),
             splash: SplashState::new(),
             help_open: false,
+            help_scroll: ScrollState::default(),
             focused: 0,
             session_scroll: ScrollState::default(),
             trace_scroll: ScrollState::default(),
@@ -627,6 +636,15 @@ pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut De
         ui.mcp.search = Some(outcome.clone());
         return;
     }
+    // `/help` from the driver opens the same overlay the `?` key opens. Reset
+    // to the top so re-opening via the command always lands at the start.
+    if let Inbound::ShowHelp = inbound {
+        ui.help_open = true;
+        ui.help_scroll = ScrollState::default();
+        ui.help_scroll.follow = false;
+        ui.help_scroll.top = 0;
+        return;
+    }
     model.apply_inbound(inbound);
     clamp(model, ui);
 }
@@ -684,7 +702,7 @@ fn clamp(model: &WorkspaceModel, ui: &mut DeckUi) {
 /// function's flow):
 ///
 /// 1. splash up — any key, Esc included, dismisses it
-/// 2. help overlay open — any key closes it
+/// 2. help overlay open — Esc/`q`/`?` close it; other keys scroll it
 /// 3. queue editor open — Esc closes the editor
 /// 4. slash popup active — Esc dismisses the popup (clears the composer)
 /// 5. scope-review gate pending, composer empty — Esc aborts the plan
@@ -741,10 +759,12 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         return DeckAction::Handled;
     }
 
-    // Help overlay is modal: any key closes it.
+    // Help overlay is modal: scrolling keys drive it, `q`/Esc close it. Only
+    // Ctrl-C quit and the splash (handled above) precede it. Unlike a plain
+    // "any key closes" dismiss, this keeps the overlay readable — the content
+    // is long enough to scroll on most terminals.
     if ui.help_open {
-        ui.help_open = false;
-        return DeckAction::Handled;
+        return handle_help_key(key, ui);
     }
 
     // The INSTALLED AGENTS sub-modes (editor / create flow / version picker)
@@ -847,6 +867,9 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
             }
             KeyCode::Char('?') if composer_empty => {
                 ui.help_open = true;
+                ui.help_scroll = ScrollState::default();
+                ui.help_scroll.follow = false;
+                ui.help_scroll.top = 0;
                 return DeckAction::Handled;
             }
             _ => {}
@@ -946,6 +969,51 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
     }
 
     handle_composer_key(key, ui)
+}
+
+/// The help-overlay key map. The overlay is modal: scrolling keys drive it,
+/// `q`/`Esc`/`?` close it. The content is long enough to scroll on a typical
+/// terminal, so a plain "any key closes" dismiss would make it unreadable.
+fn handle_help_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    let (total, height) = (ui.metrics.help_total, ui.metrics.help_height);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        // Close the overlay.
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+            ui.help_open = false;
+            DeckAction::Handled
+        }
+        // Scrolling — the same vocabulary every scrollable tab uses.
+        KeyCode::Up | KeyCode::Char('k') => {
+            ui.help_scroll.scroll_up(1, total, height);
+            DeckAction::Handled
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            ui.help_scroll.scroll_down(1, total, height);
+            DeckAction::Handled
+        }
+        KeyCode::PageUp => {
+            ui.help_scroll.page_up(total, height);
+            DeckAction::Handled
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            ui.help_scroll.page_down(total, height);
+            DeckAction::Handled
+        }
+        KeyCode::Home => {
+            ui.help_scroll.to_top();
+            DeckAction::Handled
+        }
+        KeyCode::End => {
+            ui.help_scroll.to_bottom();
+            DeckAction::Handled
+        }
+        // Ctrl-C is handled by the caller (quit precedes every modal context).
+        // Any other key is swallowed so the overlay stays open and stable —
+        // typing into the composer behind it would be invisible and confusing.
+        _ if ctrl => DeckAction::Handled,
+        _ => DeckAction::Handled,
+    }
 }
 
 /// Route one submitted prompt. The first submission after a double-Esc hold
@@ -4460,5 +4528,68 @@ mod tests {
         // The MCP tab now sits after SKILLS in the cycle, so Tab leaves SKILLS
         // for MCP (still proving SKILLS is not a dead end).
         assert_eq!(ui.tab, DeckTab::Mcp, "Tab cycles Skills → Mcp");
+    }
+
+    // ── Help overlay ───────────────────────────────────────────────────────
+
+    #[test]
+    fn question_mark_opens_help_overlay() {
+        let model = WorkspaceModel::new();
+        let mut ui = ready_ui();
+        assert!(!ui.help_open);
+        handle_deck_key(ch('?'), &model, &mut ui);
+        assert!(ui.help_open, "? opens the help overlay");
+    }
+
+    #[test]
+    fn show_help_inbound_opens_the_overlay_at_the_top() {
+        let mut model = WorkspaceModel::new();
+        let mut ui = ready_ui();
+        // Simulate a prior scroll so we can prove ShowHelp resets it.
+        ui.help_scroll.top = 42;
+        ui.help_scroll.follow = false;
+        ingest_inbound(&Inbound::ShowHelp, &mut model, &mut ui);
+        assert!(ui.help_open, "ShowHelp opens the overlay");
+        assert_eq!(ui.help_scroll.top, 0, "ShowHelp resets scroll to the top");
+        assert!(!ui.help_scroll.follow);
+    }
+
+    #[test]
+    fn help_overlay_scrolls_with_arrow_keys() {
+        let model = WorkspaceModel::new();
+        let mut ui = ready_ui();
+        ui.help_open = true;
+        ui.help_scroll.follow = false;
+        // Fake a tall document so scrolling is meaningful.
+        ui.metrics.help_total = 100;
+        ui.metrics.help_height = 10;
+        handle_deck_key(key(KeyCode::Down), &model, &mut ui);
+        assert_eq!(ui.help_scroll.top, 1, "↓ scrolls down one line");
+        handle_deck_key(key(KeyCode::PageDown), &model, &mut ui);
+        assert!(ui.help_scroll.top > 1, "PageDown scrolls by a page");
+    }
+
+    #[test]
+    fn help_overlay_closes_with_esc_or_q() {
+        let model = WorkspaceModel::new();
+        let mut ui = ready_ui();
+        ui.help_open = true;
+        handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
+        assert!(!ui.help_open, "Esc closes the help overlay");
+        // Re-open and close with q.
+        ui.help_open = true;
+        handle_deck_key(ch('q'), &model, &mut ui);
+        assert!(!ui.help_open, "q closes the help overlay");
+    }
+
+    #[test]
+    fn help_overlay_does_not_close_on_random_key() {
+        let model = WorkspaceModel::new();
+        let mut ui = ready_ui();
+        ui.help_open = true;
+        // A letter that isn't q or ? must NOT close the overlay (it used to —
+        // "any key closes" made the long content unreadable).
+        handle_deck_key(ch('x'), &model, &mut ui);
+        assert!(ui.help_open, "a random key does not close the overlay");
     }
 }

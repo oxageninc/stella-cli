@@ -2039,6 +2039,198 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Dump every table's raw rows as JSON arrays — the data behind
+    /// `/export`. Each entry is `(table_name, json_array_string)`. The JSON is
+    /// constructed in Rust (not by SQLite's json1 extension, which may be
+    /// absent from a bundled build), so the shape is stable across platforms.
+    /// Rows are ordered by the table's natural key; the exact order per table
+    /// is documented in the module-level schema comments.
+    pub fn export_all_json(&self) -> Result<Vec<(&'static str, String)>> {
+        let conn = self.lock();
+        let mut out: Vec<(&'static str, String)> = Vec::new();
+
+        // Executions — the spine everything else keys off.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, prompt, provider, model, started_at, finished_at, outcome, \
+                 cost_usd FROM executions ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "kind": row.get::<_, String>(1)?,
+                    "prompt": row.get::<_, String>(2)?,
+                    "provider": row.get::<_, String>(3)?,
+                    "model": row.get::<_, String>(4)?,
+                    "started_at": row.get::<_, Option<String>>(5)?,
+                    "finished_at": row.get::<_, Option<String>>(6)?,
+                    "outcome": row.get::<_, Option<String>>(7)?,
+                    "cost_usd": row.get::<_, f64>(8)?,
+                }))
+            })?;
+            let mut arr = Vec::new();
+            for r in rows {
+                arr.push(r?);
+            }
+            out.push((
+                "executions",
+                serde_json::to_string(&arr).unwrap_or_default(),
+            ));
+        }
+
+        // Telemetry — per-model-call token/cost/duration rows.
+        for (name, sql) in [
+            (
+                "telemetry",
+                "SELECT execution_id, step, ts, provider, model, input_tokens, \
+                 estimated_input_tokens, output_tokens, cache_read_tokens, cache_miss_tokens, \
+                 cache_write_tokens, cost_usd, duration_ms, retries, tool_calls FROM telemetry \
+                 ORDER BY execution_id ASC, step ASC"
+                    .to_string(),
+            ),
+            (
+                "tool_calls",
+                "SELECT execution_id, seq, call_id, name, surface, args_json, args_digest, \
+                 reason, ok, error, bytes_out, duration_ms FROM tool_calls ORDER BY execution_id \
+                 ASC, seq ASC"
+                    .to_string(),
+            ),
+            (
+                "files_touched",
+                "SELECT execution_id, path, ops, lines_added, lines_removed, events FROM \
+                 files_touched ORDER BY execution_id ASC, path ASC"
+                    .to_string(),
+            ),
+            (
+                "mcp_usage",
+                "SELECT execution_id, server, tool, reason, called_at_ms FROM mcp_usage ORDER BY \
+                 called_at_ms ASC"
+                    .to_string(),
+            ),
+            (
+                "agent_uses",
+                "SELECT execution_id, agent, version, reason, ts FROM agent_uses ORDER BY \
+                 execution_id ASC, ts ASC"
+                    .to_string(),
+            ),
+            (
+                "skill_usage",
+                "SELECT execution_id, skill, version, reason, ts FROM skill_usage ORDER BY \
+                 execution_id ASC, ts ASC"
+                    .to_string(),
+            ),
+            (
+                "execution_reflection",
+                "SELECT execution_id, prompt, delivered, self_rating, what_went_well, \
+                 what_to_improve, critique, produced_output, wrote_files, truncated FROM \
+                 execution_reflection ORDER BY execution_id ASC"
+                    .to_string(),
+            ),
+            (
+                "reflections",
+                "SELECT id, execution_id, kind, content, domains, occurred_at FROM reflections \
+                 ORDER BY id ASC"
+                    .to_string(),
+            ),
+        ] {
+            let arr = self.query_to_json(&conn, &sql)?;
+            out.push((name, arr));
+        }
+
+        Ok(out)
+    }
+
+    /// Execute a `SELECT *`-style query and return a JSON array string, one
+    /// object per row. Column names come from the query cursor. Used by
+    /// [`export_all_json`] for the uniform tables.
+    fn query_to_json(&self, conn: &Connection, sql: &str) -> Result<String> {
+        let mut stmt = conn.prepare(sql)?;
+        let col_count = stmt.column_count();
+        let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let rows = stmt.query_map([], |row| {
+            let mut obj = serde_json::Map::with_capacity(col_count);
+            for (i, name) in col_names.iter().enumerate() {
+                // sqlite_type → JSON type: text→string, integer→number,
+                // real→number, null/blob→null-or-string. rusqlite's
+                // value_ref covers all of them.
+                use rusqlite::types::ValueRef;
+                let val = match row.get_ref(i)? {
+                    ValueRef::Null => serde_json::Value::Null,
+                    ValueRef::Integer(n) => serde_json::Value::Number(n.into()),
+                    ValueRef::Real(f) => serde_json::Number::from_f64(f)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null),
+                    ValueRef::Text(bytes) => {
+                        serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned())
+                    }
+                    ValueRef::Blob(bytes) => serde_json::Value::String(base64_encode(bytes)),
+                };
+                obj.insert(name.clone(), val);
+            }
+            Ok(serde_json::Value::Object(obj))
+        })?;
+        let mut arr = Vec::new();
+        for r in rows {
+            arr.push(r?);
+        }
+        Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into()))
+    }
+
+    /// The timestamp of the most recent log entry across all tables — the
+    /// "as-of" watermark for the export. Returns the max of: executions
+    /// `finished_at`/`started_at`, telemetry `ts`, reflections `occurred_at`,
+    /// and mcp_usage `called_at_ms`. Returns `None` when the store is empty.
+    pub fn last_log_timestamp(&self) -> Result<Option<String>> {
+        let conn = self.lock();
+        // Try the most reliable chronological markers in priority order.
+        let candidates: [&str; 4] = [
+            "SELECT MAX(ts) FROM telemetry",
+            "SELECT MAX(started_at) FROM executions",
+            "SELECT MAX(finished_at) FROM executions WHERE finished_at IS NOT NULL",
+            "SELECT datetime(MAX(called_at_ms) / 1000, 'unixepoch') FROM mcp_usage",
+        ];
+        let mut latest: Option<String> = None;
+        for sql in candidates {
+            let row: rusqlite::Result<Option<String>> = conn.query_row(sql, [], |row| row.get(0));
+            if let Ok(Some(ts)) = row
+                && !ts.is_empty()
+            {
+                latest = Some(match latest {
+                    Some(prev) if prev >= ts => prev,
+                    _ => ts,
+                });
+            }
+        }
+        Ok(latest)
+    }
+}
+
+/// RFC 4648 base64 encode without pulling a crate — only used for blob columns
+/// in the export dump (a rare case for this store).
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        out.push(TABLE[(b[0] >> 2) as usize] as char);
+        out.push(TABLE[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b[2] & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 /// Fold chronologically-ordered MCP usage rows into per-(server, tool)

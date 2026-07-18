@@ -414,7 +414,7 @@ recall routes through).
 | `stella-fleet` | The multi-agent fleet behind `stella fleet`: DAG planner + wave scheduling, git-worktree isolation per task |
 | `stella-media` | Multimodal generation behind one `MediaProvider` port — image generation wired as the `generate_image` tool (registered when a media-capable key is set); SVG/video library-complete but not yet exposed as tools |
 | `stella-tui` | The Command Deck — a pure event-fold core + thin crossterm shell |
-| `ocp-types` · `ocp-host` · `ocp-conformance` | Open Context Protocol — wire types, host runtime, and the public conformance suite |
+| Open Context Protocol | Its own project now: [macanderson/opencontextprotocol](https://github.com/macanderson/opencontextprotocol) — wire types, host runtime, and the public conformance suite. Stella is its reference host and depends on it via git. |
 
 ## Development
 

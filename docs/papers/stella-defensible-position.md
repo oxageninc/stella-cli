@@ -10,7 +10,7 @@
 >
 > **Reading order.** This is the capstone paper. For domain-specific depth,
 > read alongside:
-> - [The Open Context Protocol: Advantages and Uniqueness](../ocp/protocol-advantages.md) — the
+> - [The Open Context Protocol: Advantages and Uniqueness](https://github.com/macanderson/opencontextprotocol/blob/main/docs/protocol-advantages.md) — the
 >   retrieval protocol's trust architecture.
 > - [`stella-core/src/lib.rs`](../../stella-core/src/lib.rs) and
 >   [`stella-core/src/driver.rs`](../../stella-core/src/driver.rs) — the engine.
@@ -440,7 +440,7 @@ reported metric, but an abort condition.
 Retrieval in Stella is designed as an open, versioned wire protocol (OCP,
 `ocp/1.0-draft`): the `ocp-types` crate (zero dependencies beyond `serde`),
 the `ocp-host` host runtime, and the `ocp-conformance` conformance suite. See
-[The Open Context Protocol: Advantages and Uniqueness](../ocp/protocol-advantages.md) for the
+[The Open Context Protocol: Advantages and Uniqueness](https://github.com/macanderson/opencontextprotocol/blob/main/docs/protocol-advantages.md) for the
 full analysis.
 
 ### Why it is hard to copy
@@ -463,7 +463,7 @@ prohibitive. OCP's specific defensibility comes from three properties:
    budget honesty, consent, conformance, citation, version stability,
    temporal validity) are irreducible. A competitor proposing an alternative
    retrieval protocol must match all seven or accept a weaker trust model. See
-   [The Open Context Protocol: Advantages and Uniqueness](../ocp/protocol-advantages.md) §10 for
+   [The Open Context Protocol: Advantages and Uniqueness](https://github.com/macanderson/opencontextprotocol/blob/main/docs/protocol-advantages.md) §10 for
    why the combination is irreducible.
 
 ### The ecosystem play
@@ -655,6 +655,6 @@ is the running code that proves it.
 
 ---
 
-*See also: [The Open Context Protocol: Advantages and Uniqueness](../ocp/protocol-advantages.md)
+*See also: [The Open Context Protocol: Advantages and Uniqueness](https://github.com/macanderson/opencontextprotocol/blob/main/docs/protocol-advantages.md)
 for the retrieval protocol's trust architecture, and the
 [OCP reference docs](./README.md) for implementation guides.*

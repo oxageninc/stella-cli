@@ -171,7 +171,7 @@ Sixteen crates. The one-sentence rule of thumb:
 | MCP client (external tool servers) | `stella-mcp` | |
 | Multimodal generation | `stella-media` | |
 | Multi-agent fan-out, worktree isolation | `stella-fleet` | |
-| Open Context Protocol (wire types / host / conformance) | `ocp-types` · `ocp-host` · `ocp-conformance` | `ocp-types` stays dependency-light by contract. |
+| Open Context Protocol (wire types / host / conformance) | external repo: [`opencontextprotocol`](https://github.com/macanderson/opencontextprotocol) | Split out of this workspace; Stella depends on it via git. `ocp-types` stays dependency-light by contract. |
 
 **Status — what ships.** The live runtime path is
 `stella-cli` → `stella-core` → `stella-model` / `stella-tools` / `stella-store` /

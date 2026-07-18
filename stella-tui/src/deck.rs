@@ -379,7 +379,8 @@ impl WorkspaceModel {
             | Inbound::SkillSearch { .. }
             | Inbound::SkillPreview { .. }
             | Inbound::McpServers(_)
-            | Inbound::McpSearchResults(_) => {}
+            | Inbound::McpSearchResults(_)
+            | Inbound::ShowHelp => {}
         }
     }
 

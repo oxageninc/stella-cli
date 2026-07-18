@@ -590,6 +590,25 @@ impl ProviderResolver for SingleProviderResolver {
     }
 }
 
+/// A [`ProviderResolver`] that borrows a single `&dyn Provider` — for
+/// pipeline paths that receive a borrowed provider (the goal loop, fleet
+/// workers) rather than owning one. Answers every model with that provider.
+pub(crate) struct BorrowedProviderResolver<'p> {
+    provider: &'p dyn Provider,
+}
+
+impl BorrowedProviderResolver<'_> {
+    pub(crate) fn new(provider: &dyn Provider) -> BorrowedProviderResolver<'_> {
+        BorrowedProviderResolver { provider }
+    }
+}
+
+impl ProviderResolver for BorrowedProviderResolver<'_> {
+    fn provider_for(&self, _model: &ModelRef) -> Option<&dyn Provider> {
+        Some(self.provider)
+    }
+}
+
 /// Repo-structure summary via `git ls-files` for the planner's split context.
 pub(crate) struct GitRepoStructure {
     pub(crate) root: std::path::PathBuf,
@@ -903,10 +922,15 @@ async fn run_raw_one_shot(
 /// single family it stays the worker provider, identical to before. The
 /// worker turns get the full tool stack (MCP + custom + interactive +
 /// skills), same as `run_one_shot`.
+/// Work in judged rounds until a judge model confirms the goal is met.
+/// `use_pipeline` (the default) runs each working round through the staged
+/// pipeline (triage → recall → plan → witness → execute → verify → judge);
+/// `false` falls back to the raw `Engine::run_goal` step-loop.
 pub async fn run_goal_cmd(
     cfg: &Config,
     goal: &str,
     budget_limit: Option<f64>,
+    use_pipeline: bool,
 ) -> Result<(), String> {
     let provider = build_provider(cfg)?;
     let registry: std::sync::Arc<ToolRegistry> =
@@ -950,19 +974,35 @@ pub async fn run_goal_cmd(
     }
 
     let started_unix = crate::memory::unix_now_secs();
-    let outcome = run_goal_turn(
-        &*provider,
-        base_tools,
-        &custom_tools,
-        &registry,
-        &mut messages,
-        &mut budget,
-        &calibration,
-        cfg,
-        &store,
-        goal,
-    )
-    .await;
+    let outcome = if use_pipeline {
+        run_goal_pipeline_turn(
+            &*provider,
+            base_tools,
+            &custom_tools,
+            &registry,
+            &mut messages,
+            &mut budget,
+            &calibration,
+            cfg,
+            &store,
+            goal,
+        )
+        .await
+    } else {
+        run_goal_turn(
+            &*provider,
+            base_tools,
+            &custom_tools,
+            &registry,
+            &mut messages,
+            &mut budget,
+            &calibration,
+            cfg,
+            &store,
+            goal,
+        )
+        .await
+    };
     if let Some(m) = &memory {
         let files = registry.files_touched();
         if turn_warrants_reflection(&messages) || !files.is_empty() {
@@ -2655,6 +2695,241 @@ async fn run_goal_turn(
             Err(format!("goal not met after {rounds} round(s): {reason}"))
         }
     }
+}
+
+/// One staged-pipeline goal turn: keep running the pipeline (triage → recall →
+/// plan → witness → execute → verify → judge) until an independent goal judge
+/// assesses the goal as met, or a backstop ends the loop. This is the pipeline
+/// analogue of [`run_goal_turn`] — same goal-loop structure, same judgment,
+/// but each working round goes through the staged pipeline instead of the raw
+/// `Engine::run_turn`.
+///
+/// The goal-loop judge is distinct from the pipeline's verify judge: the verify
+/// judge (inside [`Pipeline::run`]) answers "did this change pass its tests?",
+/// while the goal judge here answers "does the whole effort meet the goal?".
+/// Both are independent of the worker model.
+#[allow(clippy::too_many_arguments)]
+async fn run_goal_pipeline_turn(
+    provider: &dyn Provider,
+    base_tools: &dyn ToolExecutor,
+    custom_tools: &[CustomTool],
+    registry: &ToolRegistry,
+    messages: &mut Vec<CompletionMessage>,
+    budget: &mut BudgetGuard,
+    calibration: &CalibrationMap,
+    cfg: &Config,
+    store: &Option<Arc<Store>>,
+    goal: &str,
+) -> Result<(), String> {
+    let turn_start = Instant::now();
+    let execution = begin_execution(store, "goal", goal, cfg);
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+
+    // Route the goal-loop judge. The pipeline's verify judge is the same role;
+    // both want independence from the worker.
+    let configured = crate::config::discover_configured_providers();
+    let routed_judge = resolve_cross_family_judge(cfg.provider.id, &cfg.model_id, &configured);
+    if let Some((_, judge_id)) = &routed_judge {
+        println!(
+            "  {} cross-family judge: {} worker · {} judge — independent, bias-resistant \
+             assessment\n",
+            "◆".yellow(),
+            cfg.provider.id.bright_magenta(),
+            judge_id.bright_green(),
+        );
+    }
+    let judge: &dyn Provider = match &routed_judge {
+        Some((boxed, _)) => &**boxed,
+        None => provider,
+    };
+
+    let goal_config = GoalConfig::default();
+    let resolver = BorrowedProviderResolver::new(provider);
+
+    let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let renderer = spawn_renderer(
+        rx,
+        OutputFormat::Text,
+        execution.clone(),
+        cfg.provider.id.to_string(),
+    );
+
+    // Run the loop; the result is folded into `goal_result` so there is exactly
+    // one teardown path (drop tx → await renderer → record execution → return).
+    let goal_result = {
+        let customs = CustomToolSet::new(
+            base_tools,
+            custom_tools.to_vec(),
+            cfg.workspace_root.clone(),
+        );
+        let tools = InteractiveToolSet::new(&customs, tx.clone(), default_ask_io(true))
+            .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
+
+        let profile = ProviderProfile::new(
+            cfg.provider.id,
+            model_ref.clone(),
+            model_ref.clone(),
+            model_ref.clone(),
+        );
+        let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
+        let router = Router::new(RoleTable::new(), vec![profile], breaker);
+
+        let repo_structure = GitRepoStructure {
+            root: cfg.workspace_root.clone(),
+        };
+        let repo_status = GitRepoStatus {
+            root: cfg.workspace_root.clone(),
+        };
+        let command_runner = ShellCommandRunner {
+            root: cfg.workspace_root.clone(),
+        };
+        let no_recall = NoContextRecall;
+        let recall: &dyn ContextRecallPort = &no_recall;
+        let hook_runner = ShellHookRunner;
+
+        // The goal judge engine, built once and reused across rounds — shares
+        // the session calibration (keyed per model, so a cross-family judge
+        // learns its own drift) and a read-only view of the same tools.
+        let read_only = stella_core::ports::ReadOnlyTools::new(&tools);
+        let judge_engine =
+            Engine::with_sleeper(judge, &read_only, engine_config_for(cfg), &TokioSleeper)
+                .with_calibration(calibration);
+
+        let mut total_cost_usd = 0.0f64;
+        let mut result: Option<Result<(), String>> = None;
+        let mut goal_met = false;
+
+        for round in 1..=goal_config.max_rounds {
+            budget.begin_turn();
+            let pipeline_config = PipelineConfig {
+                engine: engine_config_for(cfg),
+                headless: true,
+                headless_bypass_scope_review: true,
+                ..PipelineConfig::default()
+            };
+            let ports = PipelinePorts {
+                router: &router,
+                providers: &resolver,
+                tools: &tools,
+                recall,
+                repo: &repo_structure,
+                repo_status: &repo_status,
+                commands: &command_runner,
+                approvals: &AutoApproveGate,
+                sleeper: &TokioSleeper,
+                hooks: cfg
+                    .hooks
+                    .as_ref()
+                    .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
+            };
+            let pipeline = Pipeline::new(ports, tx.clone(), pipeline_config);
+            let round_goal = format!(
+                "GOAL: {goal}\n\nWork toward this goal. An independent judge will assess the \
+                 result after each working round from the transcript evidence; keep your work \
+                 verifiable (run tests, show outputs)."
+            );
+            match pipeline.run(&round_goal, messages, budget).await {
+                Ok(outcome) => {
+                    total_cost_usd += outcome.total_cost_usd;
+                    if let PipelineStatus::Aborted { reason } = outcome.status {
+                        result = Some(Err(format!(
+                            "goal not met: working round aborted: {reason}"
+                        )));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    result = Some(Err(e.to_string()));
+                    break;
+                }
+            }
+
+            // Goal assessment (same judge + read-only tools as the raw goal loop).
+            let _ = tx.send(AgentEvent::Stage {
+                name: stella_protocol::StageKind::Judge,
+            });
+            let (verdict, judge_cost) = match judge_engine
+                .assess(judge, goal, messages, budget, &tx, &goal_config)
+                .await
+            {
+                Ok(pair) => pair,
+                Err(reason) => {
+                    result = Some(Err(format!("goal not met: judge unavailable: {reason}")));
+                    break;
+                }
+            };
+            total_cost_usd += judge_cost;
+            let _ = tx.send(AgentEvent::GoalVerdict {
+                round,
+                met: verdict.met,
+                reasoning: verdict.reasoning.clone(),
+                cost_usd: judge_cost,
+            });
+
+            if verdict.met {
+                tui::files_touched_panel(&registry.files_touched());
+                println!(
+                    "\n  {} goal met after {round} round{}: {}",
+                    "✓".green().bold(),
+                    if round == 1 { "" } else { "s" },
+                    verdict.reasoning
+                );
+                tui::cost_summary(
+                    total_cost_usd,
+                    &format!("{}/{}", cfg.provider.id, cfg.model_id),
+                    turn_start.elapsed(),
+                );
+                println!();
+                goal_met = true;
+                break;
+            }
+
+            let feedback = if verdict.feedback.trim().is_empty() {
+                verdict.reasoning.clone()
+            } else {
+                verdict.feedback.clone()
+            };
+            messages.push(CompletionMessage::user(format!(
+                "The judge assessed the goal as NOT yet met.\nJudge feedback: {feedback}\n\n\
+                 Continue working toward the goal: {goal}"
+            )));
+        }
+
+        // An explicit break result (abort/error/judge-down) stands. If the goal
+        // was met, success. Otherwise the round cap was reached unmet.
+        match (result, goal_met) {
+            (Some(r), _) => r,
+            (None, true) => Ok(()),
+            (None, false) => {
+                tui::cost_summary(
+                    total_cost_usd,
+                    &format!("{}/{}", cfg.provider.id, cfg.model_id),
+                    turn_start.elapsed(),
+                );
+                Err(format!(
+                    "goal not met after {} round(s): round cap reached without a passing verdict",
+                    goal_config.max_rounds
+                ))
+            }
+        }
+    };
+
+    drop(tx);
+    let _ = renderer.await;
+    let files = registry.files_touched();
+    if let Some((store, id)) = &execution {
+        let (outcome_label, _) = match &goal_result {
+            Ok(()) => ("goal_met", 0.0),
+            Err(_) => ("goal_unmet", 0.0),
+        };
+        if !record_execution_end(store, *id, registry, outcome_label, 0.0) {
+            warn_store_write_failed(
+                "the audit record (files touched / memory citations / outcome)",
+            );
+        }
+    }
+    tui::files_touched_panel(&files);
+    goal_result
 }
 
 /// Build the provider adapter from config. Consults the catalog first

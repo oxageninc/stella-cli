@@ -25,7 +25,7 @@ file and line.
 
 ## Related
 
-- [**The Open Context Protocol: Advantages and Uniqueness**](../ocp/protocol-advantages.md)
+- [**The Open Context Protocol: Advantages and Uniqueness**](https://github.com/macanderson/opencontextprotocol/blob/main/docs/protocol-advantages.md)
   — standalone analysis of the OCP's trust architecture: the seven advantages
   (provenance, budget honesty, consent enforcement, conformance verification,
   citation guarantees, version stability, temporal validity) and why the

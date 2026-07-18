@@ -199,6 +199,12 @@ pub enum Inbound {
     /// ([`WorkspaceInput::McpSearch`]) — also out-of-band, applied to
     /// `DeckUi::mcp` search results.
     McpSearchResults(McpSearchOutcome),
+    /// Open the help overlay. Sent by the driver when the user types `/help`
+    /// (so the slash command reaches the same rich, scrollable panel the `?`
+    /// key opens) and applied straight to `DeckUi::help_open` by
+    /// [`crate::deck_ui::ingest_inbound`]. Out-of-band view state, ignored by
+    /// the model fold — like [`Inbound::GraphSnapshot`].
+    ShowHelp,
 }
 
 /// Which config level an installed agent definition lives at.

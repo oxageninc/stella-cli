@@ -303,11 +303,13 @@ session driver and answered into the transcript.
 
 | Command | Arg hint | Description |
 |---------|----------|-------------|
-| `/help` | (none) | Show commands (into the transcript). |
+| `/help` | (none) | Show commands — opens the same rich, scrollable help overlay the `?` key opens (all keys, all tabs, all slash commands in one place). |
 | `/clear` | (none) | Reset the conversation (clears transcript + cost, returns progress to idle). |
 | `/models` | (none) | List providers & models (into the transcript). |
 | `/init` | (none) | Index the workspace: domains + code graph. Reloads custom extensions and refreshes the Graph tab. |
 | `/pipeline` | (none) | Toggle the staged pipeline (witness-verified turns: triage → recall → plan → scope → witness → execute → verify → judge). |
+| `/export` | (none) | Export all session telemetry to a timestamped ZIP archive (`.stella/exports/session-<timestamp>.zip`) containing raw JSON dumps of every table plus a self-contained HTML dashboard with interactive charts and insights. The timestamp matches the last log entry's timestamp. |
+| `/donate` | (none) | Show the GitHub Sponsors link (https://github.com/sponsors/macanderson) where users can make a recurring sponsorship pledge and view tier details. |
 | `/files` | (none) | Open the **Files** tab. |
 | `/diff` | (none) | Open the **diff viewer** (Files tab, diff open). |
 | `/graph` | (none) | Open the **code-graph** tab. |
@@ -420,7 +422,7 @@ While open these own the keyboard (only `Ctrl-C` quit precedes them).
 
 | Overlay | Opened by | Keys |
 |---------|-----------|------|
-| **Help overlay** | `?` (empty composer) | Any key closes it. |
+| **Help overlay** | `?` (empty composer) or `/help` | `↑` `↓` `k` `j` scroll · `PageUp`/`PageDown`/`Space` page · `Home`/`End` jump · `Esc` / `q` / `?` close. |
 | **Queue editor** | `Ctrl-T` / `↑` (empty, queued) | `↑` `↓` select · `⏎` edit · `Ctrl-X` delete · `Ctrl-D Ctrl-D` clear all · `Esc` close. |
 | **Graph file picker** | `/` or `⏎` (Graph tab) | Type to filter · `↑` `↓` select · `⏎` re-root · `Esc` close. |
 | **Skill preview** | `Ctrl-O` (SKILLS tab) | `↑` `↓` `PageUp` `PageDown` `Home` `End` scroll · `Esc` / `Ctrl-O` / `q` close. |
