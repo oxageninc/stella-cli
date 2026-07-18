@@ -87,6 +87,25 @@ impl GitCli for SystemGitCli {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(repo).args(args);
         cmd.env("GIT_TERMINAL_PROMPT", "0");
+        // The repo is ALWAYS the explicit `-C` argument — never whatever the
+        // environment happens to point at. Inside a git hook (e.g. the
+        // pre-push gate running `cargo test`) git exports GIT_DIR et al.,
+        // which would silently override `-C` and aim every command here —
+        // init, config, commit, worktree add — at the OUTER repo. That is
+        // not hypothetical: it once rewrote the host repo's user identity
+        // and committed test fixtures onto a real branch.
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+        ] {
+            cmd.env_remove(var);
+        }
         cmd.kill_on_drop(true);
         let output = cmd.output().await.map_err(|e| GitError::Spawn {
             command: args.join(" "),
