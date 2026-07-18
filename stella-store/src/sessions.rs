@@ -301,6 +301,7 @@ mod tests {
         reg.upsert(&crashed).unwrap();
 
         let mut done = SessionRecord::new("/w/b", "b");
+        done.id = format!("{}-b", done.id); // distinct id even within one ms
         done.pid = u32::MAX - 1;
         done.status = SessionStatus::Complete;
         reg.upsert(&done).unwrap();
