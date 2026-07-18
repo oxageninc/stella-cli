@@ -2077,6 +2077,7 @@ mod tests {
                 summary: "hit".into(),
                 full: "src/a.rs:1: hit\nsrc/b.rs:2: hit".into(),
                 duration_ms: 5,
+                speculated: false,
                 diff: None,
                 speculated: false,
             },
