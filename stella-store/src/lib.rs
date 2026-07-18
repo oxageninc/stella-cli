@@ -65,12 +65,25 @@
 //! observability loss, never a work stoppage — it warns once and keeps
 //! running (persistence must never take the agent down with it).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use stella_protocol::AgentEvent;
+use stella_protocol::{AgentEvent, ToolOutput};
+
+pub mod usage;
+
+/// FNV-1a/64 hex — a stable, dependency-free digest for prompt hashes and
+/// tool-arg fingerprints (loop detection, not security).
+fn fnv_hex(s: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
 
 /// Wrapper error: everything the store can fail with, rendered.
 #[derive(Debug)]
@@ -1012,6 +1025,11 @@ fn apply_migration(conn: &mut Connection, migration: Migration, target: i64) -> 
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// The workspace root this store was opened for — stashed so a turn's
+    /// finalize can roll up into the user-tier `usage.db` (project identity is
+    /// path-derived) without threading the root through every call site.
+    /// `None` for in-memory/ephemeral stores.
+    root: Option<PathBuf>,
 }
 
 impl Store {
@@ -1022,15 +1040,23 @@ impl Store {
         let created = !dir.exists();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError(e.to_string()))?;
         harden_workspace_dir(&dir, created)?;
-        Self::init(Connection::open(dir.join("store.db"))?)
+        Self::init(
+            Connection::open(dir.join("store.db"))?,
+            Some(workspace_root.to_path_buf()),
+        )
     }
 
     /// In-memory store — tests and ephemeral runs.
     pub fn in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    /// The workspace root this store was opened for, if any.
+    pub fn workspace_root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    fn init(conn: Connection, root: Option<PathBuf>) -> Result<Self> {
         // execute_batch tolerates the row PRAGMA journal_mode returns (a
         // plain pragma_update errors on it). WAL means a read-only caller
         // (`stella stats`) is never blocked by a live session's writes.
@@ -1048,9 +1074,24 @@ impl Store {
         )?;
         let store = Self {
             conn: Mutex::new(conn),
+            root,
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Best-effort: roll this execution up into the per-user `usage.db` at its
+    /// default location. A no-op (returns `false`) for in-memory stores or if
+    /// the aggregate can't be opened — cross-project usage stats must never
+    /// fail a turn. Call AFTER `finish_execution` so the outcome is set.
+    pub fn sync_to_usage_default(&self, execution_id: i64) -> bool {
+        let Some(root) = self.root.clone() else {
+            return false;
+        };
+        let Ok(usage) = usage::UsageStore::open_default() else {
+            return false;
+        };
+        self.sync_to_usage(execution_id, &root, &usage).unwrap_or(false)
     }
 
     /// Bring the database to [`SCHEMA_VERSION`]. `PRAGMA user_version` 0 is
@@ -1478,6 +1519,287 @@ impl Store {
             params![r.execution_id, r.kind, r.content, r.domains, r.occurred_at],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Materialize the normalized `tool_calls` log for an execution from its
+    /// already-persisted `events` stream (`tool_start` + `tool_result`). Rows
+    /// are emitted in call order; a `tool_start` with no matching result (turn
+    /// cut off mid-tool) is recorded as an incomplete, failed call so the count
+    /// stays honest. Idempotent (INSERT OR REPLACE on seq). Returns the count.
+    pub fn materialize_tool_calls(&self, execution_id: i64) -> Result<usize> {
+        let payloads: Vec<String> = {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT payload FROM events \
+                 WHERE execution_id = ?1 AND event_type IN ('tool_start', 'tool_result') \
+                 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map(params![execution_id], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            out
+        };
+
+        use std::collections::HashMap;
+        let mut order: Vec<String> = Vec::new();
+        // call_id -> (name, surface, args_json)
+        let mut starts: HashMap<String, (String, String, String)> = HashMap::new();
+        // call_id -> (ok, error, bytes_out, duration_ms)
+        let mut results: HashMap<String, (bool, String, i64, i64)> = HashMap::new();
+
+        for payload in &payloads {
+            let Ok(ev) = serde_json::from_str::<AgentEvent>(payload) else {
+                continue;
+            };
+            match ev {
+                AgentEvent::ToolStart { call } => {
+                    let args_json =
+                        serde_json::to_string(&call.input).unwrap_or_else(|_| "{}".into());
+                    let surface = if call.name.starts_with("mcp__") {
+                        "mcp"
+                    } else {
+                        "native"
+                    };
+                    order.push(call.call_id.clone());
+                    starts.insert(call.call_id, (call.name, surface.into(), args_json));
+                }
+                AgentEvent::ToolResult {
+                    call_id,
+                    output,
+                    duration_ms,
+                } => {
+                    let (ok, error, bytes) = match output {
+                        ToolOutput::Ok { content } => (true, String::new(), content.len() as i64),
+                        ToolOutput::Error { message } => {
+                            let len = message.len() as i64;
+                            (false, message, len)
+                        }
+                    };
+                    results.insert(call_id, (ok, error, bytes, duration_ms as i64));
+                }
+                _ => {}
+            }
+        }
+
+        let mut rows: Vec<ToolCallRow> = Vec::with_capacity(order.len());
+        for call_id in &order {
+            let Some((name, surface, args_json)) = starts.get(call_id) else {
+                continue;
+            };
+            let digest = fnv_hex(args_json);
+            let (ok, error, bytes_out, duration_ms) = match results.get(call_id) {
+                Some((ok, error, bytes, dur)) => (*ok, error.clone(), *bytes, *dur),
+                None => (
+                    false,
+                    "no result (turn ended before the tool returned)".to_string(),
+                    0,
+                    0,
+                ),
+            };
+            rows.push(ToolCallRow {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                surface: surface.clone(),
+                args_json: args_json.clone(),
+                args_digest: digest,
+                reason: String::new(),
+                ok,
+                error,
+                bytes_out,
+                duration_ms,
+            });
+        }
+        let n = rows.len();
+        self.record_tool_calls(execution_id, &rows)?;
+        Ok(n)
+    }
+
+    /// Derive and record the objective half of this turn's
+    /// `execution_reflection` — prompt, plus `produced_output` / `wrote_files`
+    /// / `truncated` computed from the event and file-touch logs. The model's
+    /// self-review fields are left empty here; a producer that captures a
+    /// model-emitted self-assessment can `INSERT OR REPLACE` over this row.
+    pub fn finalize_execution_reflection(&self, execution_id: i64) -> Result<()> {
+        let (prompt, produced_output, wrote_files, truncated) = {
+            let conn = self.lock();
+            let prompt: String = conn
+                .query_row(
+                    "SELECT prompt FROM executions WHERE id = ?1",
+                    params![execution_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or_default();
+            let produced_output: bool = conn.query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE execution_id = ?1 AND event_type IN ('text', 'tool_start')",
+                params![execution_id],
+                |r| r.get::<_, i64>(0),
+            )? > 0;
+            let truncated: bool = conn.query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE execution_id = ?1 AND event_type = 'error' \
+                   AND (payload LIKE '%output-token limit%' OR payload LIKE '%truncated%')",
+                params![execution_id],
+                |r| r.get::<_, i64>(0),
+            )? > 0;
+            let wrote_files: bool = conn.query_row(
+                "SELECT COUNT(*) FROM files_touched \
+                 WHERE execution_id = ?1 \
+                   AND (ops LIKE '%C%' OR ops LIKE '%U%' OR ops LIKE '%D%')",
+                params![execution_id],
+                |r| r.get::<_, i64>(0),
+            )? > 0;
+            (prompt, produced_output, wrote_files, truncated)
+        };
+        self.record_execution_reflection(
+            execution_id,
+            &ExecutionReflectionRow {
+                prompt,
+                delivered: None,
+                self_rating: None,
+                what_went_well: String::new(),
+                what_to_improve: String::new(),
+                critique: String::new(),
+                produced_output,
+                wrote_files,
+                truncated,
+            },
+        )
+    }
+
+    /// Assemble the user-tier [`usage::ExecutionRollupRow`] for one execution
+    /// from this project store (executions + telemetry + tool_calls +
+    /// files_touched). Returns `None` if the execution id is unknown. Reads
+    /// only — safe for both live finalize and `stella usage sync` backfill.
+    pub fn execution_rollup(
+        &self,
+        execution_id: i64,
+        workspace_root: &Path,
+    ) -> Result<Option<usage::ExecutionRollupRow>> {
+        let conn = self.lock();
+        let base = conn
+            .query_row(
+                "SELECT kind, prompt, provider, model, COALESCE(outcome, ''), cost_usd, started_at \
+                 FROM executions WHERE id = ?1",
+                params![execution_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, f64>(5)?,
+                        r.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((kind, prompt, provider, model, outcome, cost_usd, started_at)) = base else {
+            return Ok(None);
+        };
+        let (input_tokens, output_tokens, duration_ms): (i64, i64, i64) = conn.query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
+                    COALESCE(SUM(duration_ms), 0) FROM telemetry WHERE execution_id = ?1",
+            params![execution_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let tool_calls: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tool_calls WHERE execution_id = ?1",
+            params![execution_id],
+            |r| r.get(0),
+        )?;
+        let files_written: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM files_touched WHERE execution_id = ?1 \
+               AND (ops LIKE '%C%' OR ops LIKE '%U%' OR ops LIKE '%D%')",
+            params![execution_id],
+            |r| r.get(0),
+        )?;
+        let produced_output: bool = conn.query_row(
+            "SELECT COUNT(*) FROM events \
+             WHERE execution_id = ?1 AND event_type IN ('text', 'tool_start')",
+            params![execution_id],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        let self_rating: Option<i64> = conn
+            .query_row(
+                "SELECT self_rating FROM execution_reflection WHERE execution_id = ?1",
+                params![execution_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        let tool_histogram = {
+            let mut stmt = conn.prepare(
+                "SELECT name, surface, COUNT(*), \
+                        SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) \
+                 FROM tool_calls WHERE execution_id = ?1 GROUP BY name, surface",
+            )?;
+            let rows = stmt.query_map(params![execution_id], |r| {
+                Ok(usage::ToolBucket {
+                    tool: r.get(0)?,
+                    surface: r.get(1)?,
+                    calls: r.get(2)?,
+                    errors: r.get(3)?,
+                })
+            })?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row?);
+            }
+            v
+        };
+        drop(conn);
+
+        let day = started_at.get(0..10).unwrap_or("").to_string();
+        let project_root = workspace_root.to_string_lossy().to_string();
+        let project_name = workspace_root
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "workspace".into());
+        Ok(Some(usage::ExecutionRollupRow {
+            project_id: usage::project_id_for(workspace_root),
+            project_name,
+            project_root,
+            execution_id,
+            kind,
+            prompt_digest: fnv_hex(&prompt),
+            prompt_preview: prompt.chars().take(120).collect(),
+            model,
+            provider,
+            outcome,
+            cost_usd,
+            input_tokens,
+            output_tokens,
+            duration_ms,
+            tool_calls,
+            files_written,
+            produced_output,
+            self_rating,
+            started_at,
+            day,
+            tool_histogram,
+        }))
+    }
+
+    /// Roll one execution up into the user-tier aggregate. Best-effort: a
+    /// missing execution returns `Ok(false)` and never fails a turn.
+    pub fn sync_to_usage(
+        &self,
+        execution_id: i64,
+        workspace_root: &Path,
+        usage: &usage::UsageStore,
+    ) -> Result<bool> {
+        match self.execution_rollup(execution_id, workspace_root)? {
+            Some(rollup) => {
+                usage.sync_execution(&rollup)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Close an execution record.
@@ -2199,6 +2521,108 @@ mod tests {
             .unwrap();
         assert!(rid > 0);
         assert_eq!(store.count("reflections").unwrap(), 1);
+    }
+
+    #[test]
+    fn producer_materializes_tool_calls_reflection_and_rolls_up_to_usage() {
+        use stella_protocol::{ToolCall, ToolOutput};
+        let store = Store::in_memory().unwrap();
+        let id = store
+            .begin_execution("deck", "add a feature", "zai", "glm-5.2")
+            .unwrap();
+
+        // Simulate a turn's event stream: a successful grep, a failed read, text.
+        store
+            .record_event(
+                id,
+                0,
+                &AgentEvent::ToolStart {
+                    call: ToolCall {
+                        call_id: "c1".into(),
+                        name: "grep".into(),
+                        input: serde_json::json!({"pattern": "foo"}),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .record_event(
+                id,
+                1,
+                &AgentEvent::ToolResult {
+                    call_id: "c1".into(),
+                    output: ToolOutput::Ok {
+                        content: "hit\n".into(),
+                    },
+                    duration_ms: 12,
+                },
+            )
+            .unwrap();
+        store
+            .record_event(
+                id,
+                2,
+                &AgentEvent::ToolStart {
+                    call: ToolCall {
+                        call_id: "c2".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path": "x"}),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .record_event(
+                id,
+                3,
+                &AgentEvent::ToolResult {
+                    call_id: "c2".into(),
+                    output: ToolOutput::Error {
+                        message: "not found".into(),
+                    },
+                    duration_ms: 3,
+                },
+            )
+            .unwrap();
+        store
+            .record_event(id, 4, &AgentEvent::Text { delta: "done".into() })
+            .unwrap();
+
+        // Materialize the normalized tool_calls log from the events.
+        let n = store.materialize_tool_calls(id).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(store.count("tool_calls").unwrap(), 2);
+
+        // Objective self-reflection: produced output, wrote nothing, not truncated.
+        store.finalize_execution_reflection(id).unwrap();
+        let (po, wf, tr): (i64, i64, i64) = {
+            let conn = store.lock();
+            conn.query_row(
+                "SELECT produced_output, wrote_files, truncated \
+                 FROM execution_reflection WHERE execution_id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!((po, wf, tr), (1, 0, 0));
+
+        // Roll one turn up into the user-tier aggregate.
+        let usage = crate::usage::UsageStore::in_memory().unwrap();
+        let root = std::path::Path::new("/w/stella");
+        assert!(store.sync_to_usage(id, root, &usage).unwrap());
+        let pid = crate::usage::project_id_for(root);
+        assert_eq!(usage.execution_count(&pid).unwrap(), 1);
+        assert_eq!(
+            usage
+                .tool_totals()
+                .unwrap()
+                .iter()
+                .map(|(_, c)| *c)
+                .sum::<i64>(),
+            2,
+            "grep + read_file folded into the cross-project histogram"
+        );
     }
 
     #[test]

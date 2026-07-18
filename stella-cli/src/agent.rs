@@ -2321,6 +2321,15 @@ pub(crate) fn record_execution_end(
     let finish_ok = store
         .finish_execution(execution_id, outcome_label, cost_usd)
         .is_ok();
+    // Data plane (all best-effort — aggregation must never fail a turn, so
+    // these are NOT folded into the returned success flag): normalize the
+    // turn's tool calls from its event stream, record the objective
+    // self-reflection (prompt + produced_output/wrote_files/truncated), and —
+    // after `finish_execution` set the outcome — roll the turn up into the
+    // user-tier usage.db for cross-project stats.
+    let _ = store.materialize_tool_calls(execution_id);
+    let _ = store.finalize_execution_reflection(execution_id);
+    let _ = store.sync_to_usage_default(execution_id);
     files_ok && citations_ok && uses_ok && mcp_usage_ok && finish_ok
 }
 

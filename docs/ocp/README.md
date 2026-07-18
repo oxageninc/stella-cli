@@ -5,6 +5,10 @@ Reference documentation for the **Open Context Protocol (OCP)** crates:
 [`ocp-host`](https://crates.io/crates/ocp-host), and
 [`ocp-conformance`](https://crates.io/crates/ocp-conformance).
 
+- [**The Open Context Protocol: A Technical Overview**](./overview.md) — the
+  one-read marketing overview for engineers: the problem OCP solves, the seven
+  guarantees, the wire surface, how it relates to MCP, and why you would build
+  against it. Start here if you are new to OCP.
 - [**The Open Context Protocol: Advantages and Uniqueness**](./protocol-advantages.md)
   — standalone research analysis of the seven advantages that make OCP a
   qualitatively different approach to context retrieval (provenance, budget
