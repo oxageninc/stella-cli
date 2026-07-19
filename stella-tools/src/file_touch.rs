@@ -7,7 +7,7 @@
 //! and the line delta it caused). Events aggregate by normalized
 //! workspace-relative path into one [`FileTouchRecord`] per file, and the
 //! session payload — [`FileTouchTelemetry`] — serializes to the documented
-//! JSON Schema (see `docs/file-touch-telemetry.md`):
+//! JSON Schema (see `stella-docs/content/docs/telemetry/files-touched.mdx`):
 //!
 //! - `C` — the file went from nonexistent to existing (`lines_added` = the
 //!   new file's full line count).

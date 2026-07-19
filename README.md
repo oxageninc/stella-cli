@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/stella-logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="assets/stella-logo-light.svg">
-    <img src="assets/stella-logo-light.svg" alt="Stella" width="420">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockups/stella-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/brand/lockups/stella-logo-light.svg">
+    <img src="docs/brand/lockups/stella-logo-light.svg" alt="Stella" width="420">
   </picture>
 </p>
 
@@ -18,7 +18,7 @@
 <p align="center">
   <a href="https://stella.oxagen.sh"><b>Website</b></a> ·
   <a href="https://stella.oxagen.sh/docs"><b>Docs</b></a> ·
-  <a href="https://stella.oxagen.sh/docs/quickstart"><b>Quickstart</b></a>
+  <a href="https://stella.oxagen.sh/docs/getting-started/installation"><b>Quickstart</b></a>
 </p>
 
 Stella is an open-source, bring-your-own-key (BYOK) coding agent that runs in
@@ -276,7 +276,7 @@ queue. `--plain` (or `STELLA_PLAIN=1`, or piped stdio) falls back to the line RE
 | `/files` | Show the Files-Touched panel — `[C·R·U·D] path` per file |
 | `/models` `/config` | List providers/models · show resolved configuration |
 | `/rename <name>` `/color <name>` | Rename the tab · switch accent color |
-| `/pipeline` | Toggle witness-verified staged turns (Command Deck; see `docs/design/pipeline.md`) |
+| `/pipeline` | Toggle witness-verified staged turns (Command Deck; see `stella-docs/content/docs/inference-pipeline.mdx`) |
 | `/clear` `/help` | Clear history · show help |
 | `/exit` or `Ctrl-D` | Exit |
 
@@ -334,7 +334,7 @@ stella stats     # cost, tokens, and $/resolved task per provider/model
 uses the staged pipeline by default; `--no-pipeline` falls back to the raw
 step-loop. In pipeline mode, `--test-command <cmd>` arms deterministic
 verification with your own test; without it an independent witness author
-writes a failing test whose fail→pass flip proves the work (`docs/design/pipeline.md`).
+writes a failing test whose fail→pass flip proves the work (`stella-docs/content/docs/inference-pipeline.mdx`).
 
 ## Built-in tools
 
@@ -490,10 +490,11 @@ repository and is pulled in as a pinned git dependency, not as workspace members
 | `stella-protocol` | Zero-logic, zero-I/O stability contract: shared serde types + the `Provider`/tool ports |
 | `stella-context` | The context plane: reflection-memory recall + embedding index, episodes, bi-temporal facts |
 | `stella-graph` | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL) |
-| `stella-pipeline` | The orchestration plane above the engine — the default `stella run` path: triage → plan → scope review → witness → execute → verify → judge (`docs/design/pipeline.md`) |
+| `stella-pipeline` | The orchestration plane above the engine — the default `stella run` path: triage → plan → scope review → witness → execute → verify → judge (`stella-docs/content/docs/inference-pipeline.mdx`) |
 | `stella-fleet` | The multi-agent fleet behind `stella fleet`: DAG planner + wave scheduling, git-worktree isolation per task |
 | `stella-media` | Multimodal generation behind one `MediaProvider` port — image generation wired as the `generate_image` tool (registered when a media-capable key is set); SVG/video library-complete but not yet exposed as tools |
 | `stella-tui` | The Command Deck — a pure event-fold core + thin crossterm shell |
+| `stella-observatory` | The Observatory — `stella observe`'s loopback-only telemetry dashboard over the local SQLite stores |
 | Open Context Protocol | Its own project now: [macanderson/opencontextprotocol](https://github.com/macanderson/opencontextprotocol) — wire types, host runtime, and the public conformance suite. Stella is its reference host and depends on it via git. |
 
 The repo is a **monorepo**: alongside the Rust workspace, the documentation

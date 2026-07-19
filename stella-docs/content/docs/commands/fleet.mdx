@@ -3,22 +3,22 @@ title: stella fleet
 description: Fan a batch of tasks out to a fleet of worker agents, each isolated in its own git worktree.
 ---
 
-Run many tasks in parallel, each in its own isolated git worktree, wave-scheduled by dependency. Every attempt, commit, and dollar is recorded in `.stella/fleet.db`, and the worktrees and their `fleet/<task>` branches are left in place for review.
+Run many tasks in parallel, each in its own isolated git worktree, wave-scheduled by dependency. Every attempt, commit, and dollar is recorded in `.stella/fleet.db`, and the worktrees and their `fleet/<slug>-<hash>` branches are left in place for review.
 
 ## Synopsis
 
 ```bash
-stella fleet <task>... [--plan <FILE>] [--max-concurrency <N>] [--base-ref <ref>] [--watch]
+stella fleet <task>... [--plan <FILE>] [--max-concurrency <N>] [--base-ref <ref>] [--watch] [--no-pipeline]
 ```
 
 ## What it does
 
-Each task prompt becomes an independent, isolated task. Stella creates one git worktree per task — branched from the current `HEAD` (or `--base-ref`) onto a `fleet/<task>` branch — and dispatches tasks in dependency-ordered waves, running up to `--max-concurrency` at once within a wave. Progress, attempts, commits, and cost are persisted to `.stella/fleet.db`.
+Each task prompt becomes an independent, isolated task. Stella creates one git worktree per task under `.stella/worktrees/<slug>` — branched from the current `HEAD` (or `--base-ref`), pinned to a SHA at start, onto a `fleet/<slug>-<hash>` branch (the hash suffix keeps re-runs from colliding with branches you kept) — and dispatches tasks in dependency-ordered waves, running up to `--max-concurrency` at once within a wave. Each worker is a full engine run through the [staged pipeline](/docs/inference-pipeline) by default. Progress, attempts, commits, and cost are persisted to `.stella/fleet.db` and surface on the [Observatory dashboard](/docs/telemetry/dashboard)'s Fleet runs card.
 
-Worktrees and branches are **not** cleaned up automatically: they stay on disk so you can inspect, test, and merge each result yourself.
+Worktrees and branches are **not** cleaned up automatically: they stay on disk so you can inspect, test, and merge each result yourself. A failed task is never retried automatically, and its dependents end the run as `skipped`.
 
 <Callout type="info">
-For anything beyond a handful of independent prompts, use a plan file (`--plan`). It lets you declare task `id`, `title`, `prompt`, `depends_on` (to order the waves), and `claims` — file paths held as cooperative locks while a task runs, so two tasks never edit the same file at once.
+For anything beyond a handful of independent prompts, use a plan file (`--plan`). It lets you declare task `id`, `title`, `prompt`, `depends_on` (to order the waves), `isolation` (`isolated` for an own worktree — the default — or `shared_tree` to run in the repo root with no worktree), and `claims` — file paths held as cooperative locks while a task runs, so two tasks never edit the same file at once. See [Agent Fleets](/docs/agent-fleets) for the full plan schema.
 </Callout>
 
 ## Flags
@@ -28,8 +28,17 @@ For anything beyond a handful of independent prompts, use a plan file (`--plan`)
 | `<task>...` | One or more task prompts, each an independent isolated task. Required unless `--plan` is given. |
 | `--plan <FILE>` | A `.json` or `.toml` plan file with `[[tasks]]` entries (`id`, `title`, `prompt`, optional `depends_on`, `isolation`, and `claims`) instead of inline prompts. |
 | `--max-concurrency <N>` | Maximum tasks dispatched concurrently within one wave. Default `4`. |
-| `--base-ref <ref>` | Git ref the isolated worktrees branch from. Default: the current `HEAD`. |
-| `--watch` | After the fan-out, watch each `fleet/<task>` branch's CI to completion and reconcile its PR status via `gh`. Exits non-zero if any watched branch ends red. |
+| `--base-ref <ref>` | Git ref the isolated worktrees branch from. Default: the current `HEAD`, pinned to a SHA at start so mid-run commits can't drift the base. |
+| `--watch` | After the fan-out, watch each successful branch's CI to completion and reconcile its PR status via `gh` (30s polls, 10m startup grace, 20m stall limit, 2h wall cap). Exits non-zero if any watched branch ends red. |
+| `--no-pipeline` | Workers run the raw step loop instead of the staged pipeline. |
+
+## Budget
+
+The budget cap is the **global** `--budget` flag (or `STELLA_BUDGET`), so it goes before the subcommand. Each child is guarded by the aggregate cap divided across the concurrency width (`budget ÷ max-concurrency`), and the fleet stops launching new waves once total metered spend crosses the cap.
+
+```bash
+stella --budget 5 fleet --plan release-prep.toml
+```
 
 ## Examples
 

@@ -3,7 +3,7 @@
 //! in the catalog is a hard, immediate, named error, never a silent
 //! fallback** (the TS-era phantom `glm-5.2-turbo` slug and gateway
 //! slug-drift lessons, L-M1/L-M2). The seed below covers every provider
-//! `crates/stella-cli/src/config.rs`'s `PROVIDERS` table can select — it is
+//! `stella-cli/src/config.rs`'s `PROVIDERS` table can select — it is
 //! the compile-time floor, always accepted. `stella models refresh` pulls
 //! the live master list (models.dev) into the on-disk catalog
 //! (`stella-store`'s model cards), and `stella-cli` installs the merged

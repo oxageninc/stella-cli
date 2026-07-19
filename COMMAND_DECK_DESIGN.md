@@ -8,6 +8,11 @@ the model).
 This file is the **frozen contract** leaf-view builders code against. Types
 here are authoritative — do not change signatures without updating this doc.
 
+> **Palette note:** color values named in this contract (e.g. the `#FFAC26`
+> amber accent) predate the aurora-on-navy restyle (#185). For colors,
+> `stella-tui/src/theme.rs` and `docs/brand/BRAND_GUIDELINES.md` are
+> authoritative; this doc remains the contract for structure and types only.
+
 ## Module layout (`stella-tui/src/`)
 
 Existing (kept, reused by the Session tab — do not break):
@@ -228,7 +233,7 @@ resuming is replaying it.
   `StepUsage`/`Complete`, graph via `CodeGraph::neighbors`, CPU/MEM via sysinfo.
 - Live now: **staged pipeline routing** — `/pipeline` toggles the lead's turns
   between the raw `Engine::run_turn` loop and `stella-pipeline`'s staged flow
-  (triage → witness → execute → verify → judge; `docs/pipeline.md`), mirrored
+  (triage → witness → execute → verify → judge; `stella-docs/content/docs/inference-pipeline.mdx`), mirrored
   to the `PIPELINE` stat box via `Inbound::Pipeline`. Named seam inside it:
   scope review **auto-approves** in the deck (the `ScopeReview` event is
   narrated in the transcript, not gated) — a deck-native scope-review card is

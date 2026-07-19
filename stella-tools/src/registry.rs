@@ -170,6 +170,7 @@ impl ToolRegistry {
         let mcp_usage: stella_core::mcp_usage::McpUsageLedger = Arc::default();
         let task_board: crate::tasks::TaskBoardHandle = Arc::default();
         let spawn_queue: crate::tasks::SpawnQueue = Arc::default();
+        let code_map_tip = crate::code_map::TipOnce::default();
         let processes: crate::process::ProcessTableHandle = Arc::default();
         let repo_backend: Arc<dyn crate::repo::RepoBackend> = Arc::new(crate::repo::GitCli);
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
@@ -178,8 +179,12 @@ impl ToolRegistry {
             Arc::new(crate::write::WriteFile),
             Arc::new(crate::edit::EditFile),
             Arc::new(crate::delete::DeleteFile),
-            Arc::new(crate::grep::Grep),
-            Arc::new(crate::glob::Glob),
+            // Arc::new(crate::bash::Bash),  // @todo revisit and determine if bash should be in this list or not.
+            // One shared tip latch: the session's first mapped search —
+            // grep or glob, whichever comes first — carries the graph_query
+            // pointer; every later footer is map-only.
+            Arc::new(crate::grep::Grep::with_code_map(code_map_tip.clone())),
+            Arc::new(crate::glob::Glob::with_code_map(code_map_tip)),
             Arc::new(crate::gather::GatherContext),
             Arc::new(crate::exploration::Explorations),
             Arc::new(crate::exploration::SaveExploration),
@@ -278,7 +283,7 @@ impl ToolRegistry {
     /// call runs the blocking policy chains (`tool.call.requested`, then
     /// `file.created`/`file.updated`/`file.deleted` or `command.started`)
     /// before executing, and emits the observer events documented in
-    /// `docs/hooks.md`. Also emits one `tool.registered` per registered
+    /// `stella-docs/content/docs/agent-tools/hooks.mdx`. Also emits one `tool.registered` per registered
     /// tool, name-sorted, so extensions see the tool surface up front.
     pub fn attach_bus(&self, bus: HookBus) {
         let mut schemas = ToolRegistry::schemas(self);

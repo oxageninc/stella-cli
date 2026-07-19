@@ -18,16 +18,16 @@ const STYLE = `
 .sdg { width: 100%; height: auto; display: block; margin: 1.5rem 0; }
 .sdg text { font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif); }
 .sdg .sdg-box { fill: var(--color-fd-card); stroke: var(--color-fd-border); stroke-width: 1.25; }
-.sdg .sdg-box-accent { fill: color-mix(in oklab, var(--stella-gold) 12%, var(--color-fd-card)); stroke: var(--stella-gold); stroke-width: 1.25; }
+.sdg .sdg-box-accent { fill: color-mix(in oklab, var(--stella-azure) 12%, var(--color-fd-card)); stroke: var(--stella-azure); stroke-width: 1.25; }
 .sdg .sdg-label { fill: var(--color-fd-foreground); font-size: 13px; font-weight: 600; }
 .sdg .sdg-sub { fill: var(--color-fd-muted-foreground); font-size: 10.5px; font-weight: 400; }
 .sdg .sdg-wire { stroke: var(--color-fd-border); stroke-width: 1.25; fill: none; }
-.sdg .sdg-flow { stroke: var(--stella-gold); stroke-width: 1.5; fill: none; opacity: 0.9;
+.sdg .sdg-flow { stroke: var(--stella-azure); stroke-width: 1.5; fill: none; opacity: 0.9;
   stroke-dasharray: 6 10; animation: sdg-dash 7s linear infinite; }
 .sdg .sdg-flow-slow { animation-duration: 9s; }
 .sdg .sdg-pulse { animation: sdg-pulse 5s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
-.sdg .sdg-dot { fill: var(--stella-gold); }
-.sdg .sdg-check { stroke: var(--stella-gold); stroke-width: 2; fill: none; stroke-linecap: round;
+.sdg .sdg-dot { fill: var(--stella-azure); }
+.sdg .sdg-check { stroke: var(--stella-azure); stroke-width: 2; fill: none; stroke-linecap: round;
   stroke-dasharray: 14; stroke-dashoffset: 14; animation: sdg-draw 6s ease-out infinite; }
 @keyframes sdg-dash { to { stroke-dashoffset: -64; } }
 @keyframes sdg-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
@@ -52,7 +52,7 @@ function Defs() {
         markerHeight="7"
         orient="auto-start-reverse"
       >
-        <path d="M0.5 0.8 L7.2 4 L0.5 7.2" fill="none" stroke="var(--stella-gold)" strokeWidth="1.4" strokeLinecap="round" />
+        <path d="M0.5 0.8 L7.2 4 L0.5 7.2" fill="none" stroke="var(--stella-azure)" strokeWidth="1.4" strokeLinecap="round" />
       </marker>
     </defs>
   );

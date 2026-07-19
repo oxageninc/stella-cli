@@ -74,7 +74,7 @@ cargo test --workspace
 
 ## Where does my change go? — a workspace tour
 
-Sixteen crates sounds like a lot; the rule of thumb is one sentence each:
+Fourteen crates sounds like a lot; the rule of thumb is one sentence each:
 
 | You want to… | Go to |
 |---|---|
@@ -91,6 +91,7 @@ Sixteen crates sounds like a lot; the rule of thumb is one sentence each:
 | MCP client (external tool servers) | `stella-mcp` |
 | Multimodal generation | `stella-media` |
 | Multi-agent fan-out, worktree isolation | `stella-fleet` |
+| The Observatory telemetry dashboard (`stella observe`) | `stella-observatory` |
 | The Open Context Protocol (wire types / host / conformance) | external repo: [`opencontextprotocol`](https://github.com/macanderson/opencontextprotocol) |
 
 All of the crates ship in the CLI today: `stella-pipeline` drives the default

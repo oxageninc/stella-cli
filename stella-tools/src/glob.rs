@@ -10,16 +10,44 @@ use crate::registry::Tool;
 
 const MAX_RESULTS: usize = 500;
 
-pub struct Glob;
+pub struct Glob {
+    /// Code-map footer state; `None` disables the footer entirely (the
+    /// embedded sweeps in `gather_context` — see [`crate::grep::Grep`]).
+    code_map: Option<crate::code_map::TipOnce>,
+}
+
+impl Glob {
+    /// The model-facing tool: footer on, `graph_query` tip latch shared
+    /// with `grep` (the registry passes both clones of one
+    /// [`crate::code_map::TipOnce`]).
+    pub fn with_code_map(tip: crate::code_map::TipOnce) -> Self {
+        Self {
+            code_map: Some(tip),
+        }
+    }
+
+    /// Footer-less instance for embedded use.
+    pub fn bare() -> Self {
+        Self { code_map: None }
+    }
+}
+
+impl Default for Glob {
+    /// Footer on with a private latch — the standalone shape tests use.
+    fn default() -> Self {
+        Self::with_code_map(crate::code_map::TipOnce::default())
+    }
+}
 
 #[async_trait]
 impl Tool for Glob {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "glob".into(),
-            description:
-                "Find files matching a glob pattern. Returns relative paths from workspace root."
-                    .into(),
+            description: "Find files matching a glob pattern. Returns relative paths from \
+                          workspace root. When the code-graph index exists, results carry a \
+                          code-map footer (matched files' symbols and import edges)."
+                .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -84,7 +112,9 @@ impl Tool for Glob {
                     .map(|l| relativize(l, canon_root.as_deref()))
                     .collect::<Vec<_>>()
                     .join("\n");
-                ToolOutput::Ok { content }
+                ToolOutput::Ok {
+                    content: with_code_map(content, root, self.code_map.as_ref()),
+                }
             }
             Err(_) => {
                 // fd not installed — fall back to find (same pinned dir).
@@ -109,7 +139,9 @@ impl Tool for Glob {
                                 .map(|l| relativize(l, canon_root.as_deref()))
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            ToolOutput::Ok { content }
+                            ToolOutput::Ok {
+                                content: with_code_map(content, root, self.code_map.as_ref()),
+                            }
                         }
                     }
                     Err(e) => ToolOutput::Error {
@@ -119,6 +151,25 @@ impl Tool for Glob {
             }
         }
     }
+}
+
+/// Append the code-map footer for these matched paths, when a footer is
+/// enabled and the graph has one to give (see [`crate::code_map`]). Bound
+/// separately from the `if let` so the `content.lines()` borrow ends before
+/// `content` is mutated.
+fn with_code_map(
+    mut content: String,
+    root: &std::path::Path,
+    tip: Option<&crate::code_map::TipOnce>,
+) -> String {
+    let Some(tip) = tip else {
+        return content;
+    };
+    let map = crate::code_map::for_files(root, content.lines(), tip);
+    if let Some(map) = map {
+        content.push_str(&map);
+    }
+    content
 }
 
 /// Render an absolute match path relative to the workspace root, honoring the
@@ -152,7 +203,7 @@ mod tests {
 
         // Use a glob pattern (not regex) so both `fd` and `find -name`
         // handle it identically across platforms.
-        let result = Glob
+        let result = Glob::default()
             .execute(
                 &serde_json::json!({"pattern": "*.rs", "path": &subdir}),
                 &dir,
@@ -172,9 +223,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn results_carry_a_code_map_footer_when_an_index_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn greet() {}\n").expect("write");
+        let db = crate::graph::graph_db_path(dir.path());
+        std::fs::create_dir_all(db.parent().expect("parent")).expect("mkdir");
+        let graph = stella_graph::CodeGraph::open(dir.path(), &db).expect("open graph");
+        graph.index_all().expect("index");
+        graph.shutdown();
+
+        let result = Glob::default()
+            .execute(&serde_json::json!({"pattern": "*.rs"}), dir.path())
+            .await;
+        match result {
+            ToolOutput::Ok { content } => {
+                assert!(content.contains("lib.rs"), "the file list stays: {content}");
+                assert!(content.contains("code map"), "footer attached: {content}");
+                assert!(
+                    content.contains("function greet:1"),
+                    "maps the listed file's symbols: {content}"
+                );
+            }
+            ToolOutput::Error { message } => panic!("expected files, got: {message}"),
+        }
+    }
+
+    #[tokio::test]
     async fn no_files_returns_ok() {
         let dir = std::env::temp_dir();
-        let result = Glob
+        let result = Glob::default()
             .execute(&serde_json::json!({"pattern": "*.nonexistent"}), &dir)
             .await;
         match result {

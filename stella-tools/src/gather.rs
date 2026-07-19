@@ -462,7 +462,9 @@ async fn gather(
         async move {
             (
                 pattern.clone(),
-                crate::glob::Glob.execute(&input, root).await,
+                // `bare()`: no code-map footer inside packs — the pack runs
+                // its own graph queries; a per-section footer is duplication.
+                crate::glob::Glob::bare().execute(&input, root).await,
             )
         }
     }));
@@ -471,7 +473,7 @@ async fn gather(
         async move {
             (
                 pattern.clone(),
-                crate::grep::Grep.execute(&input, root).await,
+                crate::grep::Grep::bare().execute(&input, root).await,
             )
         }
     }));

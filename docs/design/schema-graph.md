@@ -1,8 +1,11 @@
 # Design: Schema-Aware Code Graph for Zero Schema Drift
 
-**Status:** Implemented — the SQL index, pre-write schema gate, and ORM
-detection phases described below are shipped (`stella-graph` SQL parsing,
-`stella-tools/src/schema_gate.rs` wired into the tool registry).
+**Status:** Partially implemented — Phases 1–2 are shipped (`stella-graph`
+SQL parsing, the Diesel `table!` detector, and the pre-write gate in
+`stella-tools/src/schema_gate.rs` wired into the tool registry). Phase 3's
+canonical schema model and `code_graph_schema_links`, and Phase 4's semantic
+edges, are unbuilt and have been absorbed into the superseding spec:
+`docs/design/storage-map.md` (the vendor-agnostic storage map).
 **Goal:** On super-long-horizon tasks (200+ turns), the agent never creates a
 table/column/type that already exists, never proposes a conflicting definition,
 and retrieves schema alongside code when the domain matches.
@@ -27,39 +30,39 @@ Here's the actual failure mode on a 200-turn task:
 
 Three problems:
 
-| Problem | Why "schema map + edges" alone doesn't fix it |
-|---|---|
-| **Staleness** | The graph built at `stella init` is a snapshot. When the agent itself writes migrations mid-task, the graph doesn't know. **The schema index must be live — re-indexed on every schema file change, including the agent's own writes.** |
-| **Passive vs active** | Retrieval is passive — the agent must think to look. On turn 150, the agent doesn't know to search for existing payment tables. **Zero drift requires a pre-write gate** — a deterministic check that fires when the agent is about to write schema, not when it decides to search. |
+| Problem                     | Why "schema map + edges" alone doesn't fix it                                                                                                                                                                                                                                                                                         |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Staleness**               | The graph built at `stella init` is a snapshot. When the agent itself writes migrations mid-task, the graph doesn't know. **The schema index must be live — re-indexed on every schema file change, including the agent's own writes.**                                                                                               |
+| **Passive vs active**       | Retrieval is passive — the agent must think to look. On turn 150, the agent doesn't know to search for existing payment tables. **Zero drift requires a pre-write gate** — a deterministic check that fires when the agent is about to write schema, not when it decides to search.                                                   |
 | **Tree-sitter ≠ semantics** | Tree-sitter parses structure, not meaning. `table! { payments (id) { ... } }` is parseable. But `#[derive(Insertable)] #[table_name = "payments"] struct Payment { ... }` requires understanding the derive macro attribute to know this maps to the `payments` table. **SQL migrations are the ground truth; ORM models are hints.** |
 
 ---
 
 ## Architecture: three layers
 
-```
+```bash
 Layer 3: Pre-Write Gate (stella-tools)
   ┌──────────────────────────────────────────┐
-  │  write_file / edit_file targets a schema  │
-  │  file → parse proposed content → conflict │
-  │  check against Layer 1 → warn or block    │
+  │  write_file / edit_file targets a schema │
+  │  file → parse proposed content → conflict│
+  │  check against Layer 1 → warn or block   │
   └──────────────────────────────────────────┘
                     ▲ reads from
 Layer 2: Schema-Aware Retrieval (stella-context, no new code)
   ┌──────────────────────────────────────────┐
-  │  Schema nodes are just graph nodes. They  │
-  │  participate in recall_scoped alongside   │
-  │  code nodes. Domain-tagged automatically. │
+  │  Schema nodes are just graph nodes. They │
+  │  participate in recall_scoped alongside  │
+  │  code nodes. Domain-tagged automatically.│
   └──────────────────────────────────────────┘
                     ▲ fed by
 Layer 1: Live Schema Index (stella-graph)
-  ┌──────────────────────────────────────────┐
-  │  SQL DDL parser + ORM pattern detector    │
+  ┌────────────────────────────────────────────┐
+  │  SQL DDL parser + ORM pattern detector     │
   │  Canonical schema model (Table/Column/Enum)│
-  │  Schema-to-code edges (ORM model → table) │
+  │  Schema-to-code edges (ORM model → table)  │
   │  Re-indexed on every schema file change    │
   │  (watcher + post-write trigger)            │
-  └──────────────────────────────────────────┘
+  └────────────────────────────────────────────┘
 ```
 
 ---
@@ -118,6 +121,7 @@ ORM models live in already-parsed languages. Add a **second query pass** that
 detects schema-related patterns:
 
 **Diesel (Rust):**
+
 ```scheme
 ; diesel table! macro
 (macro_invocation macro: (identifier) @macro_name
@@ -127,6 +131,7 @@ detects schema-related patterns:
 ```
 
 **Django/SQLAlchemy (Python):**
+
 ```scheme
 ; Django: class Payment(models.Model)
 ; SQLAlchemy: class Payment(Base): __tablename__ = "payments"
@@ -135,6 +140,7 @@ detects schema-related patterns:
 ```
 
 The detector extracts:
+
 - Table name (from `table!` macro name, `__tablename__` assignment, or class name)
 - Column names (from struct fields or class attributes with type annotations)
 - Source location (file + line range for provenance)
@@ -180,12 +186,14 @@ CREATE TABLE code_graph_schema_links (
 ```
 
 Edge types:
+
 - `orm_model`: ORM model class → table (e.g., `Payment` struct → `payments` table)
 - `query`: Function containing a SELECT on the table
 - `mutation`: Function containing INSERT/UPDATE/DELETE on the table
 - `handler`: API route handler that uses the ORM model
 
 These edges are inferred during parsing:
+
 - ORM models are detected by the pattern detector (1c)
 - Query/mutation/handler edges require detecting SQL string literals or ORM
   call patterns within function bodies (e.g., `Payment::all()`, `diesel::insert_into(payments)`)
@@ -195,11 +203,13 @@ These edges are inferred during parsing:
 Two triggers:
 
 **File watcher** (already exists in `watch.rs`):
+
 - Extend `is_watch_relevant` to pass through `.sql` files and schema-related
   source files (files matching ORM patterns on their last index)
 - The existing debounce → `apply_changes` pipeline handles the rest
 
 **Post-write trigger** (new, in `stella-cli`):
+
 - After `write_file` or `edit_file` succeeds, check if the target file matches
   schema patterns (`.sql`, `*.prisma`, or the file already has schema nodes)
 - If so, inject the changed path into the graph's `WatchInjector`
@@ -299,7 +309,7 @@ schema objects are known.
 
 ### What the model sees
 
-```
+```rust
 ToolOutput::Error {
     message: "Schema conflict detected before write:\n\
               \n\
@@ -318,6 +328,7 @@ ToolOutput::Error {
 ```
 
 The model sees the conflict BEFORE the write. It can then:
+
 - Choose a different table name
 - ALTER the existing table instead
 - Ask the user
@@ -351,6 +362,7 @@ deliberately not implemented today.
 ### Phase 1: Live SQL index (highest impact, smallest scope)
 
 **Files:**
+
 - `stella-graph/src/lang.rs` — add `Language::Sql`
 - `stella-graph/src/queries.rs` — add `SQL_SYMBOLS`, `SQL_IMPORTS` (empty)
 - `stella-graph/src/parse.rs` — add SQL grammar to `Grammars`
@@ -364,6 +376,7 @@ code graph, live-indexed, and retrievable by name and domain.
 ### Phase 2: Pre-write gate
 
 **Files:**
+
 - `stella-tools/src/schema_gate.rs` — conflict detection logic
 - `stella-tools/src/write.rs` / `edit.rs` — call the gate
 - `stella-tools/src/registry.rs` — hold `Option<Arc<SchemaIndex>>`
@@ -374,6 +387,7 @@ without seeing a conflict error.
 ### Phase 3: ORM pattern detection
 
 **Files:**
+
 - `stella-graph/src/queries.rs` — ORM-specific query patterns per language
 - `stella-graph/src/schema.rs` — canonical merge of SQL DDL + ORM hints
 - `stella-graph/src/store.rs` — `code_graph_schema_links` table
@@ -385,6 +399,7 @@ the ORM model AND the handler functions.
 ### Phase 4: Semantic edges (calls, FKs)
 
 **Files:**
+
 - `stella-graph/src/parse.rs` — detect SQL string literals in function bodies
 - `stella-graph/src/schema.rs` — infer `query`/`mutation`/`handler` edges
 
@@ -395,23 +410,23 @@ keys create inter-table edges. The schema graph is navigable bidirectionally.
 
 ## What this gets you
 
-| Capability | Phase | Mechanism |
-|---|---|---|
-| Agent retrieves schema alongside code | 1 | Schema nodes in recall results |
-| Agent can't create duplicate tables | 2 | Pre-write gate |
-| ORM models linked to schema | 3 | Canonical merge + edges |
-| "All payment code" returns schema + code + handlers | 3+4 | Domain-tagged schema-to-code edges |
-| Schema stays current during 200-turn tasks | 1 | Post-write re-indexing trigger |
-| Zero schema drift | 2+ | Gate enforces, index is live |
+| Capability                                          | Phase | Mechanism                          |
+| --------------------------------------------------- | ----- | ---------------------------------- |
+| Agent retrieves schema alongside code               | 1     | Schema nodes in recall results     |
+| Agent can't create duplicate tables                 | 2     | Pre-write gate                     |
+| ORM models linked to schema                         | 3     | Canonical merge + edges            |
+| "All payment code" returns schema + code + handlers | 3+4   | Domain-tagged schema-to-code edges |
+| Schema stays current during 200-turn tasks          | 1     | Post-write re-indexing trigger     |
+| Zero schema drift                                   | 2+    | Gate enforces, index is live       |
 
 ---
 
 ## Risks and tradeoffs
 
-| Risk | Mitigation |
-|---|---|
-| SQL dialect variance (Postgres vs MySQL vs SQLite) | Start with ANSI SQL + Postgres extensions (most common in migrations). `tree-sitter-sql` handles the common subset. |
-| ORM patterns change across versions | The detector is heuristic, not semantic. False positives (a class that looks like an ORM model but isn't) are harmless — they just add an extra graph node. False negatives (unrecognized ORM pattern) mean the table isn't linked, but SQL DDL is still the primary source. |
-| Gate false positives on rename/refactor | The gate returns an error, not a hard block. The model can read the error, understand the conflict, and choose to proceed with a different approach. The `strictness` setting lets users downgrade to a warning. |
-| Performance on large schema files | SQL DDL files are small (rarely >1000 lines). The conflict check is a name lookup against an in-memory HashMap, not a parse. |
-| Agent writes non-SQL schema (Prisma, GraphQL) | Phase 3 adds ORM pattern detection. The gate in Phase 2 starts with SQL only and extends as parsers are added. |
+| Risk                                               | Mitigation                                                                                                                                                                                                                                                                   |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SQL dialect variance (Postgres vs MySQL vs SQLite) | Start with ANSI SQL + Postgres extensions (most common in migrations). `tree-sitter-sql` handles the common subset.                                                                                                                                                          |
+| ORM patterns change across versions                | The detector is heuristic, not semantic. False positives (a class that looks like an ORM model but isn't) are harmless — they just add an extra graph node. False negatives (unrecognized ORM pattern) mean the table isn't linked, but SQL DDL is still the primary source. |
+| Gate false positives on rename/refactor            | The gate returns an error, not a hard block. The model can read the error, understand the conflict, and choose to proceed with a different approach. The `strictness` setting lets users downgrade to a warning.                                                             |
+| Performance on large schema files                  | SQL DDL files are small (rarely >1000 lines). The conflict check is a name lookup against an in-memory HashMap, not a parse.                                                                                                                                                 |
+| Agent writes non-SQL schema (Prisma, GraphQL)      | Phase 3 adds ORM pattern detection. The gate in Phase 2 starts with SQL only and extends as parsers are added.                                                                                                                                                               |
