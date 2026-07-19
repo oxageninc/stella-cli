@@ -49,10 +49,10 @@ use std::path::Path;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use stella_protocol::tool::{ToolOutput, ToolSchema};
 
 use crate::registry::Tool;
+use crate::staleness::hex_sha256;
 
 /// Pack store, sibling of `.stella/explorations`.
 const PACKS_DIR: &str = ".stella/context/packs";
@@ -135,17 +135,6 @@ impl PackInputs {
 struct PackSection {
     title: String,
     body: String,
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for b in digest {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
 }
 
 fn now_ms() -> u64 {

@@ -1074,6 +1074,13 @@ pub async fn run_deck_session(
         }
         session_record.summary = prompt_line(&submitted, 240);
         session_record.status = stella_store::SessionStatus::InProgress;
+        // Advertise which slices this session is mid-mapping (its live draft
+        // explorations), so other decks' SESSIONS overlays can warn before a
+        // prompt duplicates the work. Cheap: JSON parse, no hashing.
+        session_record.exploring = stella_tools::exploration::draft_slices_for_pid(
+            &cfg.workspace_root,
+            std::process::id(),
+        );
         let _ = session_registry.upsert(&session_record);
 
         // Per-turn conversation bookkeeping, mirroring `run_interactive`:
@@ -2010,16 +2017,26 @@ fn sessions_inbound(
     let sessions = registry
         .list()
         .into_iter()
-        .map(|r| stella_tui::SessionInfo {
-            mine: r.id == mine,
-            resumable: r.id != mine && r.workspace == workspace && registry.resumable(&r.id),
-            phase: session_phase(r.status),
-            id: r.id,
-            title: r.title,
-            summary: r.summary,
-            workspace: r.workspace,
-            started_ms: r.started_at_ms,
-            updated_ms: r.updated_at_ms,
+        .map(|r| {
+            // A session mid-mapping advertises its slices right in the
+            // summary line, so a human sees "already being mapped" before
+            // typing a prompt that would duplicate the exploration.
+            let summary = if r.exploring.is_empty() {
+                r.summary
+            } else {
+                format!("{} [mapping: {}]", r.summary, r.exploring.join(", "))
+            };
+            stella_tui::SessionInfo {
+                mine: r.id == mine,
+                resumable: r.id != mine && r.workspace == workspace && registry.resumable(&r.id),
+                phase: session_phase(r.status),
+                id: r.id,
+                title: r.title,
+                summary,
+                workspace: r.workspace,
+                started_ms: r.started_at_ms,
+                updated_ms: r.updated_at_ms,
+            }
         })
         .collect();
     Inbound::Sessions(sessions)

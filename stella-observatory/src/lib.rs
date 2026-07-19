@@ -136,6 +136,7 @@ pub fn respond(workspace_root: &Path, path: &str) -> Response {
         "/api/mcp-servers" => Ok(fsview::mcp_servers(root)),
         "/api/config" => Ok(fsview::config(root)),
         "/api/memories" => Ok(fsview::memories(root)),
+        "/api/explorations" => Ok(fsview::explorations(root)),
         "/api/rules" => obs.memory().map(|m| {
             serde_json::json!({
                 "db": m["rules"].clone(),
@@ -603,6 +604,61 @@ mod tests {
         assert_eq!(skill["description"], "does the thing");
         let learned = find("hard-won").expect("learned skill listed");
         assert_eq!(learned["learned"], true);
+    }
+
+    #[test]
+    fn explorations_route_reports_per_map_freshness() {
+        let ws = seeded_workspace();
+        let dir = ws.path().join(".stella/explorations");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(ws.path().join("covered.rs"), "fn mapped() {}").unwrap();
+        // sha256("fn mapped() {}") — computed with the same encoding the
+        // producer uses; freshness must verify against the live file.
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"fn mapped() {}");
+        let fresh_hash: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        std::fs::write(
+            dir.join("zone.json"),
+            serde_json::json!({
+                "slice": "zone", "title": "Zone", "summary": "s", "content": "body",
+                "files": ["covered.rs"], "created_at_ms": 2u64,
+                "manifest": { "covered.rs": fresh_hash, "gone.rs": "0000" },
+                "status": "complete", "pid": 42u32
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // A pre-manifest (v1) record must report "unknown", not crash.
+        std::fs::write(
+            dir.join("legacy.json"),
+            serde_json::json!({
+                "slice": "legacy", "title": "Old", "summary": "s", "content": "b",
+                "files": [], "created_at_ms": 1u64
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response = respond(ws.path(), "/api/explorations");
+        let v: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first.
+        assert_eq!(rows[0]["slice"], "zone");
+        assert_eq!(rows[0]["freshness"], "drifted");
+        assert_eq!(rows[0]["missing"][0], "gone.rs");
+        assert!(rows[0]["changed"].as_array().unwrap().is_empty());
+        assert_eq!(rows[0]["manifest_files"], 2);
+        assert_eq!(rows[1]["slice"], "legacy");
+        assert_eq!(rows[1]["freshness"], "unknown");
+        // Bodies are sized, never served in the listing.
+        assert!(rows[0]["content"].is_null());
+        assert_eq!(rows[0]["content_chars"], 4);
     }
 
     #[test]

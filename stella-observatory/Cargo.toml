@@ -12,6 +12,10 @@ publish.workspace = true
 rusqlite.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Re-hash exploration-map manifests for the /api/explorations freshness
+# verdicts (the observatory re-reads artifacts rather than linking the
+# stella crates that write them — same isolation as its store.db access).
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net"] }
 toml.workspace = true
