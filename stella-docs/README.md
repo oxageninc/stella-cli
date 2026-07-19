@@ -43,6 +43,7 @@ content/docs/            # all documentation (MDX + meta.json ordering)
   commands/              # per-command reference (run, chat, goal, fleet, …)
   extensions.mdx         # the extension event bus
   scripting.mdx          # headless JSON output for CI
+  showcase.mdx           # teams shipping with Stella (Oxagen, …)
 
 src/app/                 # Next.js App Router
   (home)/                # marketing landing page
