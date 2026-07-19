@@ -20,6 +20,7 @@
 mod agent;
 mod agents_installed;
 mod attachments;
+mod claims;
 mod command_deck;
 mod config;
 mod connect_cmd;
@@ -40,6 +41,7 @@ mod runtime;
 mod settings;
 mod skill_manager;
 mod stats;
+mod subsession;
 mod tui;
 
 /// Serializes tests that mutate process environment variables. `setenv` /
@@ -195,12 +197,16 @@ enum Command {
         validate: Option<Option<std::path::PathBuf>>,
     },
 
-    /// Fan tasks out to a fleet of worker agents — one git worktree per
-    /// isolated task, wave-scheduled by dependency, every attempt, commit,
-    /// and dollar recorded in .stella/fleet.db. Worktrees and their
-    /// fleet/<task> branches are left in place for review.
+    /// Fan tasks out to a fleet of worker agents in ONE shared tree —
+    /// coordinated by cooperative claims (lock-on-first-write, sub-second,
+    /// rivals named), wave-scheduled by dependency, every attempt, commit,
+    /// and dollar recorded in .stella/fleet.db. Tasks opting into
+    /// isolation = "isolated" get a dedicated worktree whose fleet/<task>
+    /// branch is left in place for review.
     Fleet {
-        /// Task prompts — each becomes an independent isolated task
+        /// Task prompts — each becomes an independent task in the SHARED
+        /// tree (cooperative claims coordinate writers; pass a plan file
+        /// with `isolation = "isolated"` for per-task worktrees)
         #[arg(required_unless_present = "plan")]
         tasks: Vec<String>,
 
@@ -214,7 +220,8 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         max_concurrency: usize,
 
-        /// Git ref isolated worktrees branch from (default: current HEAD)
+        /// Git ref `isolation = "isolated"` worktrees branch from
+        /// (default: current HEAD); shared-tree tasks ignore it
         #[arg(long)]
         base_ref: Option<String>,
 

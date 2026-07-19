@@ -26,6 +26,7 @@ pub mod router;
 pub mod rules;
 pub mod skills;
 pub(crate) mod speculation;
+pub mod tasks;
 
 pub use budget::{BudgetGuard, BudgetOutcome};
 // `bus::HookEvent` (the extension-bus envelope) stays module-qualified: the
@@ -58,3 +59,4 @@ pub use skills::{
     SkillObservation, SkillOrigin, SkillSource, decide_auto_creation, load_skills,
     mine_skill_candidates, render_skills_section, select_skills,
 };
+pub use tasks::{SpawnRequest, TaskBoard, TaskBoardError};

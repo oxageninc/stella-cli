@@ -18,8 +18,8 @@
 //! backing cell buffer (the replay-determinism test in [`crate::render`]).
 
 use stella_protocol::{
-    AgentEvent, BudgetMode, FileChangeKind, MediaJobState, MediaKind, PrStatus, ScopeProposal,
-    StageKind, ToolOutput,
+    AgentEvent, BudgetMode, CiStatus, FileChangeKind, MediaJobState, MediaKind, PrStatus,
+    ScopeProposal, StageKind, TaskItem, TaskStatus, ToolOutput,
 };
 
 /// How many characters of a tool input / output summary we retain on a
@@ -73,6 +73,10 @@ pub struct SessionModel {
     /// ordinary `ToolResult` (matched by `id`), so a `ToolResult` with the
     /// question's `call_id` clears it (also cleared on `Complete`/`Error`).
     pub pending_ask_user: Option<AskUserPrompt>,
+    /// The latest task-board snapshot (the `task_*` tools). Each
+    /// `TaskUpdate` event replaces the whole board — snapshot semantics keep
+    /// the fold pure and make a dead session's board reconstruct on replay.
+    pub tasks: Vec<TaskItem>,
 }
 
 /// A pending `ask_user` question. The renderer contract is binding: present
@@ -221,7 +225,20 @@ pub enum TranscriptEntry {
     /// A commit landed.
     Commit { sha: String, message: String },
     /// A pull request opened or changed status.
-    Pr { url: String, status: PrStatus },
+    Pr {
+        url: String,
+        status: PrStatus,
+        number: Option<u64>,
+        ci: Option<CiStatus>,
+    },
+    /// A one-line digest of a task-board change ("tasks 2/5 · doing X").
+    /// The full checklist renders from `SessionModel::tasks`, not from
+    /// scrollback.
+    TaskUpdate {
+        done: usize,
+        total: usize,
+        active: Option<String>,
+    },
     /// An error event.
     Error { message: String, retryable: bool },
     /// The turn completed.
@@ -500,10 +517,34 @@ impl SessionModel {
                     message: message.clone(),
                 });
             }
-            AgentEvent::Pr { url, status } => {
+            AgentEvent::Pr {
+                url,
+                status,
+                number,
+                ci,
+            } => {
                 self.transcript.push(TranscriptEntry::Pr {
                     url: url.clone(),
                     status: *status,
+                    number: *number,
+                    ci: *ci,
+                });
+            }
+            AgentEvent::TaskUpdate { tasks } => {
+                // The board is snapshot state (rendered as a pinned
+                // checklist card); the transcript gets a one-line digest so
+                // scrollback shows *when* the board moved.
+                self.tasks = tasks.clone();
+                self.transcript.push(TranscriptEntry::TaskUpdate {
+                    done: tasks
+                        .iter()
+                        .filter(|t| t.status == TaskStatus::Completed)
+                        .count(),
+                    total: tasks.len(),
+                    active: tasks
+                        .iter()
+                        .find(|t| t.status == TaskStatus::InProgress)
+                        .map(|t| t.subject.clone()),
                 });
             }
             // `StepUsage` is a metering/billing record consumed by
@@ -1166,6 +1207,8 @@ mod tests {
         model.apply(&AgentEvent::Pr {
             url: "https://x/pr/1".into(),
             status: PrStatus::Open,
+            number: Some(1),
+            ci: None,
         });
         assert_eq!(model.transcript.len(), 4);
         assert!(matches!(

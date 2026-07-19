@@ -53,6 +53,6 @@ pub use ledger::{
 pub use monitor::{
     CiConclusion, CiRun, CiRunStatus, CiSnapshot, CiWatchOutcome, GhCli, GhError, GhOutput,
     Monitor, MonitorError, Sleeper, SystemGhCli, TimeoutReason, TokioSleeper, WatchConfig,
-    WatchPhase, commit_event, pr_event,
+    WatchPhase, commit_event, parse_pr_number, pr_event, pr_event_with_ci,
 };
 pub use plan::{Isolation, Plan, PlanError, Task, TaskId};

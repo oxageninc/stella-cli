@@ -116,6 +116,7 @@ pub async fn run_fleet(
         // in-flight children can't collectively overshoot `--budget`.
         per_child_budget: budget_limit.map(|b| b / max_concurrency.max(1) as f64),
         use_pipeline,
+        run_id: run_id.clone(),
     };
     let fleet = Fleet::new(
         worker,
@@ -347,6 +348,11 @@ struct EngineWorker {
     /// the true total, stopping further launches once it is crossed.
     per_child_budget: Option<f64>,
     use_pipeline: bool,
+    /// The fleet run id — combined with the task id it forms the worker's
+    /// lock-table identity (`<run>/<task>`), the SAME holder string the
+    /// fleet's declared-claim acquisition uses, so a task's tool-level
+    /// claim-on-first-write is re-entrant with its declared claims.
+    run_id: String,
 }
 
 #[async_trait::async_trait]
@@ -363,6 +369,7 @@ impl FleetWorker for EngineWorker {
         let use_pipeline = self.use_pipeline;
         let task = task.clone();
         let root = workspace_root.to_path_buf();
+        let claim_holder = format!("{}/{}", self.run_id, task.id);
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let result = tokio::runtime::Builder::new_current_thread()
@@ -370,7 +377,14 @@ impl FleetWorker for EngineWorker {
                 .build()
                 .map_err(|e| format!("worker runtime failed to start: {e}"))
                 .and_then(|rt| {
-                    rt.block_on(run_task(&cfg, per_child_budget, use_pipeline, &task, &root))
+                    rt.block_on(run_task(
+                        &cfg,
+                        per_child_budget,
+                        use_pipeline,
+                        &task,
+                        &root,
+                        &claim_holder,
+                    ))
                 });
             let _ = tx.send(result);
         });
@@ -400,17 +414,28 @@ async fn run_task(
     use_pipeline: bool,
     task: &Task,
     root: &Path,
+    claim_holder: &str,
 ) -> Result<WorkerOutcome, String> {
     // Snapshot where this workspace starts so the commit report is
     // exactly this worker's commits — correct for isolated worktrees
     // (== the fleet base) and for sequential shared-tree tasks alike.
     let start_sha = git_stdout(root, &["rev-parse", "--verify", "HEAD"]).await?;
 
+    // The COORDINATION store lives at the original workspace root — shared
+    // by every worker of every fleet in this workspace, which is what makes
+    // multiple fleets (and the deck) safe in ONE tree. Captured before the
+    // per-worker root override below.
+    let claims_store = agent::open_store(&cfg.workspace_root);
+
     let mut cfg = cfg.clone();
     cfg.workspace_root = root.to_path_buf();
     let provider = agent::build_provider(&cfg)?;
     let registry = ToolRegistry::new_detected(root.to_path_buf()).await;
     crate::rules::enforce_workspace_rules(&registry, root);
+    // Claim-on-first-write (crate::claims): tool-level write claims + the
+    // transient build lane, coordinated across every writer in the
+    // workspace. Same holder as the fleet's declared claims — re-entrant.
+    let claims = crate::claims::ClaimTap::new(&registry, claims_store, claim_holder);
 
     let mut messages = vec![CompletionMessage::system(
         // Each worker is its own session in its own workspace, so its
@@ -467,7 +492,7 @@ async fn run_task(
         let ports = PipelinePorts {
             router: &router,
             providers: &resolver,
-            tools: &registry,
+            tools: &claims,
             recall: &recall,
             repo: &repo_structure,
             repo_status: &repo_status,
@@ -504,7 +529,7 @@ async fn run_task(
             let hook_runner = ShellHookRunner;
             let mut engine = Engine::with_sleeper(
                 &*provider,
-                &registry,
+                &claims,
                 agent::engine_config_for(&cfg),
                 &TokioSleeper,
             );
@@ -520,6 +545,7 @@ async fn run_task(
     };
     drop(tx);
     let _ = drain.await;
+    claims.release_all();
 
     let spent = budget.session_spent_usd();
     let commits = collect_commits(root, &start_sha, &task.id).await;

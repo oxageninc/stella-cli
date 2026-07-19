@@ -680,7 +680,7 @@ mod tests {
             FleetConfig::new("run1", "HEAD"),
         );
 
-        let task = Task::new("t1", "title", "prompt");
+        let task = Task::new("t1", "title", "prompt").isolated();
         let handle = f.dispatch(&task).await.unwrap();
 
         // An isolated task got a worktree, and the worker was handed its path.
@@ -1080,7 +1080,10 @@ mod tests {
         // for both. Each is a recorded dispatch failure (not an early return
         // that discards the wave), the run did not succeed, and the failures
         // are reported in deterministic task-id order.
-        let plan = Plan::new(vec![Task::new("t1", "t1", "p"), Task::new("t2", "t2", "p")]);
+        let plan = Plan::new(vec![
+            Task::new("t1", "t1", "p").isolated(),
+            Task::new("t2", "t2", "p").isolated(),
+        ]);
         let f = Fleet::new(
             FakeWorker::new(0.10),
             WorktreeManager::new(FailGit, "/repo"),

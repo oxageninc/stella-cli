@@ -34,6 +34,13 @@ pub struct Notification {
     /// etc. Free-form; the inbox shows it dimmed.
     #[serde(default)]
     pub source: String,
+    /// The session registry id ([`crate::SessionRecord::id`]) this
+    /// notification concerns, when known — the structured link the inbox
+    /// uses to jump to the session (unlike `source`, which is free-form).
+    /// `default` so notification files written before the field existed
+    /// still parse.
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub read: bool,
 }
@@ -56,8 +63,17 @@ impl Notification {
             title: title.into(),
             body: body.into(),
             source: source.into(),
+            session_id: None,
             read: false,
         }
+    }
+
+    /// The same notification linked to a session (builder-style, so
+    /// producers that know their session id can chain it onto
+    /// [`Notification::new`]).
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
     }
 }
 
@@ -208,6 +224,38 @@ mod tests {
 
         assert_eq!(store.mark_all_read().unwrap(), 1);
         assert_eq!(store.unread_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_id_roundtrips_and_legacy_files_still_parse() {
+        let (dir, store) = temp_store("session-id");
+
+        let linked = Notification::new("pr opened", "fleet: PR #7 opened", "fleet")
+            .with_session_id("ses-42-7");
+        store.push(&linked).unwrap();
+        // A notification file written before session_id existed — the field
+        // is simply absent from its JSON.
+        let legacy = r#"{
+          "id": "ntf-legacy-1",
+          "created_at_ms": 5,
+          "title": "old",
+          "body": "written before session_id existed",
+          "source": "mcp",
+          "read": false
+        }"#;
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ntf-legacy-1.json"), legacy).unwrap();
+
+        let listed = store.list();
+        assert_eq!(listed.len(), 2);
+        let new = listed.iter().find(|n| n.id == linked.id).unwrap();
+        assert_eq!(new.session_id.as_deref(), Some("ses-42-7"));
+        let old = listed.iter().find(|n| n.id == "ntf-legacy-1").unwrap();
+        assert_eq!(old.session_id, None, "missing field must default to None");
+        // Persist-until-read is untouched: the legacy file is still unread.
+        assert_eq!(store.unread_count(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

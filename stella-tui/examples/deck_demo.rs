@@ -203,6 +203,9 @@ async fn main() -> std::io::Result<()> {
                 | WorkspaceInput::SessionDelete { .. } => {
                     let _ = react_tx.send(Inbound::Sessions(vec![]));
                 }
+                // Replay needs the real driver's store; the demo has nothing
+                // to open, so the verb is inert here.
+                WorkspaceInput::SessionOpen { .. } => {}
                 WorkspaceInput::NotificationRead { .. } | WorkspaceInput::NotificationsReadAll => {
                     let _ = react_tx.send(Inbound::Notifications(vec![]));
                 }

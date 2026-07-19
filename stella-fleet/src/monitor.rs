@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use stella_core::Clock;
-use stella_protocol::{AgentEvent, PrStatus};
+use stella_protocol::{AgentEvent, CiStatus, PrStatus};
 
 use crate::ledger::CommitRecord;
 
@@ -635,12 +635,36 @@ pub fn commit_event(commit: &CommitRecord) -> AgentEvent {
     }
 }
 
-/// Build an [`AgentEvent::Pr`] from a reconciled PR url + status.
+/// Build an [`AgentEvent::Pr`] from a reconciled PR url + status. The PR
+/// number is derived from the url; `ci` is absent (not polled) — use
+/// [`pr_event_with_ci`] when a checks verdict was observed alongside.
 pub fn pr_event(url: impl Into<String>, status: PrStatus) -> AgentEvent {
+    pr_event_with_ci(url, status, None)
+}
+
+/// Build an [`AgentEvent::Pr`] carrying an observed CI verdict for the PR's
+/// head commit.
+pub fn pr_event_with_ci(
+    url: impl Into<String>,
+    status: PrStatus,
+    ci: Option<CiStatus>,
+) -> AgentEvent {
+    let url = url.into();
     AgentEvent::Pr {
-        url: url.into(),
+        number: parse_pr_number(&url),
+        url,
         status,
+        ci,
     }
+}
+
+/// Extract the PR number from a GitHub-style PR url — the trailing integer
+/// path segment of `…/pull/<n>`. Returns `None` for anything else rather
+/// than guessing (an absent number renders as the bare url, never wrong).
+pub fn parse_pr_number(url: &str) -> Option<u64> {
+    let mut segments = url.trim_end_matches('/').rsplit('/');
+    let number = segments.next()?.parse().ok()?;
+    (segments.next()? == "pull").then_some(number)
 }
 
 #[cfg(test)]
@@ -1051,11 +1075,39 @@ mod tests {
             other => panic!("expected a commit event, got {other:?}"),
         }
         match pr_event("https://github.com/x/y/pull/1", PrStatus::Open) {
-            AgentEvent::Pr { url, status } => {
+            AgentEvent::Pr {
+                url,
+                status,
+                number,
+                ci,
+            } => {
                 assert_eq!(url, "https://github.com/x/y/pull/1");
                 assert_eq!(status, PrStatus::Open);
+                assert_eq!(number, Some(1));
+                assert_eq!(ci, None, "un-polled ci must be absent, never passing");
             }
             other => panic!("expected a pr event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pr_number_parses_from_pull_urls_only() {
+        assert_eq!(
+            parse_pr_number("https://github.com/macanderson/stella/pull/183"),
+            Some(183)
+        );
+        assert_eq!(
+            parse_pr_number("https://github.com/macanderson/stella/pull/183/"),
+            Some(183)
+        );
+        assert_eq!(
+            parse_pr_number("https://github.com/macanderson/stella/issues/183"),
+            None
+        );
+        assert_eq!(parse_pr_number("not a url"), None);
+        assert_eq!(
+            parse_pr_number("https://github.com/macanderson/stella/pull/abc"),
+            None
+        );
     }
 }

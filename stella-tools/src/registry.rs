@@ -69,6 +69,15 @@ pub struct ToolRegistry {
     /// execution via [`ToolRegistry::take_mcp_usage`]. The registry is just the
     /// carrier so `record_execution_end` has one handle for every ledger.
     mcp_usage: stella_core::mcp_usage::McpUsageLedger,
+    /// The session task board, shared with the six registered `task_*` tool
+    /// instances. The CLI snapshots it into `AgentEvent::TaskUpdate` after
+    /// executions via [`ToolRegistry::task_board`].
+    task_board: crate::tasks::TaskBoardHandle,
+    /// Sub-agent spawn requests queued by `task_assign`, drained once per
+    /// execution by the session driver via
+    /// [`ToolRegistry::take_spawn_requests`] — exactly the citation-ledger
+    /// drain discipline, so no request is dispatched twice.
+    spawn_queue: crate::tasks::SpawnQueue,
     schema_index: std::sync::Mutex<SchemaIndex>,
     /// The session's extension hook bus, once a host attaches one
     /// ([`ToolRegistry::attach_bus`]). Every emission is `None`-guarded, so
@@ -127,6 +136,8 @@ impl ToolRegistry {
     ) -> Self {
         let citations: crate::memory::CitationLedger = Arc::default();
         let mcp_usage: stella_core::mcp_usage::McpUsageLedger = Arc::default();
+        let task_board: crate::tasks::TaskBoardHandle = Arc::default();
+        let spawn_queue: crate::tasks::SpawnQueue = Arc::default();
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         let mut entries: Vec<Arc<dyn Tool>> = vec![
             Arc::new(crate::read::ReadFile::default()),
@@ -146,6 +157,15 @@ impl ToolRegistry {
             Arc::new(crate::project::RunTests),
             Arc::new(crate::ci::CiStatus),
             Arc::new(crate::screenshot::Screenshot),
+            Arc::new(crate::tasks::TaskCreate(task_board.clone())),
+            Arc::new(crate::tasks::TaskList(task_board.clone())),
+            Arc::new(crate::tasks::TaskStart(task_board.clone())),
+            Arc::new(crate::tasks::TaskComplete(task_board.clone())),
+            Arc::new(crate::tasks::TaskCancel(task_board.clone())),
+            Arc::new(crate::tasks::TaskAssign(
+                task_board.clone(),
+                spawn_queue.clone(),
+            )),
             // SVG generation is client-side (the model authors the SVG, the
             // pipeline validates/sanitizes) — no provider key needed, so
             // unlike image/video it is always registered.
@@ -192,6 +212,8 @@ impl ToolRegistry {
             citations,
             agent_uses: std::sync::Mutex::new(crate::agent_use::AgentUseLedger::default()),
             mcp_usage,
+            task_board,
+            spawn_queue,
             schema_index: std::sync::Mutex::new(SchemaIndex::default()),
             bus: std::sync::RwLock::new(None),
         }
@@ -744,6 +766,28 @@ impl ToolRegistry {
         std::mem::take(&mut *self.citations.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
+    /// A clone of the session task-board handle, shared with the registered
+    /// `task_*` tool instances — the CLI snapshots it into
+    /// `AgentEvent::TaskUpdate` after each execution.
+    pub fn task_board(&self) -> crate::tasks::TaskBoardHandle {
+        self.task_board.clone()
+    }
+
+    /// A clone of the `task_assign` spawn-queue handle — for hosts that want
+    /// to observe queued spawns without draining them.
+    pub fn spawn_queue(&self) -> crate::tasks::SpawnQueue {
+        self.spawn_queue.clone()
+    }
+
+    /// Drain the sub-agent spawn requests `task_assign` queued since the
+    /// last drain — the session driver calls this exactly once per
+    /// execution and dispatches each request through the fleet seam, so
+    /// (like [`ToolRegistry::take_memory_citations`]) no request is ever
+    /// handled twice.
+    pub fn take_spawn_requests(&self) -> Vec<stella_core::tasks::SpawnRequest> {
+        std::mem::take(&mut *self.spawn_queue.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
     /// Record one invocation of an installed agent definition (see
     /// [`crate::agent_use`]). `version` is the definition's pinned version at
     /// invocation time; `reason` is a short free-text why/how (may be empty).
@@ -926,6 +970,12 @@ mod tests {
             "ci_status",
             "screenshot",
             "generate_svg",
+            "task_create",
+            "task_list",
+            "task_start",
+            "task_complete",
+            "task_cancel",
+            "task_assign",
             "create_issue",
             "update_issue",
             "close_issue",
@@ -937,7 +987,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(names.len(), 26, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 32, "unexpected tool count: {names:?}");
     }
 
     /// The schema list is serialized verbatim into the prompt prefix; a
@@ -956,7 +1006,7 @@ mod tests {
     fn issue_tools_absent_without_a_configured_backend() {
         let (_root, reg) = bare_registry(None);
         let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
-        assert_eq!(names.len(), 18, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 24, "unexpected tool count: {names:?}");
         for absent in [
             "create_issue",
             "update_issue",
@@ -1092,6 +1142,7 @@ mod tests {
                     | "explorations"
                     | "ci_status"
                     | "search_issues"
+                    | "task_list"
                     | "get_issue"
                     | "list_labels"
                     | "list_members"

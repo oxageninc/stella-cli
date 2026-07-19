@@ -13,11 +13,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Widget};
 use ratatui_comfy_tabs::{TabNav, TabNavState};
 
+use stella_protocol::{CiStatus, PrStatus};
+
 use crate::composer::{ComposerLayout, layout as composer_layout, split_row_at};
-use crate::deck::{DeckTab, WorkspaceModel};
+use crate::deck::{DeckTab, PrInfo, WorkspaceModel};
 use crate::deck_ui::DeckUi;
 use crate::render::{render_slash_popup, scroll_window_start, slash_popup_area};
-use crate::textline::stage_label;
+use crate::textline::{pr_status_label, stage_label};
 use crate::{fx, splash, theme, views};
 
 /// How long the deck fades in from muted after the splash hands off.
@@ -326,7 +328,7 @@ fn render_sessions_overlay(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf:
 
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
-        " ↑/↓ select · a archive · x delete · r refresh · esc/← close",
+        " ↑/↓ select · ↵ open · a archive · x delete · r refresh · esc/← close",
         theme::muted(),
     )));
 
@@ -351,8 +353,10 @@ fn phase_color(phase: crate::envelope::SessionPhase) -> ratatui::style::Color {
 }
 
 /// The INBOX overlay (`/inbox`): the persist-until-read notifications,
-/// newest first — unread bold with a ● dot, read dimmed with ✓. Marking read
-/// (Enter/Space, or `R` for all) is the only way a message leaves the badge.
+/// newest first — unread bold with a ● dot, read dimmed with ✓, and a `↗`
+/// marker on rows that link a session (⏎ marks those read AND opens the
+/// session). Marking read (⏎/Space, or `R` for all) is the only way a
+/// message leaves the badge.
 fn render_inbox_overlay(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut Buffer) {
     let w = area.width.saturating_sub(8).min(96);
     let h = area.height.saturating_sub(6).min(area.height);
@@ -405,14 +409,20 @@ fn render_inbox_overlay(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &m
         } else {
             Style::default().fg(theme::WARNING_BRIGHT)
         };
-        lines.push(Line::from(vec![
+        let mut row = vec![
             Span::raw(marker),
             Span::styled(dot, dot_style),
             Span::styled(
-                truncate_chars(&n.title, (w as usize).saturating_sub(8)),
+                truncate_chars(&n.title, (w as usize).saturating_sub(10)),
                 title_style,
             ),
-        ]));
+        ];
+        if n.session_id.is_some() {
+            // A subtle link marker: ⏎ on this row opens the session it is
+            // about (replaying it when it is no longer live).
+            row.push(Span::styled(" ↗", theme::muted()));
+        }
+        lines.push(Line::from(row));
         let source = if n.source.is_empty() {
             String::new()
         } else {
@@ -432,7 +442,7 @@ fn render_inbox_overlay(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &m
 
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
-        " ↑/↓ select · ⏎/␣ mark read · R mark all read · esc close",
+        " ↑/↓ select · ↵ open · ␣ mark read · R mark all read · esc close",
         theme::muted(),
     )));
 
@@ -961,7 +971,7 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
     // row longer; STAGE and CONTEXT are must-keep (`MUST_KEEP`) because the
     // stage and the token meter are the load-bearing cells.
     const MUST_KEEP: u8 = 9;
-    let cells: Vec<(&str, Vec<Span<'static>>, u8)> = vec![
+    let mut cells: Vec<(&str, Vec<Span<'static>>, u8)> = vec![
         (
             "AGENT",
             vec![Span::styled(
@@ -1032,30 +1042,41 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
             vec![Span::styled(pipeline_txt, pipeline_style)],
             3,
         ),
-        (
-            "INBOX",
-            {
-                // Persist-until-read notifications: the badge is the always-on
-                // surface; `/inbox` opens the overlay that clears it.
-                let unread = ui.notifications.iter().filter(|n| !n.read).count();
-                if unread == 0 {
-                    vec![Span::styled("—", dim)]
-                } else {
-                    vec![Span::styled(
-                        format!("✉ {unread}"),
-                        Style::default()
-                            .fg(theme::WARNING_BRIGHT)
-                            .add_modifier(Modifier::BOLD),
-                    )]
-                }
-            },
-            if ui.notifications.iter().any(|n| !n.read) {
-                8
-            } else {
-                2
-            },
-        ),
     ];
+    // PR: only once a Pr event has been observed. Failing CI raises the drop
+    // priority the same way an unread INBOX badge does — a red ✗ must survive
+    // a narrow row.
+    if let Some(pr) = &model.pr {
+        let priority = if pr.ci == Some(CiStatus::Failing) {
+            8
+        } else {
+            5
+        };
+        cells.push(("PR", pr_cell(pr), priority));
+    }
+    cells.push((
+        "INBOX",
+        {
+            // Persist-until-read notifications: the badge is the always-on
+            // surface; `/inbox` opens the overlay that clears it.
+            let unread = ui.notifications.iter().filter(|n| !n.read).count();
+            if unread == 0 {
+                vec![Span::styled("—", dim)]
+            } else {
+                vec![Span::styled(
+                    format!("✉ {unread}"),
+                    Style::default()
+                        .fg(theme::WARNING_BRIGHT)
+                        .add_modifier(Modifier::BOLD),
+                )]
+            }
+        },
+        if ui.notifications.iter().any(|n| !n.read) {
+            8
+        } else {
+            2
+        },
+    ));
 
     let brand = " ✦ stella ";
     let brand_w = brand.chars().count();
@@ -1162,6 +1183,53 @@ fn meter_bar(frac: f64) -> String {
     (0..CELLS)
         .map(|i| if i < filled { '▮' } else { '▯' })
         .collect()
+}
+
+/// The PR statline cell's spans: `⇢ #183 open` (or the URL tail when the
+/// monitor parsed no number) colored by PR status, plus a CI glyph once a
+/// verdict has been observed — `✓` passing, `✗` failing (bold), `◌` pending /
+/// `…` running (dim).
+fn pr_cell(pr: &PrInfo) -> Vec<Span<'static>> {
+    let status_style = Style::default().fg(pr_status_color(pr.status));
+    let ident = match pr.number {
+        Some(n) => format!("⇢ #{n}"),
+        // No parsed number — the URL tail still identifies the PR.
+        None => format!(
+            "⇢ {}",
+            pr.url.rsplit('/').find(|s| !s.is_empty()).unwrap_or("pr")
+        ),
+    };
+    let mut spans = vec![
+        Span::styled(ident, status_style.add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {}", pr_status_label(pr.status)), status_style),
+    ];
+    if let Some(ci) = pr.ci {
+        let (glyph, style) = match ci {
+            CiStatus::Passing => ("✓", Style::default().fg(theme::OK)),
+            CiStatus::Failing => (
+                "✗",
+                Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
+            ),
+            CiStatus::Pending => ("◌", Style::default().fg(theme::TEXT_TERTIARY)),
+            CiStatus::Running => ("…", Style::default().fg(theme::TEXT_TERTIARY)),
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(glyph, style));
+    }
+    spans
+}
+
+/// The transcript's PR aurora ramp — `render`'s `pr_status_color` is private
+/// to that module, so the statline replicates it: quiet amber draft (the one
+/// semantic-warning exception), azure while open, cyan on merge, magenta on
+/// close.
+fn pr_status_color(status: PrStatus) -> ratatui::style::Color {
+    match status {
+        PrStatus::Draft => theme::WARNING,
+        PrStatus::Open => theme::AURORA_AZURE,
+        PrStatus::Merged => theme::AURORA_CYAN,
+        PrStatus::Closed => theme::AURORA_MAGENTA,
+    }
 }
 
 /// Format a token count compactly: `42k`, `1.2k`, `950`.
@@ -1722,6 +1790,66 @@ mod tests {
             !text.contains("tokens"),
             "no token counts before any usage:\n{text}"
         );
+    }
+
+    /// One `Pr` event folded onto the running model.
+    fn model_with_pr(number: Option<u64>, ci: Option<stella_protocol::CiStatus>) -> WorkspaceModel {
+        let mut m = running_model_with_queue();
+        m.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Pr {
+                url: "https://github.com/x/y/pull/183".into(),
+                status: stella_protocol::PrStatus::Open,
+                number,
+                ci,
+            },
+        });
+        m
+    }
+
+    #[test]
+    fn statline_has_no_pr_cell_before_any_pr_event() {
+        let model = running_model_with_queue();
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(
+            !text.contains("PR") && !text.contains('⇢'),
+            "no PR cell before a Pr event:\n{text}"
+        );
+    }
+
+    #[test]
+    fn statline_pr_cell_shows_number_status_and_a_bold_failing_cross() {
+        let model = model_with_pr(Some(183), Some(stella_protocol::CiStatus::Failing));
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("PR"), "PR label present:\n{text}");
+        assert!(
+            text.contains("⇢ #183 open"),
+            "number + status in the cell:\n{text}"
+        );
+        assert!(text.contains('✗'), "failing CI shows the cross:\n{text}");
+    }
+
+    #[test]
+    fn statline_pr_cell_falls_back_to_the_url_tail_without_a_number() {
+        let model = model_with_pr(None, Some(stella_protocol::CiStatus::Passing));
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("⇢ 183 open"),
+            "the URL tail identifies the PR when no number parsed:\n{text}"
+        );
+        assert!(text.contains('✓'), "passing CI shows the check:\n{text}");
     }
 
     #[test]

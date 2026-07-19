@@ -1,5 +1,5 @@
 //! Session tab — the focused agent's REPL surface (identity header + HUD +
-//! any pending gate card + transcript). It **reuses** the single-session
+//! any pending gate card + the task-board checklist + transcript). It **reuses** the single-session
 //! renderers (`render_hud`, `render_transcript`, `render_scope_review`,
 //! `render_ask_user`, `entry_lines`) so the classic view is pixel-identical,
 //! just scoped to whichever agent `ui.focused` points at. No transcript
@@ -7,12 +7,14 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use std::collections::HashSet;
 use std::ops::Range;
+
+use stella_protocol::{TaskItem, TaskStatus};
 
 use crate::deck::{AgentEntry, WorkspaceModel};
 use crate::deck_ui::DeckUi;
@@ -157,12 +159,23 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
         Some(p) => (p.options.len() as u16 + 5).min(12),
         None => 0,
     };
+    // The TASKS card sits between the gates and the transcript when the
+    // board is non-empty (0 = collapsed). Its interior is capped at
+    // [`TASK_CARD_MAX_ROWS`] rows by [`task_card_rows`], so the whole card
+    // never exceeds 10 lines and cannot steal the transcript.
+    let task_rows = task_card_rows(&sm.tasks);
+    let tasks_h: u16 = if task_rows.is_empty() {
+        0
+    } else {
+        (task_rows.len() as u16 + 2).min(10)
+    };
 
     let bands = Layout::vertical([
         Constraint::Length(1),       // identity header
         Constraint::Length(3),       // HUD
         Constraint::Length(scope_h), // pending scope review (0 = collapsed)
         Constraint::Length(ask_h),   // pending ask-user (0 = collapsed)
+        Constraint::Length(tasks_h), // task-board checklist (0 = collapsed)
         Constraint::Min(1),          // transcript
     ])
     .split(area);
@@ -175,11 +188,18 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
     if let Some(prompt) = &sm.pending_ask_user {
         render_ask_user(prompt, false, bands[3], buf);
     }
+    if !task_rows.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::muted())
+            .title(" TASKS ");
+        Paragraph::new(task_rows).block(block).render(bands[4], buf);
+    }
 
     // Transcript: fold through the incremental cache (settled entries fold
     // once; only the streaming tail re-folds per frame), then reuse the
     // line-exact scroll window over the cached rows.
-    let width = inner_width(bands[4]);
+    let width = inner_width(bands[5]);
     let empty = HashSet::new();
     let expanded_set = ui.expanded.get(&agent.meta.id).unwrap_or(&empty);
     ui.session_fold.refresh(
@@ -191,7 +211,7 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
         ui.expanded_rev,
         width,
     );
-    let height = inner_height(bands[4]);
+    let height = inner_height(bands[5]);
     let total = ui.session_fold.total();
 
     // A selection move from the key handler lands here, where visual-row
@@ -243,9 +263,83 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
         total,
         ui.session_scroll.follow,
         Some(hint),
-        bands[4],
+        bands[5],
         buf,
     );
+}
+
+/// Most checklist rows the TASKS card shows before collapsing the tail.
+const TASK_CARD_MAX_ROWS: usize = 8;
+
+/// Build the TASKS card's checklist rows from the latest board snapshot —
+/// pure, so the collapse policy is unit-testable, and total on any board
+/// contents (no indexing beyond what is counted, no unwraps).
+///
+/// - Empty board → no rows (the card disappears entirely).
+/// - A board that fits ([`TASK_CARD_MAX_ROWS`] or fewer) renders every task
+///   in board order.
+/// - A larger board prefers the open work (pending + in-progress, still in
+///   board order) and folds everything hidden into one dim tail row —
+///   `… +K done` for the finished/cancelled tasks, plus `+J more` if even
+///   the open set overflows.
+fn task_card_rows(tasks: &[TaskItem]) -> Vec<Line<'static>> {
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+    if tasks.len() <= TASK_CARD_MAX_ROWS {
+        return tasks.iter().map(task_row).collect();
+    }
+    let open: Vec<&TaskItem> = tasks.iter().filter(|t| t.status.is_open()).collect();
+    let done = tasks.len() - open.len();
+    let shown = open.len().min(TASK_CARD_MAX_ROWS - 1);
+    let mut rows: Vec<Line<'static>> = open.iter().take(shown).map(|t| task_row(t)).collect();
+    let hidden_open = open.len() - shown;
+    let mut parts: Vec<String> = Vec::new();
+    if hidden_open > 0 {
+        parts.push(format!("+{hidden_open} more"));
+    }
+    if done > 0 {
+        parts.push(format!("+{done} done"));
+    }
+    if !parts.is_empty() {
+        rows.push(Line::from(Span::styled(
+            format!("… {}", parts.join(" · ")),
+            theme::muted(),
+        )));
+    }
+    rows
+}
+
+/// One checklist row: status glyph · `#id subject` · dim ` (owner)`.
+fn task_row(task: &TaskItem) -> Line<'static> {
+    let (glyph, glyph_style, text_style) = match task.status {
+        TaskStatus::Pending => ("☐", theme::muted(), Style::new().fg(theme::TEXT_SECONDARY)),
+        TaskStatus::InProgress => (
+            "▸",
+            theme::accent().add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(theme::TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TaskStatus::Completed => (
+            "✓",
+            Style::new().fg(theme::SUCCESS),
+            Style::new().fg(theme::TEXT_TERTIARY),
+        ),
+        TaskStatus::Cancelled => (
+            "✗",
+            Style::new().fg(theme::DANGER).add_modifier(Modifier::DIM),
+            Style::new().fg(theme::TEXT_TERTIARY),
+        ),
+    };
+    let mut spans = vec![
+        Span::styled(format!(" {glyph} "), glyph_style),
+        Span::styled(format!("#{} {}", task.id, task.subject), text_style),
+    ];
+    if let Some(owner) = &task.owner {
+        spans.push(Span::styled(format!(" ({owner})"), theme::muted()));
+    }
+    Line::from(spans)
 }
 
 /// The one-line identity header: `▶ lead · running   0:00:00`. The trailing
@@ -434,6 +528,150 @@ mod tests {
         assert!(
             text.contains("first-message"),
             "selected entry still visible under streaming:\n{text}"
+        );
+    }
+
+    fn task(id: &str, subject: &str, status: TaskStatus, owner: Option<&str>) -> TaskItem {
+        TaskItem {
+            id: id.into(),
+            subject: subject.into(),
+            description: None,
+            status,
+            owner: owner.map(str::to_string),
+        }
+    }
+
+    /// Flatten one card row to its plain text (content, not style).
+    fn row_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn task_card_rows_empty_board_builds_no_card() {
+        assert!(task_card_rows(&[]).is_empty(), "no board → no card");
+    }
+
+    #[test]
+    fn task_card_rows_small_board_shows_every_task_in_order_with_glyphs() {
+        let tasks = vec![
+            task("1", "Fix the redirect loop", TaskStatus::Completed, None),
+            task(
+                "2",
+                "Add the session card",
+                TaskStatus::InProgress,
+                Some("lead"),
+            ),
+            task("3", "Write the tests", TaskStatus::Pending, None),
+        ];
+        let rows = task_card_rows(&tasks);
+        assert_eq!(rows.len(), 3, "a board that fits shows every task");
+        assert_eq!(row_text(&rows[0]), " ✓ #1 Fix the redirect loop");
+        assert_eq!(row_text(&rows[1]), " ▸ #2 Add the session card (lead)");
+        assert_eq!(row_text(&rows[2]), " ☐ #3 Write the tests");
+    }
+
+    #[test]
+    fn task_card_rows_large_board_prefers_open_work_and_collapses_the_done_tail() {
+        // 12 tasks, 6 done: the 6 open ones (board order) + one collapse row.
+        let mut tasks = Vec::new();
+        for i in 0..6 {
+            tasks.push(task(
+                &format!("{}", i + 1),
+                "done work",
+                TaskStatus::Completed,
+                None,
+            ));
+        }
+        tasks.push(task("7", "doing now", TaskStatus::InProgress, None));
+        for i in 7..12 {
+            tasks.push(task(
+                &format!("{}", i + 1),
+                "still open",
+                TaskStatus::Pending,
+                None,
+            ));
+        }
+        let rows = task_card_rows(&tasks);
+        assert_eq!(rows.len(), 7, "6 open rows + the collapse row");
+        assert_eq!(
+            row_text(&rows[0]),
+            " ▸ #7 doing now",
+            "open work leads, in board order"
+        );
+        for row in &rows[1..6] {
+            assert!(row_text(row).contains("still open"), "pending rows follow");
+        }
+        assert_eq!(
+            row_text(&rows[6]),
+            "… +6 done",
+            "the finished tail folds into one dim row"
+        );
+        // And the whole card stays inside its height budget.
+        assert!(rows.len() <= TASK_CARD_MAX_ROWS);
+    }
+
+    #[test]
+    fn task_card_rows_overflowing_open_work_reports_the_hidden_count() {
+        // 12 open tasks: 7 rows shown, the rest folded as `+5 more`.
+        let tasks: Vec<TaskItem> = (0..12)
+            .map(|i| task(&format!("{}", i + 1), "open", TaskStatus::Pending, None))
+            .collect();
+        let rows = task_card_rows(&tasks);
+        assert_eq!(rows.len(), TASK_CARD_MAX_ROWS);
+        assert_eq!(row_text(&rows[7]), "… +5 more");
+    }
+
+    #[test]
+    fn tasks_card_renders_between_hud_and_transcript_and_vanishes_when_empty() {
+        let mut model = WorkspaceModel::new();
+        model.apply_inbound(&Inbound::Register(AgentMeta::new("lead", "goal", 0)));
+        let area = Rect::new(0, 0, 80, 24);
+
+        // Empty board: no card.
+        let mut ui = DeckUi::default();
+        let mut buf = Buffer::empty(area);
+        render(&model, &mut ui, area, &mut buf);
+        assert!(
+            !buffer_text(&buf).contains("TASKS"),
+            "no card on an empty board"
+        );
+
+        // A TaskUpdate folds the board in — the card appears with the rows.
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: stella_protocol::AgentEvent::TaskUpdate {
+                tasks: vec![
+                    task(
+                        "1",
+                        "Fix the auth redirect",
+                        TaskStatus::InProgress,
+                        Some("lead"),
+                    ),
+                    task("2", "Ship the fix", TaskStatus::Pending, None),
+                ],
+            },
+        });
+        let mut buf = Buffer::empty(area);
+        render(&model, &mut ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("TASKS"), "card title visible:\n{text}");
+        assert!(
+            text.contains("#1 Fix the auth redirect"),
+            "in-progress row visible:\n{text}"
+        );
+        assert!(text.contains("(lead)"), "owner suffix visible:\n{text}");
+        assert!(text.contains("#2 Ship the fix"), "pending row:\n{text}");
+
+        // An empty snapshot clears the board — the card disappears again.
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: stella_protocol::AgentEvent::TaskUpdate { tasks: vec![] },
+        });
+        let mut buf = Buffer::empty(area);
+        render(&model, &mut ui, area, &mut buf);
+        assert!(
+            !buffer_text(&buf).contains("#1 Fix the auth redirect"),
+            "cleared board removes the checklist rows"
         );
     }
 
