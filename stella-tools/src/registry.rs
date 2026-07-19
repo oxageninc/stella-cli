@@ -79,9 +79,8 @@ pub struct ToolRegistry {
     /// drain discipline, so no request is dispatched twice.
     spawn_queue: crate::tasks::SpawnQueue,
     storage_index: std::sync::Mutex<StorageIndex>,
-    schema_index: std::sync::Mutex<SchemaIndex>,
     /// Which workspace paths are covered by a FRESH saved exploration map —
-    /// the read-side analogue of `schema_index` (`docs/design/
+    /// the read-side analogue of `storage_index` (`docs/design/
     /// exploration-sharing.md` §6). Built once at construction, refreshed
     /// after every `save_exploration`; drives the once-per-session
     /// "this area is already mapped" hints on search-tool results.
@@ -92,11 +91,6 @@ pub struct ToolRegistry {
     bus: std::sync::RwLock<Option<HookBus>>,
 }
 
-/// The session's storage-map state for the pre-write gate
-/// (`docs/design/storage-map.md` §8): a host-seeded baseline snapshot plus
-/// the relations created by writes this session — which the on-disk index
-/// may not have re-indexed yet. The gate merges both over a fresh read of
-/// the persisted index on every gated write.
 /// Path-coverage of fresh exploration maps plus the hint dedup set.
 #[derive(Debug, Default)]
 struct ExplorationCoverage {
@@ -132,9 +126,11 @@ impl ExplorationCoverage {
     }
 }
 
-/// The known schema objects in the workspace, used by the schema gate to
-/// prevent duplicate table/type/view creation. Populated from the code graph
-/// or empty when no graph is open.
+/// The session's storage-map state for the pre-write gate
+/// (`docs/design/storage-map.md` §8): a host-seeded baseline snapshot plus
+/// the relations created by writes this session — which the on-disk index
+/// may not have re-indexed yet. The gate merges both over a fresh read of
+/// the persisted index on every gated write.
 #[derive(Debug, Clone, Default)]
 pub struct StorageIndex {
     baseline: stella_graph::StorageSnapshot,
@@ -322,7 +318,6 @@ impl ToolRegistry {
             task_board,
             spawn_queue,
             storage_index: std::sync::Mutex::new(StorageIndex::default()),
-            schema_index: std::sync::Mutex::new(SchemaIndex::default()),
             exploration_coverage,
             bus: std::sync::RwLock::new(None),
         }
