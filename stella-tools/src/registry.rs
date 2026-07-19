@@ -235,7 +235,8 @@ impl ToolRegistry {
             Arc::new(crate::project::RunTests),
             Arc::new(crate::project::RunLint),
             Arc::new(crate::project::FormatCode),
-            Arc::new(crate::script::RunScript),
+            Arc::new(crate::scripts::ListScripts),
+            Arc::new(crate::scripts::RunScript),
             // The process group shares one table; it lives exactly as long
             // as the registry and its Drop reaps anything still running.
             Arc::new(crate::process::StartProcess(processes.clone())),
@@ -424,6 +425,17 @@ impl ToolRegistry {
             }
         }
         let input: &Value = ledger_augmented.as_ref().unwrap_or(input);
+        // `run_script` composes its command from the scripts index at
+        // execute time; resolve it up front (best-effort) so the
+        // `command.started` policy chain and the command.* observer events
+        // carry the real command line, exactly like `bash`. A failed
+        // resolution is not gated — the tool itself returns the named error.
+        let resolved_script_command: Option<String> = match (&bus, name) {
+            (Some(_), "run_script") => {
+                crate::scripts::resolve_command_for_gate(&self.root, input).await
+            }
+            _ => None,
+        };
 
         // Classify the file op BEFORE executing: create-vs-update depends
         // on whether the file exists now, not after the write.
@@ -496,7 +508,13 @@ impl ToolRegistry {
         // plus the payload-hygiene detectors, then the observable
         // `tool.call.started` (with content-bearing fields sanitized).
         if let Some(bus) = &bus {
-            if let Err(denied) = self.gate_side_effects(bus, name, input, pending_op.as_ref()) {
+            if let Err(denied) = self.gate_side_effects(
+                bus,
+                name,
+                input,
+                pending_op.as_ref(),
+                resolved_script_command.as_deref(),
+            ) {
                 return denied;
             }
             bus.emit_named(
@@ -526,7 +544,13 @@ impl ToolRegistry {
         };
         if let Some(bus) = &bus {
             let duration_ms = started_at.elapsed().as_millis() as u64;
-            let command = || input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            // The command line the tool actually ran: bash's own input, or
+            // run_script's index-resolved command.
+            let command_line: Option<&str> = match name {
+                "bash" => Some(input.get("command").and_then(|v| v.as_str()).unwrap_or("")),
+                "run_script" => resolved_script_command.as_deref(),
+                _ => None,
+            };
             match &output {
                 ToolOutput::Error { message } => {
                     bus.emit_named(
@@ -535,10 +559,10 @@ impl ToolRegistry {
                             "tool": name, "error": message, "duration_ms": duration_ms,
                         }),
                     );
-                    if name == "bash" {
+                    if let Some(command) = command_line {
                         bus.emit_named(
                             hook_names::COMMAND_FAILED,
-                            serde_json::json!({ "command": command(), "error": message }),
+                            serde_json::json!({ "command": command, "error": message }),
                         );
                     }
                 }
@@ -547,10 +571,10 @@ impl ToolRegistry {
                         hook_names::TOOL_CALL_COMPLETED,
                         serde_json::json!({ "tool": name, "duration_ms": duration_ms }),
                     );
-                    if name == "bash" {
+                    if let Some(command) = command_line {
                         bus.emit_named(
                             hook_names::COMMAND_COMPLETED,
-                            serde_json::json!({ "command": command() }),
+                            serde_json::json!({ "command": command }),
                         );
                     }
                 }
@@ -687,7 +711,9 @@ impl ToolRegistry {
     /// detectors for one already-final input: `sensitive_operation.detected`
     /// and `secret.detected` observers first (an auditor sees the attempt
     /// even when a policy then denies it), then the `file.*` chain for a
-    /// classified C/U/D op and the `command.started` chain for `bash`.
+    /// classified C/U/D op and the `command.started` chain for `bash` and
+    /// `run_script` (`resolved_command` is the latter's index-resolved
+    /// command line).
     /// These chains gate — `modify` decisions are recorded but not honored
     /// here, because the input was already final after
     /// `tool.call.requested`. Reads are observable but never interceptable.
@@ -697,6 +723,7 @@ impl ToolRegistry {
         name: &str,
         input: &Value,
         pending: Option<&PendingTouch>,
+        resolved_command: Option<&str>,
     ) -> Result<(), ToolOutput> {
         if let Some(pending) = pending {
             if bus::is_sensitive_path(&pending.path) {
@@ -762,8 +789,12 @@ impl ToolRegistry {
                 }
             }
         }
-        if name == "bash" {
-            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let command_line: Option<&str> = match name {
+            "bash" => Some(input.get("command").and_then(|v| v.as_str()).unwrap_or("")),
+            "run_script" => resolved_command,
+            _ => None,
+        };
+        if let Some(command) = command_line {
             let outcome = bus.emit_blocking(HookEventDraft::new(
                 hook_names::COMMAND_STARTED,
                 serde_json::json!({ "command": command }),
@@ -1253,6 +1284,7 @@ mod tests {
             "run_tests",
             "run_lint",
             "format_code",
+            "list_scripts",
             "run_script",
             "start_process",
             "read_output",
@@ -1285,7 +1317,7 @@ mod tests {
         }
         // `bash` is NOT in the default surface — it is the settings opt-in.
         assert!(!names.contains(&"bash".to_string()), "{names:?}");
-        assert_eq!(names.len(), 43, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 44, "unexpected tool count: {names:?}");
     }
 
     // ---- bash opt-in (default OFF everywhere) -------------------------
@@ -1353,7 +1385,7 @@ mod tests {
     fn issue_tools_absent_without_a_configured_backend() {
         let (_root, reg) = bare_registry(None);
         let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
-        assert_eq!(names.len(), 35, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 36, "unexpected tool count: {names:?}");
         for absent in [
             "create_issue",
             "update_issue",
@@ -1487,6 +1519,7 @@ mod tests {
                     | "glob"
                     | "gather_context"
                     | "explorations"
+                    | "list_scripts"
                     | "ci_status"
                     | "search_issues"
                     | "task_list"
@@ -2201,5 +2234,38 @@ mod tests {
         std::fs::write(dir2.path().join("f.txt"), "hi\n").unwrap();
         exec_ok(&plain, "read_file", serde_json::json!({"path": "f.txt"})).await;
         assert_eq!(plain.file_touch_telemetry().files_touched.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_command_chain_gates_run_script_with_its_resolved_command() {
+        // `run_script` composes its command from the scripts index, so the
+        // same `command.started` policy that fences `bash` must fence it —
+        // with the resolved command line, not the script name.
+        let (dir, reg) = telemetry_fixture();
+        std::fs::write(dir.path().join("Makefile"), "greet:\n\t@echo hi\n").unwrap();
+        let bus = HookBus::new("sess");
+        let denied_command = StdArc::new(StdMutex::new(String::new()));
+        let sink = denied_command.clone();
+        bus.on_blocking(hook_names::COMMAND_STARTED, move |event| {
+            *sink.lock().unwrap() = event.payload["command"].as_str().unwrap_or("").to_string();
+            HookDecision::Deny {
+                reason: "no shell".into(),
+            }
+        })
+        .detach();
+        reg.attach_bus(bus);
+
+        let out = reg
+            .execute("run_script", &serde_json::json!({"script": "make:greet"}))
+            .await;
+        assert!(
+            out.is_error(),
+            "denied run_script must not execute: {out:?}"
+        );
+        assert_eq!(
+            *denied_command.lock().unwrap(),
+            "make greet",
+            "the chain must see the index-resolved command line"
+        );
     }
 }

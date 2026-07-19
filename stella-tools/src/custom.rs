@@ -102,7 +102,6 @@ pub const RESERVED_NAMES: &[&str] = &[
     // Manifest-verb execution (argv, no shell)
     "run_lint",
     "format_code",
-    "run_script",
     // The long-running process group
     "start_process",
     "read_output",
@@ -124,6 +123,9 @@ pub const RESERVED_NAMES: &[&str] = &[
     "verify_done",
     "build_project",
     "run_tests",
+    // The project scripts index (docs/design/scripts-index.md)
+    "list_scripts",
+    "run_script",
     // CI & evidence
     "ci_status",
     "screenshot",

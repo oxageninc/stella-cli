@@ -268,6 +268,15 @@ enum Command {
         target: String,
     },
 
+    /// List or run the project's package-manager scripts — deterministic
+    /// static detection (cargo/npm/uv/go/make/just/…) mapped onto canonical
+    /// verbs (install/build/start/test/lint/format). Offline: manifest
+    /// parsing plus a local subprocess, needs no API key.
+    Scripts {
+        #[command(subcommand)]
+        cmd: ScriptsCmd,
+    },
+
     /// List configured providers and available models
     Models {
         #[command(subcommand)]
@@ -594,6 +603,87 @@ fn run_observe(port: u16, open: bool) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// The `stella scripts` surface, mirroring the `list_scripts`/`run_script`
+/// tools one-for-one so a human at the CLI and the model inside a turn see
+/// the same frames (docs/design/scripts-index.md).
+#[derive(Subcommand)]
+enum ScriptsCmd {
+    /// List detected scripts and their canonical verb bindings
+    List {
+        /// Emit the index as JSON (schema_version 1)
+        #[arg(long)]
+        json: bool,
+
+        /// Narrow to one workspace package dir
+        #[arg(long)]
+        dir: Option<String>,
+    },
+    /// Run a script by canonical verb or qualified id (e.g. test, pnpm:build)
+    Run {
+        /// install|build|start|test|lint|format, or a qualified id
+        script: String,
+
+        /// Package dir when the id exists in several packages
+        #[arg(long)]
+        dir: Option<String>,
+
+        /// Timeout in seconds
+        #[arg(long, default_value_t = 600)]
+        timeout_secs: u64,
+
+        /// Extra args appended runner-natively (after `--` for npm-family)
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+}
+
+/// `stella scripts …` — the human door to the project scripts index.
+/// Detection is static manifest parsing; `run` executes one indexed entry.
+fn run_scripts(cmd: &ScriptsCmd) -> Result<(), String> {
+    let root =
+        std::env::current_dir().map_err(|e| format!("cannot determine workspace root: {e}"))?;
+    match cmd {
+        ScriptsCmd::List { json, dir } => {
+            let index = stella_tools::scripts::ScriptIndex::detect_blocking(&root);
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&index.to_json())
+                        .map_err(|e| format!("serialize index: {e}"))?
+                );
+            } else {
+                println!("{}", index.render_list(dir.as_deref()));
+            }
+            Ok(())
+        }
+        ScriptsCmd::Run {
+            script,
+            dir,
+            timeout_secs,
+            args,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to start runtime: {e}"))?;
+            let output = rt.block_on(stella_tools::scripts::run_by_name(
+                &root,
+                script,
+                dir.as_deref(),
+                args,
+                *timeout_secs,
+            ));
+            match output {
+                stella_protocol::tool::ToolOutput::Ok { content } => {
+                    println!("{content}");
+                    Ok(())
+                }
+                stella_protocol::tool::ToolOutput::Error { message } => Err(message),
+            }
+        }
+    }
+}
+
 /// `stella graph <op> <target>` — the human door to the same query surface
 /// the `graph_query` tool gives the agent. Frames print exactly as the model
 /// would receive them.
@@ -680,6 +770,11 @@ fn run(cli: Cli) -> Result<(), String> {
         Some(Command::Graph { op, target }) => {
             // Reads the local index only — works with zero API keys.
             return run_graph(*op, target);
+        }
+        Some(Command::Scripts { cmd }) => {
+            // Static manifest parsing plus a local subprocess — works with
+            // zero API keys.
+            return run_scripts(cmd);
         }
         Some(Command::Stats { format, provider }) => {
             // Reads local telemetry only — works with zero API keys.
@@ -849,6 +944,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Init
         | Command::Tools { .. }
         | Command::Graph { .. }
+        | Command::Scripts { .. }
         | Command::Stats { .. }
         | Command::Memory { .. }
         | Command::Mcp { .. }

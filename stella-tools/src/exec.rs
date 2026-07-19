@@ -122,6 +122,26 @@ async fn drive(
     ))
 }
 
+/// [`run`] with the PASSED/FAILED framing shared by `build_project`,
+/// `run_tests`, and `run_script` — the model reads success or failure from
+/// the first line without a follow-up question.
+pub(crate) async fn run_and_report(
+    command: &str,
+    dir: &std::path::Path,
+    timeout_secs: u64,
+) -> stella_protocol::tool::ToolOutput {
+    use stella_protocol::tool::ToolOutput;
+    match run(command, dir, timeout_secs).await {
+        Ok((0, output)) => ToolOutput::Ok {
+            content: format!("`{command}` PASSED (exit 0)\n{output}"),
+        },
+        Ok((code, output)) => ToolOutput::Error {
+            message: format!("`{command}` FAILED (exit {code})\n{output}"),
+        },
+        Err(e) => ToolOutput::Error { message: e },
+    }
+}
+
 /// Keep head and tail when output exceeds the cap — build/test failures
 /// matter at both ends (first error, final summary).
 pub(crate) fn truncate_middle(s: String) -> String {

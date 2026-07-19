@@ -1,90 +1,33 @@
 //! `build_project`, `run_tests`, `run_lint`, `format_code` —
 //! toolchain-aware build/test/lint/format execution.
 //!
-//! All four detect the workspace's toolchain (Cargo, package.json + its
-//! package manager, Go, Make) and run its canonical command; build/test
-//! also accept an explicit `command` override for anything exotic.
-//! `run_tests` supports `kind` (unit / e2e / all) and a `filter` mapped to
-//! the runner's native filtering flag — module, package, file, or
-//! test-name granularity is the runner's own semantics. `run_lint` and
-//! `format_code` take no free-form command at all: they run the resolved
-//! toolchain verb via argv exec (no shell), and a workspace with no
-//! recognized linter/formatter is a named error, not a guess.
+//! All four are thin verb shortcuts over the project scripts index
+//! (`crate::scripts`, spec: `docs/design/scripts-index.md`): detection is
+//! the index's one code path. `build_project` runs the `build` verb
+//! binding; `run_tests` layers its `kind` (unit / e2e / all) and `filter`
+//! semantics on top — mapped to the runner's native filtering flag, or to
+//! the project's own `test:unit`/`test:e2e` scripts; both accept an
+//! explicit `command` override for anything exotic. `run_lint` and
+//! `format_code` take no free-form command at all: they run the index's
+//! `lint`/`format` verb binding via argv exec (no shell), and a workspace
+//! with no recognized linter/formatter is a named error, not a guess.
 
 use async_trait::async_trait;
 use serde_json::Value;
 use stella_protocol::tool::{ToolOutput, ToolSchema};
 
-use crate::exec;
+use crate::exec::{self, run_and_report};
 use crate::registry::Tool;
+use crate::scripts::ScriptIndex;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
-/// What toolchain drives this workspace.
-enum Toolchain {
-    Cargo,
-    Node {
-        pm: &'static str,
-        scripts: serde_json::Map<String, Value>,
-    },
-    Go,
-    Make,
-}
-
-/// Async so the marker-file stats and the `package.json` read never block a
-/// runtime worker thread (#64) — this runs inside the tools' async
-/// `execute()` methods.
-async fn detect(root: &std::path::Path) -> Option<Toolchain> {
-    let exists = |name: &'static str| async move {
-        tokio::fs::try_exists(root.join(name))
-            .await
-            .unwrap_or(false)
-    };
-    if exists("Cargo.toml").await {
-        return Some(Toolchain::Cargo);
-    }
-    if exists("package.json").await {
-        let pm = if exists("pnpm-lock.yaml").await {
-            "pnpm"
-        } else if exists("yarn.lock").await {
-            "yarn"
-        } else {
-            "npm"
-        };
-        let scripts = tokio::fs::read_to_string(root.join("package.json"))
-            .await
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .and_then(|pkg| pkg.get("scripts").and_then(|s| s.as_object()).cloned())
-            .unwrap_or_default();
-        return Some(Toolchain::Node { pm, scripts });
-    }
-    if exists("go.mod").await {
-        return Some(Toolchain::Go);
-    }
-    if exists("Makefile").await {
-        return Some(Toolchain::Make);
-    }
-    None
-}
-
 fn no_toolchain_error() -> ToolOutput {
     ToolOutput::Error {
-        message: "no recognized toolchain (looked for Cargo.toml, package.json, go.mod, \
-                  Makefile) — pass `command` explicitly"
+        message: "no recognized toolchain (looked for Cargo.toml, package.json, deno.json, \
+                  pyproject.toml, go.mod, Makefile, justfile, Taskfile.yml, composer.json) — \
+                  pass `command` explicitly"
             .into(),
-    }
-}
-
-async fn run_and_report(command: &str, root: &std::path::Path, timeout_secs: u64) -> ToolOutput {
-    match exec::run(command, root, timeout_secs).await {
-        Ok((0, output)) => ToolOutput::Ok {
-            content: format!("`{command}` PASSED (exit 0)\n{output}"),
-        },
-        Ok((code, output)) => ToolOutput::Error {
-            message: format!("`{command}` FAILED (exit {code})\n{output}"),
-        },
-        Err(e) => ToolOutput::Error { message: e },
     }
 }
 
@@ -95,8 +38,8 @@ impl Tool for BuildProject {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "build_project".into(),
-            description: "Build the workspace with its own toolchain (cargo/npm/go/make), or a \
-                          custom command."
+            description: "Build the workspace with its own toolchain (cargo/npm/go/make/…), or \
+                          a custom command."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -117,22 +60,18 @@ impl Tool for BuildProject {
         if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
             return run_and_report(command, root, timeout_secs).await;
         }
-        let command = match detect(root).await {
-            Some(Toolchain::Cargo) => "cargo build --workspace".to_string(),
-            Some(Toolchain::Node { pm, scripts }) => {
-                if scripts.contains_key("build") {
-                    format!("{pm} run build")
-                } else {
-                    return ToolOutput::Error {
-                        message: "package.json has no `build` script — pass `command`".into(),
-                    };
-                }
-            }
-            Some(Toolchain::Go) => "go build ./...".to_string(),
-            Some(Toolchain::Make) => "make build".to_string(),
-            None => return no_toolchain_error(),
-        };
-        run_and_report(&command, root, timeout_secs).await
+        let index = ScriptIndex::detect(root).await;
+        if index.is_empty() {
+            return no_toolchain_error();
+        }
+        match index.verb_entry("build") {
+            Some(entry) => run_and_report(&entry.command, root, timeout_secs).await,
+            None => ToolOutput::Error {
+                message: "no `build` script detected in this workspace (see list_scripts) — \
+                          pass `command`"
+                    .into(),
+            },
+        }
     }
 }
 
@@ -170,8 +109,12 @@ impl Tool for RunTests {
         let kind = input.get("kind").and_then(|v| v.as_str()).unwrap_or("all");
         let filter = input.get("filter").and_then(|v| v.as_str()).unwrap_or("");
 
-        let command = match detect(root).await {
-            Some(Toolchain::Cargo) => match kind {
+        let index = ScriptIndex::detect(root).await;
+        let Some(primary) = index.primary_runner() else {
+            return no_toolchain_error();
+        };
+        let command = match primary {
+            "cargo" => match kind {
                 // Unit tests live beside the code; e2e = the integration
                 // test targets under tests/.
                 "unit" => format!("cargo test --workspace --lib --bins {filter}"),
@@ -184,14 +127,15 @@ impl Tool for RunTests {
                 }
                 _ => format!("cargo test --workspace {filter}"),
             },
-            Some(Toolchain::Node { pm, scripts }) => {
+            pm @ ("npm" | "pnpm" | "yarn" | "bun") => {
+                let scripts = index.root_script_names(pm);
                 let script = match kind {
-                    "unit" if scripts.contains_key("test:unit") => "test:unit",
-                    "e2e" if scripts.contains_key("test:e2e") => "test:e2e",
-                    "e2e" if scripts.contains_key("e2e") => "e2e",
+                    "unit" if scripts.contains("test:unit") => "test:unit",
+                    "e2e" if scripts.contains("test:e2e") => "test:e2e",
+                    "e2e" if scripts.contains("e2e") => "e2e",
                     // NO generic-`test` fallback for e2e: running unit tests
                     // while reporting "e2e passed" is a lie.
-                    "unit" | "all" if scripts.contains_key("test") => "test",
+                    "unit" | "all" if scripts.contains("test") => "test",
                     _ => {
                         return ToolOutput::Error {
                             message: format!(
@@ -207,15 +151,50 @@ impl Tool for RunTests {
                     format!("{pm} run {script} -- {filter}")
                 }
             }
-            Some(Toolchain::Go) => {
+            "go" => {
                 if filter.is_empty() {
                     "go test ./...".to_string()
                 } else {
                     format!("go test ./... -run {filter}")
                 }
             }
-            Some(Toolchain::Make) => "make test".to_string(),
-            None => return no_toolchain_error(),
+            runner => {
+                // uv/poetry/make/just/task/composer/deno: the project's own
+                // e2e script or nothing (same no-lying rule as above); unit
+                // and all ride the index's `test` verb binding. pytest takes
+                // the filter as a positional; the task runners have no
+                // native filter flag, so a filter there is ignored.
+                let scripts = index.root_script_names(runner);
+                if kind == "e2e" {
+                    let script = ["test:e2e", "e2e"]
+                        .into_iter()
+                        .find(|s| scripts.contains(s));
+                    match script.and_then(|s| index.resolve(s, Some(".")).ok()) {
+                        Some(entry) => entry.command.clone(),
+                        None => {
+                            return ToolOutput::Error {
+                                message: "no e2e test script detected for kind `e2e` — pass \
+                                          `command`"
+                                    .into(),
+                            };
+                        }
+                    }
+                } else {
+                    match index.verb_entry("test") {
+                        Some(entry) if matches!(runner, "uv" | "poetry") && !filter.is_empty() => {
+                            format!("{} {filter}", entry.command)
+                        }
+                        Some(entry) => entry.command.clone(),
+                        None => {
+                            return ToolOutput::Error {
+                                message: "no test script detected in this workspace (see \
+                                          list_scripts) — pass `command`"
+                                    .into(),
+                            };
+                        }
+                    }
+                }
+            }
         };
         run_and_report(&command, root, timeout_secs).await
     }
@@ -231,54 +210,49 @@ fn no_tool_error(what: &str, node_hint: &str) -> String {
     )
 }
 
-/// The linter argv for the detected toolchain, or a named error. Pure —
-/// separable from process spawning so the command shape is unit-testable.
-fn lint_argv(toolchain: Option<&Toolchain>, fix: bool) -> Result<Vec<String>, String> {
-    match toolchain {
-        Some(Toolchain::Cargo) => {
-            let mut argv = vec!["cargo", "clippy", "--workspace", "--all-targets"];
-            if fix {
-                argv.push("--fix");
-                argv.push("--allow-dirty");
-            }
-            Ok(argv.into_iter().map(String::from).collect())
+/// The linter argv for the index's `lint` verb binding, or a named error.
+/// Pure — separable from process spawning so the command shape is
+/// unit-testable. Verb-bound commands are runner-composed from validated
+/// script names (never free text), so whitespace-splitting one into argv
+/// is lossless.
+fn lint_argv(index: &ScriptIndex, fix: bool) -> Result<Vec<String>, String> {
+    let Some(entry) = index.verb_entry("lint") else {
+        return Err(no_tool_error("linter", "a package.json `lint` script"));
+    };
+    let mut argv: Vec<String> = entry.command.split_whitespace().map(String::from).collect();
+    if fix {
+        if entry.runner == "cargo" && entry.source == "synthesized" {
+            argv.push("--fix".into());
+            argv.push("--allow-dirty".into());
+        } else {
+            // The `lint` script's fix flag is linter-specific; guessing
+            // (`-- --fix`) could rewrite files under a linter that
+            // treats it as a filename. Named refusal instead.
+            return Err("`fix` resolves to cargo only in this version — run the \
+                        project's own fix script (e.g. `lint:fix`) via run_script"
+                .into());
         }
-        Some(Toolchain::Node { pm, scripts }) if scripts.contains_key("lint") => {
-            if fix {
-                // The `lint` script's fix flag is linter-specific; guessing
-                // (`-- --fix`) could rewrite files under a linter that
-                // treats it as a filename. Named refusal instead.
-                return Err("`fix` resolves to cargo only in this version — run the \
-                            project's own fix script (e.g. `lint:fix`) via run_script"
-                    .into());
-            }
-            Ok(vec![pm.to_string(), "run".into(), "lint".into()])
-        }
-        _ => Err(no_tool_error("linter", "a package.json `lint` script")),
     }
+    Ok(argv)
 }
 
-/// The formatter argv for the detected toolchain, or a named error. Pure,
-/// like [`lint_argv`].
-fn format_argv(toolchain: Option<&Toolchain>, check: bool) -> Result<Vec<String>, String> {
-    match toolchain {
-        Some(Toolchain::Cargo) => {
-            let mut argv = vec!["cargo".to_string(), "fmt".to_string()];
-            if check {
-                argv.push("--check".into());
-            }
-            Ok(argv)
+/// The formatter argv for the index's `format` verb binding, or a named
+/// error. Pure, like [`lint_argv`].
+fn format_argv(index: &ScriptIndex, check: bool) -> Result<Vec<String>, String> {
+    let Some(entry) = index.verb_entry("format") else {
+        return Err(no_tool_error("formatter", "a package.json `format` script"));
+    };
+    let mut argv: Vec<String> = entry.command.split_whitespace().map(String::from).collect();
+    if check {
+        if entry.runner == "cargo" && entry.source == "synthesized" {
+            argv.push("--check".into());
+        } else {
+            return Err("`check` resolves to cargo only in this version — run the \
+                        project's own check script (e.g. `format:check`) via run_script"
+                .into());
         }
-        Some(Toolchain::Node { pm, scripts }) if scripts.contains_key("format") => {
-            if check {
-                return Err("`check` resolves to cargo only in this version — run the \
-                            project's own check script (e.g. `format:check`) via run_script"
-                    .into());
-            }
-            Ok(vec![pm.to_string(), "run".into(), "format".into()])
-        }
-        _ => Err(no_tool_error("formatter", "a package.json `format` script")),
     }
+    Ok(argv)
 }
 
 /// Count rustc-style diagnostics in captured output — lines opening with
@@ -363,7 +337,7 @@ impl Tool for RunLint {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
         let fix = input.get("fix").and_then(|v| v.as_bool()).unwrap_or(false);
-        match lint_argv(detect(root).await.as_ref(), fix) {
+        match lint_argv(&ScriptIndex::detect(root).await, fix) {
             Ok(argv) => run_argv_and_report(&argv, root, timeout_secs).await,
             Err(message) => ToolOutput::Error { message },
         }
@@ -404,7 +378,7 @@ impl Tool for FormatCode {
             .get("check")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        match format_argv(detect(root).await.as_ref(), check) {
+        match format_argv(&ScriptIndex::detect(root).await, check) {
             Ok(argv) => run_argv_and_report(&argv, root, timeout_secs).await,
             Err(message) => ToolOutput::Error { message },
         }
@@ -415,51 +389,46 @@ impl Tool for FormatCode {
 mod tests {
     use super::*;
 
-    fn temp_root(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("stella_project_{tag}_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[tokio::test]
     async fn no_toolchain_is_a_named_error_and_command_overrides() {
-        let root = temp_root("none");
-        let out = BuildProject.execute(&serde_json::json!({}), &root).await;
+        let root = tempfile::tempdir().unwrap();
+        let out = BuildProject
+            .execute(&serde_json::json!({}), root.path())
+            .await;
         assert!(out.is_error());
 
         let out = BuildProject
             .execute(
                 &serde_json::json!({"command": "echo built && exit 0"}),
-                &root,
+                root.path(),
             )
             .await;
         assert!(!out.is_error(), "{out:?}");
 
         let out = RunTests
-            .execute(&serde_json::json!({"command": "exit 1"}), &root)
+            .execute(&serde_json::json!({"command": "exit 1"}), root.path())
             .await;
         match &out {
             ToolOutput::Error { message } => assert!(message.contains("FAILED"), "{message}"),
             other => panic!("{other:?}"),
         }
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn node_detection_uses_scripts_and_pm_lockfile() {
-        let root = temp_root("node");
+        let root = tempfile::tempdir().unwrap();
         std::fs::write(
-            root.join("package.json"),
+            root.path().join("package.json"),
             r#"{"scripts": {"test": "echo node-tests-ran", "build": "echo node-build-ran"}}"#,
         )
         .unwrap();
-        std::fs::write(root.join("pnpm-lock.yaml"), "").unwrap();
+        std::fs::write(root.path().join("pnpm-lock.yaml"), "").unwrap();
 
         // pnpm may not exist in the test environment — we only assert the
         // detection path constructs the right command shape, visible in the
         // success/error text either way.
         let out = RunTests
-            .execute(&serde_json::json!({"kind": "all"}), &root)
+            .execute(&serde_json::json!({"kind": "all"}), root.path())
             .await;
         let text = match &out {
             ToolOutput::Ok { content } => content.clone(),
@@ -468,73 +437,95 @@ mod tests {
         assert!(text.contains("pnpm run test"), "{text}");
 
         let out = RunTests
-            .execute(&serde_json::json!({"kind": "e2e"}), &root)
+            .execute(&serde_json::json!({"kind": "e2e"}), root.path())
             .await;
         assert!(out.is_error(), "no e2e script → named error: {out:?}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
-    #[test]
-    fn lint_and_format_argv_shapes_are_toolchain_resolved() {
+    #[tokio::test]
+    async fn make_targets_drive_build_and_tests_via_the_index() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Makefile"),
+            "build:\n\t@echo make-build-ran\ntest:\n\t@echo make-test-ran\n",
+        )
+        .unwrap();
+
+        let out = BuildProject
+            .execute(&serde_json::json!({}), root.path())
+            .await;
+        match &out {
+            ToolOutput::Ok { content } => assert!(content.contains("make-build-ran"), "{content}"),
+            other => panic!("{other:?}"),
+        }
+
+        let out = RunTests
+            .execute(&serde_json::json!({"kind": "all"}), root.path())
+            .await;
+        match &out {
+            ToolOutput::Ok { content } => assert!(content.contains("make-test-ran"), "{content}"),
+            other => panic!("{other:?}"),
+        }
+
+        // A bare `test` target must NOT pass itself off as e2e — the same
+        // no-lying rule the npm-family mapping enforces.
+        let out = RunTests
+            .execute(&serde_json::json!({"kind": "e2e"}), root.path())
+            .await;
+        assert!(out.is_error(), "no e2e target → named error: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn lint_and_format_argv_shapes_are_index_resolved() {
         let join = |argv: Vec<String>| argv.join(" ");
+
+        // Cargo workspace: the synthesized clippy/fmt verb bindings, with
+        // the cargo-only fix/check flags appended.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let cargo = ScriptIndex::detect(root.path()).await;
         assert_eq!(
-            join(lint_argv(Some(&Toolchain::Cargo), false).unwrap()),
+            join(lint_argv(&cargo, false).unwrap()),
             "cargo clippy --workspace --all-targets"
         );
         assert_eq!(
-            join(lint_argv(Some(&Toolchain::Cargo), true).unwrap()),
+            join(lint_argv(&cargo, true).unwrap()),
             "cargo clippy --workspace --all-targets --fix --allow-dirty"
         );
+        assert_eq!(join(format_argv(&cargo, false).unwrap()), "cargo fmt");
         assert_eq!(
-            join(format_argv(Some(&Toolchain::Cargo), false).unwrap()),
-            "cargo fmt"
-        );
-        assert_eq!(
-            join(format_argv(Some(&Toolchain::Cargo), true).unwrap()),
+            join(format_argv(&cargo, true).unwrap()),
             "cargo fmt --check"
         );
 
-        let scripts: serde_json::Map<String, Value> =
-            serde_json::from_str(r#"{"lint": "eslint .", "format": "prettier -w ."}"#).unwrap();
-        let node = Toolchain::Node {
-            pm: "pnpm",
-            scripts,
-        };
-        assert_eq!(
-            join(lint_argv(Some(&node), false).unwrap()),
-            "pnpm run lint"
-        );
-        assert_eq!(
-            join(format_argv(Some(&node), false).unwrap()),
-            "pnpm run format"
-        );
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"scripts": {"lint": "eslint .", "format": "prettier -w ."}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("pnpm-lock.yaml"), "").unwrap();
+        let node = ScriptIndex::detect(root.path()).await;
+        assert_eq!(join(lint_argv(&node, false).unwrap()), "pnpm run lint");
+        assert_eq!(join(format_argv(&node, false).unwrap()), "pnpm run format");
         // fix/check don't guess a node flag — they refuse, pointing at
         // run_script for the project's own fix/check verbs.
-        assert!(
-            lint_argv(Some(&node), true)
-                .unwrap_err()
-                .contains("run_script")
-        );
-        assert!(
-            format_argv(Some(&node), true)
-                .unwrap_err()
-                .contains("run_script")
-        );
+        assert!(lint_argv(&node, true).unwrap_err().contains("run_script"));
+        assert!(format_argv(&node, true).unwrap_err().contains("run_script"));
 
-        // No toolchain, and node without the scripts: the error NAMES what
-        // was looked for.
-        let bare = Toolchain::Node {
-            pm: "npm",
-            scripts: serde_json::Map::new(),
-        };
+        // No verb binding — empty index, and node without the scripts: the
+        // error NAMES what was looked for.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("package.json"), r#"{"name": "bare"}"#).unwrap();
+        let bare = ScriptIndex::detect(root.path()).await;
         for err in [
-            lint_argv(None, false).unwrap_err(),
-            lint_argv(Some(&bare), false).unwrap_err(),
+            lint_argv(&ScriptIndex::default(), false).unwrap_err(),
+            lint_argv(&bare, false).unwrap_err(),
         ] {
             assert!(err.contains("no linter configured"), "{err}");
             assert!(err.contains("package.json `lint` script"), "{err}");
         }
-        let err = format_argv(Some(&bare), false).unwrap_err();
+        let err = format_argv(&bare, false).unwrap_err();
         assert!(err.contains("no formatter configured"), "{err}");
         assert!(err.contains("package.json `format` script"), "{err}");
     }
@@ -549,16 +540,17 @@ mod tests {
 
     #[tokio::test]
     async fn run_lint_names_the_missing_linter_in_an_empty_workspace() {
-        let root = temp_root("lint_none");
-        let out = RunLint.execute(&serde_json::json!({}), &root).await;
+        let root = tempfile::tempdir().unwrap();
+        let out = RunLint.execute(&serde_json::json!({}), root.path()).await;
         match &out {
             ToolOutput::Error { message } => {
                 assert!(message.contains("no linter configured"), "{message}")
             }
             other => panic!("{other:?}"),
         }
-        let out = FormatCode.execute(&serde_json::json!({}), &root).await;
+        let out = FormatCode
+            .execute(&serde_json::json!({}), root.path())
+            .await;
         assert!(out.is_error(), "{out:?}");
-        std::fs::remove_dir_all(&root).ok();
     }
 }
