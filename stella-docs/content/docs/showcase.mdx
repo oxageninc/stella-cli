@@ -1,6 +1,6 @@
 ---
 title: Showcase
-description: Teams and projects shipping real software with the Stella CLI — starting with Oxagen, who build their platform with Stella as their code agent of choice.
+description: Teams and projects shipping real software with the Stella CLI — Oxagen, who build their platform with Stella, and stella-examples, the open cookbook with a working example for every configurable surface.
 ---
 
 Real teams, shipping real software, with Stella in the loop. Each entry names
@@ -25,6 +25,34 @@ Stella is BYOK and local-first for showcased teams too: Oxagen's sessions run
 on their own provider keys, and their telemetry never leaves their machines.
 </Callout>
 
+## stella-examples
+
+**[github.com/macanderson/stella-examples](https://github.com/macanderson/stella-examples)**
+is the open configuration cookbook for Stella itself: a working example for
+**every configurable surface** in the CLI, each file matching the schema
+Stella actually parses, each directory README saying where the file goes on
+disk. Clone it, copy a file into place, and it works.
+
+| Surface | Examples |
+| --- | --- |
+| [Settings profiles](https://github.com/macanderson/stella-examples/tree/main/settings) | [minimal](https://github.com/macanderson/stella-examples/blob/main/settings/minimal.settings.json), [balanced](https://github.com/macanderson/stella-examples/blob/main/settings/balanced.settings.json), [max-quality](https://github.com/macanderson/stella-examples/blob/main/settings/max-quality.settings.json), [dirt-cheap](https://github.com/macanderson/stella-examples/blob/main/settings/dirt-cheap.settings.json), [local-ollama](https://github.com/macanderson/stella-examples/blob/main/settings/local-ollama.settings.json), and [team](https://github.com/macanderson/stella-examples/blob/main/settings/team.settings.json) `settings.json` profiles, plus the [`credentials.toml`](https://github.com/macanderson/stella-examples/blob/main/settings/credentials.example.toml) shape — the model lineups from the [examples](/docs/examples) as ready-to-copy files |
+| [Lifecycle hooks](https://github.com/macanderson/stella-examples/tree/main/hooks) | A [`SessionStart` context injector](https://github.com/macanderson/stella-examples/blob/main/hooks/scripts/session-context.sh), a [`PreToolUse` bash guard](https://github.com/macanderson/stella-examples/blob/main/hooks/scripts/guard-bash.sh) that vetoes destructive commands, and a [`PostToolUse` JSONL audit log](https://github.com/macanderson/stella-examples/blob/main/hooks/scripts/log-tool-use.sh) — wired together in one [`hooks` block](https://github.com/macanderson/stella-examples/blob/main/hooks/settings.json) ([docs](/docs/agent-tools/hooks)) |
+| [Custom commands](https://github.com/macanderson/stella-examples/tree/main/commands) | [`/fix-issue`](https://github.com/macanderson/stella-examples/blob/main/commands/fix-issue.md) (with `$ARGUMENTS`), [`/changelog`](https://github.com/macanderson/stella-examples/blob/main/commands/changelog.md), [`/pr-description`](https://github.com/macanderson/stella-examples/blob/main/commands/pr-description.md) ([docs](/docs/agent-tools/commands)) |
+| [Custom agents](https://github.com/macanderson/stella-examples/tree/main/agents) | [`code-reviewer`](https://github.com/macanderson/stella-examples/blob/main/agents/code-reviewer.md) (read-only toolbelt), [`test-writer`](https://github.com/macanderson/stella-examples/blob/main/agents/test-writer.md) (witness tests + `verify_done`), [`docs-writer`](https://github.com/macanderson/stella-examples/blob/main/agents/docs-writer.md) (no shell) ([docs](/docs/agent-tools/custom-agents)) |
+| [Skills](https://github.com/macanderson/stella-examples/tree/main/skills) | [`conventional-commits`](https://github.com/macanderson/stella-examples/blob/main/skills/conventional-commits/SKILL.md) and [`release-checklist`](https://github.com/macanderson/stella-examples/blob/main/skills/release-checklist/SKILL.md) ([docs](/docs/agent-tools/skills)) |
+| [Rules & guards](https://github.com/macanderson/stella-examples/tree/main/rules) | Hard guards — [`no-force-push`](https://github.com/macanderson/stella-examples/blob/main/rules/no-force-push.md), [`protect-migrations`](https://github.com/macanderson/stella-examples/blob/main/rules/protect-migrations.md), [`no-shell`](https://github.com/macanderson/stella-examples/blob/main/rules/no-shell.md) — and a soft [`code-conventions`](https://github.com/macanderson/stella-examples/blob/main/rules/code-conventions.md) rule ([docs](/docs/agent-tools/permissions)) |
+| [Custom tools](https://github.com/macanderson/stella-examples/tree/main/tools) | [`todo_scan`](https://github.com/macanderson/stella-examples/blob/main/tools/todo-scan.toml) (input schema + `STELLA_INPUT_*` env) and [`loc_report`](https://github.com/macanderson/stella-examples/blob/main/tools/loc-report.toml) (minimal manifest) ([docs](/docs/agent-tools/custom-tools)) |
+| [MCP servers](https://github.com/macanderson/stella-examples/tree/main/mcp) | An [`mcp.toml`](https://github.com/macanderson/stella-examples/blob/main/mcp/mcp.toml) with both stdio and HTTP transports ([docs](/docs/agent-tools/mcp)) |
+| [Fleet plans](https://github.com/macanderson/stella-examples/tree/main/fleet) | A feature build-out DAG in [TOML](https://github.com/macanderson/stella-examples/blob/main/fleet/plan.toml) and a parallel cleanup sweep in [JSON](https://github.com/macanderson/stella-examples/blob/main/fleet/plan.json), with claims and worktree isolation ([docs](/docs/agent-fleets)) |
+| [Memory & domains](https://github.com/macanderson/stella-examples/tree/main/memory) | A hand-tuned [`domains.toml`](https://github.com/macanderson/stella-examples/blob/main/memory/domains.toml) and the lesson → skill → rule promotion loop ([docs](/docs/commands/memory)) |
+| [Scripting & CI](https://github.com/macanderson/stella-examples/tree/main/scripting) | [`ci-autofix.sh`](https://github.com/macanderson/stella-examples/blob/main/scripting/ci-autofix.sh) (budget-capped, oracle-armed) and [`nightly-goal.sh`](https://github.com/macanderson/stella-examples/blob/main/scripting/nightly-goal.sh) (cron-able goal runs) |
+
+<Callout type="info">
+Everything in stella-examples respects the trust boundary: project-scope
+hooks, MCP servers, and credential-routing fields stay inert in a cloned
+repo until you opt in with `STELLA_TRUST_PROJECT=1`.
+</Callout>
+
 ## Add your project
 
 Shipping with Stella? Open a pull request against
@@ -32,4 +60,6 @@ Shipping with Stella? Open a pull request against
 to `stella-docs/content/docs/showcase.mdx` — who you are, a link, and a few
 sentences on how Stella fits your workflow. Entries should be things that
 actually ship; hello-worlds are better served by the
-[examples](/docs/examples).
+[examples](/docs/examples). Have a hook, agent, profile, or plan worth
+sharing instead? Send it to
+[stella-examples](https://github.com/macanderson/stella-examples).
