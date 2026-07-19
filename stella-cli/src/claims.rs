@@ -22,20 +22,25 @@
 //!    process cannot release its own).
 //!
 //! The build lane is the one **transient** claim: `run_tests` /
-//! `build_project` serialize under the well-known pseudo-path
-//! [`BUILD_CLAIM`] for the duration of the call only (with a bounded wait,
-//! not a hard refusal — build contention is routine, edit contention is
-//! signal). This kills the phantom-failure class where one worker's test
-//! run observes a sibling's half-written edit.
+//! `build_project` — and the manifest-verb executors that can rewrite the
+//! tree (`run_lint`, `format_code`, `run_script`) — serialize under the
+//! well-known pseudo-path [`BUILD_CLAIM`] for the duration of the call
+//! only (with a bounded wait, not a hard refusal — build contention is
+//! routine, edit contention is signal). This kills the phantom-failure
+//! class where one worker's test run observes a sibling's half-written
+//! edit (or a sibling formatter's half-rewritten tree).
 //!
 //! A missing/failed store degrades to no coordination rather than no work —
 //! the same observability-loss-not-work-stoppage contract as every other
 //! store write.
 //!
 //! Coverage note: with `bash` OFF by default (settings `tools.bash`), the
-//! historically documented "bash hole" — shell writes invisible to claim
-//! tracking — is closed in the default configuration; it exists only in
-//! sessions that explicitly opted the shell back in.
+//! historically documented "bash hole" — arbitrary shell writes invisible
+//! to claim tracking — is closed in the default configuration; it exists
+//! only in sessions that explicitly opted the shell back in. (The
+//! manifest-verb executors still write outside per-path claims, but they
+//! run the project's own declared verbs, not arbitrary shell, and they
+//! serialize under the build lane below.)
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -166,8 +171,12 @@ impl ToolExecutor for ClaimTap<'_> {
         }
 
         // The build lane: transient, bounded-wait serialization so a test
-        // run never observes a sibling's half-written tree.
-        if matches!(name, "run_tests" | "build_project") {
+        // run never observes a sibling's half-written tree — and a sibling
+        // never observes a formatter/linter/script mid-rewrite.
+        if matches!(
+            name,
+            "run_tests" | "build_project" | "run_lint" | "format_code" | "run_script"
+        ) {
             let mut waited = 0u64;
             let acquired = loop {
                 match store.acquire_file_lock(BUILD_CLAIM, &self.holder) {
@@ -278,12 +287,22 @@ mod tests {
         let inner = Passthrough(std::sync::Mutex::new(Vec::new()));
         let tap = ClaimTap::new(&inner, Some(store.clone()), "ses-1/lead");
         let input = serde_json::json!({});
-        assert!(!tap.execute("run_tests", &input).await.is_error());
-        // Released immediately — a rival can take the lane without waiting.
-        assert!(
-            store.acquire_file_lock(BUILD_CLAIM, "ses-1/req:2").unwrap(),
-            "build lane must be free after the call"
-        );
+        // Every tree-rewriting executor rides the lane, not just tests.
+        for tool in [
+            "run_tests",
+            "build_project",
+            "run_lint",
+            "format_code",
+            "run_script",
+        ] {
+            assert!(!tap.execute(tool, &input).await.is_error());
+            // Released immediately — a rival takes the lane without waiting.
+            assert!(
+                store.acquire_file_lock(BUILD_CLAIM, "ses-1/req:2").unwrap(),
+                "build lane must be free after `{tool}`"
+            );
+            store.release_file_lock(BUILD_CLAIM, "ses-1/req:2").unwrap();
+        }
     }
 
     #[tokio::test]
