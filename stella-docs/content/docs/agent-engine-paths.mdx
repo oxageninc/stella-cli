@@ -1,0 +1,234 @@
+---
+title: Agent Engine Paths
+description: Every entry point into Stella's agent engine — one-shot runs, the REPL, the Command Deck, goal rounds, CI monitoring, sub-agents, and fleets — what actually differs between them, and when to use each.
+---
+
+Stella has **one agent engine and many doors into it**. Whether you type into
+the Command Deck, script `stella run` in CI, or fan a fleet out across
+worktrees, the same core loop does the work: the step-driver in
+`stella-core`, driving the same tool stack, metered by the same budget,
+recorded into the same session store. The paths differ in how a turn is
+*framed*, *verified*, *supervised*, and *persisted* — and picking the right
+door is most of the craft.
+
+This page is the map. For the user-level tour of the modes, see
+[Agent Modes](/docs/agent-modes); for what happens *inside* a verified turn,
+see the [Inference Pipeline](/docs/inference-pipeline).
+
+## What every path shares
+
+Before the differences, the invariants — these hold no matter which door you
+came through:
+
+- **One step loop.** The engine takes one model call per step, executes the
+  proposed tool calls (read-only calls fan out in parallel), feeds results
+  back, and repeats until the model stops, a budget trips, or a backstop
+  fires. No hidden swarm, no coordinator process.
+- **One tool stack.** Every path assembles the same layered
+  [tool executor](/docs/agent-tools): the native registry, wrapped by
+  [MCP-server tools](/docs/agent-tools/mcp), wrapped by
+  [custom script tools](/docs/agent-tools/custom-tools), wrapped by the
+  interactive layer (`ask_user`, the skills-registry tools), wrapped by the
+  discovery layer (`tool_search`, `skill_search`, `mcp_search`). What varies
+  per path is only what gets layered *on top* (deck taps, read-only views —
+  see [below](#how-the-tool-stack-varies)).
+- **Memory rides along.** Relevant memories and
+  [skills](/docs/agent-tools/skills) are recalled per prompt and injected as
+  a volatile block after the byte-stable system prefix, so prompt caching
+  survives across turns.
+- **Budgets are enforced everywhere.** `--budget` caps USD spend on every
+  path; without it, spend is still metered for the cost summary.
+- **Everything is recorded.** Each turn opens an execution record (files
+  touched, tool use, memory citations, cost, outcome) in the workspace
+  store, feeding [telemetry](/docs/telemetry), `stella stats`, and the
+  deck's AGENT ENGINE tab. Sessions are durable and resumable
+  (`stella resume`).
+- **Per-role model routing applies.** The
+  [agent engine config](/docs/configuration/agent-engine-config) pins models
+  per role (worker, triage, judge), and every path that uses those roles
+  honors the pins.
+
+## The map
+
+| Path | Command | Turn shape | Verification | Execution kind | Headless? |
+| --- | --- | --- | --- | --- | --- |
+| One-shot, pipeline | `stella run "…"` | One staged pipeline run | Pipeline stages + judge; `--test-command` arms the deterministic fail→pass oracle | `pipeline` | Yes (`--output-format json\|stream-json`) |
+| One-shot, raw | `stella run --no-pipeline "…"` | One step-loop turn | The model stops when done | `run` | Yes |
+| Plain REPL | `stella --plain` (or non-TTY) | One raw turn per prompt, shared conversation | You, live | `chat` | Interactive only |
+| Command Deck lead | `stella` | One turn per prompt; `/pipeline` toggles staged (default) vs raw | Pipeline stages, or you | `deck-pipeline` / `deck` | Interactive only |
+| Deck sub-agents | `task_assign` (agent-initiated) | One raw turn per delegated task, own context | The lead reviews results | `deck-sub` | Follows the deck |
+| Goal mode | `stella goal "…"` | Judged **rounds** until the goal is met; pipeline rounds by default, `--no-pipeline` for raw | An independent judge, from evidence, over read-only tools | `goal` | Yes |
+| CI monitor | `stella monitor [target]` | Goal mode with a fixed objective | The judge reads `ci_status`; ends only on a fully green latest run | `goal` | Yes |
+| Fleet workers | `stella fleet …` | One worker per task, wave-scheduled by dependency | Per task (pipeline when available, else raw); attempts recorded in `.stella/fleet.db` | fleet ledger | Yes |
+
+## One-shot: `stella run`
+
+The scripting workhorse: one prompt in, verified work out, an exit code
+back.
+
+**Pipeline (default).** The prompt runs the full
+[staged pipeline](/docs/inference-pipeline) — triage, plan, witness,
+execute, verify, judge — with per-role model routing and circuit-breaker
+fallback. Pass `--test-command "cargo test -p …"` and verification gets a
+deterministic oracle: a change that flips a failing test to passing can
+submit without spending a judge call. Headless formats (`--output-format
+json` for one final object, `stream-json` for a line per agent event) make
+it automation-grade — see [Scripting](/docs/scripting).
+
+**Raw (`--no-pipeline`).** Skips the stages and drives one plain step-loop
+turn. No triage, no judge — the model works until it decides it's done.
+Cheapest and fastest; the right door for questions, small mechanical edits,
+and anything you'll eyeball anyway.
+
+**Use it when** the task is well-defined and you don't need to watch.
+Prefer the pipeline default whenever the result must be *provably* right;
+drop to `--no-pipeline` when speed beats ceremony.
+
+## Interactive: the Command Deck and the plain REPL
+
+Running `stella` on a real terminal opens the **Command Deck** — the tabbed
+TUI over the engine. Each prompt becomes a lead-agent turn; `/pipeline`
+toggles between staged turns (the default) and the raw step loop. The deck
+is more than a chat surface: prompts queue while a turn runs, `!` lines run
+shell commands in their own lane, Esc cancels, and tabs expose the session's
+files, diff, code graph, skills, MCP servers, and the
+[AGENT ENGINE panel](/docs/configuration/agent-engine-config) with live
+executions and per-role model pickers.
+
+Two things are unique to deck turns:
+
+- **Taps.** The lead's tool stack is wrapped in a file-change tap (live
+  FILES/DIFF tabs) and a task tap (the task board and sub-agent spawning).
+- **Cooperative claims.** The lead claims files on first write, so parallel
+  workers in the same tree never fight over a file.
+
+`stella --plain` (or any non-TTY stdin/stdout, or `STELLA_PLAIN=1`) falls
+back to the **plain REPL**: the same per-prompt raw turns and the same
+session memory, in a line-based interface with slash commands. It's the
+low-dependency door — SSH sessions, minimal terminals, teaching demos.
+
+**Use the deck when** you're exploring, iterating, or supervising real work
+interactively. **Use the plain REPL when** you want interactivity without a
+TUI.
+
+## Delegated: deck sub-agents
+
+Inside a deck session, the lead agent can delegate: the `task_assign` tool
+queues a task, and a supervisor spawns a **sub-agent** with its own
+conversation, its own budget slice, and the same tool stack — running
+concurrently while the lead keeps working. Results return to the lead for
+review; every sub-agent turn is recorded (`deck-sub`) and visible in the
+AGENT ENGINE tab. You don't invoke this path directly — you ask for work
+that warrants it, and the lead fans out.
+
+**Use it when** (implicitly) a deck task decomposes into independent chunks —
+noisy searches, parallel investigations — that shouldn't bloat the lead's
+context.
+
+## Outcome-driven: `stella goal`
+
+Goal mode inverts the contract: you state **what must be true when done**,
+not what to do. The engine works in rounds; after each round an
+**independent judge** — routed to a different model family than the worker
+whenever possible, and holding a **read-only view** of the same tool stack —
+assesses the goal *from evidence* (running tests, reading CI, inspecting
+files), never from the worker's claims. Rounds continue until the judge
+confirms the goal, or a backstop (round cap, `--budget`, worker abort) ends
+the run honestly as *not met*.
+
+Each working round is a staged pipeline run by default; `--no-pipeline`
+makes rounds raw step-loop turns — double verification (pipeline judge *and*
+goal judge) is rigor you pay for, so drop the inner pipeline when the goal
+judge alone is enough.
+
+**Use it when** you can state the outcome crisply but not the steps —
+"the suite passes and clippy is clean", "the flaky test is fixed, proven by
+50 consecutive runs". See [Goal mode in depth](/docs/agent-modes/goal-mode).
+
+### `stella monitor`: goal mode, specialized
+
+Monitoring **is** a goal: the objective is pinned to "the latest CI run for
+*target* is fully green", assessed through the `ci_status` tool. The engine
+fixes failures, pushes, waits out the next run, and only a green board ends
+the loop. Same machinery, fixed objective.
+
+**Use it when** the branch or PR must end up green and you don't want to
+babysit the CI cycle.
+
+## Parallel: `stella fleet`
+
+When the work is *many tasks* rather than one, [fleets](/docs/agent-fleets)
+fan a dependency-ordered task DAG out to parallel workers — in one shared
+tree coordinated by cooperative file claims, or in dedicated worktrees for
+tasks marked `isolation = "isolated"`. Each worker drives the same engine
+per task (staged pipeline when available, raw step loop otherwise), and
+every attempt, commit, and dollar lands in `.stella/fleet.db` for review.
+
+**Use it when** you have a backlog, not a task: migrations across many
+modules, a list of independent fixes, wide refactors.
+
+## How the tool stack varies
+
+The [tool catalog](/docs/agent-tools) is shared, but each path decorates it
+differently:
+
+| Path | On top of the shared stack |
+| --- | --- |
+| One-shot / REPL / goal worker | Nothing extra — the shared stack as-is |
+| Command Deck lead | File-change tap + task tap (live tabs, sub-agent spawning), claim-on-first-write |
+| Goal / pipeline judge | A **read-only** view — only `read_only: true` tools are visible or executable |
+| Fleet workers | Claim coordination in the shared tree; a private worktree when isolated |
+
+Two consequences worth knowing. First, `ask_user` degrades gracefully:
+headless paths (one-shot JSON formats, goal in CI) fail it loudly with
+guidance to proceed, rather than hanging on stdin. Second, because the
+discovery tools are read-only, even the judge can run `tool_search`,
+`skill_search`, and `mcp_search` — searching is never a side effect.
+
+## Choosing a path
+
+- **Watching and steering** → the Command Deck (`stella`).
+- **Interactive, but minimal** → the plain REPL (`stella --plain`).
+- **One defined task, unattended** → `stella run` (add `--test-command` for
+  the strongest verification; `--no-pipeline` for speed).
+- **A defined outcome, unknown steps** → `stella goal`.
+- **CI must be green** → `stella monitor`.
+- **A backlog of tasks** → `stella fleet`.
+- **Continuing yesterday's session** → `stella resume`.
+
+## For contributors: the code map
+
+Every path is a thin `stella-cli` entry point over `stella_core::Engine`.
+If you're changing engine behavior, these are the seams:
+
+| Path | Entry (stella-cli) | Engine call |
+| --- | --- | --- |
+| One-shot pipeline | `agent::run_one_shot` → `run_pipeline_one_shot` | staged pipeline over the engine |
+| One-shot raw | `agent::run_one_shot` → `run_raw_one_shot` → `run_turn` | `Engine::run_turn` |
+| Plain REPL | `agent::run_interactive` → `run_turn` per prompt | `Engine::run_turn` |
+| Deck lead | `command_deck::run_lead_turn` / `run_lead_pipeline_turn` | `Engine::run_turn` / pipeline |
+| Deck sub-agent | `subsession::run_worker` | `Engine::run_turn` |
+| Goal (raw rounds) | `agent::run_goal_cmd` → `run_goal_turn` | `Engine::run_goal` with a judge |
+| Goal (pipeline rounds) | `agent::run_goal_cmd` → `run_goal_pipeline_turn` | pipeline rounds + a judge engine over `ReadOnlyTools` |
+| Fleet worker | `fleet_cmd` per-task worker | pipeline when available, else `Engine::run_turn` |
+
+The execution-kind strings in [the map](#the-map) are what these paths stamp
+on their execution records — the same strings you'll see in
+`stella stats`, the exported [dashboard](/docs/telemetry/dashboard), and the
+deck's AGENT ENGINE tab, so a telemetry row always traces back to the door
+the work came through.
+
+## Where to go next
+
+- [Agent Modes](/docs/agent-modes) — the user-level guide to the same
+  territory, with deck keybindings and examples.
+- [Inference Pipeline](/docs/inference-pipeline) — inside a staged turn:
+  triage, plan, witness, execute, verify, judge.
+- [Agent Fleets](/docs/agent-fleets) — plan files, waves, claims, and
+  isolated worktrees.
+- [Agent engine config](/docs/configuration/agent-engine-config) — per-role
+  model pins the paths share.
+- [Built-in Tools](/docs/agent-tools) — the shared catalog, including the
+  discovery tools.
+- [Scripting](/docs/scripting) — headless output formats, exit codes, and
+  automation patterns for the non-interactive paths.

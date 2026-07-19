@@ -7,6 +7,7 @@
     "inference-pipeline",
     "context-engine",
     "agent-modes",
+    "agent-engine-paths",
     "agent-fleets",
     "agent-tools",
     "configuration",
