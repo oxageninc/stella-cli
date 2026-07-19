@@ -42,6 +42,9 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
+      - name: file-size ratchet
+        run: scripts/check-file-sizes.sh
+
       - name: cargo clippy -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
