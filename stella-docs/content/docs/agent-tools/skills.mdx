@@ -56,6 +56,14 @@ and a state sidecar (`.stella-skills.json`) tracks which version is
 excluded from recall). Pin an older version to roll back without losing the
 newer one.
 
+## Searching installed skills
+
+The agent's **`skill_search`** tool (read-only) searches the skills already
+installed in this workspace — both scopes, ranked by fit for the task — and
+can return the best match's full instructions (`include_body: true`). With
+potentially thousands of installed skills, the agent pulls the relevant one
+on demand instead of frontloading them all.
+
 ## The public registry
 
 Stella integrates with the community skills registry via `npx skills`:

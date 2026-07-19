@@ -160,6 +160,10 @@ pub const RESERVED_NAMES: &[&str] = &[
     "ask_user",
     "search_skills",
     "install_skill",
+    // CLI discovery layer (tool/skill/MCP-server search — stella-cli::discovery)
+    "tool_search",
+    "skill_search",
+    "mcp_search",
 ];
 
 /// Timeout applied when a manifest omits `timeout_ms`. Public so

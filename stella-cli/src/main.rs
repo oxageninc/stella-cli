@@ -24,6 +24,7 @@ mod claims;
 mod command_deck;
 mod config;
 mod connect_cmd;
+mod discovery;
 mod domains;
 mod engine_config;
 mod export;

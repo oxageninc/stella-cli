@@ -11,6 +11,7 @@
 pub mod budget;
 pub mod bus;
 pub mod compaction;
+pub mod discovery;
 pub mod driver;
 pub mod estimator;
 pub mod extensions;
@@ -35,6 +36,7 @@ pub use budget::{BudgetGuard, BudgetOutcome};
 pub use bus::{
     ExtensionFailure, HookBus, HookDecision, HookEventDraft, HookSubscription, PolicyOutcome,
 };
+pub use discovery::{Candidate, DiscoveryQuery, QueryTerm, RankedMatch, parse_query, rank};
 pub use driver::{Engine, EngineConfig, TurnOutcome};
 pub use estimator::{Calibration, CalibrationMap};
 pub use extensions::{
