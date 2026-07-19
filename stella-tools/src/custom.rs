@@ -115,6 +115,13 @@ pub const RESERVED_NAMES: &[&str] = &[
     "screenshot",
     // Media generation: generate_svg is client-side and always registered.
     "generate_svg",
+    // The session task board
+    "task_create",
+    "task_list",
+    "task_start",
+    "task_complete",
+    "task_cancel",
+    "task_assign",
     // Conditionally registered tools: graph_query only when a code-graph index
     // exists, generate_image (and the video pair, when the key family has a
     // video adapter) only when a media key is configured. The registry-driven

@@ -76,8 +76,8 @@ pub use ui::{PanelFocus, ShellAction, UiState, ViewportMetrics, handle_key, inge
 
 // Command Deck public surface.
 pub use deck::{
-    AgentEntry, DeckTab, FileLedger, FileRecord, ResourceSample, RouteLog, TraceKind, TraceLog,
-    TraceRow, WorkspaceModel,
+    AgentEntry, DeckTab, FileLedger, FileRecord, PrInfo, ResourceSample, RouteLog, TraceKind,
+    TraceLog, TraceRow, WorkspaceModel,
 };
 pub use deck_render::render_deck;
 pub use deck_shell::{DeckOptions, run_deck};

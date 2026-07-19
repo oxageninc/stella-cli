@@ -38,6 +38,7 @@ mod runtime;
 mod settings;
 mod skill_manager;
 mod stats;
+mod subsession;
 mod tui;
 
 /// Serializes tests that mutate process environment variables. `setenv` /

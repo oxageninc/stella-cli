@@ -164,7 +164,7 @@ pub fn demo_inbound(started_ms: u64, self_pid: u32) -> Vec<Inbound> {
         ev(ci, AgentEvent::Stage { name: StageKind::Verify }),
         ev(ci, AgentEvent::JudgeVerdict { passed: true, evidence: JudgeEvidence { summary: "flip oracle: fail→pass on `pnpm --filter app test:unit`".into(), deterministic: true, evidence_refs: vec![] } }),
         ev(ci, AgentEvent::Commit { sha: "a1b2c3d".into(), message: "feat(automations): triggers + workflows UI".into() }),
-        ev(ci, AgentEvent::Pr { url: "https://github.com/macanderson/stella/pull/981".into(), status: PrStatus::Open }),
+        ev(ci, AgentEvent::Pr { url: "https://github.com/macanderson/stella/pull/981".into(), status: PrStatus::Open, number: Some(981), ci: Some(stella_protocol::CiStatus::Running) }),
         ev(ci, AgentEvent::StepUsage { step: 1, model: "glm-5.2-air".into(), input_tokens: 3_000, output_tokens: 180, cached_input_tokens: 0, cache_write_tokens: 0, estimated_input_tokens: 2_900, cost_usd: 0.004, duration_ms: 900, retries: 0, tool_calls: 0 }),
 
         // ── lead proposes a larger scope change (gate) ──────────────────

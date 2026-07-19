@@ -234,9 +234,27 @@ pub enum AgentEvent {
         message: String,
     },
     /// A pull request was opened or changed status (fleet PR/CI monitor).
+    /// `number` and `ci` ride `serde(default)` so streams recorded before
+    /// they existed still parse (additive-only wire contract).
     Pr {
         url: String,
         status: PrStatus,
+        /// The PR number (e.g. 183 for `…/pull/183`). `None` on streams
+        /// recorded before the field existed or when the monitor could not
+        /// parse one from the URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        number: Option<u64>,
+        /// The head commit's aggregate CI verdict, when observed. Absent
+        /// means "not polled yet", never "passing".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ci: Option<CiStatus>,
+    },
+    /// The turn's task board changed (an agent called one of the `task_*`
+    /// tools). Carries the FULL board snapshot, not a delta — the render
+    /// fold stays pure and any single event reconstructs the checklist,
+    /// which is what makes dead-session replay show the board as it was.
+    TaskUpdate {
+        tasks: Vec<TaskItem>,
     },
     Error {
         message: String,
@@ -360,6 +378,61 @@ pub enum PrStatus {
     Open,
     Merged,
     Closed,
+}
+
+/// Aggregate CI verdict for a PR's head commit, as observed by the
+/// fleet monitor (`gh pr checks`). Reconciled against the live source
+/// before rendering, never served from cache alone (L-V3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiStatus {
+    /// Checks exist but none have started reporting.
+    Pending,
+    /// At least one check is still running and none have failed.
+    Running,
+    Passing,
+    Failing,
+}
+
+/// One entry on the turn's task board (the `task_*` tools). The board is
+/// session-scoped working state — what the agent has planned, is doing,
+/// and has finished — mirrored to the store for cross-session findability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskItem {
+    /// Stable per-session ordinal id ("1", "2", …) — what `task_complete`
+    /// / `task_cancel` / `task_assign` reference.
+    pub id: String,
+    /// Imperative title ("Fix the auth redirect loop").
+    pub subject: String,
+    /// What needs to be done, if the creator elaborated beyond the subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub status: TaskStatus,
+    /// Which agent lane owns the task: `None` until claimed, `Some("lead")`
+    /// for the lead, or the sub-agent lane id once `task_assign` spawned a
+    /// dedicated worker for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+/// Lifecycle of a `TaskItem`. Terminal states are `Completed` and
+/// `Cancelled`; a cancelled task keeps its row (the board is an audit
+/// surface, not just a scheduler).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+impl TaskStatus {
+    /// Whether the task can still change state. Terminal tasks reject
+    /// further transitions (enforced by the board logic in `stella-core`).
+    pub fn is_open(self) -> bool {
+        matches!(self, TaskStatus::Pending | TaskStatus::InProgress)
+    }
 }
 
 #[cfg(test)]
@@ -589,6 +662,8 @@ mod tests {
             AgentEvent::Pr {
                 url: "https://github.com/x/y/pull/1".into(),
                 status: PrStatus::Open,
+                number: Some(1),
+                ci: Some(CiStatus::Running),
             },
             AgentEvent::Commit {
                 sha: "abc123".into(),
@@ -598,6 +673,71 @@ mod tests {
             let json = serde_json::to_string(&event).unwrap();
             let _back: AgentEvent = serde_json::from_str(&json).unwrap();
         }
+    }
+
+    #[test]
+    fn pr_event_from_a_pre_ci_stream_still_parses() {
+        // Backward compatibility: a `pr` line serialized before `number`
+        // and `ci` existed must deserialize with both absent — absent ci
+        // means "not polled yet", never "passing".
+        let legacy = r#"{"type":"pr","url":"https://github.com/x/y/pull/183","status":"open"}"#;
+        match serde_json::from_str::<AgentEvent>(legacy) {
+            Ok(AgentEvent::Pr { number, ci, .. }) => {
+                assert_eq!(number, None);
+                assert_eq!(ci, None);
+            }
+            other => panic!("old stream must parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_update_roundtrips_a_full_board_snapshot() {
+        let event = AgentEvent::TaskUpdate {
+            tasks: vec![
+                TaskItem {
+                    id: "1".into(),
+                    subject: "Map the auth module".into(),
+                    description: None,
+                    status: TaskStatus::Completed,
+                    owner: Some("lead".into()),
+                },
+                TaskItem {
+                    id: "2".into(),
+                    subject: "Fix the redirect loop".into(),
+                    description: Some("token refresh races the redirect".into()),
+                    status: TaskStatus::InProgress,
+                    owner: Some("sub:2".into()),
+                },
+                TaskItem {
+                    id: "3".into(),
+                    subject: "Add a witness test".into(),
+                    description: None,
+                    status: TaskStatus::Pending,
+                    owner: None,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"task_update\""), "{json}");
+        // Absent optionals are omitted, not serialized as null.
+        assert!(!json.contains("null"), "{json}");
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentEvent::TaskUpdate { tasks } => {
+                assert_eq!(tasks.len(), 3);
+                assert_eq!(tasks[1].status, TaskStatus::InProgress);
+                assert_eq!(tasks[1].owner.as_deref(), Some("sub:2"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_status_open_vs_terminal() {
+        assert!(TaskStatus::Pending.is_open());
+        assert!(TaskStatus::InProgress.is_open());
+        assert!(!TaskStatus::Completed.is_open());
+        assert!(!TaskStatus::Cancelled.is_open());
     }
 
     #[test]

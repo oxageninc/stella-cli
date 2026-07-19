@@ -25,8 +25,9 @@ pub use completion::{
 };
 pub use error::ProviderError;
 pub use event::{
-    AgentEvent, BudgetMode, ContextFrameRef, FileChangeKind, JudgeEvidence, MediaArtifactRef,
-    MediaJobState, MediaKind, PrStatus, ProviderShare, ScopeProposal, StageKind,
+    AgentEvent, BudgetMode, CiStatus, ContextFrameRef, FileChangeKind, JudgeEvidence,
+    MediaArtifactRef, MediaJobState, MediaKind, PrStatus, ProviderShare, ScopeProposal, StageKind,
+    TaskItem, TaskStatus,
 };
 pub use provider::{Provider, ToolCallObserver};
 pub use role::{ModelRef, Role};

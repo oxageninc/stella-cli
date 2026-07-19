@@ -29,6 +29,7 @@ pub mod registry;
 pub mod sandbox;
 pub mod schema_gate;
 pub mod screenshot;
+pub mod tasks;
 pub mod validate;
 pub mod verify;
 pub mod write;
