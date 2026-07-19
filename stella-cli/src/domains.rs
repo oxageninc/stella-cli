@@ -6,7 +6,7 @@
 //! (including post-turn reflection lessons), code-graph nodes/edges, and
 //! context facts all carry one or more domain tags, and recall uses domain
 //! overlap as a relevance signal — so a lesson learned while touching
-//! `crates/stella-model` surfaces again when a future turn works in that
+//! `stella-model` surfaces again when a future turn works in that
 //! area.
 //!
 //! Inference is model-assisted with a deterministic fallback: `stella init`

@@ -23,7 +23,11 @@ stella chat --plain
 
 `stella chat` opens a conversational session. You type a message, the agent runs its step loop — proposing tool calls, executing them, and feeding results back until the turn is done — and then hands the prompt back to you. Conversation history is retained across turns within the session.
 
-The default **Command Deck** presents the session as a set of tabs (transcript, files, diff, pipeline, graph, skills, MCP, agents) that you open with slash commands. The **plain REPL** (`--plain`) is a single scrolling line-based loop with a smaller command set — handy for narrow terminals, screen readers, and recordings.
+The default **Command Deck** presents the session as a set of tabs — **SESSION** (the transcript), **AGENT ENGINE** (executions, installed agents, and the embedded engine-config panel), **TRACES**, **GRAPH**, **FILES**, **SKILLS**, **MCP**, and **ISSUES** (your connected GitHub/Linear tracker, with instant type-ahead). Slash commands jump between tabs and run actions, and `?` opens a tab-aware key list. The **plain REPL** (`--plain`) is a single scrolling line-based loop with a smaller command set — handy for narrow terminals, screen readers, and recordings.
+
+### Multimodal input
+
+Prompts are multimodal: mention a path to an image, PDF, audio, or video file in your message and Stella attaches the file itself as model input alongside your text. In the deck, **Ctrl-V** pastes an image straight from the clipboard as an attachment.
 
 <Callout type="info">
 All [global flags](/docs/commands) apply. Because they are top-level flags, put them before the subcommand — e.g. `stella --model openai/gpt-5.5 chat` pins the worker model for the whole session.
@@ -55,13 +59,20 @@ Open a tab or run an action:
 | `/clear` | Clear the session / blank the transcript. |
 | `/models` | List providers and models (same output as `stella models`). |
 | `/init` | Run workspace initialization. |
-| `/pipeline` | Open the pipeline tab. |
-| `/agents` | Open the installed-agents tab. |
-| `/files` | Open the files-touched tab. |
-| `/diff` | Open the diff tab. |
-| `/graph` | Open the code-graph tab. |
-| `/skills` | Open the skills tab. |
+| `/pipeline` | Toggle the staged pipeline on or off for subsequent turns. |
+| `/agents` | Open the AGENT ENGINE tab — executions, installed agents, and the engine-config panel. |
+| `/files` | Open the FILES (files-touched) tab. |
+| `/diff` | Show the working diff. |
+| `/graph` | Open the GRAPH (code-graph) tab. |
+| `/skills` | Open the SKILLS tab. |
 | `/mcp` | Open the MCP tab (enable/disable servers, enter credentials). |
+| `/mcp-search` | Search the MCP registry without leaving the deck. |
+| `/sessions` | Browse and resume past sessions. |
+| `/context` | Open the context overlay — what's in the model's window right now. |
+| `/inbox` | Open the persistent inbox. |
+| `/export` | Export session telemetry as a self-contained ZIP. |
+| `/model-default` `/model-worker` `/model-judge` `/model-triage` | Set the model for one [engine agent](/docs/configuration/agent-engine-config). |
+| `/donate` | Support Stella's development. |
 
 Press **Ctrl-C** to quit the deck.
 
@@ -76,7 +87,12 @@ The line REPL has a smaller, different set:
 | `/config` | Show the current configuration. |
 | `/clear` | Clear the conversation history. |
 | `/goal <goal>` | Run a goal-driven turn toward the stated goal. |
-| `exit` / `/exit` / `/quit` | Leave Stella. |
+| `/files` | Show files touched this session. |
+| `/agents` | List custom agents (from `.stella/agents` or `~/.config/stella/agents`). |
+| `/init` | Index the workspace: domain taxonomy + code graph. |
+| `/rename <name>` | Rename this terminal tab. |
+| `/color <name>` | Change the accent color (for multi-window setups). |
+| `exit` / `/exit` / `/quit` (or **Ctrl-D**) | Leave Stella. |
 
 ## Examples
 

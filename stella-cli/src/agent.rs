@@ -3,7 +3,7 @@
 //!
 //! `run_turn` drives `stella_core::Engine::run_turn` (the step-driver: one
 //! model call per step, retry+backoff, compaction, loop detection, budget
-//! checks — see `crates/stella-core/src/driver.rs`) and renders its
+//! checks — see `stella-core/src/driver.rs`) and renders its
 //! `AgentEvent` stream live via a spawned draining task. This replaces the
 //! Phase 0/1 ad-hoc loop that lived here directly (no retry, no
 //! compaction, no budget, a flat iteration cap instead of real loop

@@ -147,14 +147,14 @@ The staged pipeline enforces the same contract at runtime: when no
 (the judge's resolution, never the worker) author the failing witness test up
 front, tracks its fail→pass flip in the flip oracle, and refuses to credit the
 flip if the worker modified the witness files (tamper exclusion). See
-`docs/design/pipeline.md` for the full stage flow, the distress-triggered guidance
+`stella-docs/content/docs/inference-pipeline.mdx` for the full stage flow, the distress-triggered guidance
 loop, and the `/pipeline` deck toggle.
 
 ---
 
 ## Workspace layout — where a change goes
 
-Sixteen crates. The one-sentence rule of thumb:
+Fourteen crates. The one-sentence rule of thumb:
 
 | You want to… | Crate | Notes |
 |---|---|---|
@@ -171,6 +171,7 @@ Sixteen crates. The one-sentence rule of thumb:
 | MCP client (external tool servers) | `stella-mcp` | |
 | Multimodal generation | `stella-media` | |
 | Multi-agent fan-out, worktree isolation | `stella-fleet` | |
+| The Observatory telemetry dashboard (`stella observe`) | `stella-observatory` | Loopback-only, read-only, embedded HTML. |
 | Open Context Protocol (wire types / host / conformance) | external repo: [`opencontextprotocol`](https://github.com/macanderson/opencontextprotocol) | Split out of this workspace; Stella depends on it via git. `ocp-types` stays dependency-light by contract. |
 
 **Status — what ships.** The live runtime path is

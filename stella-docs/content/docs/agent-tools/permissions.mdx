@@ -9,13 +9,13 @@ Every tool the agent can call — built-in, [custom](/docs/agent-tools/custom-to
 
 Tools fall into two categories:
 
-- **Read-only tools** only observe your workspace and environment. They never change files, run commands, or perform side effects. These tools are marked `read_only: true`. The authoritative read-only set in the [built-in catalog](/docs/agent-tools) is `read_file`, `grep`, `glob`, `explorations`, `ci_status`, `search_issues`, and — once `stella init` has built the code graph — `graph_query`.
+- **Read-only tools** only observe your workspace and environment. They never change files, run commands, or perform side effects. These tools are marked `read_only: true`. The authoritative read-only set in the [built-in catalog](/docs/agent-tools) is `read_file`, `grep`, `glob`, `gather_context`, `explorations`, `ci_status`, the read-only issue tools (`search_issues`, `get_issue`, `list_labels`, `list_members`), and — once `stella init` has built the code graph — `graph_query`. Read-only tools are also the only ones eligible for speculative execution during the model stream.
 - **Mutating and shell tools** can change files, execute commands, or perform other side effects. Examples include `write_file`, `edit_file`, `delete_file`, `bash`, `build_project`, `run_tests`, `save_memory`, `screenshot`, and `verify_done`.
 
 The `read_only: true` marker is the signal that a tool is safe to run without changing anything. Tools without it should be treated as capable of side effects — note that `screenshot` and `verify_done` are mutating even though they only write into `.stella/` or shell out to a test command.
 
 <Callout type="info">
-Read-only vs. mutating is a property of the tool, not of a specific invocation. Some friendly names are actually families whose members split across the boundary — within the issue tools, `search_issues` is read-only while `create_issue` / `update_issue` / `close_issue` / `start_work_on_issue` are mutating.
+Read-only vs. mutating is a property of the tool, not of a specific invocation. Some friendly names are actually families whose members split across the boundary — within the issue tools, `search_issues` / `get_issue` / `list_labels` / `list_members` are read-only while `create_issue` / `update_issue` / `close_issue` / `start_work_on_issue` are mutating.
 </Callout>
 
 ## Gating tool calls with hooks

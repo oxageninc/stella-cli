@@ -30,17 +30,24 @@ Stella — not as a policy, as a construction:
 
 ## What you can see
 
+The nav has eight tabs, and most panels honor a **timeframe selector** so the
+charts can zoom from the last hour to all time:
+
 | View | Answers |
 | --- | --- |
 | **Overview** | Runs, resolve rate, total spend, tokens, prompt-cache read/write/miss, a per-execution timeline |
-| **Executions** | Every run: kind, prompt, provider, model, outcome, cost, steps, tokens, tool calls, files touched |
-| **Execution drill-down** | One run's per-step telemetry, every tool call, files touched, and the post-turn self-reflection |
-| **Models** | Per provider/model: runs, resolve rate, cost, **$/resolved task**, tokens, average duration |
-| **Tools** | The tool leaderboard: calls, errors, p50/max latency, bytes |
-| **Files** | The most-touched files across runs |
-| **Memory** | The memory plane: citations, reflections, promoted rules, skill usage |
+| **Executions** | Every run: kind, prompt, provider, model, outcome, cost, steps, tokens, tool calls, files touched — with per-run drill-down into per-step telemetry, every tool call, and the post-turn self-reflection |
+| **Code Graph** | The indexed code graph: symbols, imports, and per-project drill-down |
+| **Skills** | Installed skills and their usage |
 | **MCP** | Per-server / per-tool MCP traffic |
-| **Fleet** | The fleet ledger: runs, attempts, commits, spend |
+| **Memory** | The memory plane: citations, reflections, promoted rules |
+| **Self-improve** | The self-improvement loop: lessons, promotions, and their outcomes |
+| **Config** | The resolved configuration the runs executed under |
+
+Panels within the tabs add the **Models** breakdown (per provider/model: runs,
+resolve rate, cost, **$/resolved task**, tokens, average duration), the tool
+leaderboard (calls, errors, p50/max latency, bytes), the most-touched files,
+and the **fleet ledger** (runs, tasks, attempts, successes, commits).
 
 Everything is served from `<workspace>/.stella/store.db` (and
 `.stella/fleet.db` for the fleet view) — the same SQLite files you can query

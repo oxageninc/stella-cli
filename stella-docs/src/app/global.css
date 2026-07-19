@@ -1,20 +1,24 @@
 /**
  * Stella CLI docs — styles.
  *
- * Brand system: "ember gold on warm ground". The identity is a gold
- * chevron+cells terminal mark (assets/) over a warm Night surface in dark
- * mode and a warm Paper surface in light mode. Fumadocs' neutral tokens are
- * re-tinted here so the whole site reads as Stella rather than shadcn-neutral.
+ * Brand system: "aurora light on navy black". The identity is the
+ * chevron+cells terminal mark (docs/brand/) in an aurora gradient over a
+ * navy-black Ground in dark mode and a cool Ice surface in light mode.
+ * Fumadocs' neutral tokens are re-tinted here so the whole site reads as
+ * Stella rather than shadcn-neutral.
  *
- * Palette (from the Stella brand kit):
- *   Highlight #FFD97A · Gold #F5B33C · Amber #E08A20
- *   Ink #15120C · Night #0B0A08 · Paper #FBF7EF
- *   Gradient: #FFD97A → #F5B33C (48%) → #E08A20
+ * Palette (from the Stella brand kit, stella-tui/src/theme.rs):
+ *   Cyan #3FE0FF · Azure #4D9FFF · Violet #A78BFA
+ *   Ground #050A18 · Surface #0A1226 · Ice #F2F6FF
+ *   Gradient: #3FE0FF → #4D9FFF (48%) → #A78BFA
  *
- * Contrast rule: bright gold is for the Night surface and non-text accents
+ * Contrast rule: bright cyan is for the Ground surface and non-text accents
  * (the mark, borders, hero glints, buttons). For link/active *text* on the
- * light Paper surface we drop to a deeper amber so body-size text clears
- * WCAG AA; dark mode keeps the bright gold, which clears AA on Night easily.
+ * light Ice surface we drop to a deeper azure so body-size text clears
+ * WCAG AA; dark mode keeps the bright cyan, which clears AA on Ground easily.
+ *
+ * Warm gold/amber is retired brand-wide (see docs/brand/BRAND_GUIDELINES.md)
+ * and must not reappear here outside semantic warnings.
  *
  * The landing-page layer is namespaced `lp-*` so it never leaks into /docs.
  */
@@ -30,63 +34,62 @@
  * ─────────────────────────────────────────────────────────────────────────── */
 
 :root {
-  /* Raw brand scale — reference these for decorative gold anywhere. */
-  --stella-gold-bright: #ffd97a;
-  --stella-gold: #f5b33c;
-  --stella-amber: #e08a20;
-  --stella-amber-deep: #9a6a0f; /* AA-legible gold for text on Paper */
-  --stella-ink: #15120c;
-  --stella-night: #0b0a08;
-  --stella-paper: #fbf7ef;
+  /* Raw brand scale — reference these for decorative aurora anywhere. */
+  --stella-cyan: #3fe0ff;
+  --stella-azure: #4d9fff;
+  --stella-violet: #a78bfa;
+  --stella-azure-deep: #1d4ed8; /* AA-legible azure for text on Ice */
+  --stella-ground: #050a18;
+  --stella-ice: #f2f6ff;
   --stella-gradient: linear-gradient(
     135deg,
-    var(--stella-gold-bright) 0%,
-    var(--stella-gold) 48%,
-    var(--stella-amber) 100%
+    var(--stella-cyan) 0%,
+    var(--stella-azure) 48%,
+    var(--stella-violet) 100%
   );
 
-  /* Light mode — warm Paper ground, deep-amber functional accent. */
-  --color-fd-background: #fbf7ef;
-  --color-fd-foreground: #1a160e;
-  --color-fd-muted: #f1ebdd;
-  --color-fd-muted-foreground: #625a4c;
-  --color-fd-card: #fffdf8;
-  --color-fd-card-foreground: #1a160e;
-  --color-fd-popover: #fffdf8;
-  --color-fd-popover-foreground: #1a160e;
-  --color-fd-border: #e8dfcd;
-  --color-fd-accent: #f1ebdd;
-  --color-fd-accent-foreground: #15120c;
-  --color-fd-primary: #9a6a0f;
-  --color-fd-primary-foreground: #fbf7ef;
-  --color-fd-secondary: #f1ebdd;
-  --color-fd-secondary-foreground: #15120c;
-  --color-fd-ring: #e08a20;
+  /* Light mode — cool Ice ground, deep-azure functional accent. */
+  --color-fd-background: #f5f8ff;
+  --color-fd-foreground: #0e1526;
+  --color-fd-muted: #e8eefa;
+  --color-fd-muted-foreground: #4c5a75;
+  --color-fd-card: #fcfdff;
+  --color-fd-card-foreground: #0e1526;
+  --color-fd-popover: #fcfdff;
+  --color-fd-popover-foreground: #0e1526;
+  --color-fd-border: #d8e2f4;
+  --color-fd-accent: #e8eefa;
+  --color-fd-accent-foreground: #050a18;
+  --color-fd-primary: var(--stella-azure-deep);
+  --color-fd-primary-foreground: #f5f8ff;
+  --color-fd-secondary: #e8eefa;
+  --color-fd-secondary-foreground: #050a18;
+  --color-fd-ring: #4d9fff;
 }
 
 .dark {
-  /* Dark mode — warm Night ground, bright gold accent. */
-  --color-fd-background: #0b0a08;
-  --color-fd-foreground: #f5f1e8;
-  --color-fd-muted: #1c1710;
-  --color-fd-muted-foreground: #9c9385;
-  --color-fd-card: #141109;
-  --color-fd-card-foreground: #f5f1e8;
-  --color-fd-popover: #141109;
-  --color-fd-popover-foreground: #f5f1e8;
-  --color-fd-border: #2a2318;
-  --color-fd-accent: #221c12;
-  --color-fd-accent-foreground: #f5f1e8;
-  --color-fd-primary: #f5b33c;
-  --color-fd-primary-foreground: #15120c;
-  --color-fd-secondary: #1c1710;
-  --color-fd-secondary-foreground: #f5f1e8;
-  --color-fd-ring: #f5b33c;
+  /* Dark mode — navy-black Ground, bright cyan accent. */
+  --color-fd-background: #050a18;
+  --color-fd-foreground: #f2f6ff;
+  --color-fd-muted: #0a1226;
+  --color-fd-muted-foreground: #a9b7d6;
+  --color-fd-card: #0a1226;
+  --color-fd-card-foreground: #f2f6ff;
+  --color-fd-popover: #0a1226;
+  --color-fd-popover-foreground: #f2f6ff;
+  --color-fd-border: #1b2a4a;
+  --color-fd-accent: #101a33;
+  --color-fd-accent-foreground: #f2f6ff;
+  --color-fd-primary: var(--stella-cyan);
+  --color-fd-primary-foreground: #050a18;
+  --color-fd-secondary: #0a1226;
+  --color-fd-secondary-foreground: #f2f6ff;
+  --color-fd-ring: var(--stella-cyan);
 }
 
-/* Inline code keeps a warm tint in dark mode so it reads as part of the system. */
+/* Inline code keeps a cool tint in dark mode so it reads as part of the system. */
 .dark code {
-  color: var(--stella-gold-bright);
+  color: var(--stella-cyan);
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -98,40 +101,40 @@
   background-image:
     linear-gradient(
       to right,
-      color-mix(in oklch, var(--stella-gold) 8%, transparent) 1px,
+      color-mix(in oklch, var(--stella-azure) 8%, transparent) 1px,
       transparent 1px
     ),
     linear-gradient(
       to bottom,
-      color-mix(in oklch, var(--stella-gold) 8%, transparent) 1px,
+      color-mix(in oklch, var(--stella-azure) 8%, transparent) 1px,
       transparent 1px
     );
   background-size: 44px 44px;
   mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 40%, transparent 100%);
 }
 
-/* Warm ember glow anchored to the top of the hero. */
+/* Cool aurora glow anchored to the top of the hero. */
 .lp-hero-glow {
   background: radial-gradient(
     ellipse 60% 50% at 50% -10%,
-    color-mix(in oklch, var(--stella-gold) 22%, transparent),
+    color-mix(in oklch, var(--stella-azure) 22%, transparent),
     transparent 70%
   );
 }
 
-/* Gold gradient text (the "stella" wordmark in the headline). */
-.lp-gold-text {
+/* Aurora gradient text (the "stella" wordmark in the headline). */
+.lp-brand-text {
   background: var(--stella-gradient);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
 }
 
-/* Vivid gold primary button — dark ink label for high contrast in both modes. */
+/* Vivid aurora primary button — dark ground label for high contrast in both modes. */
 .lp-cta {
   background: var(--stella-gradient);
-  color: var(--stella-ink);
-  box-shadow: 0 1px 0 0 color-mix(in oklch, var(--stella-gold-bright) 60%, transparent) inset;
+  color: var(--stella-ground);
+  box-shadow: 0 1px 0 0 color-mix(in oklch, var(--stella-cyan) 60%, transparent) inset;
 }
 .lp-cta:hover {
   filter: brightness(1.05);
@@ -143,9 +146,9 @@
     monospace;
 }
 
-/* The `>` prompt in the terminal card, in brand gold. */
+/* The `>` prompt in the terminal card, in brand cyan. */
 .lp-prompt {
-  color: var(--stella-gold);
+  color: var(--stella-azure);
 }
 
 .lp-caret {
@@ -153,7 +156,7 @@
   width: 0.55ch;
   height: 1.05em;
   translate: 0 0.16em;
-  background: var(--stella-gold);
+  background: var(--stella-azure);
   animation: lp-blink 1.05s steps(1) infinite;
 }
 

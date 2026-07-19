@@ -5,8 +5,9 @@ destined for **stella.oxagen.sh**.
 
 Built with [Next.js](https://nextjs.org) (App Router) + [Fumadocs](https://fumadocs.dev)
 (`fumadocs-core` / `fumadocs-ui` / `fumadocs-mdx`) + Tailwind CSS v4. Branded with the
-Stella identity — the gold chevron+cells mark on a warm Night/Paper palette (see
-`src/app/global.css` for the tokens and `public/brand/` for the logo lockups).
+Stella identity — the aurora chevron+cells mark on a navy-black/Ice palette (see
+`src/app/global.css` for the tokens, `public/brand/` for the logo lockups, and
+`../docs/brand/BRAND_GUIDELINES.md` for the brand system).
 
 ## Develop
 
@@ -28,16 +29,19 @@ pnpm typecheck    # tsc --noEmit
 ```
 content/docs/            # all documentation (MDX + meta.json ordering)
   index.mdx              # Introduction
-  installation.mdx
-  quickstart.mdx
-  providers.mdx          # provider matrix + credential chain
-  commands/              # per-command reference (run, chat, goal, monitor, …)
-  configuration/         # settings.json (scope hierarchy), credentials
-  tools/                 # built-in tools, permissions, custom tools, MCP, hooks
-  agent-engine.mdx       # the step loop + verify_done
-  goal-mode.mdx          # judged rounds + cross-family judge
-  memory.mdx             # memories, reflections, skills, code graph
-  telemetry.mdx          # local SQLite metering + budget
+  getting-started/       # installation, initialization, providers
+  api-providers/         # per-provider pages + the live model catalog
+  inference-pipeline.mdx # the staged pipeline: triage → … → judge
+  context-engine.mdx     # bi-temporal memory, recall, citation loop
+  agent-modes/           # chat / run / goal / monitor + goal-mode deep dive
+  agent-fleets.mdx       # parallel worker fleets in git worktrees
+  agent-tools/           # built-in tools, skills, permissions, custom, MCP, hooks
+  configuration/         # settings.json scopes, agent-engine config, credentials
+  examples/              # cost/quality profiles (dirt-cheap → max-quality)
+  telemetry/             # local SQLite metering, Observatory, files-touched
+  principles/            # determinism + the papers
+  commands/              # per-command reference (run, chat, goal, fleet, …)
+  extensions.mdx         # the extension event bus
   scripting.mdx          # headless JSON output for CI
 
 src/app/                 # Next.js App Router
@@ -45,7 +49,7 @@ src/app/                 # Next.js App Router
   docs/                  # Fumadocs docs shell
   api/search/            # Fumadocs search route
 src/lib/source.ts        # Fumadocs content source loader
-src/mdx-components.tsx    # MDX component map
+src/mdx-components.tsx   # MDX component map
 ```
 
 ## Add or edit a page

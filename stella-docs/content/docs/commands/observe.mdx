@@ -1,0 +1,39 @@
+---
+title: stella observe
+description: Serve the Observatory — your local telemetry as a web dashboard, loopback-only.
+---
+
+Serve the **Observatory**: a read-only web dashboard over the local telemetry in `.stella/store.db` and `.stella/fleet.db`. Nothing leaves your machine — the server binds to `127.0.0.1` only.
+
+## Synopsis
+
+```bash
+stella observe [--port <N>] [--open]
+```
+
+## What it does
+
+`stella observe` starts a local HTTP server (default port `7787`) and serves the embedded dashboard — no separate install, no build step, no network egress. It reads the same SQLite stores every Stella command writes, so it works on any workspace that has run Stella at least once, and it needs no API key.
+
+The dashboard's tabs cover the overview, executions (with per-run drill-down), the code graph, skills, MCP traffic, memory, self-improvement, and resolved config, plus model spend panels, fleet runs, and a timeframe selector for the charts. See [the Observatory dashboard](/docs/telemetry/dashboard) for a tour of what each tab shows.
+
+## Flags
+
+| Flag | Meaning |
+| --- | --- |
+| `--port <N>` | Port to bind on `127.0.0.1`. Default `7787`; `0` picks a free port. |
+| `--open` | Open the dashboard in your default browser once the server is up. |
+
+## Examples
+
+Serve the dashboard and open it:
+
+```bash
+stella observe --open
+```
+
+Bind an ephemeral port (useful when 7787 is taken):
+
+```bash
+stella observe --port 0
+```

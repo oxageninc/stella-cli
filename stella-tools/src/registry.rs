@@ -283,7 +283,7 @@ impl ToolRegistry {
     /// call runs the blocking policy chains (`tool.call.requested`, then
     /// `file.created`/`file.updated`/`file.deleted` or `command.started`)
     /// before executing, and emits the observer events documented in
-    /// `docs/hooks.md`. Also emits one `tool.registered` per registered
+    /// `stella-docs/content/docs/agent-tools/hooks.mdx`. Also emits one `tool.registered` per registered
     /// tool, name-sorted, so extensions see the tool surface up front.
     pub fn attach_bus(&self, bus: HookBus) {
         let mut schemas = ToolRegistry::schemas(self);
