@@ -160,7 +160,7 @@ export default function HomePage() {
           icon={GitBranch}
           title="Goal mode"
           body="Give Stella an objective and it drives to green — editing, running, and re-checking until a judge confirms the goal from evidence."
-          href="/docs/agent-modes/goal-mode"
+          href="/docs/agent-modes#outcome-driven-goal-mode"
           cta="How goal mode works"
         />
         <SplitCard
