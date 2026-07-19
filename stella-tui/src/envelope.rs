@@ -112,6 +112,15 @@ impl AgentStatus {
 pub enum Inbound {
     /// A new agent joined the workspace — its dashboard row appears.
     Register(AgentMeta),
+    /// Remove one agent's dashboard row — the visual-lifecycle inverse of
+    /// [`Inbound::Register`]. Presentation only: journaling and model state
+    /// are unaffected (the removed lane's history stays in its own session's
+    /// journal, and the engine's conversation is untouched). The driver only
+    /// ever sends it for lanes with no live process behind them — e.g. the
+    /// terminal worker rows of a session the deck is navigating away from,
+    /// which must not linger on the next session's dashboard. Folding an
+    /// unknown id is a no-op.
+    Deregister { agent: AgentId },
     /// An `AgentEvent` belonging to one agent.
     Event { agent: AgentId, event: AgentEvent },
     /// A supervisor lifecycle transition not carried by the event stream.

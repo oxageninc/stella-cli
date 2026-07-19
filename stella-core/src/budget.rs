@@ -181,6 +181,21 @@ impl BudgetGuard {
         self.turn_spent_usd = 0.0;
     }
 
+    /// Set the session-scoped accumulator to exactly `spent_usd`, replacing
+    /// the running total. The turn-scoped counter is untouched.
+    ///
+    /// This is the resume/switch seam: when the driver reopens a session
+    /// (`stella resume` at startup, or an in-deck session switch), it
+    /// reseeds the guard from the target session's journaled spend so a
+    /// configured `--budget` always means "this session" — the one on
+    /// screen — never "this process". Within one session spend stays
+    /// monotone ([`record_spend`](Self::record_spend) only ever adds);
+    /// across sessions monotonicity is deliberately the caller's concern —
+    /// switching to a cheaper session legitimately lowers the accumulator.
+    pub fn reseed_session_spend(&mut self, spent_usd: f64) {
+        self.session_spent_usd = spent_usd;
+    }
+
     /// Current spend for the active turn, in USD.
     pub fn spent_usd(&self) -> f64 {
         self.turn_spent_usd
@@ -395,6 +410,65 @@ mod tests {
         let _ = guard.evaluate();
         let _ = guard.evaluate();
         assert_eq!(guard.spent_usd(), before);
+    }
+
+    #[test]
+    fn reseed_replaces_the_session_total_and_record_spend_accumulates_from_it() {
+        let mut guard = BudgetGuard::new(BudgetMode::Observed, None, None);
+        guard.record_spend(5.0);
+        assert!((guard.session_spent_usd() - 5.0).abs() < 1e-9);
+
+        // The resume/switch seam: the session accumulator becomes exactly
+        // the seed — down as well as up (switching to a cheaper session
+        // legitimately lowers it) — and the turn counter is untouched.
+        guard.reseed_session_spend(1.25);
+        assert!((guard.session_spent_usd() - 1.25).abs() < 1e-9);
+        assert!(
+            (guard.spent_usd() - 5.0).abs() < 1e-9,
+            "turn spend must survive a session reseed"
+        );
+
+        // Subsequent spend accumulates from the seed, not from zero and not
+        // from the pre-reseed total.
+        guard.record_spend(0.5);
+        assert!((guard.session_spent_usd() - 1.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn enforced_mode_gates_relative_to_the_reseeded_session_total() {
+        let mut guard = BudgetGuard::new(BudgetMode::Enforced, None, Some(2.0));
+        guard.record_spend(1.9); // near the session limit
+        assert_eq!(guard.evaluate(), BudgetOutcome::Continue);
+
+        // Reseeding DOWN (adopting a cheaper session) restores headroom…
+        guard.reseed_session_spend(0.5);
+        assert_eq!(guard.evaluate(), BudgetOutcome::Continue);
+        assert_eq!(guard.record_spend(1.0), BudgetOutcome::Continue); // 1.5
+        // …until real spend crosses the limit relative to the seed.
+        match guard.record_spend(0.6) {
+            // 2.1
+            BudgetOutcome::AbortTurn {
+                axis: BudgetAxis::Session,
+                spent_usd,
+                limit_usd,
+            } => {
+                assert!((spent_usd - 2.1).abs() < 1e-9);
+                assert_eq!(limit_usd, 2.0);
+            }
+            other => panic!("expected a session-axis AbortTurn, got {other:?}"),
+        }
+
+        // Reseeding UP (adopting a session already over budget) gates
+        // immediately at the next safe-boundary check.
+        let mut over = BudgetGuard::new(BudgetMode::Enforced, None, Some(2.0));
+        over.reseed_session_spend(3.0);
+        assert!(matches!(
+            over.evaluate(),
+            BudgetOutcome::AbortTurn {
+                axis: BudgetAxis::Session,
+                ..
+            }
+        ));
     }
 
     #[test]

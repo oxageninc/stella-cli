@@ -341,10 +341,14 @@ writes a failing test whose fail→pass flip proves the work (`docs/design/pipel
 | Tool | Description |
 |---|---|
 | `read_file` · `write_file` · `edit_file` · `delete_file` | File CRUD with surgical exact-substring edits |
-| `bash` | Run a shell command (timeout kill; `trace: true` echoes each line) |
+| `bash` | Run a shell command (timeout kill; `trace: true` echoes each line) — **off by default**, registered only with `"tools": {"bash": "on"}` in settings (any scope) |
 | `grep` · `glob` | Regex content search (ripgrep) · glob file discovery (fd) |
 | `graph_query` | Query the indexed code graph: symbol definitions/references, file imports/importers/neighborhood — auto-built at session start, refreshed live |
 | `build_project` · `run_tests` | Build/test with the workspace's toolchain (cargo/npm/go/make) |
+| `run_lint` · `format_code` | The project's own linter/formatter (cargo clippy/fmt, or package.json `lint`/`format` scripts), spawned argv-style — no shell |
+| `run_script` | Run a verb the project itself declares (Makefile target, package.json script, cargo alias); unknown names list the discovered vocabulary |
+| `start_process` · `read_output` · `send_stdin` · `stop_process` | Long-running processes (dev servers, REPLs, watchers) from an argv vector — capped output ring, SIGTERM-then-kill stop, reaped at session end |
+| `repo_status` · `repo_commit` · `repo_push` · `repo_pull` · `repo_rollback` | Vendor-neutral repository tools: structured status, pathspec-explicit commits, pushes that structurally refuse the default branch (never forced), fast-forward-only pulls, restore-named-paths rollback |
 | `verify_done` | Replay new test files against `git HEAD` to prove the change works |
 | `explorations` · `save_exploration` | Shared codebase maps — explore once, reuse everywhere |
 | `save_memory` | Persist a lesson into every future session's system prompt |
@@ -356,6 +360,12 @@ writes a failing test whose fail→pass flip proves the work (`docs/design/pipel
 All file tools are workspace-root-pinned, and every read/write/edit/delete is
 recorded in the Files-Touched ledger (shown per turn as `[C·R·U·D] path`, also
 via `/files`).
+
+**Bash is opt-in.** The default tool surface has no shell: the model works
+through enumerable-argv tools (build/test/lint/format, `run_script`'s
+project-declared verbs, the process group, the `repo_*` tools). Enable `bash`
+per user, org, or project by adding `"tools": {"bash": "on"}` to the
+corresponding `settings.json` scope (normal per-field merge — project wins).
 
 **Opt-in bash sandbox:** `STELLA_BASH_SANDBOX=workspace-write` confines `bash`
 file writes to the workspace root plus the standard tmp dirs (network still
@@ -438,7 +448,7 @@ flowchart TD
       ENG["step driver · goal loop · budget<br/>retry · compaction · loop-detection · router"]
     end
     CORE -->|Provider port| MODEL["stella-model — adapters<br/>anthropic · openai · gemini · vertex · bedrock · zai<br/>(+ any OpenAI-compatible: xai · deepseek · openrouter · local)"]
-    CORE -->|ToolExecutor port| TOOLS["stella-tools<br/>CRUD · bash · grep · glob · build · test · verify_done · issues · CI"]
+    CORE -->|ToolExecutor port| TOOLS["stella-tools<br/>CRUD · grep · glob · build · test · lint · scripts · processes · repo · verify_done · issues · CI · opt-in bash"]
     MCP["stella-mcp<br/>external MCP servers"] -.->|merges tools into registry| TOOLS
     CORE -->|emits AgentEvent stream| STORE["stella-store<br/>SQLite: executions · events · telemetry"]
     U -->|"recall · episodes · bi-temporal facts"| CTX["stella-context — context plane<br/>recall · embeddings · memory"]
@@ -473,7 +483,7 @@ repository and is pulled in as a pinned git dependency, not as workspace members
 |---|---|
 | `stella-cli` | CLI binary — clap surface + agent loop wiring |
 | `stella-core` | The step-driver engine (no I/O): parallel tools, goal loop, budget, retry, compaction, loop detection, router |
-| `stella-tools` | The built-in tools (CRUD, `bash`, `grep`/`glob`, build/test, `verify_done`, issues, CI) |
+| `stella-tools` | The built-in tools (CRUD, `grep`/`glob`, build/test/lint/format, `run_script`, the process group, the `repo_*` tools, `verify_done`, issues, CI — plus the opt-in `bash`) |
 | `stella-model` | The `Provider` port's adapters: anthropic, openai, gemini, vertex, bedrock, zai (SSE, tool-call dialects, SigV4, pricing) |
 | `stella-store` | SQLite persistence — executions, events, telemetry, files-touched |
 | `stella-mcp` | MCP client (stdio + HTTP, protocol `2025-06-18`) merging external tools into the registry |

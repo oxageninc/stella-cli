@@ -375,6 +375,11 @@ pub struct Config {
     /// means the section is absent everywhere; consumers treat that as
     /// all-defaults (`crate::engine_config` resolves it per run).
     pub engine_settings: Option<crate::settings::AgentEngineConfig>,
+    /// Whether the `bash` tool is enabled (`tools.bash` in the settings
+    /// scope chain; absent = OFF). Threaded into every `ToolRegistry`
+    /// construction via `agent::registry_options` — the default tool
+    /// surface has no shell.
+    pub tools_bash: bool,
 }
 
 impl Config {
@@ -467,6 +472,7 @@ impl Config {
         )?;
         cfg.hooks = settings.hooks.clone();
         cfg.engine_settings = settings.agent_engine_config.clone();
+        cfg.tools_bash = settings.bash_tool_enabled();
         Ok(cfg)
     }
 
@@ -561,6 +567,7 @@ impl Config {
                     base_url_override: Some(base_url),
                     hooks: None,
                     engine_settings: None,
+                    tools_bash: false,
                 });
             }
 
@@ -745,11 +752,12 @@ impl Config {
             api_key: key,
             workspace_root: workspace_root.to_path_buf(),
             base_url_override: base_url_override.map(str::to_string),
-            // Hooks (and the agent-engine settings) ride the settings
-            // chain, not credential resolution — `load_with_settings`
-            // stamps both after the provider resolves.
+            // Hooks, the agent-engine settings, and the tool switches ride
+            // the settings chain, not credential resolution —
+            // `load_with_settings` stamps them after the provider resolves.
             hooks: None,
             engine_settings: None,
+            tools_bash: false,
         })
     }
 
@@ -1207,6 +1215,7 @@ mod tests {
             base_url_override: None,
             hooks: None,
             engine_settings: None,
+            tools_bash: false,
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains(secret), "Config Debug leaked the key: {dbg}");

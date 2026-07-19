@@ -56,7 +56,10 @@ You have these tools available:
 - write_file: Create or overwrite a file (creates parent dirs)
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
-- bash: Run a shell command in the workspace root (with timeout)
+- run_lint / format_code: Run the project's own linter/formatter (cargo clippy/fmt, or the package.json lint/format scripts)
+- run_script: Run a verb the project itself declares — a Makefile target, package.json script, or cargo alias; args are passed argv-style and an unknown name lists the declared vocabulary
+- start_process / read_output / send_stdin / stop_process: Manage long-running processes (dev servers, REPLs, watchers) from an argv vector; one-shot commands belong in build_project/run_tests/run_script
+- repo_status / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
 - graph_query: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. The index is built automatically at session start and refreshes live as files change.
 - grep: Search file contents with regex (shells to ripgrep)
 - glob: Find files matching a glob pattern
@@ -67,7 +70,7 @@ You have these tools available:
 - search_skills: Search the public skills registry for reusable skills you don't have locally
 - install_skill: Install a registry skill into the project (always requires the user's confirmation)
 
-Some tools have prerequisites: issue tracking (create_issue/update_issue/close_issue/search_issues/get_issue/list_labels/list_members/start_work_on_issue) appears only when a tracker is configured (`stella connect github|linear`, LINEAR_API_KEY, or gh auth) — search labels/members with list_labels/list_members before guessing names; ci_status requires the gh CLI. Use them when present.
+Some tools have prerequisites: issue tracking (create_issue/update_issue/close_issue/search_issues/get_issue/list_labels/list_members/start_work_on_issue) appears only when a tracker is configured (`stella connect github|linear`, LINEAR_API_KEY, or gh auth) — search labels/members with list_labels/list_members before guessing names; ci_status requires the gh CLI. Use them when present. The `bash` shell tool exists only when the workspace settings enable it ("tools": {"bash": "on"}); by default there is no shell — use the structured tools above.
 
 Rules:
 - For "where is X defined", "who calls/references X", or "what depends on this file" questions, reach for graph_query FIRST when it is available — it is precise and cheap. Fall back to grep/glob only when the graph can't answer (free-text search, a symbol the index doesn't carry, or no index yet).
@@ -88,7 +91,10 @@ You have these tools available:
 - write_file: Create or overwrite a file (creates parent dirs)
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
-- bash: Run a shell command in the workspace root (with timeout)
+- run_lint / format_code: Run the project's own linter/formatter (cargo clippy/fmt, or the package.json lint/format scripts)
+- run_script: Run a verb the project itself declares — a Makefile target, package.json script, or cargo alias; args are passed argv-style and an unknown name lists the declared vocabulary
+- start_process / read_output / send_stdin / stop_process: Manage long-running processes (dev servers, REPLs, watchers) from an argv vector; one-shot commands belong in build_project/run_tests/run_script
+- repo_status / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
 - graph_query: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. The index is built automatically at session start and refreshes live as files change. For symbol and dependency questions it is precise and cheaper than grep.
 - grep: Search file contents with regex (shells to ripgrep)
 - glob: Find files matching a glob pattern
@@ -99,7 +105,7 @@ You have these tools available:
 - search_skills: Search the public skills registry for reusable skills you don't have locally
 - install_skill: Install a registry skill into the project (always requires the user's confirmation)
 
-Some tools have prerequisites: issue tracking (create_issue/update_issue/close_issue/search_issues/get_issue/list_labels/list_members/start_work_on_issue) appears only when a tracker is configured (`stella connect github|linear`, LINEAR_API_KEY, or gh auth) — search labels/members with list_labels/list_members before guessing names; ci_status requires the gh CLI. Use them when present.
+Some tools have prerequisites: issue tracking (create_issue/update_issue/close_issue/search_issues/get_issue/list_labels/list_members/start_work_on_issue) appears only when a tracker is configured (`stella connect github|linear`, LINEAR_API_KEY, or gh auth) — search labels/members with list_labels/list_members before guessing names; ci_status requires the gh CLI. Use them when present. The `bash` shell tool exists only when the workspace settings enable it ("tools": {"bash": "on"}); by default there is no shell — use the structured tools above.
 
 Methodology (always follow in order):
 1. REPRODUCE: Run the failing test or reproduce the bug before touching any file. Never edit blind, you must see the actual error first.
@@ -344,8 +350,9 @@ async fn run_pipeline_one_shot(
     let provider = build_provider(cfg)?;
     let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
 
-    let registry: Arc<ToolRegistry> =
-        Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
+    let registry: Arc<ToolRegistry> = Arc::new(
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
+    );
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     // Auto-build + live-refresh the code graph in the background so the
@@ -1048,8 +1055,9 @@ async fn run_raw_one_shot(
     // Concrete `Arc<ToolRegistry>` (not `Arc<dyn ToolExecutor>`) so the
     // files-touched ledger is reachable after the turn — the trait object
     // hides it. It still coerces to `&dyn ToolExecutor` for the engine.
-    let registry: std::sync::Arc<ToolRegistry> =
-        std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
+    let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
+    );
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     // Auto-build + live-refresh the code graph in the background so a
@@ -1193,8 +1201,9 @@ pub async fn run_goal_cmd(
     use_pipeline: bool,
 ) -> Result<(), String> {
     let provider = build_provider(cfg)?;
-    let registry: std::sync::Arc<ToolRegistry> =
-        std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
+    let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
+    );
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     // Auto-build + live-refresh the code-graph index in the background so
@@ -1320,8 +1329,9 @@ const REPL_RESERVED: &[&str] = &[
 /// turn-scoped counter at the start of each one.
 pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<(), String> {
     let provider = build_provider(cfg)?;
-    let registry: std::sync::Arc<ToolRegistry> =
-        std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
+    let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
+    );
     let mcp = connect_mcp(
         cfg,
         registry.clone(),
@@ -2271,7 +2281,14 @@ pub fn run_tools_listing() -> Result<(), String> {
         std::env::current_dir().map_err(|e| format!("cannot determine workspace root: {e}"))?;
     tui::section_header("Stella tools");
 
-    let registry = ToolRegistry::new(workspace_root.clone());
+    // The listing mirrors a real session's surface, so the settings-driven
+    // switches (bash opt-in) apply here exactly as they do at session start.
+    let settings = crate::settings::Settings::load(&workspace_root)?;
+    let bash_enabled = settings.bash_tool_enabled();
+    let registry = ToolRegistry::new(
+        workspace_root.clone(),
+        stella_tools::RegistryOptions { bash: bash_enabled },
+    );
     println!("  {}", "built-in:".dimmed());
     let mut native: Vec<String> = stella_core::ports::ToolExecutor::schemas(&registry)
         .into_iter()
@@ -2280,6 +2297,14 @@ pub fn run_tools_listing() -> Result<(), String> {
     native.sort();
     for name in &native {
         println!("    {} {}", "·".dimmed(), name);
+    }
+    if !bash_enabled {
+        println!(
+            "    {} {}",
+            "·".dimmed(),
+            "bash — disabled (default); enable with \"tools\": {\"bash\": \"on\"} in settings"
+                .dimmed()
+        );
     }
     println!(
         "\n  {}",
@@ -3382,6 +3407,17 @@ async fn run_goal_pipeline_turn(
 /// served by the shared adapter re-identified per provider so its
 /// `Provider::id()` and error messages name the surface actually being
 /// called (an xAI 401 must never read "Z.ai rejected the API key").
+/// The registry feature switches for this session's config — the ONE
+/// translation point from settings (`tools.bash`, default off) to
+/// [`stella_tools::RegistryOptions`]. Every session driver (one-shot, goal,
+/// interactive, deck, sub-session workers, fleet workers) builds its
+/// registry through this, so no path can quietly re-enable the shell.
+pub(crate) fn registry_options(cfg: &Config) -> stella_tools::RegistryOptions {
+    stella_tools::RegistryOptions {
+        bash: cfg.tools_bash,
+    }
+}
+
 pub(crate) fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
     build_provider_parts(
         &cfg.provider,
@@ -3904,6 +3940,7 @@ mod tests {
             base_url_override: None,
             hooks: None,
             engine_settings: None,
+            tools_bash: false,
         }
     }
 

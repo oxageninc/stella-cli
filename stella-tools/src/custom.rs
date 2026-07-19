@@ -96,10 +96,24 @@ pub const RESERVED_NAMES: &[&str] = &[
     "write_file",
     "edit_file",
     "delete_file",
-    // Exec & search
-    "bash",
+    // Search
     "grep",
     "glob",
+    // Manifest-verb execution (argv, no shell)
+    "run_lint",
+    "format_code",
+    "run_script",
+    // The long-running process group
+    "start_process",
+    "read_output",
+    "send_stdin",
+    "stop_process",
+    // Vendor-neutral repository tools
+    "repo_status",
+    "repo_commit",
+    "repo_push",
+    "repo_pull",
+    "repo_rollback",
     // Codebase maps & memory
     "explorations",
     "save_exploration",
@@ -122,11 +136,13 @@ pub const RESERVED_NAMES: &[&str] = &[
     "task_complete",
     "task_cancel",
     "task_assign",
-    // Conditionally registered tools: graph_query only when a code-graph index
-    // exists, generate_image (and the video pair, when the key family has a
-    // video adapter) only when a media key is configured. The registry-driven
-    // drift test can't see these (a bare registry never advertises them), so
-    // they must be listed here by hand.
+    // Conditionally registered tools: bash only when the settings opt-in
+    // (`tools.bash: "on"`) enabled it, graph_query only when a code-graph
+    // index exists, generate_image (and the video pair, when the key family
+    // has a video adapter) only when a media key is configured. The
+    // registry-driven drift test can't see these (a bare registry never
+    // advertises them), so they must be listed here by hand.
+    "bash",
     "graph_query",
     "generate_image",
     "generate_video",

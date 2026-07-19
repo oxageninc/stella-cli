@@ -436,7 +436,14 @@ mod tests {
             "Match the surrounding code style.",
         );
 
-        let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
+        // Command guards apply to `bash`, which is settings opt-in — this
+        // fixture opts it in the way an enabled session would.
+        let registry = ToolRegistry::with_backends_and_options(
+            root.path().to_path_buf(),
+            None,
+            None,
+            stella_tools::RegistryOptions { bash: true },
+        );
         enforce_workspace_rules(&registry, root.path());
 
         let denied = registry

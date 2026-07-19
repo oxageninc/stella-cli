@@ -163,6 +163,17 @@ impl SubSessions {
         self.next_req += 1;
         format!("req:{}", self.next_req)
     }
+
+    /// Every lane a worker has ever run on this tenancy, live or ended
+    /// (specs are retained past a worker's end for Restart). Sorted for
+    /// deterministic iteration. The session-switch site deregisters these
+    /// rows when the deck navigates to another session — they are all
+    /// terminal there (the switch refuses while workers are live).
+    pub(crate) fn lanes(&self) -> Vec<String> {
+        let mut lanes: Vec<String> = self.specs.keys().cloned().collect();
+        lanes.sort();
+        lanes
+    }
 }
 
 /// `stella_core::ports::TurnGate` over a watch channel: the worker's turn
@@ -340,7 +351,8 @@ async fn run_worker(
         Ok(p) => p,
         Err(e) => return (None, 0.0, WorkerEnd::Failed(e)),
     };
-    let registry = ToolRegistry::new_detected(cfg.workspace_root.clone()).await;
+    let registry =
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), agent::registry_options(cfg)).await;
     agent::populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
 
@@ -686,6 +698,29 @@ mod tests {
         let mut subs = SubSessions::new();
         assert_eq!(subs.next_req_lane(), "req:1");
         assert_eq!(subs.next_req_lane(), "req:2");
+    }
+
+    #[test]
+    fn lanes_names_every_worker_ever_started_live_or_ended() {
+        // The session-switch site deregisters exactly this set — a lane's
+        // dashboard row outlives its worker, so `lanes` must too.
+        let mut subs = SubSessions::new();
+        assert!(subs.lanes().is_empty());
+        for lane in ["req:2", "req:1", "sub:7"] {
+            let (stop_tx, _stop_rx) = oneshot::channel();
+            let (pause_tx, _pause_rx) = watch::channel(false);
+            subs.started(lane, stop_tx, pause_tx, dummy_spec(lane));
+        }
+        subs.ended("req:1");
+        assert_eq!(
+            subs.lanes(),
+            vec![
+                "req:1".to_string(),
+                "req:2".to_string(),
+                "sub:7".to_string()
+            ],
+            "ended lanes stay listed; order is deterministic (sorted)"
+        );
     }
 
     #[test]

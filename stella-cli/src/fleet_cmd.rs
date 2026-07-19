@@ -471,7 +471,8 @@ async fn run_task(
     let mut cfg = cfg.clone();
     cfg.workspace_root = root.to_path_buf();
     let provider = agent::build_provider(&cfg)?;
-    let registry = ToolRegistry::new_detected(root.to_path_buf()).await;
+    let registry =
+        ToolRegistry::new_detected(root.to_path_buf(), agent::registry_options(&cfg)).await;
     crate::rules::enforce_workspace_rules(&registry, root);
     // Claim-on-first-write (crate::claims): tool-level write claims + the
     // transient build lane, coordinated across every writer in the

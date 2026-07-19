@@ -95,32 +95,48 @@ pub struct SchemaIndex {
     pub views: HashSet<String>,
 }
 
+/// Host-decided feature switches for registry construction. `Default` is
+/// the SECURE posture — no `bash`: arbitrary shell execution is opt-in via
+/// settings (`tools.bash: "on"` in any scope), never ambient. Every
+/// construction path (CLI session drivers, fleet workers, tests) threads a
+/// value through explicitly; there is no global.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RegistryOptions {
+    /// Register the `bash` shell tool. Off by default everywhere: when off
+    /// the model never sees the schema, and calling `bash` anyway returns
+    /// the standard unknown-tool error.
+    pub bash: bool,
+}
+
 impl ToolRegistry {
     /// Construct with auto-detected optional backends (issue tracker, media
     /// provider). Prefer [`ToolRegistry::new_detected`] from async contexts —
     /// this synchronous form probes `gh` inline, blocking the calling thread.
-    pub fn new(root: PathBuf) -> Self {
-        Self::with_backends(
+    pub fn new(root: PathBuf, options: RegistryOptions) -> Self {
+        Self::with_backends_and_options(
             root,
             crate::issues::detect_issue_backend(),
             crate::media::detect_media_backend(),
+            options,
         )
     }
 
     /// [`ToolRegistry::new`] with the process-spawning issue-backend probe
     /// routed through the blocking pool (#64) — the constructor every async
     /// session driver uses.
-    pub async fn new_detected(root: PathBuf) -> Self {
-        Self::with_backends(
+    pub async fn new_detected(root: PathBuf, options: RegistryOptions) -> Self {
+        Self::with_backends_and_options(
             root,
             crate::issues::detect_issue_backend_async().await,
             crate::media::detect_media_backend(),
+            options,
         )
     }
 
-    /// Construct with an explicit issue backend (or none) and no media
-    /// backend — the seam unit tests use so tool counts depend on neither
-    /// the host's `gh` auth nor its provider env keys.
+    /// Construct with an explicit issue backend (or none), no media
+    /// backend, and default options — the seam unit tests use so tool
+    /// counts depend on neither the host's `gh` auth nor its provider env
+    /// keys (nor any bash opt-in).
     pub fn with_issue_backend(
         root: PathBuf,
         issue_backend: Option<crate::issues::IssueBackend>,
@@ -128,23 +144,40 @@ impl ToolRegistry {
         Self::with_backends(root, issue_backend, None)
     }
 
-    /// Construct with every optional backend explicit — the full seam.
+    /// [`ToolRegistry::with_backends_and_options`] with default options.
     pub fn with_backends(
         root: PathBuf,
         issue_backend: Option<crate::issues::IssueBackend>,
         media_backend: Option<crate::media::MediaBackend>,
     ) -> Self {
+        Self::with_backends_and_options(
+            root,
+            issue_backend,
+            media_backend,
+            RegistryOptions::default(),
+        )
+    }
+
+    /// Construct with every optional backend and feature switch explicit —
+    /// the full seam.
+    pub fn with_backends_and_options(
+        root: PathBuf,
+        issue_backend: Option<crate::issues::IssueBackend>,
+        media_backend: Option<crate::media::MediaBackend>,
+        options: RegistryOptions,
+    ) -> Self {
         let citations: crate::memory::CitationLedger = Arc::default();
         let mcp_usage: stella_core::mcp_usage::McpUsageLedger = Arc::default();
         let task_board: crate::tasks::TaskBoardHandle = Arc::default();
         let spawn_queue: crate::tasks::SpawnQueue = Arc::default();
+        let processes: crate::process::ProcessTableHandle = Arc::default();
+        let repo_backend: Arc<dyn crate::repo::RepoBackend> = Arc::new(crate::repo::GitCli);
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         let mut entries: Vec<Arc<dyn Tool>> = vec![
             Arc::new(crate::read::ReadFile::default()),
             Arc::new(crate::write::WriteFile),
             Arc::new(crate::edit::EditFile),
             Arc::new(crate::delete::DeleteFile),
-            Arc::new(crate::bash::Bash),
             Arc::new(crate::grep::Grep),
             Arc::new(crate::glob::Glob),
             Arc::new(crate::gather::GatherContext),
@@ -155,6 +188,21 @@ impl ToolRegistry {
             Arc::new(crate::verify::VerifyDone),
             Arc::new(crate::project::BuildProject),
             Arc::new(crate::project::RunTests),
+            Arc::new(crate::project::RunLint),
+            Arc::new(crate::project::FormatCode),
+            Arc::new(crate::script::RunScript),
+            // The process group shares one table; it lives exactly as long
+            // as the registry and its Drop reaps anything still running.
+            Arc::new(crate::process::StartProcess(processes.clone())),
+            Arc::new(crate::process::ReadOutput(processes.clone())),
+            Arc::new(crate::process::SendStdin(processes.clone())),
+            Arc::new(crate::process::StopProcess(processes)),
+            // Vendor-neutral repository tools over the RepoBackend port.
+            Arc::new(crate::repo::RepoStatusTool(repo_backend.clone())),
+            Arc::new(crate::repo::RepoCommit(repo_backend.clone())),
+            Arc::new(crate::repo::RepoPush(repo_backend.clone())),
+            Arc::new(crate::repo::RepoPull(repo_backend.clone())),
+            Arc::new(crate::repo::RepoRollback(repo_backend)),
             Arc::new(crate::ci::CiStatus),
             Arc::new(crate::screenshot::Screenshot),
             Arc::new(crate::tasks::TaskCreate(task_board.clone())),
@@ -171,6 +219,13 @@ impl ToolRegistry {
             // unlike image/video it is always registered.
             Arc::new(crate::media::GenerateSvg),
         ];
+        // `bash` is OPT-IN, never ambient: registered only when the host
+        // enabled it (settings `tools.bash: "on"`). Absent, the model never
+        // sees the schema and a call is the standard unknown-tool error —
+        // policy enforced at the tool boundary, not by prompt discipline.
+        if options.bash {
+            entries.push(Arc::new(crate::bash::Bash));
+        }
         // The code-graph query tool exists only when `stella init` has built
         // an index — same conditional-registration discipline as the issue
         // tools: no index, no dead schema entry.
@@ -933,6 +988,7 @@ mod tests {
         // drifting out of RESERVED_NAMES. Pin them explicitly — if you add a
         // new conditionally-registered tool, add its name to this array.
         const CONDITIONALLY_REGISTERED: &[&str] = &[
+            "bash",
             "graph_query",
             "generate_image",
             "generate_video",
@@ -956,7 +1012,6 @@ mod tests {
             "write_file",
             "edit_file",
             "delete_file",
-            "bash",
             "grep",
             "glob",
             "gather_context",
@@ -967,6 +1022,18 @@ mod tests {
             "verify_done",
             "build_project",
             "run_tests",
+            "run_lint",
+            "format_code",
+            "run_script",
+            "start_process",
+            "read_output",
+            "send_stdin",
+            "stop_process",
+            "repo_status",
+            "repo_commit",
+            "repo_push",
+            "repo_pull",
+            "repo_rollback",
             "ci_status",
             "screenshot",
             "generate_svg",
@@ -987,7 +1054,58 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(names.len(), 32, "unexpected tool count: {names:?}");
+        // `bash` is NOT in the default surface — it is the settings opt-in.
+        assert!(!names.contains(&"bash".to_string()), "{names:?}");
+        assert_eq!(names.len(), 43, "unexpected tool count: {names:?}");
+    }
+
+    // ---- bash opt-in (default OFF everywhere) -------------------------
+
+    /// Witness: the default registry has NO `bash` — not in the schemas
+    /// the model sees, and executing it anyway is the standard
+    /// unknown-tool error. Shell execution is settings opt-in.
+    #[tokio::test]
+    async fn bash_is_absent_by_default_and_calling_it_is_unknown() {
+        let (_root, reg) = bare_registry(None);
+        assert!(
+            !reg.schemas().iter().any(|s| s.name == "bash"),
+            "bash must not be advertised by default"
+        );
+        let out = reg
+            .execute("bash", &serde_json::json!({"command": "echo hi"}))
+            .await;
+        match out {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("unknown tool `bash`"), "{message}")
+            }
+            other => panic!("disabled bash must be an unknown tool: {other:?}"),
+        }
+        // And the default options value IS the off posture.
+        assert!(!RegistryOptions::default().bash);
+    }
+
+    /// Witness: the explicit opt-in registers `bash` — schema advertised
+    /// and dispatchable.
+    #[tokio::test]
+    async fn bash_registers_and_dispatches_with_the_opt_in_flag() {
+        let root = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::with_backends_and_options(
+            root.path().to_path_buf(),
+            None,
+            None,
+            RegistryOptions { bash: true },
+        );
+        assert!(reg.schemas().iter().any(|s| s.name == "bash"));
+        let out = reg
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "echo bash_enabled_ok"}),
+            )
+            .await;
+        match out {
+            ToolOutput::Ok { content } => assert!(content.contains("bash_enabled_ok")),
+            ToolOutput::Error { message } => panic!("enabled bash must run: {message}"),
+        }
     }
 
     /// The schema list is serialized verbatim into the prompt prefix; a
@@ -1006,7 +1124,7 @@ mod tests {
     fn issue_tools_absent_without_a_configured_backend() {
         let (_root, reg) = bare_registry(None);
         let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
-        assert_eq!(names.len(), 24, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 35, "unexpected tool count: {names:?}");
         for absent in [
             "create_issue",
             "update_issue",
@@ -1146,6 +1264,7 @@ mod tests {
                     | "get_issue"
                     | "list_labels"
                     | "list_members"
+                    | "repo_status"
             );
             assert_eq!(
                 schema.read_only, expected,
@@ -1829,7 +1948,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_denied_command_never_runs_and_a_bus_less_registry_is_unchanged() {
-        let (_dir, reg) = telemetry_fixture();
+        // Command guards apply to `bash`, so this fixture opts it in.
+        let dir = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::with_backends_and_options(
+            dir.path().to_path_buf(),
+            None,
+            None,
+            RegistryOptions { bash: true },
+        );
         let bus = HookBus::new("sess");
         bus.on_blocking(hook_names::COMMAND_STARTED, |_| HookDecision::Deny {
             reason: "no shell".into(),
