@@ -79,7 +79,6 @@ pub struct ToolRegistry {
     /// drain discipline, so no request is dispatched twice.
     spawn_queue: crate::tasks::SpawnQueue,
     storage_index: std::sync::Mutex<StorageIndex>,
-    schema_index: std::sync::Mutex<SchemaIndex>,
     /// Which workspace paths are covered by a FRESH saved exploration map —
     /// the read-side analogue of `storage_index` (`docs/design/
     /// exploration-sharing.md` §6). Built once at construction, refreshed
@@ -92,11 +91,6 @@ pub struct ToolRegistry {
     bus: std::sync::RwLock<Option<HookBus>>,
 }
 
-/// The session's storage-map state for the pre-write gate
-/// (`docs/design/storage-map.md` §8): a host-seeded baseline snapshot plus
-/// the relations created by writes this session — which the on-disk index
-/// may not have re-indexed yet. The gate merges both over a fresh read of
-/// the persisted index on every gated write.
 /// Path-coverage of fresh exploration maps plus the hint dedup set.
 #[derive(Debug, Default)]
 struct ExplorationCoverage {
@@ -324,7 +318,6 @@ impl ToolRegistry {
             task_board,
             spawn_queue,
             storage_index: std::sync::Mutex::new(StorageIndex::default()),
-            schema_index: std::sync::Mutex::new(SchemaIndex::default()),
             exploration_coverage,
             bus: std::sync::RwLock::new(None),
         }
