@@ -200,7 +200,8 @@ async fn main() -> std::io::Result<()> {
                 // overlays render their empty states instead of waiting.
                 WorkspaceInput::SessionsRefresh
                 | WorkspaceInput::SessionArchive { .. }
-                | WorkspaceInput::SessionDelete { .. } => {
+                | WorkspaceInput::SessionDelete { .. }
+                | WorkspaceInput::SessionResume { .. } => {
                     let _ = react_tx.send(Inbound::Sessions(vec![]));
                 }
                 // Replay needs the real driver's store; the demo has nothing

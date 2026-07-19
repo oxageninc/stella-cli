@@ -82,11 +82,19 @@ use serde::Serialize;
 use stella_protocol::{AgentEvent, TaskItem, TaskStatus, ToolOutput};
 
 pub mod catalog;
+pub mod journal;
 pub mod notify;
 pub mod sessions;
 pub mod usage;
 
 pub use catalog::CatalogStore;
+// The sidecar journal's writer is deliberately NOT re-exported at the top
+// level: `SessionJournal` here names the DB read-model reassembled by
+// [`Store::session_events`] (read-only replay), while
+// [`journal::SessionJournal`] is the append-only sidecar writer behind
+// live-session durability — two different artifacts that happen to share a
+// natural name. Reach the writer through its module.
+pub use journal::JournalRecord;
 pub use notify::{Notification, NotificationStore};
 pub use sessions::{SessionRecord, SessionRegistry, SessionStatus};
 
