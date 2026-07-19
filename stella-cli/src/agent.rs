@@ -57,7 +57,8 @@ You have these tools available:
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
 - run_lint / format_code: Run the project's own linter/formatter (cargo clippy/fmt, or the package.json lint/format scripts)
-- run_script: Run a verb the project itself declares — a Makefile target, package.json script, or cargo alias; args are passed argv-style and an unknown name lists the declared vocabulary
+- run_script: Run a script the project itself declares, by canonical verb (install/build/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
+- list_scripts: The full project scripts index — every detected script and its canonical verb binding; read-only, nothing executes
 - start_process / read_output / send_stdin / stop_process: Manage long-running processes (dev servers, REPLs, watchers) from an argv vector; one-shot commands belong in build_project/run_tests/run_script
 - repo_status / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
 - graph_query: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. The index is built automatically at session start and refreshes live as files change.
@@ -95,7 +96,8 @@ You have these tools available:
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
 - run_lint / format_code: Run the project's own linter/formatter (cargo clippy/fmt, or the package.json lint/format scripts)
-- run_script: Run a verb the project itself declares — a Makefile target, package.json script, or cargo alias; args are passed argv-style and an unknown name lists the declared vocabulary
+- run_script: Run a script the project itself declares, by canonical verb (install/build/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
+- list_scripts: The full project scripts index — every detected script and its canonical verb binding; read-only, nothing executes
 - start_process / read_output / send_stdin / stop_process: Manage long-running processes (dev servers, REPLs, watchers) from an argv vector; one-shot commands belong in build_project/run_tests/run_script
 - repo_status / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
 - graph_query: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. The index is built automatically at session start and refreshes live as files change. For symbol and dependency questions it is precise and cheaper than grep.
@@ -185,6 +187,9 @@ fn append_exploration_index(prompt: &mut String, workspace_root: &std::path::Pat
     {
         prompt.push('\n');
         prompt.push_str(&index);
+    }
+}
+
 /// The project-scripts section of [`assemble_system_prompt`]: the scripts
 /// index's canonical verb → command bindings, rendered once at session
 /// start right after the base instructions (project ground truth before
@@ -4239,4 +4244,5 @@ mod tests {
             "a judge adapter that fails to build must fall back to the worker provider"
         );
     }
+}
 }
