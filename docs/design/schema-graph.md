@@ -1,8 +1,11 @@
 # Design: Schema-Aware Code Graph for Zero Schema Drift
 
-**Status:** Implemented — the SQL index, pre-write schema gate, and ORM
-detection phases described below are shipped (`stella-graph` SQL parsing,
-`stella-tools/src/schema_gate.rs` wired into the tool registry).
+**Status:** Partially implemented — Phases 1–2 are shipped (`stella-graph`
+SQL parsing, the Diesel `table!` detector, and the pre-write gate in
+`stella-tools/src/schema_gate.rs` wired into the tool registry). Phase 3's
+canonical schema model and `code_graph_schema_links`, and Phase 4's semantic
+edges, are unbuilt and have been absorbed into the superseding spec:
+`docs/design/storage-map.md` (the vendor-agnostic storage map).
 **Goal:** On super-long-horizon tasks (200+ turns), the agent never creates a
 table/column/type that already exists, never proposes a conflicting definition,
 and retrieves schema alongside code when the domain matches.
