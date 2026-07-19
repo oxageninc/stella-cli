@@ -15,6 +15,10 @@
 //! boundary (title/summary/status), and on exit. `Archived` is a user action
 //! from the SESSIONS view; archived and other terminal records stay until
 //! removed there (or swept by [`SessionRegistry::prune`]).
+//!
+//! Each record may own a **sidecar directory** (`data_dir()/sessions/<id>/`,
+//! see [`crate::journal`]) holding the durable session state that makes it
+//! resumable — deleting a record deletes its sidecar with it.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,6 +36,10 @@ pub enum SessionStatus {
     InProgress,
     /// The session is blocked on a human answer (ask-user, scope review).
     NeedsInput,
+    /// Deliberately set aside with its state intact — the deck exited (or
+    /// switched away) with work still pending. Not live (no pid downgrade
+    /// applies), and the first thing `resume` looks for.
+    Paused,
     /// The user interrupted the work (Ctrl-C mid-turn, queue abandoned).
     Cancelled,
     /// The session ended after finishing its work.
@@ -45,9 +53,10 @@ pub enum SessionStatus {
 
 impl SessionStatus {
     /// Grouping/order for the SESSIONS view: active work first.
-    pub const ALL: [SessionStatus; 6] = [
+    pub const ALL: [SessionStatus; 7] = [
         SessionStatus::InProgress,
         SessionStatus::NeedsInput,
+        SessionStatus::Paused,
         SessionStatus::Cancelled,
         SessionStatus::Complete,
         SessionStatus::Archived,
@@ -59,6 +68,7 @@ impl SessionStatus {
         match self {
             SessionStatus::InProgress => "In Progress",
             SessionStatus::NeedsInput => "Needs Input",
+            SessionStatus::Paused => "Paused",
             SessionStatus::Cancelled => "Cancelled",
             SessionStatus::Complete => "Complete",
             SessionStatus::Archived => "Archived",
@@ -128,11 +138,10 @@ impl SessionRegistry {
         Self { dir: dir.into() }
     }
 
-    fn path_for(&self, id: &str) -> PathBuf {
-        // Ids are self-minted (`ses-<ms>-<pid>`), but never trust a name to
-        // stay a single path component.
-        let safe: String = id
-            .chars()
+    /// Ids are self-minted (`ses-<ms>-<pid>`), but never trust a name to
+    /// stay a single path component.
+    fn safe_id(id: &str) -> String {
+        id.chars()
             .map(|c| {
                 if c.is_alphanumeric() || c == '-' {
                     c
@@ -140,8 +149,18 @@ impl SessionRegistry {
                     '_'
                 }
             })
-            .collect();
-        self.dir.join(format!("{safe}.json"))
+            .collect()
+    }
+
+    fn path_for(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{}.json", Self::safe_id(id)))
+    }
+
+    /// The session's sidecar directory (journal + snapshots — see
+    /// [`crate::journal`]), beside its record file. `list` only reads
+    /// `.json` files, so the directory never shadows a record.
+    pub fn sidecar_dir(&self, id: &str) -> PathBuf {
+        self.dir.join(Self::safe_id(id))
     }
 
     /// Write (create or replace) `record` atomically, stamping
@@ -180,9 +199,7 @@ impl SessionRegistry {
                 }
                 let text = std::fs::read_to_string(&path).ok()?;
                 let mut record: SessionRecord = serde_json::from_str(&text).ok()?;
-                if record.status.is_live() && !pid_alive(record.pid) {
-                    record.status = SessionStatus::Error;
-                }
+                record.status = Self::presented_status(&record);
                 Some(record)
             })
             .collect();
@@ -207,13 +224,50 @@ impl SessionRegistry {
         Ok(true)
     }
 
-    /// Delete `id`'s record; returns whether it existed.
+    /// Delete `id`'s record — and its sidecar state with it (a deleted
+    /// session must not leave an orphaned journal behind); returns whether
+    /// the record existed.
     pub fn remove(&self, id: &str) -> Result<bool> {
-        match std::fs::remove_file(self.path_for(id)) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(StoreError(format!("cannot remove session record: {e}"))),
+        let existed = match std::fs::remove_file(self.path_for(id)) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(StoreError(format!("cannot remove session record: {e}"))),
+        };
+        if let Err(e) = std::fs::remove_dir_all(self.sidecar_dir(id))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(StoreError(format!("cannot remove session state: {e}")));
         }
+        Ok(existed)
+    }
+
+    /// `record`'s status as presented to viewers: a live status whose owning
+    /// process is gone reads as `Error` ("crashed") without rewriting the
+    /// dead process's file. Every other status is returned as stored.
+    pub fn presented_status(record: &SessionRecord) -> SessionStatus {
+        if record.status.is_live() && !pid_alive(record.pid) {
+            SessionStatus::Error
+        } else {
+            record.status
+        }
+    }
+
+    /// Whether `id` can be reopened: its record exists, no live process owns
+    /// it, and there is durable state on disk to restore ([`crate::journal`]).
+    pub fn resumable(&self, id: &str) -> bool {
+        self.get(id).is_some_and(|r| {
+            !Self::presented_status(&r).is_live()
+                && crate::journal::has_state(&self.sidecar_dir(&r.id))
+        })
+    }
+
+    /// The most recently *active* resumable session for `workspace` — what a
+    /// bare `stella resume` reopens.
+    pub fn latest_resumable(&self, workspace: &str) -> Option<SessionRecord> {
+        self.list()
+            .into_iter()
+            .filter(|r| r.workspace == workspace && self.resumable(&r.id))
+            .max_by_key(|r| r.updated_at_ms)
     }
 
     /// Sweep terminal records older than `max_age_ms` (registry hygiene —
@@ -345,6 +399,93 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, new.id);
         assert_eq!(listed[1].id, old.id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paused_is_not_live_and_survives_the_owners_death() {
+        let (dir, reg) = temp_registry("paused");
+        let mut rec = SessionRecord::new("/w/p", "p");
+        rec.pid = u32::MAX - 1; // certainly not a live pid
+        rec.status = SessionStatus::Paused;
+        reg.upsert(&rec).unwrap();
+        // A paused session is deliberate, not crashed: no Error downgrade.
+        assert_eq!(reg.list()[0].status, SessionStatus::Paused);
+        assert!(!SessionStatus::Paused.is_live());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_deletes_the_sidecar_state_with_the_record() {
+        let (dir, reg) = temp_registry("sidecar");
+        let rec = SessionRecord::new("/w/s", "s");
+        reg.upsert(&rec).unwrap();
+        let sidecar = reg.sidecar_dir(&rec.id);
+        crate::journal::write_queue(&sidecar, &["pending".into()]).unwrap();
+        assert!(sidecar.exists());
+
+        assert!(reg.remove(&rec.id).unwrap());
+        assert!(!sidecar.exists(), "sidecar must not outlive its record");
+        // Removing a missing record (and missing sidecar) stays a clean no.
+        assert!(!reg.remove(&rec.id).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latest_resumable_wants_matching_workspace_state_and_no_live_owner() {
+        let (dir, reg) = temp_registry("resumable");
+
+        // Live (our own pid): never resumable, even with state on disk.
+        let mut live = SessionRecord::new("/w/a", "live");
+        reg.upsert(&live).unwrap();
+        live = reg.get(&live.id).unwrap();
+        crate::journal::write_history(&reg.sidecar_dir(&live.id), &[]).unwrap();
+
+        // Dead + state, with explicit activity stamps (bypassing upsert's
+        // restamp, as the prune test does) so the winner is deterministic
+        // even when every upsert lands in the same millisecond.
+        let pin_updated = |mut rec: SessionRecord, updated_at_ms: u64| {
+            rec.pid = u32::MAX - 1;
+            rec.status = SessionStatus::Paused;
+            reg.upsert(&rec).unwrap();
+            rec.updated_at_ms = updated_at_ms;
+            std::fs::write(
+                dir.join(format!("{}.json", rec.id)),
+                serde_json::to_string(&rec).unwrap(),
+            )
+            .unwrap();
+            crate::journal::write_history(&reg.sidecar_dir(&rec.id), &[]).unwrap();
+            rec
+        };
+        let mut old = SessionRecord::new("/w/a", "old");
+        old.id = format!("{}-old", old.id);
+        let old = pin_updated(old, 1_000);
+        let mut newest = SessionRecord::new("/w/a", "newest");
+        newest.id = format!("{}-new", newest.id);
+        let newest = pin_updated(newest, 2_000);
+
+        // Dead, right workspace, but nothing on disk to restore.
+        let mut bare = SessionRecord::new("/w/a", "bare");
+        bare.id = format!("{}-bare", bare.id);
+        bare.pid = u32::MAX - 1;
+        bare.status = SessionStatus::Complete;
+        reg.upsert(&bare).unwrap();
+
+        // Other workspace.
+        let mut other = SessionRecord::new("/w/b", "other");
+        other.id = format!("{}-other", other.id);
+        other.pid = u32::MAX - 1;
+        other.status = SessionStatus::Paused;
+        reg.upsert(&other).unwrap();
+        crate::journal::write_history(&reg.sidecar_dir(&other.id), &[]).unwrap();
+
+        assert!(!reg.resumable(&live.id));
+        assert!(!reg.resumable(&bare.id));
+        assert!(reg.resumable(&old.id));
+        let picked = reg.latest_resumable("/w/a").expect("one resumable");
+        assert_eq!(picked.id, newest.id);
+        assert_eq!(reg.latest_resumable("/w/none"), None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

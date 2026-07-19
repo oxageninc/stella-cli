@@ -292,16 +292,25 @@ fn render_sessions_overlay(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf:
                         .add_modifier(Modifier::BOLD);
                 }
                 let mine = if session.mine { "  (this session)" } else { "" };
+                // The ⏎ affordance rides the selected row, right where the
+                // eye already is — every resumable row also carries a subtle
+                // ↩ so the list is scannable for "where can I go back in".
+                let tag = if session.resumable && !session.mine {
+                    if is_sel { "  ↩ ⏎ resume" } else { "  ↩" }
+                } else {
+                    ""
+                };
                 let title: String = session
                     .title
                     .chars()
-                    .take((w as usize).saturating_sub(24 + mine.len()))
+                    .take((w as usize).saturating_sub(24 + mine.len() + tag.chars().count()))
                     .collect();
                 lines.push(Line::from(vec![
                     Span::raw(marker),
                     dot,
                     Span::styled(title, title_style),
                     Span::styled(mine.to_string(), theme::muted()),
+                    Span::styled(tag.to_string(), theme::accent()),
                 ]));
                 let summary = if session.summary.is_empty() {
                     "(no work recorded yet)".to_string()
@@ -326,7 +335,7 @@ fn render_sessions_overlay(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf:
 
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
-        " ↑/↓ select · a archive · x delete · r refresh · esc/← close",
+        " ↑/↓ select · ⏎ resume · a archive · x delete · r refresh · esc/← close",
         theme::muted(),
     )));
 
@@ -343,6 +352,7 @@ fn phase_color(phase: crate::envelope::SessionPhase) -> ratatui::style::Color {
     match phase {
         SessionPhase::InProgress => theme::SUCCESS_BRIGHT,
         SessionPhase::NeedsInput => theme::WARNING_BRIGHT,
+        SessionPhase::Paused => theme::ACCENT,
         SessionPhase::Cancelled => theme::TEXT_TERTIARY,
         SessionPhase::Complete => theme::SUCCESS,
         SessionPhase::Archived => theme::TEXT_TERTIARY,

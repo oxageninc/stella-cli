@@ -74,11 +74,13 @@ use serde::Serialize;
 use stella_protocol::{AgentEvent, ToolOutput};
 
 pub mod catalog;
+pub mod journal;
 pub mod notify;
 pub mod sessions;
 pub mod usage;
 
 pub use catalog::CatalogStore;
+pub use journal::{JournalRecord, SessionJournal};
 pub use notify::{Notification, NotificationStore};
 pub use sessions::{SessionRecord, SessionRegistry, SessionStatus};
 
