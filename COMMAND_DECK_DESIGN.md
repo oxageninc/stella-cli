@@ -8,6 +8,11 @@ the model).
 This file is the **frozen contract** leaf-view builders code against. Types
 here are authoritative — do not change signatures without updating this doc.
 
+> **Palette note:** color values named in this contract (e.g. the `#FFAC26`
+> amber accent) predate the aurora-on-navy restyle (#185). For colors,
+> `stella-tui/src/theme.rs` and `docs/brand/BRAND_GUIDELINES.md` are
+> authoritative; this doc remains the contract for structure and types only.
+
 ## Module layout (`stella-tui/src/`)
 
 Existing (kept, reused by the Session tab — do not break):
