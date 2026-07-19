@@ -2,8 +2,18 @@
   "title": "Documentation",
   "pages": [
     "index",
+    "---Start here---",
     "getting-started",
     "api-providers",
+    "---Guides---",
+    "agent-modes",
+    "agent-tools",
+    "agent-fleets",
+    "configuration",
+    "telemetry",
+    "examples",
+    "scripting",
+    "---Under the hood---",
     "inference-pipeline",
     "context-engine",
     "agent-modes",
@@ -14,10 +24,10 @@
     "examples",
     "telemetry",
     "principles",
-    "donate",
     "---Reference---",
     "commands",
-    "extensions",
-    "scripting"
+    "---Community---",
+    "showcase",
+    "donate"
   ]
 }
