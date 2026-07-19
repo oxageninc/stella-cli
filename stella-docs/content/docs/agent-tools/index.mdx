@@ -49,7 +49,7 @@ These 18 tools register in every session:
 | `generate_svg` | Validate, sanitize, and save an SVG the agent authored into `.stella/artifacts/` — scripts, event handlers, and external references are stripped. | Mutating |
 
 <Callout type="info">
-`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `gather_context`, `explorations`, `ci_status`, and (when present) `graph_query`, `search_issues`, `get_issue`, `list_labels`, `list_members` — plus `search_skills`, `tool_search`, `skill_search`, and `mcp_search` at the session layer.
+`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `gather_context`, `explorations`, `ci_status`, and (when present) `graph_query`, `search_issues`, `get_issue`, `list_labels`, `list_members`.
 </Callout>
 
 ### Conditionally registered
@@ -74,32 +74,6 @@ These appear only when their prerequisite is met:
 <Callout type="info">
 The issue backend resolves in precedence order: `LINEAR_API_KEY` env → a stored **Linear** connection (`stella connect linear`) → a stored **GitHub** connection (`stella connect github`, runs over REST with no `gh` CLI needed) → ambient `gh` CLI auth. If none is available, no issue tools are registered at all. See [stella connect](/docs/commands/connect).
 </Callout>
-
-### Interactive session tools
-
-Interactive CLI sessions layer three more tools on top of the native registry:
-
-| Tool | Description | Access |
-| --- | --- | --- |
-| `ask_user` | Ask the user a multiple-choice question when a decision is genuinely theirs to make — 2–6 short options, and the UI always adds a free-text option. In a headless run it returns a named error instead of hanging on stdin. | Mutating |
-| `search_skills` | Search the public skills registry for reusable agent [skills](/docs/agent-tools/skills) matching a topic. | Read-only |
-| `install_skill` | Install a skill from the registry into the project's `.stella/skills/` — always asks for confirmation first. | Mutating |
-
-### Discovery tools
-
-Every session also layers three read-only **discovery** tools over the whole catalog. They exist so the agent never needs the entire tool, skill, and MCP surface frontloaded: a workspace can carry hundreds of tools and thousands of installed skills, and the agent finds the best fit on demand instead of carrying all of it in every prompt.
-
-| Tool | Description | Access |
-| --- | --- | --- |
-| `tool_search` | Search every tool available this session — built-ins, `mcp__<server>__<tool>` MCP tools, custom tools — ranked by fit. Queries are keywords (`issue tracking`), `+required` terms (`+github pr`), or `select:name1,name2` for exact lookup. | Read-only |
-| `skill_search` | Search the skills **installed** in this workspace (`.stella/skills/` plus the user-global directory), ranked by fit. `include_body: true` also returns the best match's full instructions. Complements `search_skills`, which queries the public registry for skills you'd still have to install. | Read-only |
-| `mcp_search` | Find MCP servers and their tools: the workspace's configured servers (default scope), or the public MCP registry (`scope: "registry"`) for servers worth installing with `stella mcp add <name>`. | Read-only |
-
-#### Lean frontloading (experimental)
-
-Set `STELLA_LEAN_TOOLS=1` to advertise only a lean core toolset (file CRUD, `bash`, search, build/test/verify, `ask_user`) plus the discovery tools; everything else stays out of the prompt until a `tool_search` surfaces it. Matched tools are *activated* — advertised for the rest of the session. Set the variable to a comma-separated list of tool names to choose your own core. A hidden tool called by name still executes, so lean mode trims prompt weight without ever gating a capability.
-
-All told: 18 always-on tools, up to 30 native tools with the code graph, media keys, and an issue backend, plus the six session tools — before any custom script tools or MCP servers merge in.
 
 ## Where to go next
 

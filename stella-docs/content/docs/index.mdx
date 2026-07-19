@@ -53,23 +53,51 @@ ends on a verified outcome rather than the worker's own say-so.
 
 ## The documentation
 
-- **[Getting Started](/docs/getting-started)** — install, initialize a repo, configure
-  provider keys.
+The sidebar follows the same journey as this list — top to bottom, newcomer to
+expert.
+
+**Start here**
+
+- **[Getting Started](/docs/getting-started)** — install, configure provider keys,
+  initialize a repo.
+- **[API Providers](/docs/api-providers)** — the nine hosted providers + local, model
+  specs, and the live model catalog.
+
+**Guides**
+
+- **[Agent Modes](/docs/agent-modes)** — Command Deck chat, one-shot runs, judged goal
+  mode, CI monitoring.
+- **[Agent Tools](/docs/agent-tools)** — the built-in toolbelt, permissions, skills, MCP
+  servers, custom tools, and hooks.
+- **[Agent Fleets](/docs/agent-fleets)** — parallel workers in isolated git worktrees.
+- **[Configuration &amp; Settings](/docs/configuration)** — `settings.json`, per-agent
+  engine config, credentials, and the scope hierarchy.
+- **[Telemetry &amp; Usage Analytics](/docs/telemetry)** — local-only metering, the
+  Observatory dashboard, budgets, and the files-touched ledger.
+- **[Examples](/docs/examples)** — ready-made engine profiles from dirt-cheap to
+  max-quality.
+- **[Scripting](/docs/scripting)** — headless JSON output for CI and automation.
+
+**Under the hood**
+
 - **[Inference Pipeline](/docs/inference-pipeline)** — triage → plan → witness → execute →
   verify → judge: how work gets *proven*, not just done.
 - **[Context Engine](/docs/context-engine)** — memories, the tree-sitter code graph,
   reflections, and the prompt-cache-native recall that makes them cheap.
-- **[Agent Modes](/docs/agent-modes)** — Command Deck chat, one-shot runs, judged goal
-  mode, CI monitoring.
-- **[Agent Fleets](/docs/agent-fleets)** — parallel workers in isolated git worktrees.
-- **[Agent Tools](/docs/agent-tools)** — the built-in toolbelt, skills, MCP servers,
-  custom commands, hooks, and permissions.
-- **[Configuration &amp; Settings](/docs/configuration)** — `settings.json`, per-agent
-  engine config, credentials, and the scope hierarchy.
-- **[Telemetry &amp; Usage Analytics](/docs/telemetry)** — local-only metering, the
-  dashboard, budgets, and the files-touched ledger.
-- **[Donate](/docs/donate)** — keep independent, local-first tooling alive.
+- **[Extensions](/docs/extensions)** — the lifecycle event bus observers and policy hooks
+  ride on.
+- **[Engineering Principles](/docs/principles)** — determinism, and the papers behind the
+  design.
+
+**Reference**
+
 - **[Commands](/docs/commands)** — the full command and flag reference.
+
+**Community**
+
+- **[Showcase](/docs/showcase)** — teams shipping real software with Stella, starting
+  with [Oxagen](https://oxagen.sh).
+- **[Donate](/docs/donate)** — keep independent, local-first tooling alive.
 
 <Callout type="info">
   Stella is BYOK — it never proxies your traffic through a hosted service. Your keys call
