@@ -10,9 +10,9 @@
 <p align="center">
   <a href="https://github.com/macanderson/stella/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/macanderson/stella/ci.yml?branch=main&style=flat-square&logo=github&label=ci" alt="CI status"></a>
   <a href="https://github.com/macanderson/stella/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/macanderson/stella/release.yml?style=flat-square&logo=github&label=release" alt="Release status"></a>
-  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-FFAC26?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/rust-1.90%2B-FFAC26?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.90+">
-  <img src="https://img.shields.io/badge/providers-9%20%2B%20local-FFAC26?style=flat-square" alt="9 providers + local">
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-3FE0FF?style=flat-square" alt="License"></a>
+  <img src="https://img.shields.io/badge/rust-1.90%2B-3FE0FF?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.90+">
+  <img src="https://img.shields.io/badge/providers-9%20%2B%20local-3FE0FF?style=flat-square" alt="9 providers + local">
 </p>
 
 <p align="center">
@@ -465,9 +465,9 @@ flowchart TD
 
 ## Workspace layout
 
-Sixteen crates total: thirteen `stella-*` crates plus the three `ocp-*` crates
-that implement the Open Context Protocol (the retrieval abstraction Stella's
-recall routes through).
+Fourteen `stella-*` crates make up the workspace. The Open Context Protocol —
+the retrieval abstraction Stella's recall routes through — now lives in its own
+repository and is pulled in as a pinned git dependency, not as workspace members.
 
 | Crate | Role |
 |---|---|

@@ -23,7 +23,7 @@ use crate::tracker_auth::{
 };
 
 /// Which tracker the issue tools talk to.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum IssueBackend {
     /// GitHub Issues via the authenticated `gh` CLI.
     GitHub,
@@ -34,6 +34,28 @@ pub enum IssueBackend {
     /// header value: a personal API key verbatim, or `Bearer <token>` for an
     /// OAuth connection.
     Linear { api_key: String, api_url: String },
+}
+
+// Manual Debug so a stray `{backend:?}` (or a future `tracing::debug!(?backend)`)
+// can never print the GitHub token or Linear key — the rest of the codebase
+// holds secrets in a redacted `ApiKey`; these two variants carry raw Strings and
+// must be redacted here to honor SECURITY.md's "credentials never in logs".
+impl std::fmt::Debug for IssueBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GitHub => f.write_str("GitHub"),
+            Self::GitHubApi { api_base, .. } => f
+                .debug_struct("GitHubApi")
+                .field("token", &"<redacted>")
+                .field("api_base", api_base)
+                .finish(),
+            Self::Linear { api_url, .. } => f
+                .debug_struct("Linear")
+                .field("api_key", &"<redacted>")
+                .field("api_url", api_url)
+                .finish(),
+        }
+    }
 }
 
 /// [`detect_issue_backend`] off the async executor: the `gh auth status`

@@ -2124,6 +2124,20 @@ pub(crate) fn load_mcp_plan(cfg: &Config) -> McpPlan {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return McpPlan::None;
     };
+    // Trust gate. A cloned repo's `.stella/mcp.toml` can name an arbitrary
+    // stdio `command` (executed at session start — RCE on `git clone && stella`)
+    // or an attacker-controlled http endpoint (egress + a would-be-whitelisted
+    // phone-home). This is the same code-execution risk as project hooks, so it
+    // is gated by the same flag: untrusted, we do not connect and say why once.
+    // (Project settings.json hooks/credential-routing are already gated in
+    // settings.rs; this closes the parallel .stella/mcp.toml hole.)
+    if !crate::settings::project_code_execution_trusted() {
+        return McpPlan::Invalid(format!(
+            "{} was NOT loaded — set STELLA_TRUST_PROJECT=1 to let this repo start its \
+             MCP servers (they run commands / open connections on your machine)",
+            path.display()
+        ));
+    }
     let parsed = match McpConfig::from_toml_str(&text) {
         Ok(parsed) => parsed,
         Err(e) => {

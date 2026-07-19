@@ -190,6 +190,32 @@ pub async fn serve(
     }
 }
 
+/// True when the request's `Host` header names a loopback address. Any other
+/// Host (e.g. an attacker domain rebound to 127.0.0.1) is refused — the standard
+/// DNS-rebinding defense for a header-less localhost server. A missing Host is
+/// allowed: a browser `fetch` always sends one, so its absence means the request
+/// did not originate from the web attack this guards against (raw curl, tests).
+fn host_is_local(head: &str) -> bool {
+    let host = head.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("host") {
+            Some(value.trim())
+        } else {
+            None
+        }
+    });
+    let Some(h) = host else {
+        return true;
+    };
+    // Strip an optional :port, keeping bracketed IPv6 literals intact.
+    let hostname = if let Some(rest) = h.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        h.rsplit_once(':').map(|(hn, _)| hn).unwrap_or(h)
+    };
+    hostname == "localhost" || hostname == "::1" || hostname.starts_with("127.")
+}
+
 /// Read one request head, answer it, close. GET only, 8 KiB head cap.
 async fn handle(mut stream: TcpStream, workspace_root: &Path) -> std::io::Result<()> {
     let mut buf = vec![0_u8; 8192];
@@ -212,7 +238,13 @@ async fn handle(mut stream: TcpStream, workspace_root: &Path) -> std::io::Result
         (Some(m), Some(p)) => (m, p),
         _ => return Ok(()),
     };
-    let response = if method == "GET" {
+    let response = if !host_is_local(&head) {
+        // DNS-rebinding defense: a web page that resolves an attacker domain to
+        // 127.0.0.1 can otherwise read this loopback dashboard cross-origin
+        // (prompts, touched-file paths, memory, code graph). A rebound request
+        // carries the attacker's hostname in Host; refuse anything non-loopback.
+        Response::error("403 Forbidden", "forbidden Host header")
+    } else if method == "GET" {
         respond(workspace_root, path)
     } else {
         Response::error("405 Method Not Allowed", "GET only")
@@ -234,6 +266,28 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn host_header_gates_dns_rebinding() {
+        let local = [
+            "GET /api/executions HTTP/1.1\r\nHost: 127.0.0.1:7787\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost:7787\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            "GET / HTTP/1.1\r\nhost: [::1]:7787\r\n\r\n",
+            "GET / HTTP/1.1\r\n\r\n", // no Host (raw socket) — allowed
+        ];
+        for h in local {
+            assert!(host_is_local(h), "should allow: {h:?}");
+        }
+        let remote = [
+            "GET / HTTP/1.1\r\nHost: attacker.example:7787\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: evil.com\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: 127evil.com\r\n\r\n",
+        ];
+        for h in remote {
+            assert!(!host_is_local(h), "should refuse: {h:?}");
+        }
+    }
 
     /// Build a workspace with a seeded `.stella/store.db` shaped like the
     /// real schema (the subset the observatory reads).

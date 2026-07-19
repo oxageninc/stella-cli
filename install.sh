@@ -21,7 +21,6 @@ set -eu
 REPO="macanderson/stella"
 BIN="stella"
 INSTALL_DIR="${STELLA_INSTALL_DIR:-$HOME/.local/bin}"
-API="https://api.github.com/repos/${REPO}"
 DOWNLOAD_BASE="https://github.com/${REPO}/releases/download"
 
 # ---- logging -------------------------------------------------------------
@@ -80,6 +79,18 @@ is_supported_target() {
   esac
 }
 
+# The prebuilt Linux tarballs are glibc (`-gnu`). On musl (Alpine) a glibc
+# binary passes the checksum and "installs", then dies at exec with the loader's
+# cryptic "no such file or directory". Detect musl and build from source instead.
+is_musl() {
+  [ "$(uname -s)" = "Linux" ] || return 1
+  if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+    return 0
+  fi
+  # ldd is often absent on musl systems; fall back to probing for its loader.
+  [ -e /lib/ld-musl-x86_64.so.1 ] || [ -e /lib/ld-musl-aarch64.so.1 ]
+}
+
 # ---- version resolution --------------------------------------------------
 
 # Resolve the release tag (e.g. "v0.1.0"). Honors STELLA_VERSION, otherwise
@@ -93,15 +104,18 @@ resolve_tag() {
     return 0
   fi
 
-  body="$(curl -fsSL "${API}/releases/latest")" ||
-    die "could not query latest release from GitHub API"
-
-  # Extract the first "tag_name": "..." value without requiring jq.
-  TAG="$(printf '%s\n' "$body" |
-    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-    head -n1)"
-
-  [ -n "$TAG" ] || die "could not determine latest release tag"
+  # Resolve "latest" via the release redirect rather than the JSON API: the
+  # unauthenticated API is rate-limited to 60 req/hr/IP (CI farms and office
+  # NATs hit it and the install dies), and this avoids scraping JSON.
+  # /releases/latest 302-redirects to /releases/tag/<TAG>.
+  effective="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+    "https://github.com/${REPO}/releases/latest")" ||
+    die "could not resolve the latest release"
+  TAG="${effective##*/tag/}"
+  case "$TAG" in
+    v*) : ;;
+    *) die "could not determine latest release tag (resolved to '${effective}')" ;;
+  esac
 }
 
 # ---- checksum ------------------------------------------------------------
@@ -123,9 +137,36 @@ cargo_fallback() {
   if ! command -v cargo >/dev/null 2>&1; then
     die "cargo not found; install Rust from https://rustup.rs then re-run"
   fi
-  info "installing from source with cargo (this may take a while)..."
-  cargo install --locked --git "https://github.com/${REPO}" stella-cli
-  info "done. Ensure Cargo's bin dir (usually \$HOME/.cargo/bin) is on your PATH."
+
+  # Pin the source build to STELLA_VERSION when set, so the fallback path honors
+  # the requested version instead of silently building whatever `main` happens
+  # to be (which may not even match the version the user asked for).
+  ref_args=""
+  if [ -n "${STELLA_VERSION:-}" ]; then
+    case "$STELLA_VERSION" in
+      v*) tag="$STELLA_VERSION" ;;
+      *) tag="v${STELLA_VERSION}" ;;
+    esac
+    ref_args="--tag ${tag}"
+    info "building stella ${tag} from source with cargo (this may take a while)..."
+  else
+    info "building stella from source with cargo (latest main; this may take a while)..."
+  fi
+
+  # Honor STELLA_INSTALL_DIR when it looks like a .../bin directory (the default
+  # is ~/.local/bin): cargo installs the binary into <root>/bin.
+  root_args=""
+  case "$INSTALL_DIR" in
+    */bin) root_args="--root ${INSTALL_DIR%/bin}" ;;
+  esac
+
+  # shellcheck disable=SC2086 # word-splitting of the optional arg groups is intended
+  cargo install --locked ${ref_args} ${root_args} --git "https://github.com/${REPO}" stella-cli
+  if [ -n "$root_args" ]; then
+    info "installed stella to ${INSTALL_DIR}."
+  else
+    info "done. Ensure Cargo's bin dir (usually \$HOME/.cargo/bin) is on your PATH."
+  fi
   exit 0
 }
 
@@ -154,6 +195,9 @@ main() {
   detect_target
   if [ -z "$TARGET" ] || ! is_supported_target "$TARGET"; then
     cargo_fallback "no prebuilt binary for this platform ($(uname -s) $(uname -m)); falling back to cargo."
+  fi
+  if is_musl; then
+    cargo_fallback "musl libc detected; prebuilt binaries are glibc-only — building from source."
   fi
 
   resolve_tag
@@ -194,8 +238,14 @@ main() {
 
   mkdir -p "$INSTALL_DIR"
   install_path="${INSTALL_DIR}/${BIN}"
-  cp "$src" "$install_path"
-  chmod +x "$install_path"
+  # Install atomically: copy to a temp file in the same dir, make it executable,
+  # then rename over the target. A plain `cp` over the destination truncates it
+  # in place — fatal if the old binary is running (ETXTBSY / a half-written exec
+  # left in PATH if the copy is interrupted). `mv` within a filesystem is atomic.
+  tmp_bin="${INSTALL_DIR}/.${BIN}.tmp.$$"
+  cp "$src" "$tmp_bin"
+  chmod +x "$tmp_bin"
+  mv -f "$tmp_bin" "$install_path"
 
   info "installed stella to ${install_path}"
   path_hint

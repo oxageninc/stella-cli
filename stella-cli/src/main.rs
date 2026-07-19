@@ -567,6 +567,19 @@ fn parse_budget(raw: &str) -> Result<f64, String> {
 }
 
 fn main() -> ExitCode {
+    // Restore the default SIGPIPE disposition. Rust masks SIGPIPE at startup, so
+    // writing to a closed stdout (`stella tools | head`, `… | grep -q`, a piped
+    // reader that quits) surfaces as an EPIPE that `println!` *panics* on — and
+    // with panic=abort that's a SIGABRT + a scary panic dump on a routine pipe.
+    // Resetting to SIG_DFL makes the process exit quietly on a broken pipe, the
+    // way every other Unix CLI does.
+    #[cfg(unix)]
+    // SAFETY: single-threaded process startup, before any threads/runtime exist;
+    // installing a default signal disposition here races nothing.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
 
     match run(cli) {

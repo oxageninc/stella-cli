@@ -16,10 +16,18 @@ name: auto-tag
 # No commit is pushed back to main — the tag is the source of truth, so this
 # never fights branch protection. release.yml injects the tag's version into
 # the build so `stella --version` is correct.
+#
+# GATED ON GREEN CI. This runs via `workflow_run` after the `ci` workflow
+# finishes on main, and only tags when that run *succeeded* — a commit that
+# fails to compile or fails tests can never become a tagged release (which is
+# exactly how a non-compiling commit shipped as a tag before this gate).
+# Because `ci` is path-ignored for docs-only changes, those merges never run
+# `ci` and so never trigger a release either — previously they tagged blindly.
 
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
 
 concurrency:
   # Serialize so rapid merges compute their version off the previous tag.
@@ -33,9 +41,18 @@ permissions:
 jobs:
   tag:
     runs-on: ubuntu-latest
+    # Only cut a release for a *successful* CI run triggered by a push to main.
+    # Guarding on the job (not just inside the step) keeps a red build from ever
+    # reaching the tag push.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push'
     steps:
       - uses: actions/checkout@v7
         with:
+          # Tag the exact commit CI validated, not whatever main is now.
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           fetch-tags: true
 
