@@ -434,21 +434,27 @@ impl Config {
         // flag and auto-detect: an explicit flag always wins, but a
         // settings-configured default beats "first provider with a key".
         // The spec string is synthesized in --model's own grammar
-        // (`provider/slug`, or the agent's pinned provider prefixed onto a
-        // bare slug) so the whole existing resolution path applies
-        // unchanged. A provider pin without a model is left to the normal
-        // chain — the provider's own default_model already answers there.
+        // (`provider/slug`) so the whole existing resolution path applies
+        // unchanged. Pin-vs-spec precedence lives in `model_spec_for` — the
+        // one resolver every engine agent goes through — so a stale pin
+        // can't swallow a qualified flat spec into a phantom slug here
+        // while the judge/triage wiring resolves the same settings sanely.
         let engine_default: Option<String> = settings.agent_engine_config.as_ref().and_then(|e| {
             use crate::settings::EngineAgentKind;
-            let model = e.model_for(EngineAgentKind::Default)?;
-            let pinned = e
-                .agent(EngineAgentKind::Default)
-                .and_then(|a| a.provider.as_deref())
-                .filter(|p| !p.trim().is_empty());
-            Some(match pinned {
-                Some(provider) => format!("{provider}/{model}"),
-                None => model.to_string(),
-            })
+            let ids = all_provider_ids(settings);
+            let is_provider = |id: &str| ids.contains(&id);
+            match crate::engine_config::model_spec_for(e, EngineAgentKind::Default, &is_provider) {
+                Some(spec) if !spec.model.is_empty() => {
+                    Some(format!("{}/{}", spec.provider, spec.model))
+                }
+                // A pin with no model anywhere is left to the normal chain
+                // — the provider's own default_model already answers there.
+                Some(_) => None,
+                // No setting, or an unparseable string — pass the raw
+                // value through so `resolve_provider_config` keeps its
+                // named error for typos.
+                None => e.model_for(EngineAgentKind::Default).map(str::to_string),
+            }
         });
         let model_override = model_override.or(engine_default.as_deref());
 
@@ -1310,6 +1316,35 @@ mod tests {
             cfg.provider.seeded,
             "built-in overrides keep the catalog check"
         );
+    }
+
+    #[test]
+    fn a_stale_default_pin_does_not_mangle_a_qualified_engine_default_model() {
+        // Regression: `agents.default.provider: "zai"` alongside the flat
+        // `default_model: "openrouter/openrouter/auto"` (a provider-qualified
+        // spec, the shape every TUI save writes) used to stitch the phantom
+        // slug `zai/openrouter/openrouter/auto` and die on the catalog
+        // check. The qualified spec's own provider must win over the stale
+        // seeded pin.
+        let settings = settings_from(
+            r#"{
+                "providers": {"openrouter": {"api_key": "sk-or-test"}},
+                "agent_engine_config": {
+                    "default_model": "openrouter/openrouter/auto",
+                    "agents": {"default": {"provider": "zai"}}
+                }
+            }"#,
+        );
+        let cfg = Config::load_with_settings(
+            None,
+            None,
+            None,
+            &settings,
+            std::path::PathBuf::from("/tmp/ws"),
+        )
+        .expect("the qualified engine default must resolve");
+        assert_eq!(cfg.provider.id, "openrouter");
+        assert_eq!(cfg.model_id, "openrouter/auto");
     }
 
     #[test]

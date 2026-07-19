@@ -71,6 +71,17 @@ pub fn parse_model_spec(raw: &str, is_provider: &dyn Fn(&str) -> bool) -> Option
 /// chain as [`AgentEngineConfig::model_for`]) is the verbatim slug for
 /// THAT provider — no prefix splitting, which is what lets an OpenRouter
 /// entry carry a slug that itself contains `/`.
+///
+/// One exception guards the pin: the flat model keys (`default_model`,
+/// `pipeline_*_model`) hold `provider/slug` specs — the TUI writes them
+/// that way on every save — and the same precedence chain hands them to a
+/// pinned agent. For a SEEDED pin the catalog arbitrates the two readings:
+/// when it rejects the verbatim one and the string parses as a qualified
+/// spec, the spec's own provider wins (a stale `zai` pin over
+/// `openrouter/openrouter/auto` must route to OpenRouter, not become the
+/// phantom slug `zai/openrouter/openrouter/auto`). Unseeded pins
+/// (openrouter, local, settings-defined) keep verbatim semantics — their
+/// slug space is open, so the catalog has no veto.
 pub fn model_spec_for(
     engine: &AgentEngineConfig,
     kind: EngineAgentKind,
@@ -82,10 +93,23 @@ pub fn model_spec_for(
         .filter(|p| !p.trim().is_empty());
     let model = engine.model_for(kind);
     match (pinned_provider, model) {
-        (Some(provider), Some(model)) => Some(ModelSpec {
-            provider: provider.to_string(),
-            model: model.to_string(),
-        }),
+        (Some(provider), Some(model)) => {
+            let pin_seeded = crate::config::PROVIDERS
+                .iter()
+                .any(|p| p.id == provider && p.seeded);
+            if pin_seeded
+                && stella_model::catalog::Catalog::seed()
+                    .resolve_for(provider, model)
+                    .is_err()
+                && let Some(spec) = parse_model_spec(model, is_provider)
+            {
+                return Some(spec);
+            }
+            Some(ModelSpec {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            })
+        }
         // A provider pin with no model: the provider's own default model
         // applies — signalled with an empty slug the wiring layer fills
         // from `ProviderConfig::default_model`.
@@ -504,6 +528,51 @@ mod tests {
         let spec = model_spec_for(&engine, EngineAgentKind::Triage, &is_builtin).unwrap();
         assert_eq!(spec.provider, "zai");
         assert!(spec.model.is_empty());
+    }
+
+    #[test]
+    fn seeded_pin_yields_to_a_qualified_spec_the_catalog_rejects() {
+        // The flat keys hold `provider/slug` specs (the TUI writes them
+        // that way), and the precedence chain hands them to pinned agents
+        // too. A stale seeded pin must not swallow one into a phantom slug:
+        // `zai` + `openrouter/openrouter/auto` routed verbatim produced the
+        // unknown-model error `zai/openrouter/openrouter/auto`.
+        let engine = engine_from_json(
+            r#"{"default_model": "openrouter/openrouter/auto",
+                "agents": {"default": {"provider": "zai"}}}"#,
+        );
+        let spec = model_spec_for(&engine, EngineAgentKind::Default, &is_builtin).unwrap();
+        assert_eq!(spec.provider, "openrouter");
+        assert_eq!(spec.model, "openrouter/auto");
+
+        // The TUI-save shape — pin plus a flat spec naming the SAME seeded
+        // provider — resolves to the catalog slug, not `provider/provider/…`.
+        let engine = engine_from_json(
+            r#"{"pipeline_judge_model": "anthropic/claude-fable-5",
+                "agents": {"judge": {"provider": "anthropic"}}}"#,
+        );
+        let spec = model_spec_for(&engine, EngineAgentKind::Judge, &is_builtin).unwrap();
+        assert_eq!(spec.provider, "anthropic");
+        assert_eq!(spec.model, "claude-fable-5");
+
+        // A seeded pin with a catalog-valid slug is untouched.
+        let engine = engine_from_json(
+            r#"{"default_model": "glm-5.2", "agents": {"default": {"provider": "zai"}}}"#,
+        );
+        let spec = model_spec_for(&engine, EngineAgentKind::Default, &is_builtin).unwrap();
+        assert_eq!(spec.provider, "zai");
+        assert_eq!(spec.model, "glm-5.2");
+
+        // An UNSEEDED pin keeps verbatim semantics even for a flat-key
+        // model whose prefix names another provider — that slug shape is
+        // exactly how OpenRouter routes (`openai/gpt-5.5` IS its slug).
+        let engine = engine_from_json(
+            r#"{"pipeline_judge_model": "openai/gpt-5.5",
+                "agents": {"judge": {"provider": "openrouter"}}}"#,
+        );
+        let spec = model_spec_for(&engine, EngineAgentKind::Judge, &is_builtin).unwrap();
+        assert_eq!(spec.provider, "openrouter");
+        assert_eq!(spec.model, "openai/gpt-5.5");
     }
 
     #[test]
