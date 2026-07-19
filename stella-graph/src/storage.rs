@@ -540,11 +540,11 @@ fn collect_table_constraints(table: Node, src: &[u8], rel: &mut RelationDef) {
                 })
                 .filter(|t| !t.is_empty());
             for col in cols {
-                if let Some(field) = find_field_mut(rel, &col) {
-                    if let Some(target) = &target {
-                        field.references = Some(target.clone());
-                        field.constraints.push(format!("REFERENCES {target}"));
-                    }
+                if let Some(field) = find_field_mut(rel, &col)
+                    && let Some(target) = &target
+                {
+                    field.references = Some(target.clone());
+                    field.constraints.push(format!("REFERENCES {target}"));
                 }
             }
         }
