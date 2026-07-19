@@ -7,7 +7,7 @@ import {
   PipelineFlowDiagram,
   RecallLoopDiagram,
 } from "@/components/diagrams";
-import { ProviderMark } from "@/components/provider-mark";
+import { ProviderLogo, ProviderMark } from "@/components/provider-logos";
 
 /**
  * MDX component map. The Fumadocs defaults (callouts, tabs, cards, code
@@ -22,6 +22,7 @@ export function getMDXComponents(components?: MDXComponents): MDXComponents {
     PipelineFlowDiagram,
     RecallLoopDiagram,
     FleetFanoutDiagram,
+    ProviderLogo,
     ProviderMark,
     ...components,
   };
