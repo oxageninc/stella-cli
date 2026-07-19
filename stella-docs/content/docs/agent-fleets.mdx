@@ -1,11 +1,15 @@
 ---
 title: Agent Fleets
-description: Fan a dependency-ordered task DAG out to parallel worker agents, each isolated in its own git worktree — with cooperative file claims, a SQLite ledger of every attempt and dollar, and an optional CI watch.
+description: Fan a dependency-ordered task DAG out to parallel worker agents in one shared tree, coordinated by cooperative file claims — with per-task worktree isolation as the opt-in, a SQLite ledger of every attempt and dollar, and an optional CI watch.
 ---
 
 `stella fleet` runs **many tasks at once** — each task handled by a full
-Stella worker in its **own git worktree**, on its own branch, isolated from
-your working copy and from every other worker.
+Stella worker. By default the workers share **one tree**: every worker runs
+in the repository root, coordinated by cooperative file claims, so conflicts
+surface at write time with the rival named, commits interleave on one
+branch, and the build cache stays warm. A task marked
+`isolation = "isolated"` instead gets its **own git worktree** on its own
+branch, isolated from your working copy and from every other worker.
 
 ```bash
 stella fleet \
@@ -23,14 +27,17 @@ stella fleet \
    up front — a duplicate id, a self-dependency, an unknown dependency, or a
    dependency cycle is rejected before anything runs, with the offending
    task (or cycle path) named.
-2. **Isolate.** Every isolated task gets a fresh git worktree under
+2. **Share — or isolate.** By default every worker runs directly in the
+   repository root under the cooperative claim discipline (see
+   [file claims](#file-claims--cooperative-locks) below). A task marked
+   `isolation = "isolated"` instead gets a fresh git worktree under
    `.stella/worktrees/<slug>`, branched from a pinned base commit (the
    current `HEAD`, or `--base-ref`, resolved to a SHA at start so mid-run
    commits can't drift the base) onto a `fleet/<slug>-<hash>` branch. The
    16-hex-digit hash suffix keeps re-runs — which reuse task ids like `t1` —
    from colliding with branches and worktrees you kept from an earlier
-   fleet. Workers can't see each other's uncommitted work and can't touch
-   your checkout.
+   fleet. Isolated workers can't see each other's uncommitted work and can't
+   touch your checkout.
 3. **Dispatch in waves.** Dependency-ordered waves run up to
    `--max-concurrency` tasks at once (default 4). A failed task does **not**
    unblock its dependents — they end the run as `skipped` — and nothing is
@@ -47,9 +54,11 @@ stella fleet \
    [Stella telemetry](/docs/telemetry). Past runs (tasks, attempts,
    successes, commits) also surface on the **Fleet runs** card of the
    [Observatory dashboard](/docs/telemetry/dashboard).
-6. **Review.** Worktrees and `fleet/*` branches are deliberately **left
-   in place** — the branches *are* the work product. Inspect, test, and merge
-   them on your terms; `git worktree list` shows them all.
+6. **Review.** Shared-tree work lands directly on your current branch as
+   interleaved commits. Isolated tasks' worktrees and `fleet/*` branches are
+   deliberately **left in place** — those branches *are* the work product.
+   Inspect, test, and merge them on your terms; `git worktree list` shows
+   them all.
 
 ## Plan files
 
@@ -74,9 +83,13 @@ Each task carries an `id`, `title`, and `prompt`, plus optionally:
 
 - `depends_on` — ids that must succeed before this task dispatches (orders
   the waves).
-- `isolation` — `isolated` (the default: own worktree, own branch) or
-  `shared_tree` (run directly in the repo root with **no** worktree — for
-  strictly sequential or read-only tasks that must see your live checkout).
+- `isolation` — `shared_tree` (the default: run directly in the repo root
+  under the cooperative claim discipline) or `isolated` (own worktree, own
+  branch — the explicit opt-in for genuinely *divergent* work: best-of-N
+  attempts producing competing versions of the same files, or tasks that
+  mutate checkout state. Claims can't help there — the conflict is the
+  point — and the costs are real: a cold build cache per tree, and
+  conflicts deferred to integration time).
 - `claims` — workspace-relative paths held as cooperative file locks.
 
 ### File claims — cooperative locks
@@ -137,8 +150,8 @@ stella fleet --plan release-prep.toml --max-concurrency 2 --watch
 
 ## Cleaning up
 
-When you've merged (or rejected) the branches — the branch names carry a hash
-suffix, so list them rather than guessing:
+When you've merged (or rejected) the branches your isolated tasks left —
+the branch names carry a hash suffix, so list them rather than guessing:
 
 ```bash
 git worktree list                 # what the fleet left in .stella/worktrees/

@@ -13,8 +13,11 @@ inference is always an explicit choice.
 
 ## Setup
 
-There is nothing to export — no key is required (an optional `LOCAL_API_KEY` is sent as a
-bearer token if your server enforces one). What **is** required is the endpoint:
+There is nothing to export — no key is required. A bearer token is **always sent**
+regardless, because OpenAI-compatible clients must send something: the placeholder
+`local` when `LOCAL_API_KEY` is unset, your token when it is set. Servers that ignore
+auth (the common case) never notice; servers that enforce it just need `LOCAL_API_KEY`
+exported. What **is** required is the endpoint:
 `--base-url` (or its env form `STELLA_BASE_URL`) must accompany `--model local/…`,
 every time.
 
@@ -54,8 +57,18 @@ stella --model ollama/llama3.3 chat
 ```
 
 See [settings.json](/docs/configuration/settings) for the full `providers` schema —
-custom providers get the same treatment as built-ins, including a `default_model` and an
-`api_key_env` if your server sits behind auth.
+custom providers get the same treatment as built-ins, including a `default_model`. Two
+more knobs worth knowing:
+
+- **Credentials.** A config-defined provider reads its key from a derived env var:
+  the id uppercased, with anything outside `[A-Za-z0-9]` folded to `_`, plus
+  `_API_KEY` — `my-gateway` reads `MY_GATEWAY_API_KEY`, the `ollama` entry above reads
+  `OLLAMA_API_KEY`. Set `api_key_env` on the entry to name a different var.
+- **Dialect.** `dialect` may be `openai-compatible` (the default), `openai-responses`,
+  `anthropic`, or `gemini` — so a custom id can front an Anthropic-shaped or
+  Gemini-shaped gateway too. `vertex` and `bedrock` are **rejected** for custom ids:
+  those dialects need credential resolution (project/region addressing, SigV4 signing)
+  that a settings entry cannot express.
 
 ## In the pipeline
 

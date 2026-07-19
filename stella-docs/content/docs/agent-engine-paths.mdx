@@ -67,9 +67,10 @@ The scripting workhorse: one prompt in, verified work out, an exit code
 back.
 
 **Pipeline (default).** The prompt runs the full
-[staged pipeline](/docs/inference-pipeline) — triage, plan, witness,
-execute, verify, judge — with per-role model routing and circuit-breaker
-fallback. Pass `--test-command "cargo test -p …"` and verification gets a
+[staged pipeline](/docs/inference-pipeline) — triage → recall → plan → scope
+review → witness → execute → verify → judge, with a bounded revise loop —
+with per-role model routing and circuit-breaker fallback. Pass
+`--test-command "cargo test -p …"` and verification gets a
 deterministic oracle: a change that flips a failing test to passing can
 submit without spending a judge call. Headless formats (`--output-format
 json` for one final object, `stream-json` for a line per agent event) make
@@ -115,9 +116,11 @@ TUI.
 
 Inside a deck session, the lead agent can delegate: the `task_assign` tool
 queues a task, and a supervisor spawns a **sub-agent** with its own
-conversation, its own budget slice, and the same tool stack — running
-concurrently while the lead keeps working. Results return to the lead for
-review; every sub-agent turn is recorded (`deck-sub`) and visible in the
+conversation and the same tool stack — running concurrently while the lead
+keeps working, its spend metered into the session's **shared** budget guard
+(child spend always reaches the parent's ledger; fleet children, by
+contrast, each run under their own slice of the cap). Results return to the
+lead for review; every sub-agent turn is recorded (`deck-sub`) and visible in the
 AGENT ENGINE tab. You don't invoke this path directly — you ask for work
 that warrants it, and the lead fans out.
 
@@ -179,6 +182,10 @@ differently:
 | Goal / pipeline judge | A **read-only** view — only `read_only: true` tools are visible or executable |
 | Fleet workers | Claim coordination in the shared tree; a private worktree when isolated |
 
+Every path can also opt into the lean toolset — `STELLA_LEAN_TOOLS`
+advertises only a lean core plus the discovery tools; see
+[Built-in Tools](/docs/agent-tools#lean-frontloading-experimental).
+
 Two consequences worth knowing. First, `ask_user` degrades gracefully:
 headless paths (one-shot JSON formats, goal in CI) fail it loudly with
 guidance to proceed, rather than hanging on stdin. Second, because the
@@ -223,9 +230,10 @@ the work came through.
 - [Agent Modes](/docs/agent-modes) — the user-level guide to the same
   territory, with deck keybindings and examples.
 - [Inference Pipeline](/docs/inference-pipeline) — inside a staged turn:
-  triage, plan, witness, execute, verify, judge.
-- [Agent Fleets](/docs/agent-fleets) — plan files, waves, claims, and
-  isolated worktrees.
+  triage → recall → plan → scope review → witness → execute → verify →
+  judge, with a bounded revise loop.
+- [Agent Fleets](/docs/agent-fleets) — plan files, waves, claims in the
+  shared tree, and opt-in isolated worktrees.
 - [Agent engine config](/docs/configuration/agent-engine-config) — per-role
   model pins the paths share.
 - [Built-in Tools](/docs/agent-tools) — the shared catalog, including the

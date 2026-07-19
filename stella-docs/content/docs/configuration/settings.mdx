@@ -3,10 +3,22 @@ title: settings.json
 description: Override any provider's base URL, API key, display name, or default model — merged across a project, org-managed, and user scope hierarchy.
 ---
 
-`settings.json` is Stella's configuration file. Its `providers` map lets you override the
-built-in defaults for any provider — **without reaching for a provider-specific
-environment variable**. It is the recommended way to, for example, route a Z.ai coding-plan
-subscription through its dedicated endpoint.
+`settings.json` is Stella's configuration file. It has five top-level sections, each with
+its own merge rule across the [scope hierarchy](#the-scope-hierarchy):
+
+| Section | Configures | Merge across scopes |
+| --- | --- | --- |
+| [`providers`](#the-providers-map) | Override any built-in provider — or define new ones | per field |
+| [`agent_engine_config`](/docs/configuration/agent-engine-config) | Per-agent models, gateways, prompts, effort, params | per field, per agent |
+| [`hooks`](#lifecycle-hooks) | Shell commands on lifecycle events | concatenate |
+| [`tools`](#the-tools-section) | Built-in tool switches (today: `bash`) | last scope wins |
+| [`mcp`](#the-mcp-section) | MCP registry override | last scope wins |
+
+The `providers` map lets you override the built-in defaults for any provider — **without
+reaching for a provider-specific environment variable**. In **user scope**
+(`~/.config/stella/settings.json`) it is the recommended way to, for example, route a Z.ai
+coding-plan subscription through its dedicated endpoint — see the
+[coding-plan recipe](/docs/examples/zai-coding-plan).
 
 ## The `providers` map
 
@@ -37,9 +49,9 @@ default:
 | `dialect` | string | Wire adapter for a **new** provider: `openai-compatible` (default) \| `openai-responses` \| `anthropic` \| `gemini` (`vertex`/`bedrock` are reserved to built-ins) |
 
 The map key **is** the provider id (`zai` above). Leave a field out entirely to inherit the
-built-in default — note that an **empty string** for `base_url` or `name` overwrites the
-built-in with an empty value (breaking the provider) rather than being ignored; only
-`api_key` and `default_model` treat empty as unset.
+built-in default — note that an **empty string** for `base_url`, `name`, or
+`default_model` overwrites the built-in with an empty value (breaking the provider or its
+model selection) rather than being ignored; only `api_key` treats empty as unset.
 
 <Callout type="info">
   `providers` both overrides built-ins and **defines brand-new providers**: use an id that
@@ -51,9 +63,10 @@ built-in with an empty value (breaking the provider) rather than being ignored; 
 ## The scope hierarchy
 
 `settings.json` is read across three scopes and merged, applied lowest to highest so the
-more specific scope wins. The merge is **field by field** for `providers` (and last-scope-
-wins for `mcp`); `hooks` are the exception — they **concatenate** across scopes (see
-[Lifecycle hooks](#lifecycle-hooks)).
+more specific scope wins. The merge is **field by field** for `providers` and
+`agent_engine_config` (whose `allowed_models` list replaces wholesale rather than
+merging), **last-scope-wins** for `mcp` and `tools`, and `hooks` are the exception — they
+**concatenate** across scopes (see [Lifecycle hooks](#lifecycle-hooks)).
 
 | Preference | Scope | Path |
 | --- | --- | --- |
@@ -114,11 +127,20 @@ Suppose three files are present:
 }
 ```
 
-The merged result for `zai`:
+The merged result for `zai` — **with the project trusted** (`STELLA_TRUST_PROJECT=1`):
 
 - `base_url` → `https://api.z.ai/api/coding/paas/v4` — **project wins**
 - `name` → `Org Gateway` — **org-managed wins** over user (project didn't set it)
 - `api_key` → `sk-personal` — from user (only the user scope set it)
+
+<Callout type="warn">
+  Without `STELLA_TRUST_PROJECT=1` — the default for any repo you didn't explicitly
+  trust — the project's `base_url` is a **credential-routing field** and is dropped by the
+  [trust boundary](#the-project-trust-boundary): the merged `base_url` above would be the
+  org gateway's, with a stderr notice naming the skipped field. Project-scope
+  `base_url`/`api_key`/`api_key_env` examples anywhere in these docs assume a trusted
+  project; for personal routing, user scope needs no flag.
+</Callout>
 
 ## Precedence within a field
 
@@ -138,9 +160,11 @@ run that provider — no provider-specific environment variable required.
 ## The Z.ai coding-plan example
 
 If you subscribe to a Z.ai coding plan, point `providers.zai.base_url` at the coding
-endpoint instead of setting the bespoke `ZAI_GLM_CODING_PLAN=1` variable:
+endpoint instead of setting the bespoke `ZAI_GLM_CODING_PLAN=1` variable. A subscription
+is personal, so this belongs in **user scope** — project scope would silently drop the
+`base_url` unless the repo is trusted with `STELLA_TRUST_PROJECT=1`:
 
-```json title=".stella/settings.json"
+```json title="~/.config/stella/settings.json"
 {
   "providers": {
     "zai": {
@@ -149,6 +173,9 @@ endpoint instead of setting the bespoke `ZAI_GLM_CODING_PLAN=1` variable:
   }
 }
 ```
+
+The full walkthrough — plan tiers, verification, and routing the whole pipeline at the
+subscription — is the [coding-plan recipe](/docs/examples/zai-coding-plan).
 
 Your `ZAI_API_KEY` env var (or a `settings.json` `api_key`) supplies the key; the base URL
 now comes from the file. Verify:
@@ -178,6 +205,27 @@ so a project can point at a different registry than the user default.
   }
 }
 ```
+
+## The `tools` section
+
+The top-level `tools` section switches built-in tools that are **off by default**. Today
+that is exactly one tool — raw `bash`:
+
+```json title="settings.json"
+{
+  "tools": {
+    "bash": "on"
+  }
+}
+```
+
+Absent or `"off"`, the `bash` tool is **not registered** in any session — including
+interactive ones; the agent works through the structured tools (`run_tests`,
+`build_project`, `run_script`, the process tools) instead. The values are the strings
+`"on"`/`"off"` — a bare boolean or a typo is a hard, named parse error rather than a
+silent ignore. Merges last-scope-wins, so a project can switch bash on for a repo whose
+workflow needs it while your user scope keeps it off. See
+[Built-in tools](/docs/agent-tools) for what registers when.
 
 ## The project trust boundary
 

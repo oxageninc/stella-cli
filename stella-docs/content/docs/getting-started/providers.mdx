@@ -103,4 +103,10 @@ select it with `--model myollama/<model>`.
 Any built-in provider's base URL, key, display name, or default model can be overridden in
 [`settings.json`](/docs/configuration/settings) — the recommended way to, for example,
 route Z.ai through its coding-plan endpoint without a provider-specific environment
-variable.
+variable. For personal routing like a subscription endpoint, put the override in **user
+scope** (`~/.config/stella/settings.json`): project-scope `base_url`/`api_key` overrides
+are held back by the
+[trust boundary](/docs/configuration/settings#the-project-trust-boundary) until you set
+`STELLA_TRUST_PROJECT=1`. Ready-to-paste setups, organized by use case, live in
+[Examples &amp; recipes](/docs/examples) — including the
+[Z.ai coding-plan recipe](/docs/examples/zai-coding-plan).

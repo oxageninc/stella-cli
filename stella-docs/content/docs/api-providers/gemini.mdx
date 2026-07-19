@@ -18,19 +18,10 @@ export GEMINI_API_KEY="..."
 ```
 
 `GOOGLE_API_KEY` works as an alias — Stella checks both, `GEMINI_API_KEY` first. Gemini
-sits sixth in [auto-detection](/docs/api-providers#auto-detection). Alternatively, store
+sits sixth in [auto-detection](/docs/api-providers#auto-detection). Prefer a file? Store
 the key in [`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or
-reference an env var from [`settings.json`](/docs/configuration/settings):
-
-```json title=".stella/settings.json"
-{
-  "providers": {
-    "gemini": {
-      "api_key_env": "MY_TEAM_GEMINI_KEY"
-    }
-  }
-}
-```
+rename the env var Stella reads with `providers.gemini.api_key_env` — see
+[overriding the key source](/docs/api-providers#overriding-the-key-source).
 
 ## Selecting models
 
@@ -66,5 +57,6 @@ or a judge that must read an entire subsystem to verify a change. See
 | --- | --- | --- | --- | --- |
 | `gemini-3-pro` | 1M | 1.25 | 10.00 | 0.31 |
 
-List prices from Stella's seed catalog (v0.3.0) — verify with Google; see the
+List prices from Stella's seed catalog — verify with Google; your local catalog re-syncs
+from [models.dev](https://models.dev) via `stella models refresh`. See the
 [Model guide](/docs/api-providers/models) for the full cross-provider table.

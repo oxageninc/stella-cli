@@ -18,19 +18,10 @@ export XAI_API_KEY="xai-..."
 ```
 
 xAI sits fourth in [auto-detection](/docs/api-providers#auto-detection), so the key alone
-is enough. Alternatively, store the key in
-[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or reference an
-env var from [`settings.json`](/docs/configuration/settings):
-
-```json title=".stella/settings.json"
-{
-  "providers": {
-    "xai": {
-      "api_key_env": "MY_TEAM_XAI_KEY"
-    }
-  }
-}
-```
+is enough. Prefer a file? Store the key in
+[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or rename the
+env var Stella reads with `providers.xai.api_key_env` — see
+[overriding the key source](/docs/api-providers#overriding-the-key-source).
 
 ## Selecting models
 
@@ -47,7 +38,22 @@ Being OpenAI-compatible, xAI takes the standard sampling parameters — `tempera
 `top_p`, `max_tokens`, and friends — configured per agent under
 [`agent_engine_config`](/docs/configuration/agent-engine-config). The
 [settings.json `providers` map](/docs/configuration/settings) can override the base URL
-or default model like any other provider.
+or default model like any other provider:
+
+```json title="~/.config/stella/settings.json"
+{
+  "providers": {
+    "xai": {
+      "base_url": "https://llm-gateway.internal.example.com/v1",
+      "default_model": "grok-4"
+    }
+  }
+}
+```
+
+`--base-url` (env form `STELLA_BASE_URL`) overrides the settings value for one run. In a
+project's `.stella/settings.json`, `base_url` is ignored unless `STELLA_TRUST_PROJECT=1`
+— see [the project trust boundary](/docs/configuration/settings#the-project-trust-boundary).
 
 ## In the pipeline
 
@@ -63,5 +69,6 @@ tasks too. See [Examples](/docs/examples) for profile patterns and
 | --- | --- | --- | --- | --- |
 | `grok-4` | 256k | 3.00 | 15.00 | 0.75 |
 
-List prices from Stella's seed catalog (v0.3.0) — verify with xAI; see the
+List prices from Stella's seed catalog — verify with xAI; your local catalog re-syncs
+from [models.dev](https://models.dev) via `stella models refresh`. See the
 [Model guide](/docs/api-providers/models) for the full cross-provider table.

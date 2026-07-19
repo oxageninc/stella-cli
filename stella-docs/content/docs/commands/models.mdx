@@ -57,22 +57,34 @@ Provider credentials are resolved through the credential chain: `--api-key` flag
 stella models
 ```
 
-Representative output (illustrative):
+Representative output (illustrative — one line per provider, in auto-detect preference order):
 
 ```text
-PROVIDER     KEY        DEFAULT MODEL                       BASE URL
-zai          ok         glm-5.2                             https://api.z.ai/api/paas/v4
-anthropic    ok         claude-fable-5                      https://api.anthropic.com
-openai       missing    gpt-5.5                             https://api.openai.com/v1
-gemini       missing    gemini-3-pro                        https://generativelanguage.googleapis.com/v1beta
-xai          missing    grok-4                              https://api.x.ai/v1
-deepseek     missing    deepseek-chat                       https://api.deepseek.com/v1
-openrouter   missing    openrouter/auto                     https://openrouter.ai/api/v1
-vertex       missing    gemini-3-pro                        (project/region-scoped)
-bedrock      missing    us.anthropic.claude-sonnet-4-5-...  (region-scoped)
+Stella — Available Providers & Models
+
+  ✓ configured zai/glm-5.2  Z.ai (GLM 5.2)  [https://api.z.ai/api/paas/v4]
+  ✓ configured anthropic/claude-fable-5  Anthropic (Claude)  [https://api.anthropic.com]
+  ✗ no key openai/gpt-5.5  OpenAI (GPT)  [https://api.openai.com/v1]
+  ✗ no key xai/grok-4  xAI (Grok)  [https://api.x.ai/v1]
+  ✗ no key deepseek/deepseek-chat  DeepSeek  [https://api.deepseek.com/v1]
+  ✗ no key gemini/gemini-3-pro  Google Gemini  [https://generativelanguage.googleapis.com/v1beta]
+  ✗ no key openrouter/openrouter/auto  OpenRouter  [https://openrouter.ai/api/v1]
+  ✗ no key vertex/gemini-3-pro  Google Vertex AI  [https://aiplatform.googleapis.com]
+  ✗ no key bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0  Amazon Bedrock  [https://bedrock-runtime.<AWS_REGION>.amazonaws.com]
+
+  Config-defined providers (settings.json):
+  ✓ configured myproxy/<model>  My proxy  [https://llm.internal.example/v1] (OpenAI-compatible)
+
+  Use --model provider/model_id to pin a specific model.
+  Example: stella --model zai/glm-5.2 run 'fix the failing test'
+  Local endpoints (Ollama, vLLM, LM Studio): stella --model local/<model> --base-url http://localhost:11434/v1
+
+  Model catalog: 1204 models / 118 aliases — master list refreshed 2026-07-18 09:14 UTC (`stella models list` to browse, `stella models refresh` to update).
 ```
 
-`local` is not a provider row — it is surfaced only as a footer hint that reminds you to
+Each row is `{key status} {id}/{default model}  {display name}  [{base url}]`. The `vertex` and `bedrock` base URLs are display anchors — the real endpoint is built per request from your project/location (`VERTEX_PROJECT_ID`, `VERTEX_LOCATION`) or `AWS_REGION`. Config-defined providers from `settings.json` follow under their own heading with the wire dialect appended. The **Config-defined providers** section only appears when `settings.json` defines one, and the catalog line reads `seed only` until your first `stella models refresh`.
+
+`local` is not a provider row — it is surfaced only as the footer hint that reminds you to
 point at a local endpoint yourself, e.g. `stella --model local/<model> --base-url http://localhost:11434/v1`.
 
 <Callout type="warn">

@@ -1,6 +1,6 @@
 ---
 title: Inference Pipeline
-description: How Stella turns a prompt into verified work — the agent step loop, the staged pipeline (triage, plan, scope, witness, execute, verify, judge), deterministic verification, and per-role model routing.
+description: How Stella turns a prompt into verified work — the agent step loop, the staged pipeline (triage, recall, plan, scope review, witness, execute, verify, judge), deterministic verification, and per-role model routing.
 ---
 
 Stella's answer to "did the agent actually do the work?" is structural, not
@@ -37,7 +37,10 @@ in stages:
 <PipelineFlowDiagram />
 
 In full: triage → recall → plan → scope review → witness → execute → verify
-→ judge → revise.
+→ judge, with a bounded revise loop. Recall runs concurrently with triage
+but emits after it; plan, scope review, and witness are conditional — a
+simple lookup skips them, scope review fires only above thresholds, and the
+witness is authored only without `--test-command`.
 
 ### 1. Triage
 
@@ -119,6 +122,44 @@ The pipeline can generate N candidate executions and select the best by
 verification score — paid for with N× the execution cost, so it is strictly
 opt-in.
 
+## End to end: one verified run
+
+```bash
+stella run --test-command "cargo test -p pager" "fix the off-by-one in the pager"
+```
+
+- **Triage** (with recall running concurrently) classifies the prompt as a
+  single-file change: planning is skipped, verification is not. Recall's
+  frames land in the volatile block after the stable prefix.
+- **Scope review** doesn't fire — there is no plan to review.
+- **Witness** is skipped: `--test-command` already provides the
+  deterministic oracle, so no witness-author call is spent.
+- **The baseline.** Right before execution, the pipeline runs
+  `cargo test -p pager` and records the **failure**. This is the fail half
+  of the flip oracle — a suite that was already green could never prove the
+  change did the work.
+- **Execute.** The worker runs the step loop: reads the pager, finds the
+  off-by-one, edits it.
+- **Verify** re-runs the test command: it now **passes** — a genuine
+  fail→pass flip. The change is real (the zero-diff guard sees a non-empty
+  diff), the touched tests are green, and the diff — a handful of lines —
+  is far inside the 400-line budget. The deterministic ladder answers
+  *submit fast*: the run finishes on evidence alone, **judge skipped**,
+  exit code 0. The recorded evidence reads
+  `flip oracle: fail→pass of 'cargo test -p pager'; touched tests green; diff 6 lines within budget`.
+
+Drop the `--test-command` and the same run doesn't lose verification — it
+pays more for it. The **witness** stage now spends an independent model call
+(never the worker) authoring a minimal *failing* test that pins the intended
+behavior, and that test's command arms the flip oracle instead. A clean flip
+on an untampered witness still submits deterministically — but when the
+evidence stays inconclusive (no flip, tests that couldn't run, a diff over
+the 400-line budget), verification **escalates to the model judge**: a
+separate model, by preference from a different family, ruling `PASS`/`FAIL`
+on the diff and evidence summary. Same destination, more model calls at
+risk — the deterministic path is why `--test-command` is the strongest flag
+you can pass.
+
 ## Per-role model routing
 
 Each stage can run on its own model, provider, and gateway — see
@@ -150,5 +191,8 @@ left with a half-applied edit. See [Telemetry &amp; budget](/docs/telemetry).
 | `stella run` | The full staged pipeline (default) |
 | `stella run --no-pipeline` | The raw step loop |
 | Command Deck (`/pipeline` ON, the default) | The staged pipeline per turn |
-| [`stella goal`](/docs/agent-modes#outcome-driven-goal-mode) | Pipeline rounds + an independent goal judge |
-| [`stella fleet`](/docs/agent-fleets) | The pipeline per worker, in parallel worktrees |
+| [`stella goal`](/docs/agent-modes/goal-mode) | Pipeline rounds + an independent goal judge (default; `--no-pipeline` for raw rounds) |
+| [`stella fleet`](/docs/agent-fleets) | The pipeline per worker, fanned out in one shared tree (worktrees on opt-in) |
+
+Pipeline goal rounds mean **double verification**: the pipeline's own judge
+checks each round's work, and the outer goal judge checks the objective.

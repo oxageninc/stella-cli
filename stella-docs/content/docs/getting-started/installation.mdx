@@ -23,11 +23,21 @@ install alongside it.
 ### Prebuilt binary (`curl | sh`)
 
 Installs the latest tagged release for your platform, verifies its SHA-256, and falls
-back to `cargo install` where no prebuilt binary is published:
+back to `cargo install` on platforms without a prebuilt binary (unsupported targets, and
+musl-libc Linux even on supported architectures):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/macanderson/stella/main/install.sh | sh
 stella --version
+```
+
+The binary lands in `~/.local/bin` by default — if `stella` isn't found afterwards, add
+that directory to your `PATH`. Two env vars tune the script: `STELLA_INSTALL_DIR`
+overrides the destination, `STELLA_VERSION` pins a specific release tag:
+
+```bash
+STELLA_INSTALL_DIR=/usr/local/bin STELLA_VERSION=v0.4.35 \
+  sh -c "$(curl -fsSL https://raw.githubusercontent.com/macanderson/stella/main/install.sh)"
 ```
 
 ### Homebrew

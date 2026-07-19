@@ -1,0 +1,124 @@
+---
+title: "Team-shared settings"
+description: What to commit, what to gitignore, how the three scopes divide the work, and the trust flag that makes a repo's config actually load.
+---
+
+A team setup is a division of labor across the three
+[settings scopes](/docs/configuration/settings#the-scope-hierarchy): the **repo** carries
+what's true for everyone working on it, **each user** carries their identity and keys,
+and (optionally) the **org** carries policy. This page is the working pattern.
+
+## The repo: `.stella/` in version control
+
+Commit the shareable knowledge, ignore the local state and secrets:
+
+```text title=".gitignore"
+.stella/*.db
+.stella/*.db-*
+.stella/mcp_oauth.json
+.stella/worktrees/
+.stella/exports/
+.stella/reflections.jsonl
+```
+
+**Commit:** `domains.toml`, `memories/`, `rules/`, `skills/`, `commands/`, `tools/`,
+`mcp.toml`, and `settings.json` (as long as it holds no inline `api_key` — use
+`api_key_env` instead). What lands where is itemized on the
+[initialization page](/docs/getting-started/initialization#what-lands-where).
+
+A committed project `settings.json` that works for every teammate:
+
+```json title=".stella/settings.json (committed)"
+{
+  "providers": {
+    "zai": { "api_key_env": "ACME_ZAI_KEY" }
+  },
+  "tools": { "bash": "on" },
+  "agent_engine_config": {
+    "default_model": "zai/glm-5.2",
+    "pipeline_judge_model": "anthropic/claude-fable-5"
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "bash",
+        "hooks": [ { "command": "./scripts/guard.sh", "timeoutMs": 5000 } ] }
+    ]
+  }
+}
+```
+
+- **`api_key_env`** points every teammate at the same variable name
+  (`ACME_ZAI_KEY`) while each supplies their own value — key rotation becomes a
+  vault/CI change, not a settings edit.
+- **`agent_engine_config`** is deliberately *outside* the trust boundary — model
+  routing suggestions from a repo are safe and apply immediately for everyone.
+- **`tools.bash`** and the guard hook travel with the repo that needs them.
+
+## The flag that makes it real
+
+<Callout type="warn">
+  A fresh clone's `hooks`, `providers.*.base_url`/`api_key`/`api_key_env`, and
+  `mcp.registry_url` are **held back** until the user opts in — otherwise any repo you
+  clone could run commands on your machine or route your keys through its server. Each
+  teammate enables their own trusted repos:
+
+  ```bash
+  export STELLA_TRUST_PROJECT=1   # scope it per-repo with direnv or a shell profile guard
+  ```
+
+  A stderr notice names anything skipped, so "why isn't the team config applying?" is
+  diagnosable in one glance. Details: the
+  [trust boundary](/docs/configuration/settings#the-project-trust-boundary).
+</Callout>
+
+## Each user: keys and taste
+
+```json title="~/.config/stella/settings.json (per teammate)"
+{
+  "agent_engine_config": {
+    "agents": {
+      "judge": { "effort": "high" }
+    }
+  }
+}
+```
+
+```bash
+export ACME_ZAI_KEY="sk-..."          # the value behind the repo's api_key_env
+export ANTHROPIC_API_KEY="sk-ant-..." # the judge's key
+```
+
+Keys can equally live in [`credentials.toml`](/docs/configuration/credentials) (0600,
+written once via the interactive prompt). Personal endpoint routing — like a
+[Z.ai coding plan](/docs/examples/zai-coding-plan) — also belongs here, in user scope.
+
+## Merge semantics you'll actually rely on
+
+- `providers` and `agent_engine_config` merge **per field** — the repo pins the judge
+  model, a user's `effort: "high"` still applies.
+- `hooks` **concatenate** — org policy hooks, repo guard hooks, and personal hooks all
+  fire; none replaces another.
+- `tools` and `mcp` are **last scope wins** — the repo's `bash: "on"` beats a user's
+  off.
+- `allowed_models` **replaces wholesale** — whichever scope sets it owns the whole
+  list.
+
+## Shared spend visibility
+
+Telemetry is local-per-machine by design — there is no central server. For a team view,
+each seat's numbers are exportable and comparable:
+
+```bash
+stella stats --format csv > $(whoami)-stats.csv   # per-model $/resolved, resolve rate
+stella observe                                     # or eyeball the Observatory locally
+```
+
+CI runs are the one place to centralize: run with `--output-format json --budget <usd>`
+and archive the summary artifact per pipeline — the
+[scripting page](/docs/scripting) has the recipes.
+
+## Related
+
+- [Enterprise cloud](/docs/examples/enterprise-cloud) — add the org-managed scope on top
+- [Hooks](/docs/agent-tools/hooks) — the guard-script contract, payload schema included
+- [Initialization](/docs/getting-started/initialization) — everything under `.stella/`

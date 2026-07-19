@@ -32,6 +32,23 @@ to `global` and only needs setting if you pin a regional endpoint.
   401 from the API mid-run.
 </Callout>
 
+The shell function, concretely — mint a fresh token per invocation and forget about
+expiry:
+
+```bash
+# ~/.zshrc or ~/.bashrc
+stella-vertex() {
+  VERTEX_ACCESS_TOKEN="$(gcloud auth print-access-token)" stella "$@"
+}
+```
+
+```bash
+stella-vertex --model vertex/gemini-3-pro run "audit the IAM bindings module"
+```
+
+Each call gets a token good for about an hour — enough for the run it starts, and the
+next call mints its own.
+
 ## Selecting models
 
 The provider id is `vertex`; the default model is `gemini-3-pro`, and the lineup mirrors
@@ -50,7 +67,18 @@ Bedrock), deliberately: `VERTEX_ACCESS_TOKEN` and ambient Google Cloud credentia
 routinely present in shells for reasons that have nothing to do with LLM inference, and a
 generic cloud credential must never hijack provider selection. If you want Vertex, say so —
 `--model vertex/gemini-3-pro`, or set it as a default in
-[`settings.json`](/docs/configuration/settings).
+[`settings.json`](/docs/configuration/settings):
+
+```json title="~/.config/stella/settings.json"
+{
+  "agent_engine_config": {
+    "default_model": "vertex/gemini-3-pro"
+  }
+}
+```
+
+The pin sits between the `--model` flag and auto-detection — an explicit flag still
+wins, but Vertex no longer loses to whichever direct-vendor key is also in the shell.
 
 ## Thinking
 
@@ -71,5 +99,6 @@ with [`agent_engine_config`](/docs/configuration/agent-engine-config); see
 | --- | --- | --- | --- | --- |
 | `gemini-3-pro` | 1M | 1.25 | 10.00 | 0.31 |
 
-Catalog list prices (seed catalog v0.3.0) mirror the Gemini API rates — your actual
-Vertex billing is set by your Google Cloud agreement; verify there.
+Catalog list prices from Stella's seed catalog mirror the Gemini API rates — your actual
+Vertex billing is set by your Google Cloud agreement; verify there. Your local catalog
+re-syncs from [models.dev](https://models.dev) via `stella models refresh`.

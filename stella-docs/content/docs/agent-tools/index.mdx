@@ -25,31 +25,85 @@ Tool names are their exact identifiers — the agent dispatches by name, and the
 
 ### Always available
 
-These 18 tools register in every session:
+These 35 tools register in every session — no configuration, no prerequisites. Grouped by what they touch:
+
+#### Files
 
 | Tool | Description | Access |
 | --- | --- | --- |
 | `read_file` | Read a file, returned with 1-based line numbers; `offset`/`limit` read a range. | Read-only |
-| `grep` | Search file contents with a regex (ripgrep-backed when available). | Read-only |
-| `glob` | Find files by glob pattern. | Read-only |
+| `write_file` | Create a file or overwrite an existing one — parent directories are created as needed. | Mutating |
+| `edit_file` | Replace an exact substring in a file — exactly-once by default, every occurrence with `replace_all`. | Mutating |
+| `delete_file` | Delete a file — preferred over shelling out to `rm`, so the deletion lands in the file-touch audit log. | Mutating |
+
+#### Search
+
+| Tool | Description | Access |
+| --- | --- | --- |
+| `grep` | Search file contents with a regex (ripgrep-backed when available); once the code-graph index exists, matches carry a code-map footer. | Read-only |
+| `glob` | Find files by glob pattern, returned as workspace-relative paths. | Read-only |
+
+#### Context &amp; memory
+
+| Tool | Description | Access |
+| --- | --- | --- |
 | `gather_context` | Run one deterministic context sweep — grep patterns + file globs + code-graph symbol lookups + bounded excerpts — in a single call, saved as a reusable context pack. | Read-only |
 | `explorations` | List saved codebase explorations, or read one back by slice. | Read-only |
-| `ci_status` | Inspect CI runs and failure-log tails for a branch, PR, or commit via `gh`; `wait` blocks until the latest run finishes. | Read-only |
-| `write_file` | Create a file or overwrite an existing one. | Mutating |
-| `edit_file` | Replace an exact substring in a file — exactly-once by default, every occurrence with `replace_all`. | Mutating |
-| `delete_file` | Delete a file. | Mutating |
-| `bash` | Run a shell command in the workspace root, with a timeout backstop. | Mutating |
-| `save_exploration` | Save a structured exploration of the codebase for other agents to reuse. | Mutating |
-| `save_memory` | Save a durable workspace memory to `.stella/memories/` — loaded into every future session's prompt. | Mutating |
+| `save_exploration` | Persist an end-to-end map of a codebase slice for other agents to reuse. | Mutating |
+| `save_memory` | Save a durable workspace lesson (gotcha, convention, failed approach) to `.stella/memories/` — loaded into every future session's prompt. | Mutating |
 | `cite_memory` | Cite a recalled memory that informed the turn (feeds the citation loop). | Mutating |
+
+#### Verify &amp; build
+
+| Tool | Description | Access |
+| --- | --- | --- |
+| `verify_done` | Prove a change is done: the test command must pass on the new code and fail on `git HEAD`. Runs in a shadow worktree and never edits your working tree. | Mutating |
 | `build_project` | Build the workspace with its own toolchain (cargo/npm/go/make), or a custom command. | Mutating |
 | `run_tests` | Run the project's tests with its own runner — `kind` picks unit/e2e/all, `filter` is runner-native. | Mutating |
-| `verify_done` | Prove a change is done: the test command must pass on the new code and fail on `git HEAD`. Runs in a shadow worktree and never edits your working tree. | Mutating |
-| `screenshot` | Capture a screenshot (writes a PNG into `.stella/screenshots/`). | Mutating |
+| `run_lint` | Run the project's own linter (cargo clippy, or the `lint` script); `fix` applies automatic fixes. | Mutating |
+| `format_code` | Run the project's own formatter (cargo fmt, or the `format` script); `check` verifies without rewriting. | Mutating |
+| `run_script` | Run a verb the project itself declares — a Makefile target, a package.json script, or a cargo alias — argv-style, never through a shell. | Mutating |
+
+#### Process control
+
+| Tool | Description | Access |
+| --- | --- | --- |
+| `start_process` | Start a long-running process (dev server, REPL, watcher) from an argv vector — no shell — and get a handle for the other three. | Mutating |
+| `read_output` | Read a started process's buffered stdout+stderr since the last read, plus its running/exited state. | Mutating |
+| `send_stdin` | Write text to a started process's stdin (e.g. a REPL command). | Mutating |
+| `stop_process` | Stop a started process: SIGTERM to its process group, then SIGKILL; remaining output stays readable. | Mutating |
+
+#### Git
+
+| Tool | Description | Access |
+| --- | --- | --- |
+| `repo_status` | Current branch, commits ahead/behind upstream, and the changed files as structured rows. | Read-only |
+| `repo_commit` | Commit exactly the named paths — there is no stage-everything mode. | Mutating |
+| `repo_push` | Push the current (or named) branch; structurally refuses the default branch, and force-push does not exist here. | Mutating |
+| `repo_pull` | Update the current branch from upstream, fast-forward only — never merges or rewrites. | Mutating |
+| `repo_rollback` | Restore exactly the named paths to their last committed state; history itself is never rewritten. | Mutating |
+
+#### CI &amp; media
+
+| Tool | Description | Access |
+| --- | --- | --- |
+| `ci_status` | Inspect CI runs and failure-log tails for a branch, PR, or commit via `gh`; `wait` blocks until the latest run finishes. | Read-only |
+| `screenshot` | Capture the screen to a PNG in `.stella/screenshots/` as verification evidence. | Mutating |
 | `generate_svg` | Validate, sanitize, and save an SVG the agent authored into `.stella/artifacts/` — scripts, event handlers, and external references are stripped. | Mutating |
 
+#### Task board
+
+| Tool | Description | Access |
+| --- | --- | --- |
+| `task_create` | Add a task to the session task board — one per concrete deliverable, created before multi-step work starts. | Mutating |
+| `task_list` | Show the board: every task as `[status] #id subject (owner)`. | Read-only |
+| `task_start` | Mark a board task in-progress — exactly one at a time. | Mutating |
+| `task_complete` | Mark a board task completed the moment its work is done and verified. | Mutating |
+| `task_cancel` | Cancel a task that is no longer worth doing, with a reason; the row stays as an audit trail. | Mutating |
+| `task_assign` | Delegate a board task to a parallel sub-agent — the briefing is passed verbatim, so write it self-contained. | Mutating |
+
 <Callout type="info">
-`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `gather_context`, `explorations`, `ci_status`, and (when present) `graph_query`, `search_issues`, `get_issue`, `list_labels`, `list_members`.
+`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `gather_context`, `explorations`, `ci_status`, `repo_status`, `task_list`, and (when present) `graph_query`, `search_issues`, `get_issue`, `list_labels`, `list_members` — plus `search_skills`, `tool_search`, `skill_search`, and `mcp_search` at the session layer.
 </Callout>
 
 ### Conditionally registered
@@ -58,6 +112,7 @@ These appear only when their prerequisite is met:
 
 | Tool | Description | Access | Appears when |
 | --- | --- | --- | --- |
+| `bash` | Run a shell command in the workspace root, with a timeout backstop. | Mutating | Your [settings](/docs/configuration/settings) opt in with `"tools": {"bash": "on"}` (any scope). **Off by default everywhere**, including interactive sessions — see below. |
 | `graph_query` | Query the indexed code graph instead of grepping: definitions, references, imports, importers, or a file's full graph neighborhood. | Read-only | `stella init` has built `.stella/codegraph.db` (also picked up mid-session once the graph exists). |
 | `generate_image` | Generate an image from a text prompt into `.stella/artifacts/`. | Mutating | An image-capable BYOK provider key is configured. |
 | `generate_video` | Submit an asynchronous text-to-video job. Video costs real money: any job with a positive estimated cost is denied unless `confirm_spend` is true. | Mutating | The configured media provider has a **video** adapter — an image-only key registers `generate_image` without the video pair. |
@@ -71,9 +126,39 @@ These appear only when their prerequisite is met:
 | `list_members` | Search assignable people by login, name, or email substring. | Read-only | An issue backend is configured. |
 | `start_work_on_issue` | Move an issue to in-progress and create or check out its branch. | Mutating | An issue backend is configured. |
 
+<Callout type="warn">
+**There is no shell by default.** `bash` is opt-in via `"tools": {"bash": "on"}` in [`settings.json`](/docs/configuration/settings) — in any scope, in every kind of session. When it's off, the model never sees the schema, and calling `bash` anyway returns the standard unknown-tool error: the policy is enforced at the tool boundary, not by prompt discipline. The structured tools above (`run_script`, `build_project`, the process group, the `repo_*` family) cover most of what a shell would do, with an auditable surface.
+</Callout>
+
 <Callout type="info">
 The issue backend resolves in precedence order: `LINEAR_API_KEY` env → a stored **Linear** connection (`stella connect linear`) → a stored **GitHub** connection (`stella connect github`, runs over REST with no `gh` CLI needed) → ambient `gh` CLI auth. If none is available, no issue tools are registered at all. See [stella connect](/docs/commands/connect).
 </Callout>
+
+### Session tools
+
+The CLI layers **six** more tools on top of the native registry. Three belong to interactive sessions:
+
+| Tool | Description | Access |
+| --- | --- | --- |
+| `ask_user` | Ask the user a multiple-choice question when a decision is genuinely theirs to make — 2–6 short options, and the UI always adds a free-text option. In a headless run it returns a named error instead of hanging on stdin. | Mutating |
+| `search_skills` | Search the public skills registry for reusable agent [skills](/docs/agent-tools/skills) matching a topic. | Read-only |
+| `install_skill` | Install a skill from the registry into the project's `.stella/skills/` — always asks for confirmation first. | Mutating |
+
+### Discovery tools
+
+The other three session tools are read-only **discovery** tools layered over the whole catalog. They exist so the agent never needs the entire tool, skill, and MCP surface frontloaded: a workspace can carry hundreds of tools and thousands of installed skills, and the agent finds the best fit on demand instead of carrying all of it in every prompt.
+
+| Tool | Description | Access |
+| --- | --- | --- |
+| `tool_search` | Search every tool available this session — built-ins, `mcp__<server>__<tool>` MCP tools, custom tools — ranked by fit. Queries are keywords (`issue tracking`), `+required` terms (`+github pr`), or `select:name1,name2` for exact lookup. | Read-only |
+| `skill_search` | Search the skills **installed** in this workspace (`.stella/skills/` plus the user-global directory), ranked by fit. `include_body: true` also returns the best match's full instructions. Complements `search_skills`, which queries the public registry for skills you'd still have to install. | Read-only |
+| `mcp_search` | Find MCP servers and their tools: the workspace's configured servers (default scope), or the public MCP registry (`scope: "registry"`) for servers worth installing with `stella mcp install <name>`. | Read-only |
+
+#### Lean frontloading (experimental)
+
+Set `STELLA_LEAN_TOOLS=1` to advertise only a lean core toolset (file CRUD, search, build/test/verify, `ask_user`, and `bash` when the opt-in has enabled it) plus the discovery tools; everything else stays out of the prompt until a `tool_search` surfaces it. Matched tools are *activated* — advertised for the rest of the session. Set the variable to a comma-separated list of tool names to choose your own core. A hidden tool called by name still executes, so lean mode trims prompt weight without ever gating a capability.
+
+All told: 35 always-on tools, up to 48 native tools with the `bash` opt-in, the code graph, media keys, and an issue backend, plus the six session tools — before any custom script tools or MCP servers merge in.
 
 ## Where to go next
 

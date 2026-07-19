@@ -1,6 +1,6 @@
 ---
 title: Telemetry & budget
-description: Local-only token, cost, and step metering in a local SQLite store — and how --budget turns metering into a hard spend cap.
+description: Local-only telemetry in a SQLite store on your disk — tokens, cost, steps, tool calls, files, memory, reflections — and how --budget turns metering into a hard spend cap.
 ---
 
 Stella meters every run **locally**. Token usage, cost, and per-step accounting land in a
@@ -8,15 +8,37 @@ SQLite store on your disk — nothing is sent anywhere.
 
 ## Local metering
 
-| What | Where |
-| --- | --- |
-| Token usage, cost, per-step metering | `<workspace>/.stella/store.db` (SQLite) |
-
-Because the store is a real SQLite file, you can inspect it with any SQLite client after a
-run — e.g. `sqlite3 <workspace>/.stella/store.db` — and every execution, its model, and its
-cost are queryable on your own machine. WAL is enabled, so a read-only reader like
+Everything lands in one SQLite file: `<workspace>/.stella/store.db`. Because the store is
+a real SQLite file, you can inspect it with any SQLite client after a run — e.g.
+`sqlite3 <workspace>/.stella/store.db` — and every execution, its model, and its cost are
+queryable on your own machine. WAL is enabled, so a read-only reader like
 [`stella stats`](/docs/commands/stats) is never blocked by a live session. Stella never
 transmits this data.
+
+### What's in the store
+
+Metering is only part of it. The store owns **17 tables** — a full record of what each run
+*did*, not just what it cost — and the [Observatory](/docs/telemetry/dashboard) reads these
+same tables:
+
+| Table | What it records |
+| --- | --- |
+| `executions` | One row per run / goal / chat turn — kind, prompt, provider/model, outcome, cost. The spine every other table keys off |
+| `events` | The full, ordered event stream of each execution — replayable, reasoning deltas included |
+| `telemetry` | One row per model call: input/output tokens, cache read/write/miss, cost, latency, retries |
+| `files_touched` | The per-execution file-touch ledger — CRUD letters, line deltas, JSON audit log ([details](/docs/telemetry/files-touched)) |
+| `tool_calls` | One row per tool call (native, MCP, skill, or agent) — shape, timing, success, bytes returned |
+| `mcp_usage` | Per-call MCP log: server, tool, reason, call time |
+| `skill_usage` | One row per skill applied in a turn, with the skill's pinned version |
+| `agent_uses` | One row per invocation of an installed agent definition, with its pinned version |
+| `memory_citations` | Recall receipts: per memory cited in a turn, its usefulness score and truthfulness verdict |
+| `rules` | Promoted workspace rules — the full rule markdown, one row per rule |
+| `reflections` | Durable lessons and self-critiques, tagged by domain |
+| `execution_reflection` | The post-turn self-review, tied 1:1 to its execution |
+| `tasks` | The latest task-board snapshot, one row per task per session |
+| `pull_requests` | Tracked pull requests — status and CI verdict, keyed by URL |
+| `file_locks` | Cooperative file claims for multi-agent work |
+| `graph_nodes` / `graph_edges` | Reserved schema for a future context-plane seam — the code graph itself lives in `.stella/codegraph.db` |
 
 ## Budget: observed vs. enforced
 

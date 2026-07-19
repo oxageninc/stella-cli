@@ -1,0 +1,129 @@
+---
+title: "Z.ai coding plan"
+description: Route Stella at the GLM coding-plan endpoint — the flat-quota subscription setup, the exact precedence chain, and a full pipeline profile that stops metering the worker.
+---
+
+<ProviderMark id="zai" size={30} />
+
+If you subscribe to a Z.ai **GLM coding plan**, your quota lives on a dedicated
+endpoint — `https://api.z.ai/api/coding/paas/v4` instead of the pay-per-token
+`https://api.z.ai/api/paas/v4`. Same key, same models, different billing: a flat
+subscription instead of a meter. This page is the complete setup.
+
+## Route Stella at the plan
+
+Two equivalent routes — pick one:
+
+**The env toggle** (quickest — one line in your shell profile):
+
+```bash
+export ZAI_API_KEY="..."
+export ZAI_GLM_CODING_PLAN=1
+```
+
+**The settings route** (durable, provider-agnostic mechanism). A subscription is
+personal, so this belongs in **user scope**:
+
+```json title="~/.config/stella/settings.json"
+{
+  "providers": {
+    "zai": {
+      "base_url": "https://api.z.ai/api/coding/paas/v4"
+    }
+  }
+}
+```
+
+<Callout type="warn">
+  Don't set both, and know the full precedence chain — later entries are silently
+  overridden by earlier ones:
+  `--base-url` / `STELLA_BASE_URL` &gt; `ZAI_GLM_CODING_PLAN=1` &gt; `settings.json`
+  `base_url` &gt; the built-in default. A stray `STELLA_BASE_URL` in your environment
+  routes you **off** the plan without a word; a leftover `ZAI_GLM_CODING_PLAN=1`
+  overrides the settings file. And if you put the `base_url` in a **project's**
+  `.stella/settings.json` instead of user scope, the
+  [trust boundary](/docs/configuration/settings#the-project-trust-boundary) drops it
+  unless `STELLA_TRUST_PROJECT=1` is set.
+</Callout>
+
+Verify before trusting it:
+
+```bash
+stella config    # Base URL must read https://api.z.ai/api/coding/paas/v4
+```
+
+## The full profile
+
+With the plan carrying the worker, route the whole pipeline accordingly. Two sensible
+shapes:
+
+**Plan worker, API judge** — the [balanced](/docs/examples/balanced) shape with the
+worker's marginal cost near zero. The judge stays cross-family on a metered key you
+barely touch (a verdict is a few cents, and `--test-command` runs often skip it
+entirely):
+
+```json title="~/.config/stella/settings.json"
+{
+  "providers": {
+    "zai": { "base_url": "https://api.z.ai/api/coding/paas/v4" }
+  },
+  "agent_engine_config": {
+    "default_model": "zai/glm-5.2",
+    "pipeline_judge_model": "anthropic/claude-fable-5",
+    "pipeline_triage_model": "zai/glm-5.2",
+    "effort_auto": "on",
+    "reasoning_auto": "on"
+  }
+}
+```
+
+**All-in on the plan** — every role on GLM, nothing metered. The judge is same-family
+with the worker, so give it a strict prompt and prefer arming
+[`--test-command`](/docs/inference-pipeline) so verification is deterministic rather
+than a same-family opinion:
+
+```json title="~/.config/stella/settings.json"
+{
+  "providers": {
+    "zai": { "base_url": "https://api.z.ai/api/coding/paas/v4" }
+  },
+  "agent_engine_config": {
+    "default_model": "zai/glm-5.2",
+    "pipeline_judge_model": "zai/glm-5.2",
+    "pipeline_triage_model": "zai/glm-5.2",
+    "agents": {
+      "judge": {
+        "prompt": "You are a strict, evidence-first code judge. Demand proof.",
+        "effort": "high"
+      }
+    }
+  }
+}
+```
+
+`default_model` is what routes the pipeline's execute turns — see
+[model precedence](/docs/configuration/agent-engine-config#model-precedence).
+
+## Fleets on a flat quota
+
+The plan's economics invert the usual caution: [fleet](/docs/agent-fleets) workers all
+draw on the same subscription, so parallel width costs attention, not dollars:
+
+```bash
+stella fleet --plan tasks.toml --max-concurrency 4 --watch
+```
+
+<Callout type="info">
+  Stella's [telemetry](/docs/telemetry) prices tokens at the catalog's **list** rates —
+  on a coding plan the `$` figures in `stella stats` are notional (you pay the flat
+  subscription, not per token). Token counts, step counts, and $/resolved comparisons
+  between models remain meaningful; absolute dollars for `zai/*` do not. `--budget`
+  caps are enforced against those notional prices too — set them generously or not at
+  all for plan-routed runs.
+</Callout>
+
+## Related
+
+- [Z.ai provider reference](/docs/api-providers/zai) — models, pricing, thinking mode
+- [Single-key setups](/docs/examples/single-key) — the same idea for other providers
+- [Balanced profile](/docs/examples/balanced) — the metered version of this shape

@@ -19,10 +19,11 @@ stella chat
 | --- | --- |
 | `stella run <prompt>` | Send a one-shot prompt, non-interactive (staged pipeline by default). |
 | `stella chat` | Interactive session — the Command Deck TUI (the default when no subcommand is given). |
+| `stella resume [id]` | Reopen a previous Command Deck session exactly where it stood; `--list` shows every session on this machine. |
 | `stella goal <goal>` | Work in judged rounds until a judge model confirms the goal is met. |
 | `stella monitor [target]` | Watch CI for a branch/PR and fix failures until fully green. |
 | `stella init` | Analyze the workspace, infer its domain taxonomy, and build the code-graph index. |
-| `stella fleet <tasks...>` | Fan tasks out to a fleet of worker agents — one git worktree per task. |
+| `stella fleet <tasks...>` | Fan tasks out to a fleet of worker agents in one shared tree, coordinated by cooperative file claims. |
 | `stella graph <op> <target>` | Query the code graph built by `stella init` (offline, no API key). |
 | `stella models` | List configured providers and available models. |
 | `stella stats` | Summarize cost, tokens, and resolve rate per provider/model from local telemetry. |

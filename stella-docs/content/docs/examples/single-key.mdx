@@ -1,0 +1,79 @@
+---
+title: "Single provider, single key"
+description: Complete one-key setups — Anthropic-only, OpenAI-only, or Z.ai-only — with a same-family judge done right. The profiles most people should start with.
+---
+
+The three [cost profiles](/docs/examples) mix providers for cross-family judging — which
+means two or three API keys. If you have **one** key, everything here works with it. This
+is the setup most people should run first; graduate to a cross-family judge later if the
+data says so.
+
+## The zero-config baseline
+
+One env var is a working setup — auto-detection does the rest:
+
+```bash
+export ANTHROPIC_API_KEY="..."   # or OPENAI_API_KEY, ZAI_API_KEY, …
+stella run "fix the flaky retry test"
+```
+
+Every pipeline role rides the same model. That is already safe: with no configured
+judge, the [verification ladder](/docs/inference-pipeline)'s deterministic checks (the
+test-flip oracle, the diff budget) still gate the result, and the judge role simply
+rides the worker.
+
+Two habits make one-key runs materially better, no config required:
+
+```bash
+# 1. Arm the flip oracle — deterministic verification, judge often skipped entirely
+stella run --test-command "cargo test -p api" "add cursor pagination to /orders"
+
+# 2. Cap the spend — enforced between steps, aborts cleanly
+stella --budget 2.00 goal "the linter passes and the snapshot tests are green"
+```
+
+## A tuned one-key profile
+
+When every role is the same family, make the judge *behave* differently: strict prompt,
+high effort. Same shape for any provider — swap the model line:
+
+```json title="~/.config/stella/settings.json (Anthropic)"
+{
+  "agent_engine_config": {
+    "default_model": "anthropic/claude-fable-5",
+    "pipeline_judge_model": "anthropic/claude-fable-5",
+    "agents": {
+      "judge": {
+        "prompt": "You are a strict, evidence-first code judge. Demand proof over plausibility.",
+        "effort": "high"
+      }
+    },
+    "reasoning_auto": "on"
+  }
+}
+```
+
+| One key for… | Worker &amp; judge model | Notes |
+| --- | --- | --- |
+| Anthropic | `anthropic/claude-fable-5` | Flagship quality; the priciest single-key option |
+| OpenAI | `openai/gpt-5.5` | 400k window; `service_tier: "priority"` available for the judge |
+| Z.ai | `zai/glm-5.2` | The budget pick — and on a [coding plan](/docs/examples/zai-coding-plan), flat-rate |
+| DeepSeek | `deepseek/deepseek-chat` | Cheapest metered option; see [dirt cheap](/docs/examples/dirt-cheap) |
+
+<Callout type="warn">
+  A same-family judge shares the worker's blind spots — it is real review, not
+  independent review. Compensate deterministically: arm `--test-command` wherever a test
+  can express "done" (verified runs then skip the judge), and treat the judge as a
+  regression net rather than the main gate. When you add a second key someday, the
+  [balanced profile](/docs/examples/balanced) upgrades the judge to cross-family with
+  two settings lines.
+</Callout>
+
+## Why not just always do this?
+
+Cross-family judging exists because an independent model family catches what the
+worker's family rationalizes — Stella even
+[prefers cross-family automatically](/docs/configuration/agent-engine-config#auto-modes)
+when `auto_mode` is on and the credentials exist. One key is the right *starting* point,
+not a ceiling: watch **$/resolved** in the [Observatory](/docs/telemetry/dashboard) for
+a week, and let the number tell you whether a second key pays for itself.

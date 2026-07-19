@@ -18,19 +18,10 @@ is present, it is the provider you get without asking. Stella speaks the
 export ZAI_API_KEY="..."
 ```
 
-Alternatively, store the key in
-[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or reference an
-env var from [`settings.json`](/docs/configuration/settings):
-
-```json title=".stella/settings.json"
-{
-  "providers": {
-    "zai": {
-      "api_key_env": "MY_TEAM_ZAI_KEY"
-    }
-  }
-}
-```
+Prefer a file? Store the key in
+[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or rename the
+env var Stella reads with `providers.zai.api_key_env` — see
+[overriding the key source](/docs/api-providers#overriding-the-key-source).
 
 ## Selecting models
 
@@ -53,7 +44,7 @@ export ZAI_GLM_CODING_PLAN=1
 
 or, provider-agnostically, in [`settings.json`](/docs/configuration/settings):
 
-```json title=".stella/settings.json"
+```json title="~/.config/stella/settings.json"
 {
   "providers": {
     "zai": {
@@ -63,12 +54,22 @@ or, provider-agnostically, in [`settings.json`](/docs/configuration/settings):
 }
 ```
 
+That snippet is user-scope on purpose — in a project's `.stella/settings.json`,
+`base_url` is ignored unless `STELLA_TRUST_PROJECT=1` (see
+[the project trust boundary](/docs/configuration/settings#the-project-trust-boundary)).
+
 <Callout type="warn">
-  If both are set, the `ZAI_GLM_CODING_PLAN=1` env toggle wins over the `settings.json`
-  `base_url` — unset the toggle when you switch to the settings route, or the file value
-  is silently overridden. Details on the precedence chain live in
-  [settings.json](/docs/configuration/settings).
+  The endpoint precedence chain, top to bottom: `--base-url` (or its env form
+  `STELLA_BASE_URL`) beats `ZAI_GLM_CODING_PLAN=1`, which beats the `settings.json`
+  `base_url`, which beats the built-in default. Two silent traps follow: with both the
+  env toggle and the settings route set, the file value is overridden — and a stray
+  `--base-url` or `STELLA_BASE_URL` overrides **both**, taking you off the coding-plan
+  endpoint without a word. Unset the layers you are not using.
 </Callout>
+
+The full recipe — plan setup, verification that requests actually hit the coding-plan
+endpoint, per-agent wiring — lives in
+[the Z.ai coding-plan example](/docs/examples/zai-coding-plan).
 
 ## Thinking
 
@@ -90,6 +91,7 @@ plan, it is the obvious default for high-volume fleet work. Per-agent wiring liv
 | --- | --- | --- | --- | --- |
 | `glm-5.2` | 200k | 0.60 | 2.20 | 0.11 |
 
-List prices from Stella's seed catalog (v0.3.0) — coding-plan subscriptions bill
-differently (flat quota, not per token); verify with Z.ai. See the
+List prices from Stella's seed catalog — coding-plan subscriptions bill differently
+(flat quota, not per token); verify with Z.ai. Your local catalog re-syncs from
+[models.dev](https://models.dev) via `stella models refresh`. See the
 [Model guide](/docs/api-providers/models) for the full cross-provider table.

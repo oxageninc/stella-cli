@@ -18,7 +18,8 @@ an environment-variable equivalent for CI.
 | `stream-json` | One JSON line per agent event, as it happens | Live progress in a pipeline |
 
 `stream-json` is a line-per-event serialization of Stella's internal event enum — a stable
-machine interface you can parse incrementally.
+machine interface you can parse incrementally. Each line is one event object tagged
+`"type"` in snake_case (`stage`, `text`, `reasoning`, `tool_start`, `tool_result`, …).
 
 ```bash
 # One final JSON object
@@ -29,6 +30,15 @@ stella --output-format stream-json run "fix the failing test" | while IFS= read 
   echo "$line" | jq -r '.type // "event"'
 done
 ```
+
+`json` embeds those same event objects under an `events` key in its single summary
+object — exactly what `stream-json` would have emitted line by line. The summary's other
+keys depend on the execution path: a default run goes through the staged pipeline and
+summarizes as `status`, `text`, `cost_usd`, `reason`, `task_class`, `verdict`,
+`revisions`, `candidates_run`, `model`, and `events`; a `--no-pipeline` (raw step-loop)
+run summarizes as `status`, `text`, `cost_usd`, `reason`, `model`, and `events`, plus the
+top-level [`files_touched`](/docs/telemetry/files-touched) telemetry payload — which the
+pipeline summary does **not** carry.
 
 ## Configure via environment
 

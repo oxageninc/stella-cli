@@ -1,0 +1,71 @@
+---
+title: stella resume
+description: Reopen a previous Command Deck session exactly where it stood — transcript, conversation, and pending prompts.
+---
+
+Reopen a previous [Command Deck](/docs/commands/chat) session exactly where it stood — transcript, LLM conversation, and the pending prompt backlog. Sessions are durable through quit, Ctrl-C, a killed terminal, and power loss: every fold-relevant event is journaled as it happens, and resuming replays that journal.
+
+## Synopsis
+
+```bash
+stella resume [id] [--list] [global flags]
+```
+
+## What it does
+
+Every deck session registers itself in a machine-wide registry — one JSON file per session under the platform data dir (`~/Library/Application Support/stella/sessions/` on macOS; `STELLA_DATA_DIR` overrides), with the session's durable state journaled beside it. `stella resume` picks a session from that registry and reopens it in the deck:
+
+- **`stella resume`** (no id) reopens the most recently active resumable session **of the current workspace**. If there is none, it says so and points you at `--list`.
+- **`stella resume <id>`** reopens one specific session by its registry id — ids are minted at session start as `ses-<ms>-<pid>` and shown by `--list`.
+
+What comes back: the transcript is rebuilt by replaying the session journal, the LLM conversation is restored from its last committed turn boundary, and the pending prompt queue returns exactly as you left it. Prompts an interruption cut short mid-dispatch are requeued at the **front** in their original order — at most the in-flight turn's streamed tail is re-run. The session's staged-pipeline toggle and cumulative spend are restored too, so a `--budget` cap keeps meaning "this session", not "since the restart".
+
+A session can only be reopened where it belongs: it must not be live in another stella process (there is no attach — stop that session first), it must belong to the current workspace (the deck's tools, memory, and graph are workspace-bound), and it must have durable state on disk (sessions predating session journaling are listed but not resumable).
+
+<Callout type="info">
+`stella resume` opens the Command Deck, so it needs a real terminal — it cannot combine with `--plain`, `STELLA_PLAIN`, or a piped stream. `stella resume --list` works anywhere.
+</Callout>
+
+## `--list`
+
+`stella resume --list` prints every session recorded on this machine, newest activity first — local reads only, no API key required. Each row shows the registry id, status (In Progress, Needs Input, Paused, Cancelled, Complete, Archived, Error — a live-status session whose process died reads as Error), and the session title. A `↩` marker means resumable from the current directory; `·` means resumable from its own workspace.
+
+```text
+   ID                       STATUS       SESSION
+↩  ses-1752940000123-8812   Paused       stella: migrate the config loader to serde…
+·  ses-1752861200456-3301   Complete     webapp: fix the flaky auth test…
+
+↩ resumable here (`stella resume [ID]`) · resumable from its own workspace
+inside the deck: `←` on an empty prompt opens SESSIONS, `⏎` reopens a session
+```
+
+The deck's **SESSIONS** overlay (`←` on an empty prompt, or `/sessions`) is the same navigation from inside a session — `⏎` on a row reopens it.
+
+## Flags
+
+| Flag | Meaning |
+| --- | --- |
+| `[id]` | Registry id (`ses-…`) of the session to reopen. Omitted: the most recently active resumable session of this workspace. |
+| `--list` | List this machine's sessions (resumable ones marked) and exit. |
+
+The [global flags](/docs/commands) apply — `--budget` is re-seeded with the session's prior spend, and `--no-anim` freezes deck animation as usual.
+
+## Examples
+
+Reopen where you left off in this workspace:
+
+```bash
+stella resume
+```
+
+Reopen one specific session by id:
+
+```bash
+stella resume ses-1752940000123-8812
+```
+
+See every session on this machine first:
+
+```bash
+stella resume --list
+```
