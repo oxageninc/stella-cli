@@ -132,6 +132,12 @@ Rules:
 /// the prompt cache on every call, so they must stay dense.
 const MEMORY_PROMPT_BUDGET_CHARS: usize = 16_000;
 
+/// Cap on the workspace-maps index appended to the system prompt
+/// (`docs/design/exploration-sharing.md` §4a): metadata only — slice,
+/// title, freshness verdict, age — never map bodies, which stay one cheap
+/// `explorations` tool call away.
+const EXPLORATION_INDEX_BUDGET_CHARS: usize = 2_000;
+
 /// A/B recall measurement rate (Proposal 4): `1/N` turns suppress recall
 /// entirely so the outcome can be compared against recalled turns. 10 means
 /// ~10% of turns are control turns. 0 disables the A/B mechanism.
@@ -154,6 +160,7 @@ fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> Strin
     let mut prompt = base.to_string();
     append_project_scripts(&mut prompt, workspace_root);
     append_workspace_memories(&mut prompt, workspace_root);
+    append_exploration_index(&mut prompt, workspace_root);
     let rules_section = stella_core::rules::render_rules_section(
         &crate::rules::load_workspace_rules(workspace_root),
     );
@@ -164,6 +171,20 @@ fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> Strin
     prompt
 }
 
+/// The workspace-maps half of [`assemble_system_prompt`]: the exploration
+/// store's index — every saved map with its per-file freshness verdict, plus
+/// in-progress drafts with producer liveness — so orientation is pushed at
+/// turn 1 instead of waiting for the model to think of pulling it. Computed
+/// ONCE per session (freshness verdicts included) for the same prompt-cache
+/// byte-stability reason as memories; maps saved mid-session by other
+/// sessions surface through the registry's coverage hints instead.
+fn append_exploration_index(prompt: &mut String, workspace_root: &std::path::Path) {
+    let summaries = stella_tools::exploration::summaries_sync(workspace_root);
+    if let Some(index) =
+        stella_tools::exploration::render_index(&summaries, EXPLORATION_INDEX_BUDGET_CHARS)
+    {
+        prompt.push('\n');
+        prompt.push_str(&index);
 /// The project-scripts section of [`assemble_system_prompt`]: the scripts
 /// index's canonical verb → command bindings, rendered once at session
 /// start right after the base instructions (project ground truth before
@@ -3997,6 +4018,39 @@ mod tests {
             prompt.contains("Never force-push.  [enforced]"),
             "a guarded rule must render with the enforced marker: {prompt}"
         );
+    }
+
+    #[test]
+    fn system_prompt_carries_the_workspace_maps_index() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join(".stella/explorations");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cli.json"),
+            serde_json::json!({
+                "slice": "cli", "title": "CLI surface", "summary": "maps the CLI",
+                "content": "big body that must NOT be in the prompt",
+                "files": [], "created_at_ms": 1u64
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let prompt = build_system_prompt(&cfg_for("zai"), root.path());
+        assert!(
+            prompt.contains("## Workspace maps"),
+            "index section missing"
+        );
+        assert!(prompt.contains("`cli`") && prompt.contains("CLI surface"));
+        assert!(
+            !prompt.contains("big body"),
+            "map bodies must stay pull-only, never in the prompt"
+        );
+
+        // No maps → no section, no tokens.
+        let bare = tempfile::tempdir().expect("tempdir");
+        let empty = build_system_prompt(&cfg_for("zai"), bare.path());
+        assert!(!empty.contains("## Workspace maps"));
     }
 
     /// A `Config` selecting `provider_id` at its default model, with a dummy

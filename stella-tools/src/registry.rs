@@ -79,6 +79,13 @@ pub struct ToolRegistry {
     /// drain discipline, so no request is dispatched twice.
     spawn_queue: crate::tasks::SpawnQueue,
     storage_index: std::sync::Mutex<StorageIndex>,
+    schema_index: std::sync::Mutex<SchemaIndex>,
+    /// Which workspace paths are covered by a FRESH saved exploration map —
+    /// the read-side analogue of `schema_index` (`docs/design/
+    /// exploration-sharing.md` §6). Built once at construction, refreshed
+    /// after every `save_exploration`; drives the once-per-session
+    /// "this area is already mapped" hints on search-tool results.
+    exploration_coverage: std::sync::Mutex<ExplorationCoverage>,
     /// The session's extension hook bus, once a host attaches one
     /// ([`ToolRegistry::attach_bus`]). Every emission is `None`-guarded, so
     /// a bus-less registry behaves exactly as it did before hooks existed.
@@ -90,6 +97,44 @@ pub struct ToolRegistry {
 /// the relations created by writes this session — which the on-disk index
 /// may not have re-indexed yet. The gate merges both over a fresh read of
 /// the persisted index on every gated write.
+/// Path-coverage of fresh exploration maps plus the hint dedup set.
+#[derive(Debug, Default)]
+struct ExplorationCoverage {
+    /// Workspace-relative path → slices of fresh, complete maps covering it.
+    by_path: HashMap<String, Vec<String>>,
+    /// Slices already hinted this session — each map is suggested at most
+    /// once, so the nudge can never become nagging.
+    hinted: HashSet<String>,
+}
+
+impl ExplorationCoverage {
+    /// Scan the exploration store; only fresh, complete maps generate
+    /// coverage (a drifted or draft map must not suppress real exploration).
+    fn rebuild(root: &std::path::Path) -> Self {
+        let mut by_path: HashMap<String, Vec<String>> = HashMap::new();
+        for summary in crate::exploration::summaries_sync(root) {
+            if summary.status != crate::exploration::ExplorationStatus::Complete
+                || !summary.freshness.is_fresh()
+            {
+                continue;
+            }
+            for path in &summary.covered {
+                by_path
+                    .entry(path.clone())
+                    .or_default()
+                    .push(summary.slice.clone());
+            }
+        }
+        Self {
+            by_path,
+            hinted: HashSet::new(),
+        }
+    }
+}
+
+/// The known schema objects in the workspace, used by the schema gate to
+/// prevent duplicate table/type/view creation. Populated from the code graph
+/// or empty when no graph is open.
 #[derive(Debug, Clone, Default)]
 pub struct StorageIndex {
     baseline: stella_graph::StorageSnapshot,
@@ -265,6 +310,7 @@ impl ToolRegistry {
             let name = tool.schema().name;
             tools.insert(name, tool);
         }
+        let exploration_coverage = std::sync::Mutex::new(ExplorationCoverage::rebuild(&root));
         Self {
             tools,
             late_tools: std::sync::RwLock::new(HashMap::new()),
@@ -276,6 +322,8 @@ impl ToolRegistry {
             task_board,
             spawn_queue,
             storage_index: std::sync::Mutex::new(StorageIndex::default()),
+            schema_index: std::sync::Mutex::new(SchemaIndex::default()),
+            exploration_coverage,
             bus: std::sync::RwLock::new(None),
         }
     }
@@ -359,6 +407,30 @@ impl ToolRegistry {
         }
         let input: &Value = modified_input.as_ref().unwrap_or(input);
 
+        // A save_exploration's staleness manifest is built from the map's
+        // actual evidence: pass the session's read paths from the file-touch
+        // ledger through the internal input key (spec §3d). The model never
+        // authors this field; a value it did author is replaced.
+        let mut ledger_augmented: Option<Value> = None;
+        if name == "save_exploration"
+            && let Value::Object(map) = input
+        {
+            let read_paths: Vec<String> = self
+                .files_touched()
+                .into_iter()
+                .filter(|(_, letters)| letters.contains('R'))
+                .map(|(path, _)| path)
+                .collect();
+            if !read_paths.is_empty() {
+                let mut map = map.clone();
+                map.insert(
+                    crate::exploration::LEDGER_FILES_KEY.to_string(),
+                    serde_json::json!(read_paths),
+                );
+                ledger_augmented = Some(Value::Object(map));
+            }
+        }
+        let input: &Value = ledger_augmented.as_ref().unwrap_or(input);
         // `run_script` composes its command from the scripts index at
         // execute time; resolve it up front (best-effort) so the
         // `command.started` policy chain and the command.* observer events
@@ -462,7 +534,7 @@ impl ToolRegistry {
                 .get(name)
                 .cloned()
         });
-        let output = match tool {
+        let mut output = match tool {
             Some(tool) => tool.execute(input, &self.root).await,
             None => ToolOutput::Error {
                 message: format!(
@@ -518,6 +590,72 @@ impl ToolRegistry {
             }
             if let Some(pending) = pending_op {
                 self.record_touch(pending, pre_content, name, input, bus.as_ref());
+            }
+            // A new/updated map changes what is covered — rebuild (also
+            // resets nothing: the hinted set survives via re-insertion
+            // below being per-slice, and a freshly saved map needs no hint
+            // for its own author).
+            if name == "save_exploration" {
+                let mut refreshed = ExplorationCoverage::rebuild(&self.root);
+                let mut coverage = self
+                    .exploration_coverage
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                refreshed.hinted = std::mem::take(&mut coverage.hinted);
+                // The author of a map never needs a hint about it.
+                if let Some(slice) = input.get("slice").and_then(|v| v.as_str()) {
+                    refreshed.hinted.insert(slice.to_string());
+                }
+                *coverage = refreshed;
+            }
+        }
+
+        // Coverage hints (spec §6b): when a search/read touches territory a
+        // FRESH map covers, say so once per (session, slice) — meeting the
+        // grep habit where it lives. Appended to the result text, outside
+        // the cached prompt prefix, so the hint costs no cache stability.
+        if matches!(name, "grep" | "glob" | "read_file" | "graph_query")
+            && let ToolOutput::Ok { content } = &mut output
+        {
+            let mut haystack = String::new();
+            for key in ["path", "target", "pattern"] {
+                if let Some(v) = input.get(key).and_then(|v| v.as_str()) {
+                    haystack.push_str(v);
+                    haystack.push('\n');
+                }
+            }
+            // Cap the scan window (char-boundary-safe) — a huge grep dump
+            // is already summarizing many files; the head names them.
+            let mut cap = content.len().min(20_000);
+            while cap < content.len() && !content.is_char_boundary(cap) {
+                cap += 1;
+            }
+            haystack.push_str(&content[..cap]);
+            let mut fresh_hits: Vec<String> = {
+                let mut coverage = self
+                    .exploration_coverage
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let mut hits: Vec<String> = coverage
+                    .by_path
+                    .iter()
+                    .filter(|(path, _)| haystack.contains(path.as_str()))
+                    .flat_map(|(_, slices)| slices.iter().cloned())
+                    .filter(|slice| !coverage.hinted.contains(slice))
+                    .collect();
+                hits.sort();
+                hits.dedup();
+                hits.truncate(3);
+                for slice in &hits {
+                    coverage.hinted.insert(slice.clone());
+                }
+                hits
+            };
+            for slice in fresh_hits.drain(..) {
+                content.push_str(&format!(
+                    "\n\nnote: saved exploration `{slice}` covers this area (fresh) — \
+                     explorations({{\"slice\": \"{slice}\"}}) may already answer this"
+                ));
             }
         }
         output
@@ -1033,6 +1171,97 @@ mod tests {
         let (_root, reg) = bare_registry(None);
         let result = reg.execute("nonexistent", &Value::Null).await;
         assert!(result.is_error());
+    }
+
+    #[tokio::test]
+    async fn session_reads_flow_into_saved_exploration_manifest() {
+        let (root, reg) = bare_registry(None);
+        std::fs::write(root.path().join("evidence.rs"), "fn seen() {}").unwrap();
+
+        // Read through the registry so the file-touch ledger records it.
+        let read = reg
+            .execute(
+                "read_file",
+                &serde_json::json!({"path": "evidence.rs", "reason": "test"}),
+            )
+            .await;
+        assert!(!read.is_error(), "{read:?}");
+
+        // Save WITHOUT declaring the file — the ledger must supply it.
+        let saved = reg
+            .execute(
+                "save_exploration",
+                &serde_json::json!({
+                    "slice": "auto", "title": "Auto", "summary": "s", "content": "map"
+                }),
+            )
+            .await;
+        match &saved {
+            ToolOutput::Ok { content } => {
+                assert!(content.contains("1 files tracked"), "{content}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_map_hints_once_on_covering_search_results() {
+        let (root, reg) = bare_registry(None);
+        std::fs::write(root.path().join("covered.rs"), "fn mapped() {}").unwrap();
+        let saved = reg
+            .execute(
+                "save_exploration",
+                &serde_json::json!({
+                    "slice": "zone", "title": "Zone", "summary": "s", "content": "map",
+                    "files": ["covered.rs"]
+                }),
+            )
+            .await;
+        assert!(!saved.is_error(), "{saved:?}");
+        // The author never needs a hint about its own map — simulate a new
+        // session (fresh registry, same workspace) which does.
+        let reg2 = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
+
+        let hit = reg2
+            .execute("grep", &serde_json::json!({"pattern": "mapped"}))
+            .await;
+        match &hit {
+            ToolOutput::Ok { content } => {
+                assert!(
+                    content.contains("saved exploration `zone`"),
+                    "first covering search must carry the hint: {content}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Once per session: the second covering search stays clean.
+        let again = reg2
+            .execute("grep", &serde_json::json!({"pattern": "mapped"}))
+            .await;
+        match &again {
+            ToolOutput::Ok { content } => {
+                assert!(
+                    !content.contains("saved exploration `zone`"),
+                    "hint must not repeat: {content}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // And the author's own registry was seeded as already-hinted.
+        let author_search = reg
+            .execute("grep", &serde_json::json!({"pattern": "mapped"}))
+            .await;
+        match &author_search {
+            ToolOutput::Ok { content } => {
+                assert!(
+                    !content.contains("saved exploration `zone`"),
+                    "author must not be hinted about its own map: {content}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@ engine — see [Agent Engine Paths](/docs/agent-engine-paths).)
 | Interactive chat | `stella` / `stella chat` | Exploring, iterating, supervising | You, live |
 | One-shot run | `stella run "…"` | Scripts, CI, a single well-defined task | The [staged pipeline](/docs/inference-pipeline) |
 | Raw step loop | `stella run --no-pipeline "…"` | Quick questions, cheap tasks | The model stops when done |
-| Goal mode | `stella goal "…"` | An outcome, not a task list | An independent [judge](/docs/agent-modes/goal-mode), in rounds |
+| Goal mode | `stella goal "…"` | An outcome, not a task list | An independent [judge](#outcome-driven-goal-mode), in rounds |
 | CI monitor | `stella monitor` | "Make CI green and keep it green" | The latest CI run, all-green |
 | Fleet | `stella fleet …` | Many tasks in parallel | Per-task, in isolated [worktrees](/docs/agent-fleets) |
 
@@ -62,20 +62,92 @@ stella run "add a --json flag to the export command and update the tests" \
 
 ## Outcome-driven: goal mode
 
-`stella goal` doesn't take a task — it takes an **objective**, and works in
-judged rounds until an independent judge (routed to a different model family
-than the worker whenever possible) confirms the objective is met *from
-evidence*. Backstops — a round cap, `--budget`, worker aborts — end the run
-honestly as "not met" rather than optimistically.
+`stella goal` doesn't take a task — it takes an **objective**, and turns
+Stella loose on it until the goal is actually met, as judged by an
+independent model rather than the worker's own say-so.
 
 ```bash
 stella goal "the test suite passes and there are no clippy warnings"
 ```
 
-→ [Goal mode in depth](/docs/agent-modes/goal-mode)
+Where `stella run` executes a single one-shot prompt, `stella goal` runs
+**judged rounds**. Each round the worker agent makes progress using the normal
+[agent step loop](/docs/inference-pipeline), and then a separate judge model
+reviews the evidence and decides whether the objective has been satisfied. The
+loop ends when the judge confirms — or when a backstop trips: a hard round cap
+(default **8** rounds), the `--budget` limit, or a worker-turn abort. Reaching
+a backstop ends the run honestly, reporting the goal as **not met** with a
+named reason.
 
-`stella monitor` is goal mode specialized for CI: the objective is "the
-latest CI run is all-green", assessed through the `ci_status` tool.
+### How judged rounds work
+
+1. **The worker works a round.** The worker model runs the step loop —
+   proposing tool calls, executing them, and feeding results back — to make
+   progress toward the objective.
+2. **The judge assesses from evidence.** The judge is not a passive transcript
+   reader — it runs as its own bounded engine turn with read-only access to the
+   same tools the worker used (`read_file`, `grep`, `ci_status`, and so on),
+   actively inspecting the changed files, tests, and CI, and rejecting
+   claimed-but-unproven success.
+3. **Repeat or finish.** If the judge is not satisfied, another round begins —
+   until the judge confirms or a backstop (round cap, budget, abort) ends the run.
+
+Because the judge assesses **from evidence** rather than from the worker's
+narration, "I think I'm done" is never enough on its own — the goal is only
+considered met when the judge, looking at what actually happened, agrees.
+
+### Cross-family judging
+
+The judge is **routed cross-family** — it deliberately runs on a *different model
+family* than the worker. Asking a model to grade its own work invites
+same-model bias: it tends to share the worker's blind spots and rubber-stamp its
+output. Routing the judge to a different family provides a genuinely independent
+second opinion.
+
+<Callout type="info">
+If only one provider family is configured, Stella cannot route the judge to a
+different family — so the worker doubles as the judge. Configuring a second
+provider family enables true cross-family judging and a more independent
+verdict.
+</Callout>
+
+### Example
+
+Give Stella a concrete objective and let it iterate until the judge signs off:
+
+```bash
+stella goal "Add input validation to the /signup endpoint and make sure the existing test suite passes"
+```
+
+Stella will work in rounds — editing code, running the tests, reading the
+output — and a cross-family judge will assess each round from the evidence. The
+run finishes only once the judge confirms the endpoint is validated and the test
+suite is green.
+
+You can combine goal mode with global flags, for example pinning a specific
+worker model or capping spend:
+
+```bash
+stella --model anthropic/claude-fable-5 --budget 5.00 \
+  goal "Migrate the config loader to the new settings schema and keep all tests green"
+```
+
+See [Configuration](/docs/configuration) and [Telemetry](/docs/telemetry) for
+more on `--model` and `--budget`.
+
+## CI monitor: `stella monitor`
+
+`stella monitor` is goal mode specialized for continuous integration. It
+watches CI for a branch or PR (default `main`) and keeps fixing failures until
+the pipeline is fully green.
+
+```bash
+stella monitor
+```
+
+Under the hood it uses the `ci_status` tool, and the goal is considered met only
+when the latest CI run is all-green — the same judged-loop discipline as goal
+mode, with "all CI checks pass" as the objective.
 
 ## Parallel: fleets
 

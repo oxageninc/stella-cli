@@ -1,0 +1,116 @@
+---
+title: Custom Agents
+description: Define reusable personas in AGENT.md files — the frontmatter schema, where definitions live, versioned editing, and how stella init adopts agents from .claude/ and .agents/ directories.
+---
+
+A **custom agent** is a named persona the session can adopt: a
+system-prompt-shaped Markdown body with a frontmatter header, invoked as
+`/agent-name <task>`. Agents are distinct from
+[skills](/docs/agent-tools/skills) (know-how selected into context
+automatically) and [custom commands](/docs/agent-tools/commands) (prompt
+templates) — an agent changes *who is doing the work*, optionally with a
+restricted toolbelt.
+
+## The AGENT.md schema
+
+An agent is one Markdown file with YAML frontmatter — nested
+`<slug>/AGENT.md` or flat `<slug>.md`:
+
+```md title=".stella/agents/docs-writer.md"
+---
+name: docs-writer
+description: Writes end-user documentation in our house style.
+tools: [read_file, grep, glob, write_file, edit_file]
+---
+
+You are a technical writer. Prefer working examples over abstractions.
+Never document a flag you haven't verified against --help output.
+```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `name` | No | The agent's slug. Falls back to the filename stem (flat layout) or the directory name (nested layout). |
+| `description` | No | One-line summary for the `/agents` listing. Falls back to the body's first non-empty line, truncated to 72 characters. |
+| `tools` | No | The agent's toolbelt — the tool names granted to this persona. Omitted means **all** tools. |
+| *body* | **Yes** | The persona's instructions — everything after the frontmatter. A file with an empty body is skipped with a diagnostic, never a fatal error. |
+
+The `tools:` field is parsed tolerantly, accepting every shape the
+ecosystem has taught authors: a bare comma list (`Read, Grep`), a JSON/YAML
+flow array (`["Read", "Grep"]`, `[Read, Grep]`), a block sequence, per-item
+quotes, and trailing commas all normalize to the same clean list, with
+duplicates collapsed. An empty list or the explicit wildcard forms (`*`,
+`all`, `all tools`) mean the same as omitting the field: no restriction.
+
+## Where agents live
+
+| Scope | Path | Travels with |
+| --- | --- | --- |
+| Project | `<workspace>/.stella/agents/` | The repo — commit it, the team shares it |
+| User | `~/.config/stella/agents/` | You, across every workspace |
+
+Definitions load user-global first, then workspace — **workspace wins** on
+a name collision.
+
+## Invoking an agent
+
+Typing `/docs-writer polish the CLI reference` wraps the agent's body as an
+explicit persona-adoption instruction above your task and runs it as the
+prompt. In the slash menu, built-ins can never be shadowed, and when a
+custom name collides across kinds, commands shadow skills shadow agents.
+
+## Versioned editing in the Command Deck
+
+`/agents` opens the Agents tab, which lists installed agents in both scopes
+with versioned editing and pinning — like skills, every save is a new
+version you can roll back:
+
+```text
+<agents-dir>/<slug>.md                  ← the loaded definition
+<agents-dir>/.versions/<slug>/vNNNN.md  ← immutable version snapshots
+<agents-dir>/.versions/<slug>/PINNED    ← one line: the pinned version
+```
+
+No `.versions/` entry is created until the first edit, so hand-authored
+agents stay exactly as you wrote them. Editing an agent that was adopted as
+a symlink (see below) replaces the symlink with a real file in the agents
+directory — the original stays untouched, and your edit lives on the
+Stella side from then on.
+
+## Adopted from .claude/ and .agents/ on init
+
+Ecosystem tools already maintain `.claude/{commands,skills,agents}` and
+`.agents/{commands,skills,agents}`. On `stella init` (and `/init`),
+definitions found there are **symlinked** into the matching Stella
+directory — adopted, not copied, so edits stay in one place and your
+existing setup carries over instead of being rewritten:
+
+| Source | Destination |
+| --- | --- |
+| `<workspace>/.claude/agents/` · `<workspace>/.agents/agents/` | `<workspace>/.stella/agents/` |
+| `~/.claude/agents/` · `~/.agents/agents/` | `~/.config/stella/agents/` |
+
+(The same sync adopts `commands/` and `skills/` into their matching
+directories.) Three rules keep the adoption sane:
+
+1. **`.claude` wins over `.agents`.** Sources are scanned in that
+   precedence order; the first occurrence of a name is the one adopted.
+2. **Never clobber, never re-adopt.** A name already present in the
+   destination — hand-authored or linked by a previous init — is skipped,
+   so the sync is idempotent and your own definitions always win.
+3. **Never follow a symlink.** Other tools symlink between these
+   directories too (e.g. `.claude/agents/x → ../../.agents/agents/x`);
+   Stella links each definition from its *real* home exactly once. A
+   directory entry with no `AGENT.md` inside is also skipped — and
+   reported, so nothing disappears silently.
+
+After init, the `/agents` tab lists the adopted definitions alongside your
+own, and init itself prints a per-scope `✓ adopted …` summary of what it
+linked and skipped.
+
+<Callout type="info">
+  An agent's `tools:` restriction is a prompt-level toolbelt grant. For
+  hard boundaries enforced outside the model — gated mutations, blocked
+  paths — reach for [permissions](/docs/agent-tools/permissions) and
+  [hooks](/docs/agent-tools/hooks); to add genuinely new actions, define a
+  [custom tool](/docs/agent-tools/custom-tools).
+</Callout>

@@ -199,6 +199,71 @@ pub fn memories(workspace_root: &Path) -> Value {
     ))
 }
 
+/// Exploration maps from `.stella/explorations/*.json` with a per-map
+/// freshness verdict computed by re-hashing each record's `path → sha256`
+/// manifest against the working tree — the human-facing twin of the agents'
+/// startup index (`docs/design/exploration-sharing.md` §4e). Records without
+/// a manifest (pre-v2) report `"unknown"`.
+pub fn explorations(workspace_root: &Path) -> Value {
+    use sha2::{Digest, Sha256};
+    let dir = workspace_root.join(".stella/explorations");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return json!([]);
+    };
+    let mut rows: Vec<Value> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(record) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        else {
+            continue;
+        };
+        let manifest = record["manifest"].as_object().cloned().unwrap_or_default();
+        let (mut changed, mut missing) = (Vec::new(), Vec::new());
+        for (rel, saved) in &manifest {
+            match std::fs::read(workspace_root.join(rel)) {
+                Ok(bytes) => {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&bytes);
+                    let digest = hasher.finalize();
+                    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                    if Some(hex.as_str()) != saved.as_str() {
+                        changed.push(rel.clone());
+                    }
+                }
+                Err(_) => missing.push(rel.clone()),
+            }
+        }
+        let freshness = if manifest.is_empty() {
+            "unknown"
+        } else if changed.is_empty() && missing.is_empty() {
+            "fresh"
+        } else {
+            "drifted"
+        };
+        rows.push(json!({
+            "slice": record["slice"],
+            "title": record["title"],
+            "summary": record["summary"],
+            "status": record["status"].as_str().unwrap_or("complete"),
+            "pid": record["pid"],
+            "created_at_ms": record["created_at_ms"],
+            "git_head": record["git_head"],
+            "manifest_files": manifest.len(),
+            "freshness": freshness,
+            "changed": changed,
+            "missing": missing,
+            "content_chars": record["content"].as_str().map(|s| s.chars().count()).unwrap_or(0),
+        }));
+    }
+    rows.sort_by_key(|r| -(r["created_at_ms"].as_i64().unwrap_or(0)));
+    json!(rows)
+}
+
 /// Rule files: `.stella/rules/*.md` (the db-promoted rules live in
 /// [`crate::db::Observatory::memory`]'s payload).
 pub fn rules_files(workspace_root: &Path) -> Value {

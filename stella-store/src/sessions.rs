@@ -100,6 +100,12 @@ pub struct SessionRecord {
     pub status: SessionStatus,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
+    /// Exploration slices this session is currently mapping (its live draft
+    /// records in `.stella/explorations/`) — lets the SESSIONS view warn
+    /// before a prompt that would re-map territory another live session is
+    /// already on. Absent in pre-v2 records.
+    #[serde(default)]
+    pub exploring: Vec<String>,
 }
 
 impl SessionRecord {
@@ -116,6 +122,7 @@ impl SessionRecord {
             status: SessionStatus::InProgress,
             started_at_ms: now,
             updated_at_ms: now,
+            exploring: Vec::new(),
         }
     }
 }

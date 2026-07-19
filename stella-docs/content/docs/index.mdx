@@ -26,7 +26,7 @@ stella run "add a --json flag to the export command and update the tests"
 - **BYOK, no lock-in.** Stella auto-detects the provider from whichever API keys you have
   set. Bring Anthropic, OpenAI, Gemini, Vertex, Bedrock, xAI, DeepSeek, Z.ai, OpenRouter,
   or any OpenAI-compatible local server.
-- **Verified outcomes.** [Goal mode](/docs/agent-modes/goal-mode) doesn't stop on a hunch — a separate
+- **Verified outcomes.** [Goal mode](/docs/agent-modes#outcome-driven-goal-mode) doesn't stop on a hunch — a separate
   judge model verifies the definition of done from evidence before the loop ends.
 - **Real tools with a permission model.** Read, edit, glob, grep, shell, CI, screenshots,
   issue tracking, and developer-defined script tools — each gated by a per-tool permission
@@ -48,7 +48,7 @@ context engine — and, in goal mode, an independent judge asking "is the goal
 
 Stella sends your prompt to the model you selected, lets the model call tools to read and
 change your workspace, feeds the results back, and repeats until the task is done. In
-[goal mode](/docs/agent-modes/goal-mode) a second model judges the result from evidence, so the loop
+[goal mode](/docs/agent-modes#outcome-driven-goal-mode) a second model judges the result from evidence, so the loop
 ends on a verified outcome rather than the worker's own say-so.
 
 ## The documentation

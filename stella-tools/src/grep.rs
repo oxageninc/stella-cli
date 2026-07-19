@@ -169,7 +169,8 @@ impl Tool for Grep {
                     if lines.len() == MAX_RESULTS {
                         result.push_str(&format!("\n... (showing first {MAX_RESULTS} matches)"));
                     }
-                    if let Some(map) = code_map_for(self.code_map.as_ref(), &search_dir, root, &lines)
+                    if let Some(map) =
+                        code_map_for(self.code_map.as_ref(), &search_dir, root, &lines)
                     {
                         result.push_str(&map);
                     }

@@ -10,7 +10,7 @@ configures the four engine agents individually:
 | --- | --- |
 | `default` | The interactive / step-loop agent (`stella chat`, the Command Deck, `--no-pipeline`) |
 | `worker` | The [pipeline](/docs/inference-pipeline)'s execute turns (plan and witness ride its settings) |
-| `judge` | The pipeline's verify judge and [goal mode](/docs/agent-modes/goal-mode)'s round judge |
+| `judge` | The pipeline's verify judge and [goal mode](/docs/agent-modes#outcome-driven-goal-mode)'s round judge |
 | `triage` | The pipeline's fast task classifier |
 
 Every field is optional, and it merges across the same user → org-managed →
