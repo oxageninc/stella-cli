@@ -45,8 +45,10 @@ mod frames;
 mod graph;
 mod import;
 mod lang;
+pub mod manifest;
 mod parse;
 mod queries;
+pub mod storage;
 mod store;
 mod symbol;
 mod walk;
@@ -57,10 +59,32 @@ pub use frames::PROVIDER_ID;
 pub use graph::{CodeGraph, FileNeighborhood, NeighborhoodSymbol};
 pub use import::{ImportEdge, ImportKind};
 pub use lang::Language;
+pub use storage::{StorageExtract, StorageExtractor, StorageSnapshot};
 pub use store::IndexStats;
 pub use symbol::{Symbol, SymbolKind};
 #[doc(hidden)]
 pub use watch::WatchInjector;
+
+/// Assemble the storage map without mounting a graph: read the persisted
+/// index (if `stella init` has built one) and merge `stella.storage.toml`.
+/// The pre-write gate and `stella storage` call this per use so the map is
+/// always current — no session-start cache to go stale. Best-effort: no
+/// index and no manifest yields an empty snapshot, which makes every
+/// storage mechanism a no-op (spec §11).
+pub fn load_storage_snapshot(workspace_root: &std::path::Path) -> StorageSnapshot {
+    let manifest = manifest::StorageManifest::load(workspace_root)
+        .ok()
+        .flatten();
+    let db_path = workspace_root.join(".stella").join("codegraph.db");
+    let rows = if db_path.exists() {
+        store::open(&db_path)
+            .and_then(|conn| store::storage_rows(&conn))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    manifest::merge_snapshot(rows, manifest.as_ref())
+}
 
 // Re-export the OCP wire types this provider produces so downstream callers
 // need not also depend on `ocp-types` directly for the return shapes.

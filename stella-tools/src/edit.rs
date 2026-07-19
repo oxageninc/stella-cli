@@ -22,7 +22,8 @@ impl Tool for EditFile {
                     "old_string": { "type": "string", "description": "Exact text to find" },
                     "new_string": { "type": "string", "description": "Replacement text" },
                     "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)" },
-                    "reason": { "type": "string", "description": "Why you are editing this file — recorded in the session's file-touch audit log" }
+                    "reason": { "type": "string", "description": "Why you are editing this file — recorded in the session's file-touch audit log" },
+                    "storage_intent": { "type": "string", "description": "Only when creating a database table/column that the storage gate flagged as similar to an existing one: one sentence of purpose plus why the existing objects don't fit. Recorded in stella.storage.toml." }
                 },
                 "required": ["path", "old_string", "new_string"]
             }),

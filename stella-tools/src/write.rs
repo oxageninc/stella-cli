@@ -19,7 +19,8 @@ impl Tool for WriteFile {
                 "properties": {
                     "path": { "type": "string", "description": "File path relative to workspace root" },
                     "content": { "type": "string", "description": "Full file content to write" },
-                    "reason": { "type": "string", "description": "Why you are creating/overwriting this file — recorded in the session's file-touch audit log" }
+                    "reason": { "type": "string", "description": "Why you are creating/overwriting this file — recorded in the session's file-touch audit log" },
+                    "storage_intent": { "type": "string", "description": "Only when creating a database table/column that the storage gate flagged as similar to an existing one: one sentence of purpose plus why the existing objects don't fit. Recorded in stella.storage.toml." }
                 },
                 "required": ["path", "content"]
             }),

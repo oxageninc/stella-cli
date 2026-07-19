@@ -2086,22 +2086,14 @@ pub(crate) fn graph_snapshot_focus(
     })
 }
 
-/// Open the code graph (read-only) and populate the tool registry's schema
-/// index with all known table/type/view names. Best-effort: if the graph
-/// can't open (no `.stella/codegraph.db`), the schema gate runs with an
-/// empty index — it just won't catch conflicts until `stella init` runs.
+/// Seed the tool registry's storage-gate baseline with the assembled
+/// storage map (persisted index + `stella.storage.toml`). Best-effort: with
+/// no `.stella/codegraph.db` and no manifest the snapshot is empty and every
+/// gate mechanism is a no-op until `stella init` runs. The gate also
+/// re-reads the persisted map per gated write, so this baseline only has to
+/// cover session start.
 pub(crate) fn populate_schema_index(registry: &ToolRegistry, workspace_root: &std::path::Path) {
-    let db_path = workspace_root.join(".stella").join("codegraph.db");
-    if !db_path.exists() {
-        return;
-    }
-    let graph = match stella_graph::CodeGraph::open(workspace_root, &db_path) {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let (tables, types, views) = graph.schema_names();
-    registry.update_schema_index(tables, types, views);
-    graph.shutdown();
+    registry.update_storage_index(stella_graph::load_storage_snapshot(workspace_root));
 }
 
 /// `stella init` — infer the workspace's domain taxonomy, build the code-graph

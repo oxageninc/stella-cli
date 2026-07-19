@@ -315,6 +315,18 @@ impl CodeGraph {
         })
     }
 
+    /// The assembled storage map: parsed structure from the index merged
+    /// with `stella.storage.toml` meaning (spec §6). Best-effort — an
+    /// unreadable store or malformed manifest yields whatever half works,
+    /// never an error, matching [`CodeGraph::schema_names`]' posture.
+    pub fn storage_snapshot(&self) -> crate::storage::StorageSnapshot {
+        let rows = store::storage_rows(&self.inner.read_guard()).unwrap_or_default();
+        let manifest = crate::manifest::StorageManifest::load(&self.inner.root)
+            .ok()
+            .flatten();
+        crate::manifest::merge_snapshot(rows, manifest.as_ref())
+    }
+
     /// All known table, type, and view names (lowercased) from the index.
     /// Used by the schema gate to populate the known-schema set at session
     /// start. Returns empty sets if the index is empty or unreadable.

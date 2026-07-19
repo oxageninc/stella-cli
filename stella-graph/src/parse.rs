@@ -97,6 +97,18 @@ pub(crate) struct Parsed {
     pub imports: Vec<ImportSpec>,
 }
 
+/// Parse SQL source into a raw tree for the storage adapter's structural
+/// walk ([`crate::storage::extract_sql`]). `None` = un-armable grammar or
+/// wholly unparseable input, same contract as [`parse_file`].
+pub(crate) fn parse_sql_tree(grammars: &Grammars, source: &str) -> Option<tree_sitter::Tree> {
+    let pack = grammars.pack(Language::Sql);
+    let mut parser = Parser::new();
+    if parser.set_language(&pack.language).is_err() {
+        return None;
+    }
+    parser.parse(source.as_bytes(), None)
+}
+
 /// Parse one file's `source`. `None` = un-armable grammar or wholly
 /// unparseable input → the caller records a skip and continues.
 pub(crate) fn parse_file(grammars: &Grammars, lang: Language, source: &str) -> Option<Parsed> {

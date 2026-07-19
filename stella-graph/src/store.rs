@@ -29,7 +29,9 @@ use sha2::{Digest, Sha256};
 use crate::error::GraphError;
 use crate::import::{self, ImportKind};
 use crate::lang::Language;
+use crate::manifest::StorageManifest;
 use crate::parse::{Grammars, parse_file};
+use crate::storage::{self, FieldEntry, RelationEntry};
 use crate::symbol::SymbolKind;
 use crate::walk::walk_indexable;
 
@@ -64,6 +66,27 @@ CREATE INDEX IF NOT EXISTS code_graph_symbols_name ON code_graph_symbols(name);
 CREATE INDEX IF NOT EXISTS code_graph_symbols_file ON code_graph_symbols(file_id);
 CREATE INDEX IF NOT EXISTS code_graph_imports_from ON code_graph_imports(from_file_id);
 CREATE INDEX IF NOT EXISTS code_graph_imports_to   ON code_graph_imports(to_path);
+CREATE TABLE IF NOT EXISTS code_graph_storage_objects (
+    id            INTEGER PRIMARY KEY,
+    file_id       INTEGER NOT NULL REFERENCES code_graph_files(id) ON DELETE CASCADE,
+    parent_id     INTEGER REFERENCES code_graph_storage_objects(id) ON DELETE CASCADE,
+    address       TEXT NOT NULL,
+    layer         TEXT NOT NULL,
+    namespace     TEXT NOT NULL,
+    level         TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    display_name  TEXT NOT NULL,
+    data_type     TEXT,
+    nullable      INTEGER,
+    default_value TEXT,
+    constraints   TEXT,
+    ref_target    TEXT,
+    comment       TEXT,
+    start_line    INTEGER NOT NULL,
+    end_line      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS code_graph_storage_addr ON code_graph_storage_objects(address);
+CREATE INDEX IF NOT EXISTS code_graph_storage_file ON code_graph_storage_objects(file_id);
 "#;
 
 /// Outcome of one index pass. `files_parsed` is the honest parse-invocation
@@ -129,12 +152,15 @@ pub(crate) fn index_tree(
 ) -> Result<IndexStats, GraphError> {
     let files = walk_indexable(root);
     let mut stats = IndexStats::default();
+    // Manifest layer mapping is loaded once per pass; a malformed manifest
+    // degrades to the implicit layer, never aborts the batch (L-L1).
+    let manifest = StorageManifest::load(root).ok().flatten();
     let tx = conn.transaction()?;
 
     let mut current: HashSet<String> = HashSet::with_capacity(files.len());
     for abs in &files {
         current.insert(rel_path(root, abs));
-        index_one(&tx, root, grammars, abs, &mut stats)?;
+        index_one(&tx, root, grammars, manifest.as_ref(), abs, &mut stats)?;
     }
     stats.files_pruned = prune_missing(&tx, &current)?;
 
@@ -152,13 +178,14 @@ pub(crate) fn apply_changes(
     changed: &[PathBuf],
 ) -> Result<IndexStats, GraphError> {
     let mut stats = IndexStats::default();
+    let manifest = StorageManifest::load(root).ok().flatten();
     let tx = conn.transaction()?;
     for abs in changed {
         if Language::from_path(abs).is_none() {
             continue;
         }
         if abs.is_file() {
-            index_one(&tx, root, grammars, abs, &mut stats)?;
+            index_one(&tx, root, grammars, manifest.as_ref(), abs, &mut stats)?;
         } else {
             let rel = rel_path(root, abs);
             stats.files_pruned +=
@@ -176,6 +203,7 @@ fn index_one(
     tx: &Transaction,
     root: &Path,
     grammars: &Grammars,
+    manifest: Option<&StorageManifest>,
     abs: &Path,
     stats: &mut IndexStats,
 ) -> Result<(), GraphError> {
@@ -251,7 +279,233 @@ fn index_one(
     }
     stats.symbols += parsed.symbols.len();
     stats.imports += edges.len();
+
+    // Storage adapter (deep pass, spec §6): the same transaction that
+    // replaced this file's symbols replaces its storage rows. SQL only
+    // today; further adapters slot in per-language here.
+    tx.execute(
+        "DELETE FROM code_graph_storage_objects WHERE file_id = ?1",
+        params![file_id],
+    )?;
+    if lang == Language::Sql {
+        let extract = storage::extract_sql(grammars, text);
+        let layer = manifest
+            .map(|m| m.layer_for(&rel))
+            .unwrap_or_else(|| storage::DEFAULT_SQL_LAYER.to_string());
+        insert_storage_extract(tx, file_id, &layer, &extract)?;
+    }
     Ok(())
+}
+
+/// Persist one file's extracted storage entities: relation rows with their
+/// field children, plus parentless field rows for `ALTER TABLE … ADD COLUMN`
+/// (attached to their relation by address at snapshot-assembly time).
+fn insert_storage_extract(
+    tx: &Transaction,
+    file_id: i64,
+    layer: &str,
+    extract: &storage::StorageExtract,
+) -> Result<(), GraphError> {
+    for rel in &extract.relations {
+        let address = storage::relation_address(layer, &rel.namespace, &rel.name);
+        let rel_id: i64 = tx.query_row(
+            "INSERT INTO code_graph_storage_objects(\
+                 file_id, parent_id, address, layer, namespace, level, kind, \
+                 display_name, constraints, comment, start_line, end_line) \
+             VALUES(?1, NULL, ?2, ?3, ?4, 'relation', ?5, ?6, ?7, ?8, ?9, ?10) \
+             RETURNING id",
+            params![
+                file_id,
+                address,
+                storage::normalize_name(layer),
+                storage::normalize_name(&rel.namespace),
+                rel.kind.tag(),
+                rel.name,
+                // Relations reuse the constraints column for their enum
+                // variants (JSON array; empty for tables/views).
+                serde_json::to_string(&rel.enum_values).unwrap_or_default(),
+                rel.comment,
+                rel.start_line,
+                rel.end_line,
+            ],
+            |row| row.get(0),
+        )?;
+        for field in &rel.fields {
+            insert_storage_field(tx, file_id, Some(rel_id), &address, layer, rel, field)?;
+        }
+    }
+    for addition in &extract.additions {
+        let address = storage::relation_address(layer, &addition.namespace, &addition.relation);
+        let rel = storage::RelationDef {
+            name: addition.relation.clone(),
+            namespace: addition.namespace.clone(),
+            kind: storage::RelationKind::Table,
+            fields: Vec::new(),
+            enum_values: Vec::new(),
+            comment: None,
+            start_line: addition.field.line,
+            end_line: addition.field.line,
+        };
+        insert_storage_field(tx, file_id, None, &address, layer, &rel, &addition.field)?;
+    }
+    Ok(())
+}
+
+fn insert_storage_field(
+    tx: &Transaction,
+    file_id: i64,
+    parent_id: Option<i64>,
+    relation_address: &str,
+    layer: &str,
+    rel: &storage::RelationDef,
+    field: &storage::FieldDef,
+) -> Result<(), GraphError> {
+    let address = format!(
+        "{relation_address}/{}",
+        storage::normalize_name(&field.name)
+    );
+    tx.execute(
+        "INSERT INTO code_graph_storage_objects(\
+             file_id, parent_id, address, layer, namespace, level, kind, \
+             display_name, data_type, nullable, default_value, constraints, \
+             ref_target, comment, start_line, end_line) \
+         VALUES(?1, ?2, ?3, ?4, ?5, 'field', 'column', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+        params![
+            file_id,
+            parent_id,
+            address,
+            storage::normalize_name(layer),
+            storage::normalize_name(&rel.namespace),
+            field.name,
+            field.data_type,
+            field.nullable,
+            field.default_value,
+            serde_json::to_string(&field.constraints).unwrap_or_default(),
+            field.references,
+            field.comment,
+            field.line,
+        ],
+    )?;
+    Ok(())
+}
+
+// ---- Storage read side (snapshot assembly) -------------------------------
+
+/// Every persisted storage entity, grouped into [`RelationEntry`] shape:
+/// relation rows carry their child fields; parentless field rows (`ALTER`
+/// additions) fold onto the relation their address names, or synthesize a
+/// placeholder relation when the CREATE lives outside the indexed tree.
+/// Harvested comments ride along as intent (manifest meaning overrides at
+/// merge time). Ordered by address for deterministic snapshots.
+pub(crate) fn storage_rows(conn: &Connection) -> Result<Vec<RelationEntry>, GraphError> {
+    let mut relations: Vec<RelationEntry> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT o.id, o.address, o.layer, o.namespace, o.kind, o.display_name, \
+                    o.constraints, o.comment, o.start_line, f.path \
+             FROM code_graph_storage_objects o \
+             JOIN code_graph_files f ON f.id = o.file_id \
+             WHERE o.level = 'relation' ORDER BY o.address, f.path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let enum_values: Option<String> = row.get(6)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                RelationEntry {
+                    address: row.get(1)?,
+                    layer: row.get(2)?,
+                    namespace: row.get(3)?,
+                    kind: row.get(4)?,
+                    name: row.get(5)?,
+                    fields: Vec::new(),
+                    enum_values: enum_values
+                        .and_then(|v| serde_json::from_str(&v).ok())
+                        .unwrap_or_default(),
+                    intent: row.get(7)?,
+                    boundary: None,
+                    redirects: Vec::new(),
+                    source: Some(format!(
+                        "{}:{}",
+                        row.get::<_, String>(9)?,
+                        row.get::<_, u32>(8)?
+                    )),
+                },
+            ))
+        })?;
+        for row in rows {
+            let (_id, entry) = row?;
+            // The same address can be defined in several migration files;
+            // the first (path-ordered) definition wins, its fields merge in
+            // the field pass below regardless of which file defined them.
+            if !relations.iter().any(|r| r.address == entry.address) {
+                relations.push(entry);
+            }
+        }
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT o.address, o.display_name, o.data_type, o.nullable, o.default_value, \
+                o.constraints, o.ref_target, o.comment, o.start_line \
+         FROM code_graph_storage_objects o \
+         WHERE o.level = 'field' ORDER BY o.address, o.start_line",
+    )?;
+    let fields = stmt.query_map([], |row| {
+        let constraints: Option<String> = row.get(5)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            FieldEntry {
+                name: row.get(1)?,
+                data_type: row.get(2)?,
+                nullable: row.get::<_, Option<bool>>(3)?.unwrap_or(true),
+                default_value: row.get(4)?,
+                constraints: constraints
+                    .and_then(|v| serde_json::from_str(&v).ok())
+                    .unwrap_or_default(),
+                references: row.get(6)?,
+                intent: row.get(7)?,
+                line: row.get(8)?,
+            },
+        ))
+    })?;
+    for row in fields {
+        let (address, field) = row?;
+        let Some(relation_address) = address.rsplit_once('/').map(|(rel, _)| rel.to_string())
+        else {
+            continue;
+        };
+        let entry = match relations.iter_mut().find(|r| r.address == relation_address) {
+            Some(entry) => entry,
+            None => {
+                // ALTER addition whose CREATE is not indexed: synthesize the
+                // relation so the field is still visible and gate-checkable.
+                let (layer, rest) = relation_address.split_once('/').unwrap_or(("sql", ""));
+                let (namespace, name) = rest.split_once('/').unwrap_or(("default", rest));
+                relations.push(RelationEntry {
+                    address: relation_address.clone(),
+                    layer: layer.to_string(),
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                    kind: "table".into(),
+                    fields: Vec::new(),
+                    enum_values: Vec::new(),
+                    intent: None,
+                    boundary: None,
+                    redirects: Vec::new(),
+                    source: None,
+                });
+                relations.last_mut().expect("just pushed")
+            }
+        };
+        let key = storage::normalize_name(&field.name);
+        if !entry
+            .fields
+            .iter()
+            .any(|f| storage::normalize_name(&f.name) == key)
+        {
+            entry.fields.push(field);
+        }
+    }
+    Ok(relations)
 }
 
 /// Upsert a file row keyed by its unique path, returning the (stable) row id.
@@ -589,6 +843,52 @@ mod tests {
         assert_eq!(reindex.files_parsed, 0);
         assert_eq!(reindex.files_skipped_unchanged, 2);
         assert_eq!(file_count(&conn3).unwrap(), 2);
+    }
+
+    #[test]
+    fn sql_files_produce_storage_rows_and_prune_with_their_file() {
+        let ws = tempdir().unwrap();
+        let dbdir = tempdir().unwrap();
+        let root = canon(&ws);
+        let db = dbdir.path().join("context.db");
+        fs::write(
+            root.join("001_init.sql"),
+            "CREATE TABLE payments (\n\
+                 id SERIAL PRIMARY KEY,\n\
+                 amount NUMERIC(10,2) NOT NULL,\n\
+                 user_id INTEGER REFERENCES users(id)\n\
+             );\n\
+             COMMENT ON COLUMN payments.amount IS 'Gross amount charged.';\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("002_alter.sql"),
+            "ALTER TABLE payments ADD COLUMN refunded_at TIMESTAMP;\n",
+        )
+        .unwrap();
+        let grammars = Grammars::load().unwrap();
+        let mut conn = open(&db).unwrap();
+        index_tree(&mut conn, &root, &grammars).unwrap();
+
+        let rows = storage_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "one relation expected: {rows:?}");
+        let rel = &rows[0];
+        assert_eq!(rel.address, "sql/default/payments");
+        assert_eq!(rel.fields.len(), 4, "3 columns + 1 ALTER addition");
+        let amount = rel.fields.iter().find(|f| f.name == "amount").unwrap();
+        assert_eq!(amount.data_type.as_deref(), Some("NUMERIC(10,2)"));
+        assert!(!amount.nullable);
+        assert_eq!(amount.intent.as_deref(), Some("Gross amount charged."));
+        let user_id = rel.fields.iter().find(|f| f.name == "user_id").unwrap();
+        assert_eq!(user_id.references.as_deref(), Some("users"));
+        assert!(rel.fields.iter().any(|f| f.name == "refunded_at"));
+
+        // The ALTER's column prunes with its file (CASCADE); the CREATE stays.
+        fs::remove_file(root.join("002_alter.sql")).unwrap();
+        index_tree(&mut conn, &root, &grammars).unwrap();
+        let rows = storage_rows(&conn).unwrap();
+        assert_eq!(rows[0].fields.len(), 3);
+        assert!(!rows[0].fields.iter().any(|f| f.name == "refunded_at"));
     }
 
     #[test]

@@ -78,6 +78,7 @@ pub struct ToolRegistry {
     /// [`ToolRegistry::take_spawn_requests`] — exactly the citation-ledger
     /// drain discipline, so no request is dispatched twice.
     spawn_queue: crate::tasks::SpawnQueue,
+    storage_index: std::sync::Mutex<StorageIndex>,
     schema_index: std::sync::Mutex<SchemaIndex>,
     /// Which workspace paths are covered by a FRESH saved exploration map —
     /// the read-side analogue of `schema_index` (`docs/design/
@@ -91,6 +92,11 @@ pub struct ToolRegistry {
     bus: std::sync::RwLock<Option<HookBus>>,
 }
 
+/// The session's storage-map state for the pre-write gate
+/// (`docs/design/storage-map.md` §8): a host-seeded baseline snapshot plus
+/// the relations created by writes this session — which the on-disk index
+/// may not have re-indexed yet. The gate merges both over a fresh read of
+/// the persisted index on every gated write.
 /// Path-coverage of fresh exploration maps plus the hint dedup set.
 #[derive(Debug, Default)]
 struct ExplorationCoverage {
@@ -130,10 +136,9 @@ impl ExplorationCoverage {
 /// prevent duplicate table/type/view creation. Populated from the code graph
 /// or empty when no graph is open.
 #[derive(Debug, Clone, Default)]
-pub struct SchemaIndex {
-    pub tables: HashSet<String>,
-    pub types: HashSet<String>,
-    pub views: HashSet<String>,
+pub struct StorageIndex {
+    baseline: stella_graph::StorageSnapshot,
+    session: Vec<stella_graph::storage::RelationEntry>,
 }
 
 /// Host-decided feature switches for registry construction. `Default` is
@@ -316,6 +321,7 @@ impl ToolRegistry {
             mcp_usage,
             task_board,
             spawn_queue,
+            storage_index: std::sync::Mutex::new(StorageIndex::default()),
             schema_index: std::sync::Mutex::new(SchemaIndex::default()),
             exploration_coverage,
             bus: std::sync::RwLock::new(None),
@@ -452,53 +458,48 @@ impl ToolRegistry {
             _ => None,
         };
 
-        // Schema gate: if the target is a SQL file, parse the proposed
-        // content for DDL objects and check them against the known schema
-        // index before the write/edit lands. Objects the target file already
-        // defines on disk are exempt — rewriting an existing migration in
-        // place is not a duplicate.
-        let mut pending_schema: Vec<crate::schema_gate::DdlObject> = Vec::new();
+        // Storage gate (docs/design/storage-map.md §8): if the target is a
+        // storage-definition file, parse the proposed content with the SAME
+        // adapter extraction the indexer uses and judge it against the live
+        // storage map before the write/edit lands. Objects the target file
+        // already defines on disk are exempt — rewriting an existing
+        // migration in place is not a duplicate.
+        let mut pending_storage: Option<crate::schema_gate::GatePass> = None;
+        let mut declared_intent: Option<String> = None;
         if let Some(path) = input.get("path").and_then(|v| v.as_str())
             && matches!(name, "write_file" | "edit_file")
             && crate::schema_gate::is_schema_file(path)
+            && let Some(extractor) = crate::schema_gate::extractor()
         {
             // write_file carries the full file in `content`; edit_file
-            // introduces new DDL only through `new_string`.
+            // introduces new schema only through `new_string`.
             let proposed_src = match name {
                 "write_file" => input.get("content").and_then(|v| v.as_str()),
                 _ => input.get("new_string").and_then(|v| v.as_str()),
             };
             let proposed = proposed_src
-                .map(crate::schema_gate::extract_ddl_objects)
+                .map(|src| extractor.extract_sql(src))
                 .unwrap_or_default();
             if !proposed.is_empty() {
-                let own: HashSet<String> = crate::resolve_within_root(&self.root, path)
+                let own = crate::resolve_within_root(&self.root, path)
                     .and_then(|p| std::fs::read_to_string(p).ok())
-                    .map(|current| {
-                        crate::schema_gate::extract_ddl_objects(&current)
-                            .into_iter()
-                            .map(|o| o.name.to_lowercase())
-                            .collect()
-                    })
+                    .map(|current| extractor.extract_sql(&current))
                     .unwrap_or_default();
-                let fresh: Vec<crate::schema_gate::DdlObject> = proposed
-                    .into_iter()
-                    .filter(|o| !own.contains(&o.name.to_lowercase()))
-                    .collect();
-                if !fresh.is_empty() {
-                    let index = self.schema_index.lock().unwrap_or_else(|p| p.into_inner());
-                    let conflicts = crate::schema_gate::find_conflicts(
-                        &fresh,
-                        &index.tables,
-                        &index.types,
-                        &index.views,
-                    );
-                    if !conflicts.is_empty() {
-                        return ToolOutput::Error {
-                            message: crate::schema_gate::format_conflicts(&conflicts),
-                        };
+                let snapshot = self.storage_snapshot();
+                let layer = crate::schema_gate::layer_for(&self.root, path);
+                let intent = input.get("storage_intent").and_then(|v| v.as_str());
+                match crate::schema_gate::check(&crate::schema_gate::GateRequest {
+                    layer: &layer,
+                    proposed: &proposed,
+                    own: &own,
+                    snapshot: &snapshot,
+                    storage_intent: intent,
+                }) {
+                    Ok(pass) => {
+                        declared_intent = intent.map(str::to_string);
+                        pending_storage = Some(pass);
                     }
-                    pending_schema = fresh;
+                    Err(message) => return ToolOutput::Error { message },
                 }
             }
         }
@@ -582,10 +583,10 @@ impl ToolRegistry {
         }
         if !output.is_error() {
             // The write landed, so the objects it creates now exist: grow
-            // the index so a duplicate later this session conflicts even
-            // before any re-index from the code graph.
-            if !pending_schema.is_empty() {
-                self.record_schema_objects(&pending_schema);
+            // the session overlay so a duplicate later this session
+            // conflicts even before any re-index from the code graph.
+            if let Some(pass) = pending_storage {
+                self.record_storage_objects(&pass, declared_intent.as_deref());
             }
             if let Some(pending) = pending_op {
                 self.record_touch(pending, pre_content, name, input, bus.as_ref());
@@ -816,18 +817,61 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Merge just-created DDL objects into the schema index (lowercased —
-    /// `find_conflicts` matches case-insensitively against lowercase names).
-    fn record_schema_objects(&self, objects: &[crate::schema_gate::DdlObject]) {
-        let mut index = self.schema_index.lock().unwrap_or_else(|p| p.into_inner());
-        for obj in objects {
-            let name = obj.name.to_lowercase();
-            match obj.kind {
-                crate::schema_gate::DdlKind::Table => index.tables.insert(name),
-                crate::schema_gate::DdlKind::Type => index.types.insert(name),
-                crate::schema_gate::DdlKind::View => index.views.insert(name),
-            };
+    /// The live storage map for the gate: the persisted index + manifest,
+    /// re-read per gated write (so a mid-session `stella init` or manifest
+    /// edit is seen immediately), merged with the host-seeded baseline and
+    /// the objects created by earlier writes this session (covers the
+    /// watcher's re-index lag).
+    fn storage_snapshot(&self) -> stella_graph::StorageSnapshot {
+        let mut snapshot = stella_graph::load_storage_snapshot(&self.root);
+        let index = self.storage_index.lock().unwrap_or_else(|p| p.into_inner());
+        for rel in index.baseline.relations.iter().chain(index.session.iter()) {
+            if let Some(existing) = snapshot
+                .relations
+                .iter_mut()
+                .find(|r| r.address == rel.address)
+            {
+                // Same relation known from disk: union in any fields the
+                // overlay knows about that the index hasn't caught up on.
+                for field in &rel.fields {
+                    let key = stella_graph::storage::normalize_name(&field.name);
+                    if !existing
+                        .fields
+                        .iter()
+                        .any(|f| stella_graph::storage::normalize_name(&f.name) == key)
+                    {
+                        existing.fields.push(field.clone());
+                    }
+                }
+            } else {
+                snapshot.relations.push(rel.clone());
+            }
         }
+        snapshot
+    }
+
+    /// Record what a landed write created: grow the session overlay, and —
+    /// when the model declared a `storage_intent` — append it to
+    /// `stella.storage.toml` (origin `declared`). The gate's justification
+    /// path is what populates the map: every challenged object is born
+    /// documented (spec §8 ring 3).
+    fn record_storage_objects(&self, pass: &crate::schema_gate::GatePass, intent: Option<&str>) {
+        if let Some(intent) = intent {
+            for address in &pass.intent_addresses {
+                let _ = stella_graph::manifest::append_meaning(
+                    &self.root,
+                    "relations",
+                    address,
+                    intent,
+                    "declared",
+                );
+            }
+        }
+        if pass.created.is_empty() {
+            return;
+        }
+        let mut index = self.storage_index.lock().unwrap_or_else(|p| p.into_inner());
+        index.session.extend(pass.created.iter().cloned());
     }
 
     /// `[C|R|U|D]`-classify a call: reads → R, writes → C (new) or U
@@ -1070,19 +1114,13 @@ impl ToolRegistry {
         &self.root
     }
 
-    /// Update the known schema index from the code graph. Called at session
-    /// start and whenever schema files are re-indexed. The schema gate uses
-    /// this to prevent duplicate table/type/view creation.
-    pub fn update_schema_index(
-        &self,
-        tables: HashSet<String>,
-        types: HashSet<String>,
-        views: HashSet<String>,
-    ) {
-        let mut index = self.schema_index.lock().unwrap_or_else(|p| p.into_inner());
-        index.tables = tables;
-        index.types = types;
-        index.views = views;
+    /// Seed the gate's baseline storage map. Called at session start with
+    /// the assembled snapshot; the gate additionally re-reads the persisted
+    /// index on every gated write, so the baseline mainly serves hosts and
+    /// tests that inject a map without an on-disk index.
+    pub fn update_storage_index(&self, snapshot: stella_graph::StorageSnapshot) {
+        let mut index = self.storage_index.lock().unwrap_or_else(|p| p.into_inner());
+        index.baseline = snapshot;
     }
 }
 
@@ -1536,16 +1574,46 @@ mod tests {
         }
     }
 
+    /// A baseline snapshot with the given tables in the implicit `sql`
+    /// layer, `default` namespace — the shape `stella init` would seed.
+    fn seeded_snapshot(tables: &[&str]) -> stella_graph::StorageSnapshot {
+        stella_graph::StorageSnapshot {
+            layers: vec![],
+            relations: tables
+                .iter()
+                .map(|name| stella_graph::storage::RelationEntry {
+                    address: stella_graph::storage::relation_address("sql", "default", name),
+                    layer: "sql".into(),
+                    namespace: "default".into(),
+                    name: name.to_string(),
+                    kind: "table".into(),
+                    fields: vec![stella_graph::storage::FieldEntry {
+                        name: "id".into(),
+                        data_type: Some("INT".into()),
+                        nullable: false,
+                        default_value: None,
+                        constraints: vec!["PRIMARY KEY".into()],
+                        references: None,
+                        intent: None,
+                        line: 1,
+                    }],
+                    enum_values: vec![],
+                    intent: None,
+                    boundary: None,
+                    redirects: vec![],
+                    source: Some("migrations/001.sql:1".into()),
+                })
+                .collect(),
+            orphaned_meanings: vec![],
+        }
+    }
+
     #[tokio::test]
     async fn schema_gate_blocks_duplicate_table_on_write() {
         let dir = std::env::temp_dir().join(format!("stella_gate_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
-
-        // Populate the schema index with a known table.
-        let mut tables = HashSet::new();
-        tables.insert("users".to_string());
-        reg.update_schema_index(tables, HashSet::new(), HashSet::new());
+        reg.update_storage_index(seeded_snapshot(&["users"]));
 
         // Attempt to write a SQL file that creates `users` again.
         let result = reg
@@ -1560,8 +1628,15 @@ mod tests {
         assert!(result.is_error());
         match result {
             ToolOutput::Error { message } => {
-                assert!(message.contains("Table `users` already exists"));
-                assert!(message.contains("ALTER"));
+                assert!(
+                    message.contains("Table `users` already exists"),
+                    "{message}"
+                );
+                assert!(message.contains("ALTER"), "{message}");
+                // Gate v2: the conflict cites the canonical address and the
+                // existing columns, so the model can decide without a read.
+                assert!(message.contains("store://sql/default/users"), "{message}");
+                assert!(message.contains("columns: id INT"), "{message}");
             }
             _ => panic!("expected error"),
         }
@@ -1573,12 +1648,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("stella_gate_ok_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
+        reg.update_storage_index(seeded_snapshot(&["users"]));
 
-        let mut tables = HashSet::new();
-        tables.insert("users".to_string());
-        reg.update_schema_index(tables, HashSet::new(), HashSet::new());
-
-        // Write a SQL file with a genuinely new table.
+        // Write a SQL file with a genuinely new, dissimilar table.
         let result = reg
             .execute(
                 "write_file",
@@ -1593,6 +1665,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_gate_blocks_normalized_duplicate_and_column_dup() {
+        let dir = std::env::temp_dir().join(format!("stella_gate_norm_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
+        reg.update_storage_index(seeded_snapshot(&["user_profiles"]));
+
+        // `UserProfile` is the same relation as `user_profiles` after
+        // normalization + plural folding.
+        let camel = reg
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": "migrations/004.sql",
+                    "content": "CREATE TABLE UserProfile (id INT);\n"
+                }),
+            )
+            .await;
+        assert!(camel.is_error(), "normalized duplicate must be blocked");
+
+        // Adding a column that already exists (id) is column-level drift.
+        let column = reg
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": "migrations/005.sql",
+                    "content": "ALTER TABLE user_profiles ADD COLUMN Id BIGINT;\n"
+                }),
+            )
+            .await;
+        assert!(column.is_error(), "duplicate column must be blocked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn schema_gate_challenge_passes_with_declared_intent_and_records_it() {
+        let dir = std::env::temp_dir().join(format!("stella_gate_intent_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
+        reg.update_storage_index(seeded_snapshot(&["payments"]));
+
+        // `payment_records` is not a name duplicate, but it resembles
+        // `payments` — withheld once with the evidence.
+        let call = serde_json::json!({
+            "path": "migrations/006.sql",
+            "content": "CREATE TABLE payment_records (id INT);\n"
+        });
+        let challenged = reg.execute("write_file", &call).await;
+        match &challenged {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("write withheld"), "{message}");
+                assert!(message.contains("storage_intent"), "{message}");
+            }
+            _ => panic!("expected the similarity challenge"),
+        }
+
+        // Retrying with a declared intent passes, lands the file, and
+        // records the sentence in stella.storage.toml (origin `declared`).
+        let mut with_intent = call.clone();
+        with_intent["storage_intent"] = serde_json::json!(
+            "Immutable ledger of imported legacy charges; payments holds live charges."
+        );
+        let passed = reg.execute("write_file", &with_intent).await;
+        assert!(!passed.is_error(), "declared intent must pass: {passed:?}");
+        let manifest = std::fs::read_to_string(dir.join("stella.storage.toml")).unwrap();
+        assert!(
+            manifest.contains("sql/default/payment_records"),
+            "{manifest}"
+        );
+        assert!(manifest.contains("Immutable ledger"), "{manifest}");
+        assert!(manifest.contains("origin = \"declared\""), "{manifest}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn schema_gate_exempts_rewriting_a_files_own_objects() {
         let dir = std::env::temp_dir().join(format!("stella_gate_own_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("migrations")).unwrap();
@@ -1602,10 +1748,7 @@ mod tests {
         )
         .unwrap();
         let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
-
-        let mut tables = HashSet::new();
-        tables.insert("users".to_string());
-        reg.update_schema_index(tables, HashSet::new(), HashSet::new());
+        reg.update_storage_index(seeded_snapshot(&["users"]));
 
         // Rewriting the file that defines `users` is an in-place change to
         // the existing object, not a duplicate creation.
@@ -1661,10 +1804,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("migrations")).unwrap();
         std::fs::write(dir.join("migrations/002.sql"), "-- add payments\n").unwrap();
         let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
-
-        let mut tables = HashSet::new();
-        tables.insert("users".to_string());
-        reg.update_schema_index(tables, HashSet::new(), HashSet::new());
+        reg.update_storage_index(seeded_snapshot(&["users"]));
 
         // An edit whose replacement introduces a duplicate CREATE is gated
         // exactly like a write.
@@ -1690,10 +1830,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("stella_gate_nosql_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let reg = ToolRegistry::with_issue_backend(dir.clone(), None);
-
-        let mut tables = HashSet::new();
-        tables.insert("users".to_string());
-        reg.update_schema_index(tables, HashSet::new(), HashSet::new());
+        reg.update_storage_index(seeded_snapshot(&["users"]));
 
         // Writing a Rust file should never trigger the schema gate.
         let result = reg

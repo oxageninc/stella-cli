@@ -1,6 +1,20 @@
 # Design: The Storage Map — Vendor-Agnostic Storage Layer Indexing for Zero Drift
 
-**Status:** Draft v1 · **Date:** 2026-07-19
+**Status:** Phases A–C implemented, D partial · **Date:** 2026-07-19
+**Implemented in this pass:** the canonical model, addresses, and deep SQL
+extraction (`stella-graph/src/storage.rs`: types, constraints, defaults,
+PK/FK, `ALTER TABLE … ADD COLUMN`, `COMMENT ON` harvesting); the
+`stella.storage.toml` manifest with layers/boundaries/redirects/stubs and
+textual append (`stella-graph/src/manifest.rs`); `code_graph_storage_objects`
+persistence and snapshot assembly (`store.rs`, `load_storage_snapshot`);
+gate v2 rings 1–3 with the `storage_intent` declared-justification path
+(`stella-tools/src/schema_gate.rs`, wired in `registry.rs`); embed cards
+(§7a); and the `stella storage tree|show|grep|drift` CLI. **Not yet built:**
+non-SQL adapters (§4a table), context.db embedding of the cards +
+`NodeKind::Storage` recall integration (§7b–c), the LLM inference fold
+(§5c), `stella storage init` discovery (§4c), and the Observatory panel.
+Ring 3 runs on name-token similarity today; embed-card cosine slots in once
+the cards are embedded.
 **Goal:** On very long-horizon tasks in complex projects, the agent (a) always
 knows every storage layer the project uses, what belongs in each, and the full
 schema down to individual fields — retrievable by name *and* by meaning — and
