@@ -177,6 +177,11 @@ pub struct Engine<'a> {
     /// compaction decision. When `None` the turn path is exactly the
     /// uncalibrated engine.
     pub(crate) calibration: Option<&'a CalibrationMap>,
+    /// Boundary pause gate ([`crate::ports::TurnGate`]), off by default.
+    /// Attached via [`Engine::with_gate`]; consulted once per step, before
+    /// any model call — a paused turn parks at that safe boundary and
+    /// spends nothing until resumed. `None` adds zero work.
+    gate: Option<&'a dyn crate::ports::TurnGate>,
 }
 
 /// Upper bound on tool calls from one step executing concurrently. Tools
@@ -223,6 +228,7 @@ impl<'a> Engine<'a> {
             config,
             hooks: None,
             calibration: None,
+            gate: None,
         }
     }
 
@@ -245,6 +251,13 @@ impl<'a> Engine<'a> {
     /// built without this estimates exactly as before.
     pub fn with_calibration(mut self, calibration: &'a CalibrationMap) -> Self {
         self.calibration = Some(calibration);
+        self
+    }
+
+    /// Attach a boundary pause gate — Pause/Resume at step granularity,
+    /// never mid-tool.
+    pub fn with_gate(mut self, gate: &'a dyn crate::ports::TurnGate) -> Self {
+        self.gate = Some(gate);
         self
     }
 
@@ -305,6 +318,12 @@ impl<'a> Engine<'a> {
         let mut calibration_model: Option<String> = None;
 
         for step in 0..self.config.max_steps {
+            // Pause parks HERE — after the previous step fully settled and
+            // before any new model call, mirroring the budget-abort
+            // boundary. Resuming continues the very same turn.
+            if let Some(gate) = self.gate {
+                gate.wait_if_paused().await;
+            }
             self.run_compaction_pass(messages, calibration_model.as_deref(), events);
 
             if let Some(aborted) = self.check_loop_detection(messages, events) {

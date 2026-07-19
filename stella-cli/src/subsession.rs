@@ -30,7 +30,7 @@ use stella_protocol::{AgentEvent, CompletionMessage, TaskItem};
 use stella_tools::ToolRegistry;
 use stella_tui::{AgentMeta, AgentStatus, Inbound};
 use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::agent;
 use crate::command_deck::{now_ms, prompt_line, spawn_forwarder};
@@ -79,6 +79,11 @@ pub(crate) struct SubSessions {
     active: usize,
     next_req: u64,
     stops: HashMap<String, oneshot::Sender<()>>,
+    /// Live workers' pause switches (watch: `true` = parked at the next
+    /// step boundary).
+    pauses: HashMap<String, watch::Sender<bool>>,
+    /// Every lane's spec, retained past its end — what Restart respawns.
+    specs: HashMap<String, SubSessionSpec>,
 }
 
 impl SubSessions {
@@ -87,6 +92,8 @@ impl SubSessions {
             active: 0,
             next_req: 0,
             stops: HashMap::new(),
+            pauses: HashMap::new(),
+            specs: HashMap::new(),
         }
     }
 
@@ -94,14 +101,43 @@ impl SubSessions {
         self.active < MAX_CONCURRENT
     }
 
-    fn started(&mut self, lane: &str, stop: oneshot::Sender<()>) {
+    fn started(
+        &mut self,
+        lane: &str,
+        stop: oneshot::Sender<()>,
+        pause: watch::Sender<bool>,
+        spec: SubSessionSpec,
+    ) {
         self.active += 1;
         self.stops.insert(lane.to_string(), stop);
+        self.pauses.insert(lane.to_string(), pause);
+        self.specs.insert(lane.to_string(), spec);
     }
 
     pub(crate) fn ended(&mut self, lane: &str) {
         self.active = self.active.saturating_sub(1);
         self.stops.remove(lane);
+        self.pauses.remove(lane);
+        // `specs` is retained on purpose: Restart respawns an ended lane.
+    }
+
+    /// Pause (`true`) or resume (`false`) a live worker at its next step
+    /// boundary. `false` when no such worker is live.
+    pub(crate) fn set_paused(&mut self, lane: &str, paused: bool) -> bool {
+        match self.pauses.get(lane) {
+            Some(tx) => tx.send(paused).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Whether `lane` currently has a live worker.
+    pub(crate) fn is_live(&self, lane: &str) -> bool {
+        self.stops.contains_key(lane)
+    }
+
+    /// The retained spec for `lane`, for a Restart respawn.
+    pub(crate) fn spec(&self, lane: &str) -> Option<SubSessionSpec> {
+        self.specs.get(lane).cloned()
     }
 
     /// Signal one worker to stop (clean cancel: its turn future drops at the
@@ -129,8 +165,27 @@ impl SubSessions {
     }
 }
 
+/// `stella_core::ports::TurnGate` over a watch channel: the worker's turn
+/// parks at its next step boundary while the driver holds `true` (Pause)
+/// and continues on `false` (Resume). A dropped sender (driver gone) reads
+/// as resumed — a worker must never park forever on teardown.
+struct WatchGate(watch::Receiver<bool>);
+
+#[async_trait::async_trait]
+impl stella_core::ports::TurnGate for WatchGate {
+    async fn wait_if_paused(&self) {
+        let mut rx = self.0.clone();
+        while *rx.borrow() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 /// Everything a worker needs to run, owned (the thread outlives the caller's
 /// borrows).
+#[derive(Clone)]
 pub(crate) struct SubSessionSpec {
     /// Deck lane id — `req:<n>` for a dispatched prompt, `sub:<task-id>` for
     /// an assigned task.
@@ -180,6 +235,7 @@ pub(crate) fn spawn(
     in_tx: UnboundedSender<Inbound>,
     sup_tx: UnboundedSender<SupervisorMsg>,
     stop_rx: oneshot::Receiver<()>,
+    pause_rx: watch::Receiver<bool>,
 ) {
     let mut meta = AgentMeta::new(spec.lane.clone(), spec.title.clone(), now_ms())
         .with_role("subagent")
@@ -205,6 +261,7 @@ pub(crate) fn spawn(
                 &session_id,
                 &in_tx,
                 stop_rx,
+                pause_rx,
             )),
             Err(e) => (
                 None,
@@ -277,6 +334,7 @@ async fn run_worker(
     session_id: &str,
     in_tx: &UnboundedSender<Inbound>,
     stop_rx: oneshot::Receiver<()>,
+    pause_rx: watch::Receiver<bool>,
 ) -> (Option<i64>, f64, WorkerEnd) {
     let provider = match agent::build_provider(cfg) {
         Ok(p) => p,
@@ -325,13 +383,15 @@ async fn run_worker(
         format!("{session_id}/{}", spec.lane),
     );
     let raced = {
+        let gate = WatchGate(pause_rx);
         let engine = Engine::with_sleeper(
             &*provider,
             &claims,
             agent::engine_config_for(cfg),
             &TokioSleeper,
         )
-        .with_calibration(&calibration);
+        .with_calibration(&calibration)
+        .with_gate(&gate);
         let turn = engine.run_turn(&mut messages, &mut budget, &tx);
         // A dropped sender (driver gone at session teardown) must not read
         // as a stop — only an actual signal cancels, so the wait parks
@@ -427,23 +487,62 @@ pub(crate) fn drain_queue(
             text: text.clone(),
         });
         let (stop_tx, stop_rx) = oneshot::channel();
-        subs.started(&lane, stop_tx);
+        let (pause_tx, pause_rx) = watch::channel(false);
+        let spec = SubSessionSpec {
+            lane: lane.clone(),
+            title: prompt_line(&text, 48),
+            notify_title: format!("reply ready — {}", prompt_line(&text, 40)),
+            prompt: text,
+        };
+        subs.started(&lane, stop_tx, pause_tx, spec.clone());
         spawn(
             cfg,
-            SubSessionSpec {
-                lane,
-                title: prompt_line(&text, 48),
-                notify_title: format!("reply ready — {}", prompt_line(&text, 40)),
-                prompt: text,
-            },
+            spec,
             budget_limit,
             session_id.to_string(),
             workspace_name.to_string(),
             in_tx.clone(),
             sup_tx.clone(),
             stop_rx,
+            pause_rx,
         );
     }
+}
+
+/// Respawn an ended lane from its retained spec — the Restart verb. `false`
+/// when the lane has no retained spec or is still live (stop it first).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn respawn(
+    lane: &str,
+    subs: &mut SubSessions,
+    cfg: &Config,
+    budget_limit: Option<f64>,
+    session_id: &str,
+    workspace_name: &str,
+    in_tx: &UnboundedSender<Inbound>,
+    sup_tx: &UnboundedSender<SupervisorMsg>,
+) -> bool {
+    if subs.is_live(lane) {
+        return false;
+    }
+    let Some(spec) = subs.spec(lane) else {
+        return false;
+    };
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let (pause_tx, pause_rx) = watch::channel(false);
+    subs.started(lane, stop_tx, pause_tx, spec.clone());
+    spawn(
+        cfg,
+        spec,
+        budget_limit,
+        session_id.to_string(),
+        workspace_name.to_string(),
+        in_tx.clone(),
+        sup_tx.clone(),
+        stop_rx,
+        pause_rx,
+    );
+    true
 }
 
 /// Dispatch one `task_assign` spawn request (or park it if no slot is free —
@@ -461,25 +560,28 @@ pub(crate) fn spawn_task_worker(
 ) {
     let lane = format!("sub:{}", req.task_id);
     let (stop_tx, stop_rx) = oneshot::channel();
-    subs.started(&lane, stop_tx);
+    let (pause_tx, pause_rx) = watch::channel(false);
+    let spec = SubSessionSpec {
+        lane: lane.clone(),
+        title: format!("task #{}: {}", req.task_id, prompt_line(&req.subject, 40)),
+        prompt: task_prompt(req),
+        notify_title: format!(
+            "task #{} done — {}",
+            req.task_id,
+            prompt_line(&req.subject, 40)
+        ),
+    };
+    subs.started(&lane, stop_tx, pause_tx, spec.clone());
     spawn(
         cfg,
-        SubSessionSpec {
-            lane,
-            title: format!("task #{}: {}", req.task_id, prompt_line(&req.subject, 40)),
-            prompt: task_prompt(req),
-            notify_title: format!(
-                "task #{} done — {}",
-                req.task_id,
-                prompt_line(&req.subject, 40)
-            ),
-        },
+        spec,
         budget_limit,
         session_id.to_string(),
         workspace_name.to_string(),
         in_tx.clone(),
         sup_tx.clone(),
         stop_rx,
+        pause_rx,
     );
 }
 
@@ -487,13 +589,76 @@ pub(crate) fn spawn_task_worker(
 mod tests {
     use super::*;
 
+    fn dummy_spec(lane: &str) -> SubSessionSpec {
+        SubSessionSpec {
+            lane: lane.to_string(),
+            title: "t".into(),
+            prompt: "p".into(),
+            notify_title: "n".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_gate_parks_while_paused_and_releases_on_resume_or_teardown() {
+        use stella_core::ports::TurnGate;
+        let (tx, rx) = watch::channel(true);
+        let gate = WatchGate(rx);
+        let wait = gate.wait_if_paused();
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut wait)
+                .await
+                .is_err(),
+            "a paused gate must park"
+        );
+        tx.send(false).unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(500), wait)
+            .await
+            .expect("resume releases the gate");
+
+        // A dropped sender (driver teardown) must release, never park forever.
+        let (tx2, rx2) = watch::channel(true);
+        let gate2 = WatchGate(rx2);
+        drop(tx2);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            gate2.wait_if_paused(),
+        )
+        .await
+        .expect("teardown releases the gate");
+    }
+
+    #[test]
+    fn pause_resume_flips_the_watch_and_restart_needs_a_dead_lane() {
+        let mut subs = SubSessions::new();
+        let (stop_tx, _stop_rx) = oneshot::channel();
+        let (pause_tx, pause_rx) = watch::channel(false);
+        subs.started("req:1", stop_tx, pause_tx, dummy_spec("req:1"));
+        assert!(subs.set_paused("req:1", true));
+        assert!(*pause_rx.borrow());
+        assert!(subs.set_paused("req:1", false));
+        assert!(!*pause_rx.borrow());
+        assert!(!subs.set_paused("req:404", true), "unknown lane is a no-op");
+        // A live lane refuses respawn; its spec survives its end.
+        assert!(subs.is_live("req:1"));
+        subs.ended("req:1");
+        assert!(!subs.is_live("req:1"));
+        assert!(subs.spec("req:1").is_some(), "spec retained for Restart");
+    }
+
     #[test]
     fn slot_bookkeeping_caps_and_recovers() {
         let mut subs = SubSessions::new();
         for i in 0..MAX_CONCURRENT {
             assert!(subs.has_slot());
             let (stop_tx, _stop_rx) = oneshot::channel();
-            subs.started(&format!("req:{i}"), stop_tx);
+            let (pause_tx, _pause_rx) = watch::channel(false);
+            subs.started(
+                &format!("req:{i}"),
+                stop_tx,
+                pause_tx,
+                dummy_spec(&format!("req:{i}")),
+            );
         }
         assert!(!subs.has_slot());
         subs.ended("req:0");
@@ -508,7 +673,8 @@ mod tests {
     fn stop_signals_a_live_worker_once_and_only_once() {
         let mut subs = SubSessions::new();
         let (stop_tx, mut stop_rx) = oneshot::channel();
-        subs.started("req:1", stop_tx);
+        let (pause_tx, _pause_rx) = watch::channel(false);
+        subs.started("req:1", stop_tx, pause_tx, dummy_spec("req:1"));
         assert!(subs.stop("req:1"), "a live worker accepts the signal");
         assert_eq!(stop_rx.try_recv(), Ok(()));
         assert!(!subs.stop("req:1"), "a second stop is a stale no-op");

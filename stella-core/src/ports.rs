@@ -71,3 +71,14 @@ pub trait Clock: Send + Sync {
     /// Monotonic milliseconds since an arbitrary epoch.
     fn now_ms(&self) -> u64;
 }
+
+/// Boundary pause gate — polled by the engine between model calls, the same
+/// safe boundary as budget aborts (L-E6: never mid-tool). `wait_if_paused`
+/// returns immediately when the turn may proceed and parks (await) while it
+/// is paused; the driver flips the underlying state from supervisor input.
+/// A port so `stella-core` stays I/O-free — the CLI implements it over a
+/// watch channel.
+#[async_trait::async_trait]
+pub trait TurnGate: Send + Sync {
+    async fn wait_if_paused(&self);
+}

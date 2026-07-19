@@ -604,6 +604,9 @@ pub async fn run_deck_session(
     // waiting for one (drained oldest-first as workers end).
     let mut subs = SubSessions::new();
     let mut pending_spawns: VecDeque<stella_core::tasks::SpawnRequest> = VecDeque::new();
+    // Lanes whose Restart arrived while the worker was still live: stop
+    // first, respawn on its Ended.
+    let mut pending_restarts: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Worker spend not yet metered into the session budget guard — applied
     // at the loop top, where the guard is free (budget aborts happen at
     // safe boundaries only).
@@ -663,6 +666,7 @@ pub async fn run_deck_session(
                         handle_supervisor_msg(
                             msg,
                             &mut subs,
+                            &mut pending_restarts,
                             &mut pending_spawns,
                             &mut queue,
                             dispatch.held(),
@@ -684,14 +688,21 @@ pub async fn run_deck_session(
                 match input {
                     None => break 'session,
                     Some(WorkspaceInput::Quit) => break 'session,
-                    // Stopping a worker lane works between lead turns too —
-                    // the lead being idle says nothing about a running
-                    // worker.
-                    Some(WorkspaceInput::Control {
-                        agent,
-                        control: stella_tui::AgentControl::Stop,
-                    }) if agent != LEAD => {
-                        subs.stop(&agent);
+                    // Worker controls work between lead turns too — the
+                    // lead being idle says nothing about a running worker.
+                    Some(WorkspaceInput::Control { agent, control }) if agent != LEAD => {
+                        service_worker_control(
+                            &agent,
+                            control,
+                            &mut subs,
+                            &mut pending_restarts,
+                            cfg,
+                            budget_limit,
+                            &session_record.id,
+                            &workspace_name,
+                            &in_tx,
+                            &sup_tx,
+                        );
                         continue 'session;
                     }
                     // Any submission releases a hold and runs NOW — ahead of the
@@ -1150,6 +1161,7 @@ pub async fn run_deck_session(
                         handle_supervisor_msg(
                             msg,
                             &mut subs,
+                            &mut pending_restarts,
                             &mut pending_spawns,
                             &mut queue,
                             dispatch.held(),
@@ -1219,6 +1231,21 @@ pub async fn run_deck_session(
                                 break TurnEnd::Cancelled { hold: false };
                             }
                             subs.stop(&agent);
+                        }
+                        // Worker Pause/Resume/Restart while the lead works.
+                        Some(WorkspaceInput::Control { agent, control }) if agent != LEAD => {
+                            service_worker_control(
+                                &agent,
+                                control,
+                                &mut subs,
+                                &mut pending_restarts,
+                                cfg,
+                                budget_limit,
+                                &session_record.id,
+                                &workspace_name,
+                                &in_tx,
+                                &sup_tx,
+                            );
                         }
                         // Double-Esc: cancel AND park dispatch — the
                         // interrupted prompt returns to the front of the
@@ -1991,6 +2018,7 @@ fn notifications_inbound(store: &stella_store::NotificationStore) -> Inbound {
 fn handle_supervisor_msg(
     msg: SupervisorMsg,
     subs: &mut SubSessions,
+    pending_restarts: &mut std::collections::HashSet<String>,
     pending_spawns: &mut VecDeque<stella_core::tasks::SpawnRequest>,
     queue: &mut crate::session_persist::DurableQueue,
     dispatch_held: bool,
@@ -2029,6 +2057,20 @@ fn handle_supervisor_msg(
             end,
         } => {
             subs.ended(&lane);
+            // A Restart that arrived while this worker was live respawns it
+            // now — restart takes the freed slot ahead of parked spawns.
+            if pending_restarts.remove(&lane) {
+                let _ = subsession::respawn(
+                    &lane,
+                    subs,
+                    cfg,
+                    budget_limit,
+                    session_id,
+                    workspace_name,
+                    in_tx,
+                    sup_tx,
+                );
+            }
             // Worker spend reaches the session's parent budget guard (the
             // L-E9 discipline). The guard is mutably borrowed by any in-
             // flight lead turn, so the driver accumulates here and meters at
@@ -2087,6 +2129,63 @@ fn handle_supervisor_msg(
                 in_tx,
                 sup_tx,
             );
+        }
+    }
+}
+
+/// Route one Pause/Resume/Stop/Restart at a worker lane. Pause parks the
+/// worker at its next step boundary (never mid-tool — the engine's
+/// `TurnGate`); Resume releases it; Restart respawns the lane from its
+/// retained spec, stopping the live worker first when necessary.
+#[allow(clippy::too_many_arguments)]
+fn service_worker_control(
+    lane: &str,
+    control: stella_tui::AgentControl,
+    subs: &mut SubSessions,
+    pending_restarts: &mut std::collections::HashSet<String>,
+    cfg: &Config,
+    budget_limit: Option<f64>,
+    session_id: &str,
+    workspace_name: &str,
+    in_tx: &UnboundedSender<Inbound>,
+    sup_tx: &UnboundedSender<SupervisorMsg>,
+) {
+    match control {
+        stella_tui::AgentControl::Stop => {
+            subs.stop(lane);
+        }
+        stella_tui::AgentControl::Pause => {
+            if subs.set_paused(lane, true) {
+                let _ = in_tx.send(Inbound::Status {
+                    agent: lane.to_string(),
+                    status: AgentStatus::Paused,
+                });
+            }
+        }
+        stella_tui::AgentControl::Resume => {
+            if subs.set_paused(lane, false) {
+                let _ = in_tx.send(Inbound::Status {
+                    agent: lane.to_string(),
+                    status: AgentStatus::Running,
+                });
+            }
+        }
+        stella_tui::AgentControl::Restart => {
+            if subs.is_live(lane) {
+                pending_restarts.insert(lane.to_string());
+                subs.stop(lane);
+            } else {
+                let _ = subsession::respawn(
+                    lane,
+                    subs,
+                    cfg,
+                    budget_limit,
+                    session_id,
+                    workspace_name,
+                    in_tx,
+                    sup_tx,
+                );
+            }
         }
     }
 }

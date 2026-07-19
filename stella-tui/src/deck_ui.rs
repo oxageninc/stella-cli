@@ -3265,14 +3265,31 @@ fn handle_agents_key(
             Some(DeckAction::Handled)
         }
         // Agent controls — only when the composer is empty (else they type).
-        // Only `s` (stop) is bound: the driver drops Pause/Restart as no-ops
-        // (they need the fleet supervisor), and a key that visibly does
-        // nothing erodes trust in the ones that work. Re-add `p`/`r` here
-        // and in the help overlay when the driver honors them.
+        // `s` stop · `p` pause/resume toggle (by the row's current status) ·
+        // `r` restart. The driver honors all three on worker lanes
+        // (`req:`/`sub:`): pause parks the worker at its next step boundary
+        // (never mid-tool), restart respawns the lane from its retained
+        // spec. On the lead they are no-ops (Esc is the lead's interrupt).
         KeyCode::Char('s') if composer_empty => model.agents.get(ui.focused).map(|entry| {
             DeckAction::Send(WorkspaceInput::Control {
                 agent: entry.meta.id.clone(),
                 control: AgentControl::Stop,
+            })
+        }),
+        KeyCode::Char('p') if composer_empty => model.agents.get(ui.focused).map(|entry| {
+            DeckAction::Send(WorkspaceInput::Control {
+                agent: entry.meta.id.clone(),
+                control: if entry.status == AgentStatus::Paused {
+                    AgentControl::Resume
+                } else {
+                    AgentControl::Pause
+                },
+            })
+        }),
+        KeyCode::Char('r') if composer_empty => model.agents.get(ui.focused).map(|entry| {
+            DeckAction::Send(WorkspaceInput::Control {
+                agent: entry.meta.id.clone(),
+                control: AgentControl::Restart,
             })
         }),
         _ => None,
