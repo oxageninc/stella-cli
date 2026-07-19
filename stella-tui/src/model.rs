@@ -426,6 +426,7 @@ impl SessionModel {
                 after_tokens,
                 evicted,
                 deduped,
+                ..
             } => {
                 self.transcript.push(TranscriptEntry::Compaction {
                     before_tokens: *before_tokens,

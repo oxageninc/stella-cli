@@ -83,13 +83,31 @@ pub fn compaction(
     after_tokens: u64,
     evicted: usize,
     deduped: usize,
+    superseded: usize,
+    aged: usize,
+    summarized: usize,
 ) -> EventLine {
+    // Name only the mechanisms that actually fired — most passes use one
+    // or two, and a line of zeros reads as noise.
+    let mut parts: Vec<String> = Vec::new();
+    for (count, label) in [
+        (evicted, "evicted"),
+        (deduped, "deduped"),
+        (superseded, "superseded"),
+        (aged, "aged"),
+        (summarized, "summarized"),
+    ] {
+        if count > 0 {
+            parts.push(format!("{count} {label}"));
+        }
+    }
     EventLine {
         glyph: "⤵",
         tone: Tone::Info,
         strong: false,
         body: format!(
-            "compacted context: {before_tokens} → {after_tokens} tokens ({evicted} evicted, {deduped} deduped)"
+            "compacted context: {before_tokens} → {after_tokens} tokens ({})",
+            parts.join(", ")
         ),
         detail: None,
     }
@@ -390,11 +408,17 @@ pub fn event_line(event: &AgentEvent) -> Option<EventLine> {
             after_tokens,
             evicted,
             deduped,
+            superseded,
+            aged,
+            summarized,
         } => Some(compaction(
             *before_tokens,
             *after_tokens,
             *evicted,
             *deduped,
+            *superseded,
+            *aged,
+            *summarized,
         )),
         AgentEvent::BudgetTick {
             spent_usd,
@@ -617,7 +641,7 @@ mod tests {
     fn wording_matches_the_pre_extraction_plain_renderer_byte_for_byte() {
         assert_eq!(retry(2, "rate limited").text(), "↻ retry #2: rate limited");
         assert_eq!(
-            compaction(10_000, 4_000, 3, 2).text(),
+            compaction(10_000, 4_000, 3, 2, 0, 0, 0).text(),
             "⤵ compacted context: 10000 → 4000 tokens (3 evicted, 2 deduped)"
         );
         assert_eq!(
@@ -775,6 +799,9 @@ mod tests {
                 after_tokens: 1,
                 evicted: 1,
                 deduped: 0,
+                superseded: 0,
+                aged: 0,
+                summarized: 0,
             },
             AgentEvent::BudgetTick {
                 spent_usd: 0.1,
