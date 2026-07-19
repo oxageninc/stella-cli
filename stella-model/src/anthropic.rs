@@ -714,7 +714,15 @@ async fn aggregate_anthropic_stream(
                     }
                 }
                 Ok(AnthropicStreamEvent::ContentBlockDelta { index, delta }) => match delta {
-                    AnthropicDelta::TextDelta { text: delta } => text.push_str(&delta),
+                    // Only user-visible answer text is announced — thinking
+                    // deltas (`thinking_delta`) deserialize as `Other` and
+                    // never reach the observer.
+                    AnthropicDelta::TextDelta { text: delta } => {
+                        if let Some(observer) = observer {
+                            observer.text_delta(&delta);
+                        }
+                        text.push_str(&delta);
+                    }
                     AnthropicDelta::InputJsonDelta { partial_json } => {
                         if let Some(acc) = tool_uses.get_mut(&index) {
                             acc.input_json.push_str(&partial_json);
@@ -1486,12 +1494,77 @@ mod tests {
 
     /// Shared with the zai tests in spirit: records every announcement so a
     /// test can compare them against the final `CompletionResult`.
-    struct RecordingObserver(std::sync::Mutex<Vec<stella_protocol::ToolCall>>);
+    struct RecordingObserver {
+        calls: std::sync::Mutex<Vec<stella_protocol::ToolCall>>,
+        deltas: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingObserver {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                deltas: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
 
     impl ToolCallObserver for RecordingObserver {
         fn tool_call_streamed(&self, call: &stella_protocol::ToolCall) {
-            self.0.lock().unwrap().push(call.clone());
+            self.calls.lock().unwrap().push(call.clone());
         }
+        fn text_delta(&self, delta: &str) {
+            self.deltas.lock().unwrap().push(delta.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_observed_streams_answer_deltas_in_order_never_thinking() {
+        let server = MockServer::start().await;
+        // Answer fragments interleaved with a thinking delta: the observer
+        // must see exactly the user-visible fragments, in stream order —
+        // thinking deltas parse as `Other` and never reach it.
+        let sse_body = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me think\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo!\"}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(ApiKey::new("sk-test"), "claude-fable-5")
+            .with_base_url(server.uri());
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage::user("say hello")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+            reasoning: None,
+            params: None,
+        };
+
+        let observer = RecordingObserver::new();
+        let result = provider
+            .complete_observed(req, &observer)
+            .await
+            .expect("should succeed");
+
+        let deltas = observer.deltas.lock().unwrap();
+        assert_eq!(
+            *deltas,
+            vec!["Hel".to_string(), "lo!".to_string()],
+            "answer fragments only, in order — thinking excluded"
+        );
+        assert_eq!(
+            result.text, "Hello!",
+            "the committed text is the announced deltas' concatenation"
+        );
     }
 
     #[tokio::test]
@@ -1530,13 +1603,13 @@ mod tests {
             params: None,
         };
 
-        let observer = RecordingObserver(std::sync::Mutex::new(Vec::new()));
+        let observer = RecordingObserver::new();
         let result = provider
             .complete_observed(req, &observer)
             .await
             .expect("should succeed");
 
-        let announced = observer.0.lock().unwrap();
+        let announced = observer.calls.lock().unwrap();
         assert_eq!(announced.len(), 1, "exactly one announcement per block");
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(
@@ -1581,13 +1654,13 @@ mod tests {
             params: None,
         };
 
-        let observer = RecordingObserver(std::sync::Mutex::new(Vec::new()));
+        let observer = RecordingObserver::new();
         let result = provider
             .complete_observed(req, &observer)
             .await
             .expect("broken JSON on a finished block is the repair sentinel, not an error");
         assert!(
-            observer.0.lock().unwrap().is_empty(),
+            observer.calls.lock().unwrap().is_empty(),
             "unparseable input must not be announced"
         );
         // The committed call still carries the Null repair sentinel.

@@ -380,6 +380,7 @@ pub fn event_line(event: &AgentEvent) -> Option<EventLine> {
     match event {
         AgentEvent::Stage { .. }
         | AgentEvent::Text { .. }
+        | AgentEvent::TextDelta { .. }
         | AgentEvent::Reasoning { .. }
         | AgentEvent::ToolStart { .. }
         | AgentEvent::ToolResult { .. } => None,

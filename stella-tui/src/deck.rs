@@ -531,13 +531,18 @@ impl WorkspaceModel {
         if let AgentEvent::StepUsage { model, .. } = event {
             self.routes.record(now, agent.clone(), model.clone());
         }
-        let (kind, summary) = trace_of(event);
-        self.trace.push(TraceRow {
-            ts: now,
-            agent: agent.clone(),
-            kind,
-            summary,
-        });
+        // Streaming previews never reach the trace: one row per token would
+        // churn the whole capped ring during a single answer, and the
+        // authoritative `Text` event lands the same content as one row.
+        if !matches!(event, AgentEvent::TextDelta { .. }) {
+            let (kind, summary) = trace_of(event);
+            self.trace.push(TraceRow {
+                ts: now,
+                agent: agent.clone(),
+                kind,
+                summary,
+            });
+        }
     }
 }
 
@@ -809,7 +814,7 @@ fn event_intensity(ev: &AgentEvent) -> u8 {
         AgentEvent::FileChange { .. } => 255,
         AgentEvent::ToolStart { .. } | AgentEvent::ToolResult { .. } => 210,
         AgentEvent::Stage { .. } => 170,
-        AgentEvent::Text { .. } => 130,
+        AgentEvent::Text { .. } | AgentEvent::TextDelta { .. } => 130,
         AgentEvent::Reasoning { .. } => 90,
         AgentEvent::Commit { .. } | AgentEvent::Pr { .. } => 230,
         AgentEvent::BudgetTick { .. } | AgentEvent::StepUsage { .. } => 60,
@@ -835,6 +840,7 @@ fn status_from_event(ev: &AgentEvent) -> Option<AgentStatus> {
         }
         AgentEvent::Stage { .. }
         | AgentEvent::Text { .. }
+        | AgentEvent::TextDelta { .. }
         | AgentEvent::Reasoning { .. }
         | AgentEvent::ToolStart { .. }
         | AgentEvent::ToolResult { .. } => Some(AgentStatus::Running),
@@ -848,6 +854,9 @@ fn trace_of(ev: &AgentEvent) -> (TraceKind, String) {
     match ev {
         AgentEvent::Stage { name } => (TraceKind::Stage, format!("{name:?}").to_lowercase()),
         AgentEvent::Text { delta } => (TraceKind::Text, snip(delta)),
+        // Mapped for completeness; `apply_event` never traces deltas (one
+        // row per token would churn the capped ring — see the guard there).
+        AgentEvent::TextDelta { text } => (TraceKind::Text, snip(text)),
         AgentEvent::Reasoning { delta } => (TraceKind::Reasoning, snip(delta)),
         AgentEvent::ToolStart { call } => (TraceKind::Tool, format!("{}()", call.name)),
         AgentEvent::ToolResult {
@@ -956,6 +965,36 @@ mod tests {
             agent: agent.into(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn text_deltas_feed_the_preview_without_flooding_the_trace() {
+        let mut w = WorkspaceModel::new();
+        w.apply_inbound(&reg("lead"));
+        let baseline = w.trace.rows.len();
+        for _ in 0..100 {
+            w.apply_inbound(&ev(
+                "lead",
+                AgentEvent::TextDelta {
+                    text: "tok ".into(),
+                },
+            ));
+        }
+        assert_eq!(
+            w.trace.rows.len(),
+            baseline,
+            "per-token previews never land trace rows"
+        );
+        assert_eq!(
+            w.agents[0].status,
+            AgentStatus::Running,
+            "streaming still reads as activity"
+        );
+        assert_eq!(
+            w.agents[0].model.streaming_text.len(),
+            400,
+            "the per-agent fold accumulates the preview"
+        );
     }
 
     #[test]

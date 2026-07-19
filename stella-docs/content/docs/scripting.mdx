@@ -20,6 +20,10 @@ an environment-variable equivalent for CI.
 `stream-json` is a line-per-event serialization of Stella's internal event enum — a stable
 machine interface you can parse incrementally. Each line is one event object tagged
 `"type"` in snake_case (`stage`, `text`, `reasoning`, `tool_start`, `tool_result`, …).
+The vocabulary is additive-only: skip lines whose `type` you don't recognize. In
+particular, `text_delta` lines stream the answer token by token as a best-effort live
+preview — the `text` event that follows carries the full step text and is authoritative
+(replace any accumulated deltas with it; a retried model call re-streams its deltas).
 
 ```bash
 # One final JSON object

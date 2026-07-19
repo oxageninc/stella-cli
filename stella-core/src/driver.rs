@@ -453,6 +453,12 @@ impl<'a> Engine<'a> {
         let messages_snapshot = messages.to_vec();
         let req_config = &self.config;
         let speculation_read_only = read_only_tools.clone();
+        // The gate forwards answer-text fragments straight onto the turn's
+        // event stream as `TextDelta` previews. Deliberately NOT rolled back
+        // on a failed attempt: a retry's deltas re-stream from the start
+        // with no reset marker — the eventual `Text` event is authoritative
+        // and consumers replace the preview with it (protocol docs).
+        let delta_events = events.clone();
         // Each attempt runs the provider call and the speculation pump
         // concurrently: the pump executes read-only calls the moment the
         // adapter announces them (`crate::speculation`), so their wall-clock
@@ -472,11 +478,12 @@ impl<'a> Engine<'a> {
                 tools: tools_schema.clone(),
             };
             let read_only = speculation_read_only.clone();
+            let delta_tx = delta_events.clone();
             Box::pin(async move {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 let pump = self.pump_speculations(rx);
                 let complete = async move {
-                    let gate = SpeculationGate::new(read_only, tx);
+                    let gate = SpeculationGate::new(read_only, tx, delta_tx);
                     self.provider.complete_observed(req, &gate).await
                     // `gate` (and its sender) drop here → the pump's
                     // stream ends once in-flight executions drain.
@@ -1326,6 +1333,77 @@ mod tests {
             )),
             "a re-executed result must NOT claim speculation: {events:?}"
         );
+    }
+
+    /// A provider that streams its answer through the observer before
+    /// committing it — the adapter side of token-level streaming.
+    struct StreamingTextProvider;
+    #[async_trait]
+    impl Provider for StreamingTextProvider {
+        fn id(&self) -> &str {
+            "streaming"
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResultAlias, ProviderError> {
+            unreachable!("the engine must drive complete_observed, never bare complete")
+        }
+        async fn complete_observed(
+            &self,
+            _req: CompletionRequest,
+            observer: &dyn stella_protocol::ToolCallObserver,
+        ) -> Result<CompletionResultAlias, ProviderError> {
+            observer.text_delta("Hel");
+            observer.text_delta("lo!");
+            Ok(text_result("Hello!"))
+        }
+    }
+
+    #[tokio::test]
+    async fn text_deltas_precede_the_authoritative_text_and_concatenate_to_it() {
+        let provider = StreamingTextProvider;
+        let tools = CountingTools {
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let sleeper = NoopSleeper;
+        let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut messages = vec![CompletionMessage::user("say hello")];
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+
+        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        assert!(
+            matches!(outcome, TurnOutcome::Completed { ref text, .. } if text == "Hello!"),
+            "turn must complete: {outcome:?}"
+        );
+
+        let events = drain_events(&mut rx);
+        let text_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Text { .. }))
+            .expect("the authoritative Text event lands");
+        let deltas: Vec<(usize, &str)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                AgentEvent::TextDelta { text } => Some((i, text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), 2, "both fragments stream live: {events:?}");
+        assert!(
+            deltas.iter().all(|(i, _)| *i < text_idx),
+            "every delta precedes the authoritative Text: {events:?}"
+        );
+        let concatenated: String = deltas.iter().map(|(_, t)| *t).collect();
+        match &events[text_idx] {
+            AgentEvent::Text { delta } => assert_eq!(
+                &concatenated, delta,
+                "on a clean run the preview equals the committed text"
+            ),
+            other => unreachable!("{other:?}"),
+        }
     }
 
     #[tokio::test]

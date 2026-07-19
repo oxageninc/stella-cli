@@ -47,7 +47,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
-use stella_protocol::{ToolCall, ToolCallObserver, ToolOutput};
+use stella_protocol::{AgentEvent, ToolCall, ToolCallObserver, ToolOutput};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// One speculatively-executed call's outcome, held until dispatch decides
@@ -70,28 +70,52 @@ pub(crate) struct SpeculativeResult {
 /// work is safe to waste.
 pub(crate) type SpeculationPool = HashMap<String, SpeculativeResult>;
 
-/// The observer handed to `Provider::complete_observed`: filters announced
-/// calls down to the speculation-safe prefix (read-only, well-formed,
-/// before any mutating call) and forwards them to the engine's pump.
+/// The observer handed to `Provider::complete_observed` — the engine's one
+/// stream-side seam. Tool calls: filtered down to the speculation-safe
+/// prefix (read-only, well-formed, before any mutating call) and forwarded
+/// to the engine's pump. Answer text: each fragment is forwarded to the
+/// turn's event channel as a best-effort `TextDelta` preview (the step's
+/// eventual `Text` event stays authoritative — see its protocol docs).
 pub(crate) struct SpeculationGate {
     read_only_tools: HashSet<String>,
     /// Set on the first non-read-only announcement; never cleared. See the
     /// module docs' ordering-safety section.
     fenced: AtomicBool,
     tx: UnboundedSender<ToolCall>,
+    /// The turn's event stream, for live `TextDelta` previews. Deltas from
+    /// an attempt that later fails have already been emitted by design —
+    /// no reset marker exists; consumers replace the preview when the
+    /// authoritative `Text` lands.
+    events: UnboundedSender<AgentEvent>,
 }
 
 impl SpeculationGate {
-    pub(crate) fn new(read_only_tools: HashSet<String>, tx: UnboundedSender<ToolCall>) -> Self {
+    pub(crate) fn new(
+        read_only_tools: HashSet<String>,
+        tx: UnboundedSender<ToolCall>,
+        events: UnboundedSender<AgentEvent>,
+    ) -> Self {
         Self {
             read_only_tools,
             fenced: AtomicBool::new(false),
             tx,
+            events,
         }
     }
 }
 
 impl ToolCallObserver for SpeculationGate {
+    fn text_delta(&self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        // A send after the renderer hung up is fine — previews are lossy by
+        // contract.
+        let _ = self.events.send(AgentEvent::TextDelta {
+            text: delta.to_string(),
+        });
+    }
+
     fn tool_call_streamed(&self, call: &ToolCall) {
         if self.fenced.load(Ordering::Relaxed) {
             return;
@@ -131,15 +155,37 @@ mod tests {
     ) -> (
         SpeculationGate,
         tokio::sync::mpsc::UnboundedReceiver<ToolCall>,
+        tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     ) {
         let (tx, rx) = unbounded_channel();
+        let (events_tx, events_rx) = unbounded_channel();
         let read_only: HashSet<String> = names.iter().map(|s| s.to_string()).collect();
-        (SpeculationGate::new(read_only, tx), rx)
+        (
+            SpeculationGate::new(read_only, tx, events_tx),
+            rx,
+            events_rx,
+        )
+    }
+
+    #[test]
+    fn text_deltas_forward_to_the_event_stream_skipping_empty_fragments() {
+        let (gate, _rx, mut events_rx) = gate_with(&[]);
+        gate.text_delta("Hel");
+        gate.text_delta("");
+        gate.text_delta("lo");
+
+        let forwarded: Vec<String> = std::iter::from_fn(|| events_rx.try_recv().ok())
+            .map(|e| match e {
+                AgentEvent::TextDelta { text } => text,
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect();
+        assert_eq!(forwarded, vec!["Hel".to_string(), "lo".to_string()]);
     }
 
     #[test]
     fn forwards_read_only_calls_and_drops_everything_after_a_mutating_one() {
-        let (gate, mut rx) = gate_with(&["read_file", "grep"]);
+        let (gate, mut rx, _events) = gate_with(&["read_file", "grep"]);
         gate.tool_call_streamed(&call("read_file", "c1"));
         gate.tool_call_streamed(&call("grep", "c2"));
         // The barrier: nothing after this may run early, including reads.
@@ -158,7 +204,7 @@ mod tests {
 
     #[test]
     fn null_input_never_reaches_the_pump_but_does_not_fence() {
-        let (gate, mut rx) = gate_with(&["read_file"]);
+        let (gate, mut rx, _events) = gate_with(&["read_file"]);
         gate.tool_call_streamed(&ToolCall {
             call_id: "bad".to_string(),
             name: "read_file".to_string(),
@@ -179,7 +225,7 @@ mod tests {
 
     #[test]
     fn send_after_receiver_dropped_is_silently_lost() {
-        let (gate, rx) = gate_with(&["read_file"]);
+        let (gate, rx, _events) = gate_with(&["read_file"]);
         drop(rx);
         // Must not panic — the announcement is simply lost and dispatch
         // executes the call normally.

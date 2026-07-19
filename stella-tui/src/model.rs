@@ -77,6 +77,15 @@ pub struct SessionModel {
     /// `TaskUpdate` event replaces the whole board — snapshot semantics keep
     /// the fold pure and make a dead session's board reconstruct on replay.
     pub tasks: Vec<TaskItem>,
+    /// The in-progress answer preview, accumulated from `TextDelta` events
+    /// while a model call streams and rendered as a live trailing entry.
+    /// Best-effort by protocol contract: REPLACED (never merged) when the
+    /// step's authoritative `Text` event lands — which also folds retries
+    /// away, since a retried attempt re-streams its deltas from the start —
+    /// and dropped on `Error`/`Complete`/a new prompt. Middle-out capped at
+    /// [`OUTPUT_BUDGET`] so an unbounded stream can't grow per-frame render
+    /// cost; the authoritative `Text` entry is never capped by this.
+    pub streaming_text: String,
 }
 
 /// A pending `ask_user` question. The renderer contract is binding: present
@@ -319,7 +328,14 @@ impl SessionModel {
                 }
                 self.transcript.push(TranscriptEntry::Stage(*name));
             }
-            AgentEvent::Text { delta } => self.push_text(delta),
+            AgentEvent::Text { delta } => {
+                // The authoritative step text replaces any streamed preview
+                // outright — merging would duplicate (or, after a retry,
+                // garble) what the deltas already showed.
+                self.streaming_text.clear();
+                self.push_text(delta)
+            }
+            AgentEvent::TextDelta { text } => self.push_streaming_delta(text),
             AgentEvent::Reasoning { delta } => self.push_reasoning(delta),
             AgentEvent::ToolStart { call } => {
                 self.transcript.push(TranscriptEntry::ToolStart {
@@ -557,6 +573,9 @@ impl SessionModel {
             AgentEvent::Error { message, retryable } => {
                 self.pending_scope_review = None;
                 self.pending_ask_user = None;
+                // An aborted model call never commits its text — without
+                // this the un-committed preview would linger indefinitely.
+                self.streaming_text.clear();
                 self.transcript.push(TranscriptEntry::Error {
                     message: message.clone(),
                     retryable: *retryable,
@@ -569,6 +588,7 @@ impl SessionModel {
                 self.hud.complete = true;
                 self.pending_scope_review = None;
                 self.pending_ask_user = None;
+                self.streaming_text.clear();
                 self.transcript.push(TranscriptEntry::Complete {
                     model: model.clone(),
                     cost_usd: *cost_usd,
@@ -598,6 +618,18 @@ impl SessionModel {
         }
     }
 
+    /// Append one best-effort answer fragment to the streaming preview,
+    /// re-capping middle-out at [`OUTPUT_BUDGET`] once it overflows — the
+    /// cap keeps the per-frame re-fold of the live tail bounded no matter
+    /// how long the model streams. Still a pure fold: the capped buffer is
+    /// a deterministic function of the delta sequence.
+    fn push_streaming_delta(&mut self, text: &str) {
+        self.streaming_text.push_str(text);
+        if self.streaming_text.len() > OUTPUT_BUDGET {
+            self.streaming_text = cap_middle(&self.streaming_text, OUTPUT_BUDGET);
+        }
+    }
+
     /// Append a streaming reasoning delta, coalescing like [`Self::push_text`].
     fn push_reasoning(&mut self, delta: &str) {
         if let Some(TranscriptEntry::Reasoning(buf)) = self.transcript.last_mut() {
@@ -618,6 +650,9 @@ impl SessionModel {
     pub fn push_user_prompt(&mut self, text: &str) {
         self.hud.complete = false;
         self.hud.final_cost_usd = None;
+        // A preview surviving into the next turn could only be stale — the
+        // prior turn either committed (cleared on `Text`) or aborted.
+        self.streaming_text.clear();
         // Also drop the prior turn's stage, or the progress bar would resume
         // frozen at that stale position (e.g. verify → 83%) instead of restarting
         // at the new turn's beginning. A model turn's first `Stage` event resets
@@ -936,6 +971,109 @@ mod tests {
         assert!(matches!(model.transcript[0], TranscriptEntry::Text(_)));
         assert!(matches!(model.transcript[1], TranscriptEntry::Stage(_)));
         assert!(matches!(model.transcript[2], TranscriptEntry::Text(_)));
+    }
+
+    fn delta(text: &str) -> AgentEvent {
+        AgentEvent::TextDelta { text: text.into() }
+    }
+
+    #[test]
+    fn text_deltas_accumulate_as_a_preview_the_authoritative_text_replaces() {
+        let mut model = SessionModel::new();
+        model.apply(&delta("Hel"));
+        model.apply(&delta("lo!"));
+        assert_eq!(model.streaming_text, "Hello!");
+        assert!(
+            model.transcript.is_empty(),
+            "the preview is not a transcript entry"
+        );
+
+        // The step commits: bookkeeping events land between the last delta
+        // and the authoritative Text (exactly the live wire order).
+        model.apply(&AgentEvent::BudgetTick {
+            spent_usd: 0.01,
+            limit_usd: None,
+            mode: BudgetMode::Observed,
+        });
+        model.apply(&text("Hello!"));
+        assert!(
+            model.streaming_text.is_empty(),
+            "the authoritative Text replaces the preview outright"
+        );
+        let texts: Vec<&String> = model
+            .transcript
+            .iter()
+            .filter_map(|e| match e {
+                TranscriptEntry::Text(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["Hello!"], "the answer appears exactly once");
+    }
+
+    #[test]
+    fn streaming_preview_clears_on_error_complete_and_a_new_prompt() {
+        for terminal in [
+            AgentEvent::Error {
+                message: "aborted".into(),
+                retryable: false,
+            },
+            AgentEvent::Complete {
+                model: "glm".into(),
+                cost_usd: 0.01,
+            },
+        ] {
+            let mut model = SessionModel::new();
+            model.apply(&delta("partial answ"));
+            assert!(!model.streaming_text.is_empty());
+            model.apply(&terminal);
+            assert!(
+                model.streaming_text.is_empty(),
+                "an uncommitted preview must not outlive the turn: {terminal:?}"
+            );
+        }
+        let mut model = SessionModel::new();
+        model.apply(&delta("stale"));
+        model.push_user_prompt("next question");
+        assert!(model.streaming_text.is_empty());
+    }
+
+    #[test]
+    fn streaming_preview_is_middle_out_capped() {
+        let mut model = SessionModel::new();
+        for _ in 0..(OUTPUT_BUDGET / 4) {
+            model.apply(&delta("abcdefgh"));
+        }
+        assert!(
+            model.streaming_text.chars().count() <= OUTPUT_BUDGET,
+            "the preview respects the render cap"
+        );
+        assert!(
+            model.streaming_text.contains("truncated"),
+            "middle-out elision marker present"
+        );
+    }
+
+    #[test]
+    fn replaying_a_log_with_deltas_is_deterministic() {
+        let log = vec![
+            delta("Hel"),
+            delta("lo"),
+            AgentEvent::BudgetTick {
+                spent_usd: 0.01,
+                limit_usd: None,
+                mode: BudgetMode::Observed,
+            },
+            text("Hello"),
+            AgentEvent::Complete {
+                model: "glm".into(),
+                cost_usd: 0.01,
+            },
+        ];
+        let a = SessionModel::replay(&log);
+        let b = SessionModel::replay(&log);
+        assert_eq!(a, b);
+        assert!(a.streaming_text.is_empty());
     }
 
     #[test]

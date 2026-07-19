@@ -2851,7 +2851,13 @@ fn spawn_renderer(
         let mut seq = 0u64;
         let mut store_warned = false;
         while let Some(event) = rx.recv().await {
-            if let Some((store, id)) = &execution {
+            // `TextDelta` previews never reach the store: the authoritative
+            // `Text` event carries the full step text into the audit record,
+            // and one SQLite insert per token would stall this drain loop.
+            let preview = matches!(event, AgentEvent::TextDelta { .. });
+            if let Some((store, id)) = &execution
+                && !preview
+            {
                 if !persist_event(store, *id, seq, &event, &provider_id) && !store_warned {
                     eprintln!(
                         "  {} store write failed — telemetry for this execution is incomplete",

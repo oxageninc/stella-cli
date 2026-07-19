@@ -65,6 +65,10 @@ pub struct ViewportMetrics {
 struct TranscriptCache {
     len: usize,
     trailing_stream_len: usize,
+    /// Length of the `TextDelta` streaming preview at fold time — its own
+    /// term (see `ensure_transcript_lines`) so clearing the preview always
+    /// changes the fingerprint.
+    streaming_len: usize,
     expand_thinking: bool,
     width: usize,
     lines: Vec<Line<'static>>,
@@ -161,9 +165,14 @@ impl UiState {
             Some(TranscriptEntry::Text(s) | TranscriptEntry::Reasoning(s)) => s.len(),
             _ => 0,
         };
+        // A separate fingerprint term — not summed into the trailing one, or
+        // the authoritative `Text` coalescing a cleared preview into the
+        // trailing entry could leave the total unchanged and the cache stale.
+        let streaming_len = model.streaming_text.len();
         let fresh = self.transcript_cache.as_ref().is_some_and(|c| {
             c.len == len
                 && c.trailing_stream_len == trailing_stream_len
+                && c.streaming_len == streaming_len
                 && c.expand_thinking == expand_thinking
                 && c.width == width
         });
@@ -172,6 +181,7 @@ impl UiState {
             self.transcript_cache = Some(TranscriptCache {
                 len,
                 trailing_stream_len,
+                streaming_len,
                 expand_thinking,
                 width,
                 lines,

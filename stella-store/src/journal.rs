@@ -174,6 +174,15 @@ impl SessionJournal {
     /// lands itself — fsynced when it is a conversation transition.
     pub fn write(&mut self, record: &JournalRecord) -> Result<()> {
         if let JournalRecord::Event { agent, event } = record {
+            // Streaming previews are never journaled: the step's `Text` event
+            // carries the same text in full (the protocol's authoritative
+            // record), so persisting deltas would double every answer on disk
+            // — and, arriving one per token, tear the coalescing runs below
+            // into per-fragment flushes. Replay renders identically without
+            // them.
+            if matches!(event, AgentEvent::TextDelta { .. }) {
+                return Ok(());
+            }
             let (kind, delta) = match event {
                 AgentEvent::Text { delta } => (DeltaKind::Text, delta),
                 AgentEvent::Reasoning { delta } => (DeltaKind::Reasoning, delta),
@@ -450,6 +459,30 @@ mod tests {
             .iter()
             .map(|r| serde_json::to_string(r).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn text_delta_previews_never_persist_and_never_tear_a_coalescing_run() {
+        let dir = temp_dir("text-delta");
+        {
+            let mut j = SessionJournal::open(&dir).unwrap();
+            j.write(&text("lead", "hel")).unwrap();
+            // A preview arriving mid-run must neither land on disk nor flush
+            // the pending run — the run below must still coalesce whole.
+            j.write(&JournalRecord::Event {
+                agent: "lead".into(),
+                event: AgentEvent::TextDelta { text: "hel".into() },
+            })
+            .unwrap();
+            j.write(&text("lead", "lo")).unwrap();
+            j.write(&complete("lead")).unwrap();
+        }
+        let back = read_journal(&dir);
+        assert_eq!(
+            js(&back),
+            js(&[text("lead", "hello"), complete("lead")]),
+            "one coalesced run, no text_delta lines"
+        );
     }
 
     #[test]

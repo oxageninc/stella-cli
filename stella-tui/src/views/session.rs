@@ -50,11 +50,17 @@ impl SessionFold {
     /// no-selection ctrl+o overlay: every expandable entry folds as if
     /// individually expanded (it participates in the cache key, so toggling
     /// it invalidates exactly once).
+    /// `streaming` is the in-flight `TextDelta` preview
+    /// ([`SessionModel::streaming_text`](crate::model::SessionModel)): folded
+    /// into the live tail after the last entry, so it re-wraps per frame
+    /// like the tail does and vanishes without residue when the
+    /// authoritative `Text` clears it — never a settled entry.
     #[allow(clippy::too_many_arguments)]
     fn refresh(
         &mut self,
         agent: &str,
         transcript: &[TranscriptEntry],
+        streaming: &str,
         thinking: bool,
         expanded: &HashSet<usize>,
         expand_all: bool,
@@ -107,6 +113,10 @@ impl SessionFold {
                 width,
                 &mut self.tail,
             );
+        }
+        if !streaming.is_empty() {
+            let preview = TranscriptEntry::Text(streaming.to_string());
+            entry_lines(&preview, thinking, false, width, &mut self.tail);
         }
     }
 
@@ -205,6 +215,7 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
     ui.session_fold.refresh(
         &agent.meta.id,
         &sm.transcript,
+        &sm.streaming_text,
         ui.thinking_expanded,
         expanded_set,
         ui.transcript_expand_all,
@@ -457,6 +468,46 @@ mod tests {
     }
 
     #[test]
+    fn streaming_preview_renders_in_the_session_tab_until_the_text_replaces_it() {
+        let mut model = WorkspaceModel::new();
+        model.apply_inbound(&Inbound::Register(AgentMeta::new("lead", "goal", 0)));
+        for fragment in ["streamed toke", "ns arriving"] {
+            model.apply_inbound(&Inbound::Event {
+                agent: "lead".into(),
+                event: AgentEvent::TextDelta {
+                    text: fragment.into(),
+                },
+            });
+        }
+
+        let mut ui = DeckUi::default();
+        let area = Rect::new(0, 0, 90, 24);
+        let mut buf = Buffer::empty(area);
+        render(&model, &mut ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("streamed tokens arriving"),
+            "deltas render live, before any Text event:\n{text}"
+        );
+
+        // The authoritative Text replaces the preview — never a duplicate.
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Text {
+                delta: "streamed tokens arriving".into(),
+            },
+        });
+        let mut buf = Buffer::empty(area);
+        render(&model, &mut ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert_eq!(
+            text.matches("streamed tokens arriving").count(),
+            1,
+            "the committed answer appears exactly once:\n{text}"
+        );
+    }
+
+    #[test]
     fn fold_cache_stays_line_exact_across_front_eviction() {
         // The dangerous shape: the cache settles on a SHORT prefix, then the
         // transcript grows past the cap so a chunk of the front evicts while
@@ -472,15 +523,42 @@ mod tests {
             model.apply(&retry(i));
         }
         let mut fold = SessionFold::default();
-        fold.refresh("lead", &model.transcript, false, &expanded, false, 0, 80);
+        fold.refresh(
+            "lead",
+            &model.transcript,
+            "",
+            false,
+            &expanded,
+            false,
+            0,
+            80,
+        );
         for i in 1_000..(MAX_TRANSCRIPT_ENTRIES + 50) {
             model.apply(&retry(i));
         }
         assert!(model.evicted_entries() > 0, "an eviction pass occurred");
-        fold.refresh("lead", &model.transcript, false, &expanded, false, 0, 80);
+        fold.refresh(
+            "lead",
+            &model.transcript,
+            "",
+            false,
+            &expanded,
+            false,
+            0,
+            80,
+        );
 
         let mut fresh = SessionFold::default();
-        fresh.refresh("lead", &model.transcript, false, &expanded, false, 0, 80);
+        fresh.refresh(
+            "lead",
+            &model.transcript,
+            "",
+            false,
+            &expanded,
+            false,
+            0,
+            80,
+        );
         assert_eq!(fold.total(), fresh.total());
         assert_eq!(
             fold.window_lines(0..fold.total()),

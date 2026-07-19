@@ -25,6 +25,16 @@ pub trait ToolCallObserver: Send + Sync {
     /// One tool call's block has fully streamed: id, name, and complete,
     /// well-formed input are known.
     fn tool_call_streamed(&self, call: &ToolCall);
+
+    /// One fragment of user-visible answer text arrived on the stream, in
+    /// order. Only answer text — never thinking/reasoning content — and
+    /// strictly best-effort: the definitive text is `CompletionResult::text`
+    /// (a retried attempt re-streams from the start, and an adapter without
+    /// mid-stream visibility calls this not at all). Default no-op so
+    /// existing observers compile unchanged.
+    fn text_delta(&self, delta: &str) {
+        let _ = delta;
+    }
 }
 
 /// One model provider adapter. `stella-core` drives every call through

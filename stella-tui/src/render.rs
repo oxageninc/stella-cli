@@ -867,7 +867,10 @@ fn push_labeled_block(
 // ---------------------------------------------------------------------------
 
 /// The full visual-line list for the transcript. Each entry is rendered with
-/// per-entry wrapping so continuation lines respect the label column.
+/// per-entry wrapping so continuation lines respect the label column. An
+/// in-flight streaming preview (`SessionModel::streaming_text`) renders as a
+/// live trailing agent entry — it is not a transcript entry, so the
+/// authoritative `Text` event replaces it without leaving a duplicate row.
 pub(crate) fn transcript_lines(
     model: &SessionModel,
     expand_thinking: bool,
@@ -876,6 +879,10 @@ pub(crate) fn transcript_lines(
     let mut out = Vec::new();
     for entry in &model.transcript {
         entry_lines(entry, expand_thinking, expand_thinking, width, &mut out);
+    }
+    if !model.streaming_text.is_empty() {
+        let preview = TranscriptEntry::Text(model.streaming_text.clone());
+        entry_lines(&preview, expand_thinking, expand_thinking, width, &mut out);
     }
     out
 }
@@ -2025,6 +2032,52 @@ mod tests {
     }
 
     #[test]
+    fn streaming_preview_renders_live_and_the_authoritative_text_leaves_no_duplicate() {
+        let mut model = SessionModel::new();
+        model.apply(&AgentEvent::TextDelta {
+            text: "streamed toke".into(),
+        });
+        model.apply(&AgentEvent::TextDelta {
+            text: "ns arriving".into(),
+        });
+        let mut ui = UiState::default();
+        let text = draw(&model, &mut ui, 140, 12);
+        assert!(
+            text.contains("streamed tokens arriving"),
+            "the preview is visible before any Text event lands:\n{text}"
+        );
+
+        // A further delta grows the preview WITHOUT changing the entry count
+        // — the memoized lines must still invalidate and show it.
+        model.apply(&AgentEvent::TextDelta {
+            text: " token by token".into(),
+        });
+        let text = draw(&model, &mut ui, 140, 12);
+        assert!(
+            text.contains("arriving token by token"),
+            "a grown preview must re-render:\n{text}"
+        );
+
+        // The step commits: bookkeeping lands, then the authoritative Text
+        // replaces the preview — the answer must appear exactly once.
+        model.apply(&AgentEvent::BudgetTick {
+            spent_usd: 0.01,
+            limit_usd: None,
+            mode: BudgetMode::Observed,
+        });
+        model.apply(&AgentEvent::Text {
+            delta: "streamed tokens arriving token by token".into(),
+        });
+        let text = draw(&model, &mut ui, 140, 12);
+        assert_eq!(
+            text.matches("streamed tokens arriving token by token")
+                .count(),
+            1,
+            "replaced, never duplicated:\n{text}"
+        );
+    }
+
+    #[test]
     fn a_panicking_panel_becomes_an_error_card_and_input_stays_alive() {
         // L-T7: force a panel to panic via a panicking draw closure and prove
         // (a) it renders as a visible error card, (b) a sibling panel still
@@ -2284,6 +2337,7 @@ mod tests {
     fn any_event() -> impl Strategy<Value = AgentEvent> {
         prop_oneof![
             "[a-z ]{0,12}".prop_map(|delta| AgentEvent::Text { delta }),
+            "[a-z ]{0,12}".prop_map(|text| AgentEvent::TextDelta { text }),
             any::<u8>().prop_map(|n| AgentEvent::Stage {
                 name: match n % 4 {
                     0 => StageKind::Triage,

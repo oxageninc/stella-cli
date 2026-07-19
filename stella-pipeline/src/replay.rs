@@ -201,6 +201,11 @@ pub fn event_signature(event: &AgentEvent) -> String {
         // Text/Reasoning deltas are volatile content — only their presence
         // and kind are structural.
         AgentEvent::Text { .. } => "text".to_string(),
+        // Streaming previews have no structural identity at all — even their
+        // COUNT varies run to run with chunk boundaries — so
+        // [`structural_diff`] excludes them before comparing; the signature
+        // exists only to keep this function total.
+        AgentEvent::TextDelta { .. } => "text_delta".to_string(),
         AgentEvent::Reasoning { .. } => "reasoning".to_string(),
         AgentEvent::ToolStart { call } => format!("tool_start:{}", call.name),
         // A tool_result's structural identity is that it answered a call and
@@ -275,11 +280,19 @@ pub struct StreamDiff {
 /// a spurious insertion should surface as a divergence, not be quietly
 /// realigned away.
 pub fn structural_diff(left: &[AgentEvent], right: &[AgentEvent]) -> Vec<StreamDiff> {
+    // `TextDelta` previews are excluded before the positional walk: the same
+    // answer streams in different chunkings run to run, so even their count
+    // is volatile — the authoritative `Text` event that follows them is the
+    // structural record. Diff indices therefore address the delta-free
+    // sequence.
+    let keep = |e: &&AgentEvent| !matches!(e, AgentEvent::TextDelta { .. });
+    let left: Vec<&AgentEvent> = left.iter().filter(keep).collect();
+    let right: Vec<&AgentEvent> = right.iter().filter(keep).collect();
     let mut diffs = Vec::new();
     let max_len = left.len().max(right.len());
     for i in 0..max_len {
-        let l = left.get(i).map(event_signature);
-        let r = right.get(i).map(event_signature);
+        let l = left.get(i).copied().map(event_signature);
+        let r = right.get(i).copied().map(event_signature);
         if l != r {
             diffs.push(StreamDiff {
                 index: i,

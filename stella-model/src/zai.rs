@@ -884,6 +884,13 @@ async fn aggregate_zai_stream(
                     truncated_at_token_limit = true;
                 }
                 if let Some(content) = choice.delta.content {
+                    // Only `content` (the user-visible answer) is announced —
+                    // `reasoning_content`/`reasoning` stay observer-silent,
+                    // including when the reasoning-only fallback below ends up
+                    // supplying the final text (the deltas are best-effort).
+                    if let Some(observer) = observer {
+                        observer.text_delta(&content);
+                    }
                     text.push_str(&content);
                 }
                 if let Some(rc) = choice.delta.reasoning_content {
@@ -1198,12 +1205,76 @@ mod tests {
     }
 
     /// Records announcements for comparison with the committed result.
-    struct RecordingObserver(std::sync::Mutex<Vec<ToolCall>>);
+    struct RecordingObserver {
+        calls: std::sync::Mutex<Vec<ToolCall>>,
+        deltas: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingObserver {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                deltas: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
 
     impl ToolCallObserver for RecordingObserver {
         fn tool_call_streamed(&self, call: &ToolCall) {
-            self.0.lock().unwrap().push(call.clone());
+            self.calls.lock().unwrap().push(call.clone());
         }
+        fn text_delta(&self, delta: &str) {
+            self.deltas.lock().unwrap().push(delta.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_observed_streams_content_deltas_in_order_never_reasoning() {
+        let server = MockServer::start().await;
+        // Answer `content` interleaved with `reasoning_content`: the observer
+        // must see exactly the visible fragments, in stream order — the
+        // chain-of-thought never streams to it.
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"more thought\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo!\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider =
+            ZaiProvider::new(ApiKey::new("sk-test-zai"), "glm-5.2").with_base_url(server.uri());
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage::user("say hello")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+            reasoning: None,
+            params: None,
+        };
+
+        let observer = RecordingObserver::new();
+        let result = provider
+            .complete_observed(req, &observer)
+            .await
+            .expect("should succeed");
+
+        let deltas = observer.deltas.lock().unwrap();
+        assert_eq!(
+            *deltas,
+            vec!["Hel".to_string(), "lo!".to_string()],
+            "answer fragments only, in order — reasoning excluded"
+        );
+        assert_eq!(
+            result.text, "Hello!",
+            "the committed text is the announced deltas' concatenation"
+        );
     }
 
     #[tokio::test]
@@ -1236,13 +1307,13 @@ mod tests {
             params: None,
         };
 
-        let observer = RecordingObserver(std::sync::Mutex::new(Vec::new()));
+        let observer = RecordingObserver::new();
         let result = provider
             .complete_observed(req, &observer)
             .await
             .expect("completion should succeed");
 
-        let announced = observer.0.lock().unwrap();
+        let announced = observer.calls.lock().unwrap();
         assert_eq!(result.tool_calls.len(), 2);
         assert_eq!(
             announced.len(),

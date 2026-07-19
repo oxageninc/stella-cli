@@ -67,6 +67,18 @@ pub enum AgentEvent {
     Text {
         delta: String,
     },
+    /// One in-order fragment of the answer text, emitted live while the
+    /// model call streams. Strictly a best-effort preview: the step's
+    /// following `Text` event carries the full text and is authoritative —
+    /// consumers must REPLACE any accumulated deltas with it, never merge
+    /// (a retried model call re-streams its deltas from the start, so the
+    /// accumulation can be garbled; there is no reset marker). Additive to
+    /// the stream-json wire contract: consumers must tolerate `text_delta`
+    /// lines appearing between events, and persistence layers may drop them
+    /// (the `Text` event is the durable record).
+    TextDelta {
+        text: String,
+    },
     Reasoning {
         delta: String,
     },
@@ -453,6 +465,21 @@ mod tests {
         let back: AgentEvent = serde_json::from_str(&json).unwrap();
         match back {
             AgentEvent::ToolStart { call } => assert_eq!(call.name, "read_file"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_delta_roundtrips_with_its_own_type_tag() {
+        // `text_delta` is additive on the wire: a distinct tag from `text`,
+        // so a pre-delta consumer that skips unknown lines keeps parsing the
+        // authoritative `text` events unchanged.
+        let event = AgentEvent::TextDelta { text: "Hel".into() };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"text_delta\""), "{json}");
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentEvent::TextDelta { text } => assert_eq!(text, "Hel"),
             other => panic!("unexpected variant: {other:?}"),
         }
     }
