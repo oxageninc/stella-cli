@@ -92,3 +92,44 @@ fn agents_dashboard_shows_status_and_spend_columns() {
         );
     }
 }
+
+/// The `?` help overlay is context-aware: it lists the active tab's own keys
+/// plus the deck-wide keys — and nothing from other tabs — as one aligned
+/// `key  description` row per shortcut.
+#[test]
+fn help_overlay_shows_only_the_active_tabs_shortcuts() {
+    let model = folded_model();
+    let render_help = |tab: DeckTab| {
+        let mut ui = DeckUi::default();
+        ui.splash.skip();
+        ui.tab = tab;
+        ui.help_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| render_deck(&model, &mut ui, f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let area = *buf.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let traces = render_help(DeckTab::Traces);
+    assert!(traces.contains("TRACES tab"), "titled for the tab:\n{traces}");
+    assert!(traces.contains("cycle the per-agent filter"), "{traces}");
+    // Deck-wide keys are always present…
+    assert!(traces.contains("switch tabs"), "{traces}");
+    assert!(traces.contains("quit stella"), "{traces}");
+    // …but other tabs' keys are not.
+    assert!(!traces.contains("search skills"), "{traces}");
+    assert!(!traces.contains("OAuth login"), "{traces}");
+
+    let skills = render_help(DeckTab::Skills);
+    assert!(skills.contains("SKILLS tab"), "{skills}");
+    assert!(skills.contains("search skills"), "{skills}");
+    assert!(!skills.contains("cycle the per-agent filter"), "{skills}");
+}

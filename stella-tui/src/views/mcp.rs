@@ -150,7 +150,7 @@ fn render_browse(state: &McpTabState, lines: &mut Vec<Line<'static>>) {
         )));
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            "  Press / to search a registry, then Enter to install one.",
+            "  Press s to search a registry, then Enter to install one.",
             theme::muted(),
         )));
         return;
