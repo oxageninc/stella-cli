@@ -1186,10 +1186,7 @@ fn tab_shortcuts(tab: DeckTab) -> &'static [(&'static str, &'static str)] {
             ("← → ↑ ↓", "walk the neighborhood"),
             ("/ or ⏎", "file picker — re-root on any indexed file"),
         ],
-        DeckTab::Files => &[
-            ("↑ ↓", "select a file"),
-            ("⏎", "open / close the diff"),
-        ],
+        DeckTab::Files => &[("↑ ↓", "select a file"), ("⏎", "open / close the diff")],
         DeckTab::Skills => &[
             ("← →", "switch panes"),
             ("↑ ↓", "select a skill"),
@@ -1223,7 +1220,10 @@ const GLOBAL_SHORTCUTS: &[(&str, &str)] = &[
     ("ctrl-v", "paste — a copied image is attached to the prompt"),
     ("ctrl-t", "open the queue editor"),
     ("esc", "stop the running turn (next queued prompt runs)"),
-    ("esc esc", "stop & hold — nothing runs until your next prompt"),
+    (
+        "esc esc",
+        "stop & hold — nothing runs until your next prompt",
+    ),
     ("ctrl-c", "quit stella"),
 ];
 
