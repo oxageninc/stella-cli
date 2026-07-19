@@ -47,6 +47,15 @@ pub const GIT_REPO_ENV_VARS: [&str; 8] = [
     "GIT_PREFIX",
 ];
 
+/// Environment variables that force CLIs to colorize even when piped.
+/// Everything spawned here writes to a captured pipe that is parsed
+/// (`gh … --json` into serde) or fed to the model — never a terminal — so
+/// an inherited `CLICOLOR_FORCE=1` from the user's shell wraps `gh`'s JSON
+/// in ANSI escapes and every parse dies with "expected value at line 1
+/// column 1". Scrubbing only the *force* overrides restores standard
+/// pipe detection; tools stay colorless on pipes, as they'd be anywhere.
+pub const FORCED_COLOR_ENV_VARS: [&str; 3] = ["CLICOLOR_FORCE", "FORCE_COLOR", "GH_FORCE_TTY"];
+
 /// Run `command` via `bash -c` in `dir`. Returns `(exit_code, combined
 /// stdout+stderr)`; `Err` is spawn failure or timeout (the process group is
 /// killed on timeout so nothing lingers).
@@ -114,6 +123,9 @@ async fn drive(
 ) -> Result<(i32, String), String> {
     cmd.current_dir(dir);
     for var in GIT_REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    for var in FORCED_COLOR_ENV_VARS {
         cmd.env_remove(var);
     }
     cmd.stdout(std::process::Stdio::piped());
@@ -284,6 +296,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(dead, "cancelled run left subprocess {pid} running");
+    }
+
+    /// An inherited force-color env must not reach subprocesses: `gh`
+    /// would wrap its `--json` output in ANSI escapes and every serde
+    /// parse of it dies at line 1 column 1.
+    #[tokio::test]
+    async fn run_scrubs_forced_color_env() {
+        unsafe { std::env::set_var("CLICOLOR_FORCE", "1") };
+        let result = run(
+            "echo \"force=${CLICOLOR_FORCE-unset}\"",
+            std::path::Path::new("/tmp"),
+            30,
+        )
+        .await;
+        unsafe { std::env::remove_var("CLICOLOR_FORCE") };
+        let (code, out) = result.unwrap();
+        assert_eq!(code, 0);
+        assert!(out.contains("force=unset"), "{out}");
     }
 
     #[tokio::test]

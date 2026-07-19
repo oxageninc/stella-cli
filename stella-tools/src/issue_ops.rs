@@ -117,8 +117,48 @@ async fn gh_json(args: String, root: &std::path::Path) -> Result<Value, String> 
     if code != 0 {
         return Err(format!("gh failed (exit {code}): {output}"));
     }
-    serde_json::from_str(output.trim())
+    serde_json::from_str(&strip_ansi(output.trim()))
         .map_err(|e| format!("gh returned unparsable JSON ({e}) — output may be truncated"))
+}
+
+/// Strip ANSI escape sequences from CLI output. A raw 0x1b byte is invalid
+/// inside a JSON string, so this can never corrupt well-formed JSON — it
+/// only rescues output from a `gh` that colorized despite the pipe (a
+/// force-color override the exec env scrub didn't cover).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI: `ESC [`, parameter/intermediate bytes, one final `@`–`~`.
+            Some('[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if matches!(c, '@'..='~') {
+                        break;
+                    }
+                }
+            }
+            // OSC: `ESC ]` … terminated by BEL or `ESC \`.
+            Some(']') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 async fn gh_run(args: String, root: &std::path::Path) -> Result<String, String> {
@@ -1305,6 +1345,20 @@ mod tests {
         assert_eq!(filter_members(members.clone(), "@octo", 10).len(), 1);
         assert_eq!(filter_members(members.clone(), "mona", 10).len(), 1);
         assert_eq!(filter_members(members, "", 1).len(), 1);
+    }
+
+    #[test]
+    fn strip_ansi_rescues_force_colored_gh_json() {
+        // The exact shape `gh issue list --json …` emits under
+        // CLICOLOR_FORCE=1: every token wrapped in SGR sequences.
+        let colored = "\u{1b}[1;37m[\u{1b}[m\u{1b}[1;37m]\u{1b}[m";
+        assert_eq!(strip_ansi(colored), "[]");
+        // OSC (BEL- and ST-terminated) and bare two-byte escapes go too;
+        // JSON-encoded `` inside strings is untouched (no raw 0x1b).
+        let mixed = "\u{1b}]0;title\u{7}{\"a\":\"\\u001b[1m\"}\u{1b}]8;;x\u{1b}\\\u{1b}M";
+        assert_eq!(strip_ansi(mixed), "{\"a\":\"\\u001b[1m\"}");
+        // Plain JSON passes through byte-identical.
+        assert_eq!(strip_ansi("[{\"n\":1}]"), "[{\"n\":1}]");
     }
 
     #[test]
