@@ -57,6 +57,7 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
     let bands = Layout::vertical([
         Constraint::Length(3),          // tab bar
         Constraint::Min(1),             // active view
+        Constraint::Length(2),          // trace micro-summary strip (rule + line)
         Constraint::Length(1),          // run progress bar
         Constraint::Length(composer_h), // composer
         Constraint::Length(1),          // composer footer (keys + line counter)
@@ -76,19 +77,21 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
         DeckTab::Files => views::files::render(model, ui, content, buf),
         DeckTab::Skills => views::skills::render(model, ui, content, buf),
         DeckTab::Mcp => views::mcp::render(model, ui, content, buf),
+        DeckTab::Issues => views::issues::render(model, ui, content, buf),
     }
 
-    crate::progress::render(model, ui, bands[2], buf);
-    render_composer(ui, &c_layout, model.now_ms, bands[3], buf);
-    render_composer_footer(model, ui, &c_layout, bands[4], buf);
-    render_status_bar(model, ui, bands[5], buf);
+    render_trace_strip(model, bands[2], buf);
+    crate::progress::render(model, ui, bands[3], buf);
+    render_composer(ui, &c_layout, model.now_ms, bands[4], buf);
+    render_composer_footer(model, ui, &c_layout, bands[5], buf);
+    render_status_bar(model, ui, bands[6], buf);
 
     // Floating popups sit above the chrome: the slash menu anchors to the
     // composer; the queue editor centers over the content.
     let slash = ui.composer.slash_menu(&ui.slash_commands);
     if let Some(menu) = slash.filter(|m| !m.is_empty()) {
         let selected = ui.slash_selected.min(menu.matches.len().saturating_sub(1));
-        let popup = slash_popup_area(area, bands[3], menu.matches.len());
+        let popup = slash_popup_area(area, bands[4], menu.matches.len());
         render_slash_popup(&menu, selected, popup, buf);
     }
     if ui.queue_open {
@@ -658,6 +661,47 @@ fn render_graph_picker(ui: &DeckUi, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines).block(block).render(popup, buf);
 }
 
+/// The deck-wide transcript micro-summary strip: a hairline rule with, under
+/// it, one dimmed line summarizing the NEWEST entry of the cross-agent trace
+/// ([`WorkspaceModel::trace`]) — a glanceable "what just happened" on every
+/// tab, refreshed naturally every frame. Sits directly above the composer
+/// chrome (two rows: rule + summary).
+fn render_trace_strip(model: &WorkspaceModel, area: Rect, buf: &mut Buffer) {
+    if area.height == 0 {
+        return;
+    }
+    let rule: String = "─".repeat(area.width as usize);
+    Paragraph::new(Line::from(Span::styled(rule, theme::rule())))
+        .render(Rect { height: 1, ..area }, buf);
+    if area.height < 2 {
+        return;
+    }
+    let line = match model.trace.rows.back() {
+        Some(row) => Line::from(vec![
+            Span::styled(
+                format!(" {} ", row.kind.label()),
+                Style::default().fg(theme::trace_kind_color(row.kind)),
+            ),
+            Span::styled(
+                truncate_chars(&row.summary, (area.width as usize).saturating_sub(10)),
+                Style::default().fg(theme::TEXT_TERTIARY),
+            ),
+        ]),
+        None => Line::from(Span::styled(
+            " · no activity yet",
+            Style::default().fg(theme::TEXT_TERTIARY),
+        )),
+    };
+    Paragraph::new(line).render(
+        Rect {
+            y: area.y + 1,
+            height: 1,
+            ..area
+        },
+        buf,
+    );
+}
+
 /// Cap on the deck composer's visible rows — it grows with the prompt up to
 /// this, then scrolls (with a gutter indicator) to keep the cursor row in view.
 const DECK_COMPOSER_MAX_ROWS: usize = 4;
@@ -1207,6 +1251,15 @@ fn tab_shortcuts(tab: DeckTab) -> &'static [(&'static str, &'static str)] {
             ("x", "remove the server"),
             ("r", "refresh"),
         ],
+        DeckTab::Issues => &[
+            ("↑ ↓", "select an issue"),
+            ("r", "refresh the list"),
+            ("/", "search the tracker"),
+            ("n", "new issue — tab cycles fields · ctrl-s creates"),
+            ("c", "comment on the selected issue"),
+            ("s", "set the selected issue's status"),
+            ("w", "start work on the selected issue"),
+        ],
     }
 }
 
@@ -1372,6 +1425,38 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn trace_strip_shows_a_rule_and_the_newest_trace_entry() {
+        let mut model = running_model_with_queue();
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Text {
+                delta: "Found the root cause.".into(),
+            },
+        });
+        let area = Rect::new(0, 0, 60, 2);
+        let mut buf = Buffer::empty(area);
+        render_trace_strip(&model, area, &mut buf);
+        let text = buffer_text(&buf);
+        let rows: Vec<&str> = text.lines().collect();
+        assert!(
+            rows[0].starts_with("──"),
+            "hairline rule on top: {:?}",
+            rows[0]
+        );
+        assert!(rows[1].contains("text"), "kind label shown:\n{text}");
+        assert!(
+            rows[1].contains("Found the root cause."),
+            "newest entry summarized:\n{text}"
+        );
+
+        // No trace yet → a quiet idle line, never a panic.
+        let empty = WorkspaceModel::new();
+        let mut buf = Buffer::empty(area);
+        render_trace_strip(&empty, area, &mut buf);
+        assert!(buffer_text(&buf).contains("no activity yet"));
     }
 
     fn running_model_with_queue() -> WorkspaceModel {

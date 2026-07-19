@@ -170,6 +170,21 @@ async fn main() -> std::io::Result<()> {
                         busy: false,
                     }));
                 }
+                // The ISSUES tab talks to a real tracker through the CLI
+                // driver; the demo has none, so a list request answers with
+                // the same no-tracker hint the driver would send and the
+                // rest are inert.
+                WorkspaceInput::IssuesRefresh { seq, .. } => {
+                    let _ = react_tx.send(Inbound::IssuesList {
+                        seq,
+                        outcome: Err("no tracker connected — run `stella connect github` or \
+                             `stella connect linear`"
+                            .to_string()),
+                    });
+                }
+                WorkspaceInput::IssueCreate { .. }
+                | WorkspaceInput::IssueAct { .. }
+                | WorkspaceInput::EntitySearch { .. } => {}
                 // The MCP tab's actions are serviced by the real CLI driver;
                 // this demo has no MCP state, so they are inert here.
                 WorkspaceInput::McpToggle { .. }

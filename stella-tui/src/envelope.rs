@@ -244,6 +244,94 @@ pub enum Inbound {
         state: EngineConfigState,
         status: Option<String>,
     },
+    /// The answer to an ISSUES-tab [`WorkspaceInput::IssuesRefresh`] (and the
+    /// follow-up refresh a successful [`WorkspaceInput::IssueCreate`]
+    /// triggers): the tracker's issue list, or the error that stopped it —
+    /// including the "no tracker connected" hint the tab renders as its
+    /// empty state. Out-of-band view state like [`Inbound::McpSearchResults`];
+    /// `seq` echoes the request so the panel can drop stale replies.
+    IssuesList {
+        seq: u64,
+        outcome: Result<Vec<IssueRow>, String>,
+    },
+    /// The outcome of one ISSUES-tab mutation ([`WorkspaceInput::IssueCreate`]
+    /// / [`WorkspaceInput::IssueAct`]): a human status line on success (the
+    /// created key + url, "comment added", …) or the failure reason. `key` is
+    /// the issue acted on (the created key for a create; empty when a create
+    /// failed before a key existed). Out-of-band, seq-guarded like
+    /// [`Inbound::IssuesList`].
+    IssueActDone {
+        seq: u64,
+        key: String,
+        outcome: Result<String, String>,
+    },
+    /// The answer to a type-ahead [`WorkspaceInput::EntitySearch`]: the merged
+    /// hit list for the create form's Assignee/Labels popup. `query` echoes
+    /// the text searched (display only); `seq` echoes the request so the
+    /// per-keystroke stream can drop out-of-order replies — only the newest
+    /// emitted seq is ever applied.
+    EntityHits {
+        field: EntityField,
+        seq: u64,
+        query: String,
+        hits: Vec<EntityHit>,
+    },
+}
+
+/// One row of the ISSUES tab's browse list — a tracker-agnostic mirror of
+/// `stella-tools`' `IssueSummary` (the TUI never links the tools crate; the
+/// driver maps one to the other).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IssueRow {
+    /// `#123` (GitHub) or `ENG-123` (Linear).
+    pub key: String,
+    pub title: String,
+    pub state: String,
+    pub labels: Vec<String>,
+    pub assignee: Option<String>,
+    pub url: String,
+    pub updated_at: Option<String>,
+}
+
+/// One row of the create form's type-ahead popup. `kind` is a display type
+/// label ("Person", "Agent", "Memory", "Symbol", "Label", …) — rows render as
+/// `Kind: label — description`. `insert` is what picking the row writes into
+/// the field: `@login` or an email for people, the label name for labels.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntityHit {
+    pub kind: String,
+    pub label: String,
+    pub description: String,
+    pub insert: String,
+}
+
+/// Which create-form field a type-ahead [`WorkspaceInput::EntitySearch`]
+/// feeds — each has its own vocabulary (people vs. labels).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntityField {
+    Assignee,
+    Label,
+}
+
+impl EntityField {
+    pub fn label(self) -> &'static str {
+        match self {
+            EntityField::Assignee => "assignee",
+            EntityField::Label => "labels",
+        }
+    }
+}
+
+/// An action on one existing issue ([`WorkspaceInput::IssueAct`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IssueAction {
+    /// Add a comment (the deck's `c` prompt).
+    Comment(String),
+    /// Move to a named status (`open`/`closed` on GitHub; any workflow-state
+    /// word on Linear).
+    SetStatus(String),
+    /// Start work: the driver moves the issue to in-progress (`w`).
+    StartWork,
 }
 
 /// The session-registry lifecycle phase, exactly the grouping the SESSIONS
@@ -512,6 +600,39 @@ pub enum WorkspaceInput {
     /// ENGINE overlay opened (or wants a reload): re-read the settings
     /// scope chain and answer with a fresh [`Inbound::EngineConfig`].
     EngineConfigRefresh,
+    /// ISSUES tab: list (or tracker-search) issues. `query`/`state` are the
+    /// tracker-side filters; the driver answers with [`Inbound::IssuesList`]
+    /// echoing `seq` so stale replies can be dropped.
+    IssuesRefresh {
+        query: Option<String>,
+        state: Option<String>,
+        seq: u64,
+    },
+    /// ISSUES tab: create an issue from the `n` form. The driver answers
+    /// with [`Inbound::IssueActDone`] (the created key + url on success) and
+    /// then a fresh [`Inbound::IssuesList`] under the same `seq`.
+    IssueCreate {
+        title: String,
+        body: String,
+        labels: Vec<String>,
+        assignee: Option<String>,
+        seq: u64,
+    },
+    /// ISSUES tab: act on one existing issue (comment / set-status / start
+    /// work). Answered with [`Inbound::IssueActDone`].
+    IssueAct {
+        key: String,
+        action: IssueAction,
+        seq: u64,
+    },
+    /// ISSUES tab: one per-keystroke type-ahead query from the create form's
+    /// Assignee/Labels field. Answered with [`Inbound::EntityHits`] echoing
+    /// `seq` — the panel keeps only the newest.
+    EntitySearch {
+        field: EntityField,
+        query: String,
+        seq: u64,
+    },
     /// Tear down the deck.
     Quit,
 }

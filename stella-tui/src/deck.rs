@@ -36,10 +36,11 @@ pub enum DeckTab {
     Files,
     Skills,
     Mcp,
+    Issues,
 }
 
 impl DeckTab {
-    pub const ALL: [DeckTab; 7] = [
+    pub const ALL: [DeckTab; 8] = [
         DeckTab::Session,
         DeckTab::Agents,
         DeckTab::Traces,
@@ -47,10 +48,11 @@ impl DeckTab {
         DeckTab::Files,
         DeckTab::Skills,
         DeckTab::Mcp,
+        DeckTab::Issues,
     ];
 
     /// The tab-bar label. Deck tab labels are UPPERCASE by convention —
-    /// every tab added later must follow (e.g. `SKILLS`, `MCP`).
+    /// every tab added later must follow (e.g. `SKILLS`, `MCP`, `ISSUES`).
     pub fn title(self) -> &'static str {
         match self {
             DeckTab::Session => "SESSION",
@@ -60,6 +62,7 @@ impl DeckTab {
             DeckTab::Files => "FILES",
             DeckTab::Skills => "SKILLS",
             DeckTab::Mcp => "MCP",
+            DeckTab::Issues => "ISSUES",
         }
     }
 
@@ -384,6 +387,9 @@ impl WorkspaceModel {
             | Inbound::Notifications(_)
             | Inbound::McpOauthStatus { .. }
             | Inbound::EngineConfig { .. }
+            | Inbound::IssuesList { .. }
+            | Inbound::IssueActDone { .. }
+            | Inbound::EntityHits { .. }
             | Inbound::ShowHelp
             | Inbound::Splash(_) => {}
         }
@@ -1505,12 +1511,29 @@ mod tests {
     #[test]
     fn deck_tab_cycles_both_ways() {
         assert_eq!(DeckTab::Session.next(), DeckTab::Agents);
-        // Tab order ends …Files → Skills → Mcp; Mcp wraps to Session and is
-        // Session's predecessor backward.
+        // Tab order ends …Files → Skills → Mcp → Issues; Issues wraps to
+        // Session and is Session's predecessor backward.
         assert_eq!(DeckTab::Files.next(), DeckTab::Skills);
         assert_eq!(DeckTab::Skills.next(), DeckTab::Mcp);
-        assert_eq!(DeckTab::Mcp.next(), DeckTab::Session);
-        assert_eq!(DeckTab::Session.prev(), DeckTab::Mcp);
+        assert_eq!(DeckTab::Mcp.next(), DeckTab::Issues);
+        assert_eq!(DeckTab::Issues.next(), DeckTab::Session);
+        assert_eq!(DeckTab::Session.prev(), DeckTab::Issues);
+    }
+
+    #[test]
+    fn deck_tab_all_round_trips_through_index() {
+        // Every tab in ALL maps to a unique index and back; a full next()
+        // walk visits each exactly once before wrapping.
+        for (i, tab) in DeckTab::ALL.iter().enumerate() {
+            assert_eq!(tab.index(), i);
+            assert_eq!(DeckTab::from_index(i), *tab);
+        }
+        let mut tab = DeckTab::Session;
+        for expected in DeckTab::ALL.iter().skip(1) {
+            tab = tab.next();
+            assert_eq!(tab, *expected);
+        }
+        assert_eq!(tab.next(), DeckTab::Session, "the cycle closes");
     }
 
     #[test]

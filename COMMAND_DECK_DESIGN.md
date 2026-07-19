@@ -195,6 +195,58 @@ impl WorkspaceModel {
   today; deep per-agent pause/kill needs a new `stella-fleet` abort API (noted
   as the follow-up integration).
 
+## ISSUES tab
+
+The tracker-backed issue panel: browse/search the connected tracker's issues
+(GitHub via `gh` or a `stella connect github` token, Linear via
+`LINEAR_API_KEY` / `stella connect linear`), create one through a form,
+comment, move status, and start work — without leaving the deck. The TUI does
+**no I/O**: every operation is a `WorkspaceInput` the driver services through
+`stella_tools::issue_ops` (always `tokio::spawn`ed, so the tab works mid-turn)
+and answers with out-of-band `Inbound::IssuesList` / `IssueActDone` /
+`EntityHits` snapshots. With no tracker connected, every list request answers
+with the `run stella connect …` hint, which the tab renders as its empty
+state. The first Tab-visit auto-loads the list (the INSTALLED AGENTS
+first-visit idiom).
+
+- Browse (composer stays live; letter verbs gate on a blank composer):
+  `↑/↓` select · `r` refresh · `/` tracker search · `n` create form ·
+  `c` comment · `s` set status · `w` start work (= status → in-progress;
+  branch checkout stays the `start_work_on_issue` tool's job).
+- Sub-modes (search line, create form, comment, set-status) are **modal**
+  exactly like the INSTALLED AGENTS editor: they own the keyboard — the form
+  claims Tab for field cycling ahead of deck tab-nav — and Esc returns to
+  Browse from any of them.
+- Create form: Title · Body (a plain `Composer` textarea — ⏎ is a line
+  break) · Labels (comma-separated) · Assignee. `tab`/`⇧tab` (or `↑/↓` off
+  the body) cycle fields; `ctrl+s` submits from anywhere, and ⏎ on the last
+  field (popup closed) submits too. A successful create reports the new
+  key + url and refreshes the list under the same seq.
+
+**The type-ahead contract** (the Assignee and Labels fields): the popup opens
+the INSTANT the first character lands in the field — `@` included; a bare `@`
+searches the empty query, which lists all members. Every subsequent edit
+(insert/backspace) immediately emits `EntitySearch { field, query, seq }` —
+per-keystroke, **no debounce** — where the query is the field text minus a
+leading `@` (assignee) / the segment after the last comma (labels). Replies
+are seq-guarded: only the newest emitted seq is ever applied, so out-of-order
+`EntityHits` can never regress the popup (the same stale-drop rule guards
+`IssuesList`/`IssueActDone`). Rows render `Kind: label — description`; the
+assignee vocabulary merges four independent sources — tracker members
+(kind "Person"), installed agents ("Agent"), workspace memories ("Memory",
+with content preview + `observed/valid from` provenance + citation stats),
+and code-graph symbol definitions ("Symbol") — tracker first, capped at 20,
+each source failing alone. While open the popup owns `↑/↓` (select),
+`⏎`/`tab` (insert — assignee replaces the field, a label appends
+comma-separated), and `esc` (close, keeping the typed text); every other key
+keeps editing the field and re-fires the search. Emptying the field closes
+the popup.
+
+Deck-wide (all tabs): a two-row **trace strip** sits directly above the
+composer chrome — a hairline rule over one dimmed line summarizing the newest
+entry of the cross-agent `TraceLog` (`{kind} {summary}`), the glanceable
+"what just happened" refreshed every frame.
+
 ## Build/test rules for every subagent (verbatim)
 
 - Work in `/Users/macanderson/Workspaces/stella` on branch

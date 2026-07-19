@@ -70,9 +70,12 @@ use stella_store::Store;
 use stella_tools::ToolRegistry;
 use stella_tools::custom::{CustomTool, CustomToolSet};
 use stella_tools::hook_runner::ShellHookRunner;
+use stella_tools::issue_ops::{CreateParams, IssueFilters, IssueSummary, LabelInfo, MemberInfo};
+use stella_tools::issues::IssueBackend;
 use stella_tui::{
-    AgentMeta, AgentScope, AgentStatus, DeckOptions, Inbound, SkillOp, SkillScope, SkillSearchHit,
-    SkillsView, SlashCommand, SplashCue, UserInput, WorkspaceInput, run_deck,
+    AgentMeta, AgentScope, AgentStatus, DeckOptions, EntityField, EntityHit, Inbound, IssueAction,
+    IssueRow, SkillOp, SkillScope, SkillSearchHit, SkillsView, SlashCommand, SplashCue, UserInput,
+    WorkspaceInput, run_deck,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -461,6 +464,10 @@ pub async fn run_deck_session(
     let mut session_exit = stella_store::SessionStatus::Complete;
     spawn_notification_poller(in_tx.clone());
 
+    // The ISSUES tab's lazily-detected tracker backend (see
+    // [`issue_backend`]); shared by every spawned issues task.
+    let issue_backend_cache: IssueBackendCache = Arc::new(tokio::sync::Mutex::new(None));
+
     // ── The driver loop ─────────────────────────────────────────────────────
     let mut queue: VecDeque<String> = VecDeque::new();
     // Double-Esc bookkeeping: parks dispatch and retains what the pair's
@@ -556,8 +563,9 @@ pub async fn run_deck_session(
                 // (install/search hit the network, so they must not stall a
                 // live turn): MCP tab actions first, then the session-registry
                 // / inbox verbs, then the INSTALLED AGENTS pane's synchronous
-                // filesystem ops. A stray answer/decision/control with no turn
-                // in flight falls through all three no-ops.
+                // filesystem ops, then the ISSUES tab's spawned tracker ops.
+                // A stray answer/decision/control with no turn in flight
+                // falls through all four no-ops.
                 Some(other) => {
                     if !service_mcp_action(&other, cfg, &mcp, &mcp_disabled, &in_tx).await
                         && !service_registry_action(
@@ -567,6 +575,7 @@ pub async fn run_deck_session(
                             &in_tx,
                         )
                         && !handle_agents_input(&other, cfg, &in_tx)
+                        && !handle_issues_input(&other, cfg, &issue_backend_cache, &in_tx)
                     {
                         handle_engine_config_input(&other, cfg, &in_tx);
                     }
@@ -884,6 +893,17 @@ pub async fn run_deck_session(
                             | WorkspaceInput::EngineConfigRefresh),
                         ) => {
                             handle_engine_config_input(&input, cfg, &in_tx);
+                        }
+                        // The ISSUES tab stays live while a turn runs too —
+                        // every op spawns its own task and answers from it,
+                        // so nothing here blocks the event pump.
+                        Some(
+                            input @ (WorkspaceInput::IssuesRefresh { .. }
+                            | WorkspaceInput::IssueCreate { .. }
+                            | WorkspaceInput::IssueAct { .. }
+                            | WorkspaceInput::EntitySearch { .. }),
+                        ) => {
+                            handle_issues_input(&input, cfg, &issue_backend_cache, &in_tx);
                         }
                         // Scope review is not engine-driven yet, and deep
                         // pause/resume/restart need the fleet supervisor —
@@ -1445,6 +1465,430 @@ fn spawn_mcp_oauth_login(
             outcome: Some(ok),
         });
     });
+}
+
+// ── ISSUES tab: tracker-backed operations ───────────────────────────────────
+
+/// The lazily-detected issue-tracker backend shared by every ISSUES-tab
+/// task. `None` inside the mutex means "not detected yet — or nothing was
+/// connected the last time we looked": detection re-runs on the next
+/// request, so a `stella connect …` performed mid-session is picked up
+/// without a restart; once a backend IS found it is cached for the session.
+type IssueBackendCache = Arc<tokio::sync::Mutex<Option<Arc<IssueBackend>>>>;
+
+/// What every ISSUES-tab request answers with while no tracker is connected
+/// — the tab renders it as its empty-state hint.
+const NO_TRACKER_HINT: &str =
+    "no tracker connected — run `stella connect github` or `stella connect linear`";
+
+/// The cached backend, detecting on first use (Linear env/connection beats a
+/// GitHub connection beats ambient `gh` auth — `detect_issue_backend_async`).
+async fn issue_backend(cache: &IssueBackendCache) -> Result<Arc<IssueBackend>, String> {
+    let mut guard = cache.lock().await;
+    if let Some(backend) = guard.as_ref() {
+        return Ok(backend.clone());
+    }
+    match stella_tools::issues::detect_issue_backend_async().await {
+        Some(backend) => {
+            let backend = Arc::new(backend);
+            *guard = Some(backend.clone());
+            Ok(backend)
+        }
+        None => Err(NO_TRACKER_HINT.to_string()),
+    }
+}
+
+/// `IssueSummary` → the TUI's `IssueRow` (the deck never links the tools
+/// crate; this driver maps one to the other, field for field).
+fn issue_row(summary: IssueSummary) -> IssueRow {
+    IssueRow {
+        key: summary.key,
+        title: summary.title,
+        state: summary.state,
+        labels: summary.labels,
+        assignee: summary.assignee,
+        url: summary.url,
+        updated_at: summary.updated_at,
+    }
+}
+
+/// List issues via the cached backend, mapped to deck rows.
+async fn list_issue_rows(
+    cache: &IssueBackendCache,
+    root: &std::path::Path,
+    query: Option<String>,
+    state: Option<String>,
+) -> Result<Vec<IssueRow>, String> {
+    let backend = issue_backend(cache).await?;
+    let filters = IssueFilters {
+        query,
+        state,
+        ..IssueFilters::default()
+    };
+    stella_tools::issue_ops::list_issues(&backend, root, &filters)
+        .await
+        .map(|issues| issues.into_iter().map(issue_row).collect())
+}
+
+/// A tracker member as a type-ahead hit (kind "Person"): the label and the
+/// inserted text are the handle (`@login` on GitHub, an email on Linear);
+/// the description carries the human name/email where they add anything.
+fn member_hit(member: MemberInfo) -> EntityHit {
+    let description = match (&member.name, &member.email) {
+        (Some(name), Some(email)) if *email != member.handle => format!("{name} · {email}"),
+        (Some(name), _) => name.clone(),
+        (None, Some(email)) if *email != member.handle => email.clone(),
+        _ => String::new(),
+    };
+    EntityHit {
+        kind: "Person".to_string(),
+        label: member.handle.clone(),
+        description,
+        insert: member.handle,
+    }
+}
+
+/// A tracker label as a type-ahead hit (kind "Label"); the description is
+/// the label's description, falling back to its color swatch value.
+fn label_hit(label: LabelInfo) -> EntityHit {
+    EntityHit {
+        kind: "Label".to_string(),
+        label: label.name.clone(),
+        description: label.description.or(label.color).unwrap_or_default(),
+        insert: label.name,
+    }
+}
+
+/// Installed agents whose name or description contains `query`
+/// (case-insensitive; an empty query matches all) as "Agent" hits.
+fn agent_entity_hits(entries: &[stella_tui::InstalledAgentEntry], query: &str) -> Vec<EntityHit> {
+    let needle = query.trim().to_lowercase();
+    entries
+        .iter()
+        .filter(|e| {
+            needle.is_empty()
+                || e.name.to_lowercase().contains(&needle)
+                || e.description.to_lowercase().contains(&needle)
+        })
+        .map(|e| EntityHit {
+            kind: "Agent".to_string(),
+            label: e.name.clone(),
+            description: e.description.clone(),
+            insert: e.name.clone(),
+        })
+        .collect()
+}
+
+/// Cap on the content preview a memory hit carries.
+const MEMORY_PREVIEW_CHARS: usize = 60;
+
+/// One memory node as a type-ahead hit: a flattened content preview plus a
+/// provenance suffix (`· observed … · valid from …` — valid-from falls back
+/// to the observation time, the store's own convention) and, when the
+/// memory has been cited, its citation stats.
+fn memory_hit(
+    display_name: &str,
+    content: &str,
+    recorded_at: &str,
+    valid_from: Option<&str>,
+    citations: Option<(i64, f64)>,
+) -> EntityHit {
+    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview: String = if flat.chars().count() > MEMORY_PREVIEW_CHARS {
+        let head: String = flat.chars().take(MEMORY_PREVIEW_CHARS - 1).collect();
+        format!("{head}…")
+    } else {
+        flat
+    };
+    let mut description = format!(
+        "{preview} · observed {recorded_at} · valid from {}",
+        valid_from.unwrap_or(recorded_at)
+    );
+    if let Some((count, avg)) = citations {
+        description.push_str(&format!(" · cited {count}× avg {avg:.1}"));
+    }
+    EntityHit {
+        kind: "Memory".to_string(),
+        label: display_name.to_string(),
+        description,
+        insert: display_name.to_string(),
+    }
+}
+
+/// One code-graph definition frame as a type-ahead hit: the kind is the
+/// frame kind capitalized ("Symbol"), the label its human title (`fn foo`),
+/// the description its file location (the citation's parenthetical, else
+/// the frame uri), and the inserted text the bare symbol name — the title's
+/// last token.
+fn symbol_hit(frame: &ocp_types::ContextFrame) -> EntityHit {
+    let label = frame.title.clone();
+    let insert = label
+        .split_whitespace()
+        .last()
+        .unwrap_or(label.as_str())
+        .to_string();
+    let description = frame
+        .citation_label
+        .as_deref()
+        .and_then(|citation| {
+            let start = citation.rfind('(')?;
+            let end = citation.rfind(')')?;
+            (start + 1 < end).then(|| citation[start + 1..end].to_string())
+        })
+        .or_else(|| frame.uri.clone())
+        .unwrap_or_default();
+    EntityHit {
+        kind: format!("{:?}", frame.kind),
+        label,
+        description,
+        insert,
+    }
+}
+
+/// The local (non-tracker) assignee sources, read synchronously (call on
+/// the blocking pool): memories from `.stella/context.db` — with citation
+/// stats joined from `store.db` by `public_id` — and code-graph symbol
+/// definitions when an index exists. Read-only politeness (the `stella
+/// stats` discipline): a missing database reads as "no hits", never a
+/// write. Failures of one source never kill another.
+fn local_assignee_hits(root: &std::path::Path, query: &str) -> Vec<EntityHit> {
+    let needle = query.trim().to_lowercase();
+    let mut hits = Vec::new();
+
+    // Memories: substring over display_name/content; empty query lists all.
+    let context_db = root.join(".stella").join("context.db");
+    if context_db.exists()
+        && let Ok(context) = stella_context::ContextStore::open(&context_db)
+        && let Ok(nodes) = context.memory_nodes()
+    {
+        let stats: std::collections::HashMap<String, (i64, f64)> = {
+            let store_db = root.join(".stella").join("store.db");
+            if store_db.exists() {
+                stella_store::Store::open(root)
+                    .and_then(|store| store.memory_citation_stats())
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(|s| (s.memory_id, (s.citations, s.avg_score)))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Default::default()
+            }
+        };
+        hits.extend(
+            nodes
+                .iter()
+                .filter(|n| {
+                    needle.is_empty()
+                        || n.display_name.to_lowercase().contains(&needle)
+                        || n.content.to_lowercase().contains(&needle)
+                })
+                .take(20)
+                .map(|n| {
+                    memory_hit(
+                        &n.display_name,
+                        &n.content,
+                        &n.recorded_at,
+                        n.valid_from.as_deref(),
+                        stats.get(&n.public_id).copied(),
+                    )
+                }),
+        );
+    }
+
+    // Code-graph definitions of the queried name, when an index exists
+    // (definitions are an exact-name lookup, so an empty query has nothing
+    // to resolve).
+    if !needle.is_empty() {
+        let db = stella_tools::graph::graph_db_path(root);
+        if db.exists()
+            && let Ok(graph) = stella_graph::CodeGraph::open(root, &db)
+            && let Ok(frames) = graph.definitions(query.trim())
+        {
+            hits.extend(frames.iter().map(symbol_hit));
+        }
+    }
+    hits
+}
+
+/// Merge the assignee sources in priority order — tracker people first,
+/// then installed agents, then local memories/symbols — capped at `cap`.
+fn merge_assignee_hits(
+    tracker: Vec<EntityHit>,
+    agents: Vec<EntityHit>,
+    local: Vec<EntityHit>,
+    cap: usize,
+) -> Vec<EntityHit> {
+    let mut merged = tracker;
+    merged.extend(agents);
+    merged.extend(local);
+    merged.truncate(cap);
+    merged
+}
+
+/// Service one ISSUES-tab request. ALWAYS spawns the work and sends the
+/// `Inbound` from the spawned task — the tab is serviced identically idle or
+/// mid-turn, and a tracker round-trip must never stall the driver loop
+/// (the `spawn_mcp_oauth_login` shape). Returns `true` when the input was
+/// one of the tab's.
+fn handle_issues_input(
+    input: &WorkspaceInput,
+    cfg: &Config,
+    cache: &IssueBackendCache,
+    in_tx: &UnboundedSender<Inbound>,
+) -> bool {
+    let root = cfg.workspace_root.clone();
+    match input {
+        WorkspaceInput::IssuesRefresh { query, state, seq } => {
+            let (cache, in_tx, seq) = (cache.clone(), in_tx.clone(), *seq);
+            let (query, state) = (query.clone(), state.clone());
+            tokio::spawn(async move {
+                let outcome = list_issue_rows(&cache, &root, query, state).await;
+                let _ = in_tx.send(Inbound::IssuesList { seq, outcome });
+            });
+            true
+        }
+        WorkspaceInput::IssueCreate {
+            title,
+            body,
+            labels,
+            assignee,
+            seq,
+        } => {
+            let (cache, in_tx, seq) = (cache.clone(), in_tx.clone(), *seq);
+            let params = CreateParams {
+                title: title.clone(),
+                body: body.clone(),
+                labels: labels.clone(),
+                assignee: assignee.clone(),
+                team: None,
+            };
+            tokio::spawn(async move {
+                let created = match issue_backend(&cache).await {
+                    Ok(backend) => {
+                        stella_tools::issue_ops::create_issue(&backend, &root, &params).await
+                    }
+                    Err(e) => Err(e),
+                };
+                match created {
+                    Ok(created) => {
+                        let _ = in_tx.send(Inbound::IssueActDone {
+                            seq,
+                            key: created.key.clone(),
+                            outcome: Ok(format!("created {} — {}", created.key, created.url)),
+                        });
+                        // The list changed — refresh it under the same seq
+                        // (the panel armed its list lane on submit).
+                        let outcome = list_issue_rows(&cache, &root, None, None).await;
+                        let _ = in_tx.send(Inbound::IssuesList { seq, outcome });
+                    }
+                    Err(e) => {
+                        let _ = in_tx.send(Inbound::IssueActDone {
+                            seq,
+                            key: String::new(),
+                            outcome: Err(e),
+                        });
+                    }
+                }
+            });
+            true
+        }
+        WorkspaceInput::IssueAct { key, action, seq } => {
+            let (cache, in_tx, seq) = (cache.clone(), in_tx.clone(), *seq);
+            let (key, action) = (key.clone(), action.clone());
+            tokio::spawn(async move {
+                let outcome = match issue_backend(&cache).await {
+                    Ok(backend) => match &action {
+                        IssueAction::Comment(text) => {
+                            stella_tools::issue_ops::add_comment(&backend, &root, &key, text)
+                                .await
+                                .map(|()| format!("comment added to {key}"))
+                        }
+                        IssueAction::SetStatus(status) => {
+                            stella_tools::issue_ops::set_status(&backend, &root, &key, status).await
+                        }
+                        // Start work = move the issue to in-progress. Branch
+                        // creation/checkout stays the `start_work_on_issue`
+                        // tool's job; on GitHub (whose issues know only
+                        // open/closed) this reports the tracker's honest
+                        // "no such state" message.
+                        IssueAction::StartWork => {
+                            stella_tools::issue_ops::set_status(
+                                &backend,
+                                &root,
+                                &key,
+                                "in progress",
+                            )
+                            .await
+                        }
+                    },
+                    Err(e) => Err(e),
+                };
+                let _ = in_tx.send(Inbound::IssueActDone { seq, key, outcome });
+            });
+            true
+        }
+        WorkspaceInput::EntitySearch { field, query, seq } => {
+            let (cache, in_tx, seq, field) = (cache.clone(), in_tx.clone(), *seq, *field);
+            let query = query.clone();
+            tokio::spawn(async move {
+                let hits = match field {
+                    EntityField::Label => match issue_backend(&cache).await {
+                        Ok(backend) => {
+                            stella_tools::issue_ops::search_labels(&backend, &root, &query, 20)
+                                .await
+                                .map(|labels| labels.into_iter().map(label_hit).collect())
+                                .unwrap_or_default()
+                        }
+                        // No tracker: no label vocabulary. The popup shows
+                        // "no matches"; the list-level requests carry the
+                        // connect hint.
+                        Err(_) => Vec::new(),
+                    },
+                    EntityField::Assignee => {
+                        // Four independent sources — a failure of one must
+                        // not kill the others; collect what succeeds.
+                        let tracker = match issue_backend(&cache).await {
+                            Ok(backend) => {
+                                stella_tools::issue_ops::search_members(&backend, &root, &query, 15)
+                                    .await
+                                    .map(|members| members.into_iter().map(member_hit).collect())
+                                    .unwrap_or_default()
+                            }
+                            Err(_) => Vec::new(),
+                        };
+                        let agents = {
+                            let project = crate::agents_installed::project_agents_dir(&root);
+                            let user = crate::agents_installed::user_agents_dir();
+                            agent_entity_hits(
+                                &crate::agents_installed::discover(user.as_deref(), &project),
+                                &query,
+                            )
+                        };
+                        let local = {
+                            let root = root.clone();
+                            let query = query.clone();
+                            // SQLite opens + tree-sitter grammar loading are
+                            // synchronous — keep them off the async workers.
+                            tokio::task::spawn_blocking(move || local_assignee_hits(&root, &query))
+                                .await
+                                .unwrap_or_default()
+                        };
+                        merge_assignee_hits(tracker, agents, local, 20)
+                    }
+                };
+                let _ = in_tx.send(Inbound::EntityHits {
+                    field,
+                    seq,
+                    query,
+                    hits,
+                });
+            });
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The disposition of a would-be slash command.
@@ -3318,6 +3762,191 @@ mod tests {
         let mut dispatch = HoldState::new();
         assert!(dispatch.stop_and_hold(None).is_empty());
         assert!(!dispatch.held());
+    }
+
+    // ── ISSUES tab: entity-hit assembly ─────────────────────────────────────
+
+    #[test]
+    fn member_and_label_hits_carry_kind_insert_and_description() {
+        let hit = member_hit(MemberInfo {
+            handle: "@octocat".into(),
+            name: Some("Octo Cat".into()),
+            email: None,
+        });
+        assert_eq!(
+            (hit.kind.as_str(), hit.label.as_str()),
+            ("Person", "@octocat")
+        );
+        assert_eq!(hit.insert, "@octocat");
+        assert_eq!(hit.description, "Octo Cat");
+
+        // A Linear member's handle IS the email — never repeated in the
+        // description.
+        let hit = member_hit(MemberInfo {
+            handle: "mona@example.com".into(),
+            name: Some("Mona Lisa".into()),
+            email: Some("mona@example.com".into()),
+        });
+        assert_eq!(hit.description, "Mona Lisa");
+
+        let hit = label_hit(LabelInfo {
+            name: "bug".into(),
+            color: Some("d73a4a".into()),
+            description: Some("Something is broken".into()),
+        });
+        assert_eq!((hit.kind.as_str(), hit.insert.as_str()), ("Label", "bug"));
+        assert_eq!(hit.description, "Something is broken");
+        // No description → the color stands in.
+        let hit = label_hit(LabelInfo {
+            name: "ci".into(),
+            color: Some("00ff00".into()),
+            description: None,
+        });
+        assert_eq!(hit.description, "00ff00");
+    }
+
+    #[test]
+    fn agent_entity_hits_filter_by_name_or_description_case_insensitively() {
+        let entries = vec![
+            stella_tui::InstalledAgentEntry {
+                name: "reviewer".into(),
+                description: "Reviews diffs".into(),
+                tools: None,
+                scope: AgentScope::Project,
+                source_path: String::new(),
+                version: 1,
+                versions: vec![],
+                content: String::new(),
+            },
+            stella_tui::InstalledAgentEntry {
+                name: "planner".into(),
+                description: "Plans work".into(),
+                tools: None,
+                scope: AgentScope::User,
+                source_path: String::new(),
+                version: 1,
+                versions: vec![],
+                content: String::new(),
+            },
+        ];
+        let hits = agent_entity_hits(&entries, "REVIEW");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "Agent");
+        assert_eq!(hits[0].insert, "reviewer");
+        // Description text matches too; the empty query matches all.
+        assert_eq!(agent_entity_hits(&entries, "plans")[0].label, "planner");
+        assert_eq!(agent_entity_hits(&entries, "").len(), 2);
+    }
+
+    #[test]
+    fn memory_hits_carry_the_preview_provenance_and_citation_suffixes() {
+        let hit = memory_hit(
+            "naming-convention",
+            "Prefer kebab-case for  skill names\nand slugs.",
+            "2026-07-01T00:00:00Z",
+            Some("2026-06-15T00:00:00Z"),
+            Some((12, 0.9)),
+        );
+        assert_eq!(hit.kind, "Memory");
+        assert_eq!(hit.insert, "naming-convention");
+        assert_eq!(
+            hit.description,
+            "Prefer kebab-case for skill names and slugs. · observed \
+             2026-07-01T00:00:00Z · valid from 2026-06-15T00:00:00Z · cited 12× avg 0.9"
+        );
+
+        // No valid_from → observation time stands in; no citations → no
+        // suffix; a long content truncates char-safe with an ellipsis.
+        let long = "x".repeat(200);
+        let hit = memory_hit("m", &long, "2026-07-01", None, None);
+        assert!(
+            hit.description
+                .starts_with(&"x".repeat(MEMORY_PREVIEW_CHARS - 1))
+        );
+        assert!(
+            hit.description
+                .contains("… · observed 2026-07-01 · valid from 2026-07-01")
+        );
+        assert!(!hit.description.contains("cited"));
+    }
+
+    #[test]
+    fn symbol_hits_take_the_bare_name_and_the_file_location() {
+        let frame = ocp_types::ContextFrame {
+            id: "code-graph:sym:src/lib.rs:12:issue_row".into(),
+            kind: ocp_types::FrameKind::Symbol,
+            title: "fn issue_row".into(),
+            content: "fn issue_row(...) { ... }".into(),
+            uri: Some("file:///repo/src/lib.rs".into()),
+            score: 0.9,
+            token_cost: 10,
+            valid_from: None,
+            valid_to: None,
+            recorded_at: None,
+            provenance: vec![],
+            citation_label: Some("fn issue_row (src/lib.rs:12)".into()),
+            embedding: None,
+            relations: vec![],
+        };
+        let hit = symbol_hit(&frame);
+        assert_eq!(hit.kind, "Symbol");
+        assert_eq!(hit.label, "fn issue_row");
+        assert_eq!(hit.insert, "issue_row", "the bare name is what inserts");
+        assert_eq!(hit.description, "src/lib.rs:12");
+
+        // Without a citation label the frame's uri stands in.
+        let mut bare = frame;
+        bare.citation_label = None;
+        assert_eq!(symbol_hit(&bare).description, "file:///repo/src/lib.rs");
+    }
+
+    #[test]
+    fn merge_assignee_hits_orders_tracker_agents_local_and_caps() {
+        let person = |l: &str| EntityHit {
+            kind: "Person".into(),
+            label: l.into(),
+            description: String::new(),
+            insert: l.into(),
+        };
+        let tracker: Vec<EntityHit> = (0..3).map(|i| person(&format!("p{i}"))).collect();
+        let agents: Vec<EntityHit> = (0..2).map(|i| person(&format!("a{i}"))).collect();
+        let local: Vec<EntityHit> = (0..3).map(|i| person(&format!("m{i}"))).collect();
+        let merged = merge_assignee_hits(tracker, agents, local, 6);
+        let labels: Vec<&str> = merged.iter().map(|h| h.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["p0", "p1", "p2", "a0", "a1", "m0"],
+            "tracker first, then agents, then local — capped"
+        );
+    }
+
+    #[test]
+    fn issue_rows_map_field_for_field() {
+        let row = issue_row(IssueSummary {
+            key: "ENG-42".into(),
+            title: "Fix".into(),
+            state: "open".into(),
+            labels: vec!["bug".into()],
+            assignee: Some("mona@example.com".into()),
+            url: "https://linear.app/x/issue/ENG-42".into(),
+            updated_at: Some("2026-07-18T00:00:00Z".into()),
+        });
+        assert_eq!(row.key, "ENG-42");
+        assert_eq!(row.labels, vec!["bug"]);
+        assert_eq!(row.assignee.as_deref(), Some("mona@example.com"));
+        assert_eq!(row.updated_at.as_deref(), Some("2026-07-18T00:00:00Z"));
+    }
+
+    #[test]
+    fn local_assignee_hits_read_as_empty_on_a_bare_workspace() {
+        // Read-only politeness: no `.stella/` databases → no hits and, above
+        // all, no directories/files created as a side effect.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(local_assignee_hits(dir.path(), "anything").is_empty());
+        assert!(
+            !dir.path().join(".stella").exists(),
+            "a lookup must never create the workspace store"
+        );
     }
 
     /// `requeue_front` front-inserts in push order and mirrors every insert

@@ -29,8 +29,9 @@ use crate::composer::{
 };
 use crate::deck::{DeckTab, WorkspaceModel};
 use crate::envelope::{
-    AgentControl, AgentId, AgentScope, AgentStatus, EngineRole, Inbound, InstalledAgentEntry,
-    Secret, SkillOp, SkillScope, SkillSearchHit, SkillsView, SplashCue, WorkspaceInput,
+    AgentControl, AgentId, AgentScope, AgentStatus, EngineRole, EntityField, EntityHit, Inbound,
+    InstalledAgentEntry, IssueAction, IssueRow, Secret, SkillOp, SkillScope, SkillSearchHit,
+    SkillsView, SplashCue, WorkspaceInput,
 };
 use crate::graph::GraphSnapshot;
 use crate::input::{ScopeDecision, UserInput};
@@ -256,6 +257,264 @@ pub struct SkillsPanel {
     pub preview: Option<SkillPreview>,
 }
 
+/// The ISSUES tab's interaction mode. `Browse` is plain tab state (the
+/// composer stays live, like every other tab); every other mode is modal —
+/// it owns the keyboard while open, exactly like the INSTALLED AGENTS
+/// sub-modes, so its typing never leaks into the composer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IssuesMode {
+    #[default]
+    Browse,
+    /// A tracker-side search query line (`/`): ⏎ fires
+    /// [`WorkspaceInput::IssuesRefresh`] with the query.
+    SearchTracker,
+    /// The create form (`n`): Title · Body · Labels · Assignee.
+    Create,
+    /// A one-line comment input for the selected issue (`c`).
+    Comment,
+    /// A small status-word input for the selected issue (`s`).
+    SetStatus,
+}
+
+/// The create form's focusable fields, in Tab order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IssueField {
+    #[default]
+    Title,
+    Body,
+    Labels,
+    Assignee,
+}
+
+impl IssueField {
+    pub const ALL: [IssueField; 4] = [
+        IssueField::Title,
+        IssueField::Body,
+        IssueField::Labels,
+        IssueField::Assignee,
+    ];
+
+    fn index(self) -> usize {
+        IssueField::ALL.iter().position(|f| *f == self).unwrap_or(0)
+    }
+
+    pub fn next(self) -> IssueField {
+        IssueField::ALL[(self.index() + 1) % IssueField::ALL.len()]
+    }
+
+    pub fn prev(self) -> IssueField {
+        IssueField::ALL[(self.index() + IssueField::ALL.len() - 1) % IssueField::ALL.len()]
+    }
+
+    /// The type-ahead vocabulary this field searches, if any.
+    pub fn entity_field(self) -> Option<EntityField> {
+        match self {
+            IssueField::Labels => Some(EntityField::Label),
+            IssueField::Assignee => Some(EntityField::Assignee),
+            IssueField::Title | IssueField::Body => None,
+        }
+    }
+}
+
+/// The reusable type-ahead sub-state behind the create form's Assignee and
+/// Labels fields: opened the instant the first character is typed, fed by
+/// per-keystroke [`WorkspaceInput::EntitySearch`] requests, and seq-guarded
+/// so out-of-order [`Inbound::EntityHits`] replies are dropped (only the
+/// newest emitted `seq` is ever applied).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TypeAhead {
+    /// Which vocabulary the popup searches (decided by the field it serves).
+    pub field: Option<EntityField>,
+    /// The last query emitted (display only).
+    pub query: String,
+    /// The newest hits accepted (kept while the next keystroke's reply is in
+    /// flight, so the popup never flickers empty between keystrokes).
+    pub hits: Vec<EntityHit>,
+    /// Selected row.
+    pub sel: usize,
+    /// The seq of the newest emitted request — replies with an older seq are
+    /// stale and dropped.
+    pub seq: u64,
+    /// True while the newest request is unanswered.
+    pub loading: bool,
+}
+
+impl TypeAhead {
+    /// Whether the popup is on screen (it exists only while a searching
+    /// field owns the keyboard).
+    pub fn open(&self) -> bool {
+        self.field.is_some()
+    }
+
+    pub fn close(&mut self) {
+        *self = TypeAhead::default();
+    }
+}
+
+/// All ISSUES-tab view state. The rows come from [`Inbound::IssuesList`]
+/// snapshots the driver sends; everything else (selection, the modal
+/// sub-modes and their input buffers, the type-ahead) is local — the same
+/// split as [`InstalledPanel`].
+#[derive(Debug, Clone)]
+pub struct IssuesPanel {
+    /// Newest driver snapshot of the issue list.
+    pub rows: Vec<IssueRow>,
+    /// Selected row in the browse list.
+    pub sel: usize,
+    /// True once the first [`Inbound::IssuesList`] arrived.
+    pub loaded: bool,
+    /// A request is in flight driver-side.
+    pub busy: bool,
+    /// A transient one-line status/hint (op outcomes, errors, the
+    /// no-tracker-connected hint).
+    pub notice: Option<String>,
+    pub mode: IssuesMode,
+    /// The tracker-search query buffer (`SearchTracker` mode).
+    pub search_query: String,
+    /// The one-line input shared by the Comment / SetStatus prompts.
+    pub input: String,
+    /// The create form's fields. The body reuses [`Composer`] as a plain
+    /// textarea (paste inserts verbatim — `usize::MAX` chip threshold, the
+    /// same trick as the agent-definition editor).
+    pub form_field: IssueField,
+    pub form_title: String,
+    pub form_body: Composer,
+    pub form_labels: String,
+    pub form_assignee: String,
+    /// The Assignee/Labels type-ahead popup.
+    pub typeahead: TypeAhead,
+    /// Monotonic per-panel request counter — every emitted request carries
+    /// the next value, so replies can be lane-ordered.
+    next_seq: u64,
+    /// Newest seq expected to answer with [`Inbound::IssuesList`].
+    pub list_wait: u64,
+    /// Newest seq expected to answer with [`Inbound::IssueActDone`].
+    pub act_wait: u64,
+}
+
+impl Default for IssuesPanel {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            sel: 0,
+            loaded: false,
+            busy: false,
+            notice: None,
+            mode: IssuesMode::default(),
+            search_query: String::new(),
+            input: String::new(),
+            form_field: IssueField::default(),
+            form_title: String::new(),
+            form_body: Composer::with_paste_threshold(usize::MAX),
+            form_labels: String::new(),
+            form_assignee: String::new(),
+            typeahead: TypeAhead::default(),
+            next_seq: 0,
+            list_wait: 0,
+            act_wait: 0,
+        }
+    }
+}
+
+impl IssuesPanel {
+    /// The browse list's selected row, if any.
+    pub fn selected(&self) -> Option<&IssueRow> {
+        self.rows.get(self.sel)
+    }
+
+    /// The next request seq (monotonic; starts at 1 so the `0` defaults of
+    /// the wait lanes always read as "nothing awaited yet").
+    fn bump_seq(&mut self) -> u64 {
+        self.next_seq += 1;
+        self.next_seq
+    }
+
+    /// Reset the create form to blank fields (and close the type-ahead).
+    fn clear_form(&mut self) {
+        self.form_field = IssueField::Title;
+        self.form_title.clear();
+        self.form_body = Composer::with_paste_threshold(usize::MAX);
+        self.form_labels.clear();
+        self.form_assignee.clear();
+        self.typeahead.close();
+    }
+
+    /// A mutable handle on the active single-line entity field's text
+    /// (`None` for Title/Body — they have no type-ahead).
+    fn entity_text_mut(&mut self) -> Option<(&mut String, EntityField)> {
+        match self.form_field {
+            IssueField::Labels => Some((&mut self.form_labels, EntityField::Label)),
+            IssueField::Assignee => Some((&mut self.form_assignee, EntityField::Assignee)),
+            IssueField::Title | IssueField::Body => None,
+        }
+    }
+}
+
+/// The type-ahead query for a field's current text: the assignee strips one
+/// leading `@` (typing `@mac` searches `mac`; a bare `@` searches the empty
+/// query, which lists all members); the labels field searches the segment
+/// after the last comma, since earlier segments are already-picked labels.
+pub(crate) fn entity_query(field: EntityField, text: &str) -> String {
+    match field {
+        EntityField::Assignee => text.trim().trim_start_matches('@').to_string(),
+        EntityField::Label => text.rsplit(',').next().unwrap_or(text).trim().to_string(),
+    }
+}
+
+/// Write a picked hit's `insert` into a field: the assignee is replaced
+/// outright; the labels field keeps its already-picked comma-separated
+/// segments and swaps the in-progress last segment for the picked label.
+pub(crate) fn apply_entity_insert(text: &mut String, field: EntityField, insert: &str) {
+    match field {
+        EntityField::Assignee => {
+            *text = insert.to_string();
+        }
+        EntityField::Label => {
+            let kept: Vec<&str> = {
+                let mut segments: Vec<&str> = text.split(',').map(str::trim).collect();
+                // The last segment is the partial query being typed — the
+                // picked label replaces it.
+                segments.pop();
+                segments.into_iter().filter(|s| !s.is_empty()).collect()
+            };
+            *text = if kept.is_empty() {
+                insert.to_string()
+            } else {
+                format!("{}, {insert}", kept.join(", "))
+            };
+        }
+    }
+}
+
+/// After any edit to an entity field: open the popup on the first character,
+/// close it when the field empties, and (while text exists) emit the
+/// per-keystroke [`WorkspaceInput::EntitySearch`] — no debounce, seq-guarded.
+/// Returns the input to push onto [`DeckUi::pending_inputs`], if any.
+pub(crate) fn typeahead_after_edit(panel: &mut IssuesPanel) -> Option<WorkspaceInput> {
+    let (text, field) = {
+        let (text, field) = panel.entity_text_mut()?;
+        (text.clone(), field)
+    };
+    if text.is_empty() {
+        // Everything deleted: back to the untouched state (the popup opens
+        // again the instant the next first character lands).
+        panel.typeahead.close();
+        return None;
+    }
+    let seq = panel.bump_seq();
+    let query = entity_query(field, &text);
+    if panel.typeahead.field != Some(field) {
+        // First character in this field: open fresh (stale hits from the
+        // other field must never show under this one).
+        panel.typeahead = TypeAhead::default();
+        panel.typeahead.field = Some(field);
+    }
+    panel.typeahead.query = query.clone();
+    panel.typeahead.seq = seq;
+    panel.typeahead.loading = true;
+    Some(WorkspaceInput::EntitySearch { field, query, seq })
+}
+
 /// All ephemeral view state for the deck.
 #[derive(Debug, Clone)]
 pub struct DeckUi {
@@ -266,6 +525,8 @@ pub struct DeckUi {
     pub installed: InstalledPanel,
     /// The SKILLS tab's view state (installed list, search, overlays).
     pub skills: SkillsPanel,
+    /// The ISSUES tab's view state (list, create form, type-ahead).
+    pub issues: IssuesPanel,
     /// The one global composer — typing works from any tab.
     pub composer: Composer,
     pub splash: SplashState,
@@ -410,6 +671,7 @@ impl Default for DeckUi {
             agents_pane: AgentsPane::default(),
             installed: InstalledPanel::default(),
             skills: SkillsPanel::default(),
+            issues: IssuesPanel::default(),
             composer: Composer::with_paste_threshold(crate::composer::DECK_PASTE_LINE_THRESHOLD),
             splash: SplashState::new(),
             help_open: false,
@@ -498,6 +760,36 @@ impl DeckUi {
                 // Scope / version pickers hold no text — swallow, never leak.
                 InstalledMode::CreateScope | InstalledMode::PickVersion | InstalledMode::Browse => {
                 }
+            }
+            return;
+        }
+
+        // 1b. The ISSUES tab's sub-modes are modal while open: a paste
+        //     belongs to whichever input owns the keyboard. The body is the
+        //     one multi-line surface (verbatim paste, like the agent
+        //     editor); pasting into an entity field re-fires its type-ahead
+        //     search exactly like typing would.
+        if self.tab == DeckTab::Issues && self.issues.mode != IssuesMode::Browse {
+            match self.issues.mode {
+                IssuesMode::SearchTracker => {
+                    push_single_line(&mut self.issues.search_query, text);
+                }
+                IssuesMode::Comment | IssuesMode::SetStatus => {
+                    push_single_line(&mut self.issues.input, text);
+                }
+                IssuesMode::Create => match self.issues.form_field {
+                    IssueField::Title => push_single_line(&mut self.issues.form_title, text),
+                    IssueField::Body => self.issues.form_body.paste(text),
+                    IssueField::Labels | IssueField::Assignee => {
+                        if let Some((field_text, _)) = self.issues.entity_text_mut() {
+                            push_single_line(field_text, text);
+                        }
+                        if let Some(input) = typeahead_after_edit(&mut self.issues) {
+                            self.pending_inputs.push(input);
+                        }
+                    }
+                },
+                IssuesMode::Browse => {}
             }
             return;
         }
@@ -740,6 +1032,55 @@ pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut De
         crate::views::engine::ingest_config(ui, state, status);
         return;
     }
+    // The ISSUES tab's out-of-band replies, each lane seq-guarded: only the
+    // newest emitted request's answer is applied; anything older is stale
+    // and dropped (the per-keystroke type-ahead stream depends on this).
+    if let Inbound::IssuesList { seq, outcome } = inbound {
+        if *seq < ui.issues.list_wait {
+            return;
+        }
+        ui.issues.busy = false;
+        ui.issues.loaded = true;
+        match outcome {
+            Ok(rows) => {
+                ui.issues.rows = rows.clone();
+                ui.issues.sel = ui.issues.sel.min(rows.len().saturating_sub(1));
+                ui.issues.notice = Some(format!("{} issue(s)", rows.len()));
+            }
+            Err(e) => ui.issues.notice = Some(e.clone()),
+        }
+        return;
+    }
+    if let Inbound::IssueActDone { seq, key, outcome } = inbound {
+        if *seq < ui.issues.act_wait {
+            return;
+        }
+        ui.issues.busy = false;
+        ui.issues.notice = Some(match outcome {
+            Ok(message) => message.clone(),
+            Err(e) if key.is_empty() => e.clone(),
+            Err(e) => format!("{key}: {e}"),
+        });
+        return;
+    }
+    if let Inbound::EntityHits {
+        field,
+        seq,
+        query: _,
+        hits,
+    } = inbound
+    {
+        let ta = &mut ui.issues.typeahead;
+        // Popup closed, re-targeted to the other field, or an out-of-order
+        // reply from an older keystroke — all stale, all dropped.
+        if ta.field != Some(*field) || *seq < ta.seq {
+            return;
+        }
+        ta.hits = hits.clone();
+        ta.sel = ta.sel.min(hits.len().saturating_sub(1));
+        ta.loading = false;
+        return;
+    }
     // Launch-cinematic cues: the driver replays the splash held open over a
     // running init (`/init`, session startup) and releases it when init
     // finishes. Out-of-band view state like `ShowHelp`. `--no-anim`
@@ -886,6 +1227,15 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         return handle_installed_modal_key(key, ui);
     }
 
+    // The ISSUES tab's sub-modes (tracker search / create form / comment /
+    // set-status) are modal in exactly the same way while the tab is active:
+    // the create form owns Tab (field cycling), Enter, and the type-ahead
+    // popup's keys, so it must claim them ahead of the deck-global tab
+    // navigation and the composer.
+    if ui.tab == DeckTab::Issues && ui.issues.mode != IssuesMode::Browse {
+        return handle_issues_modal_key(key, ui);
+    }
+
     // Ctrl-R toggles the collapsed-thinking view from anywhere.
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('r')) {
         ui.thinking_expanded = !ui.thinking_expanded;
@@ -998,10 +1348,12 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         match key.code {
             KeyCode::Tab => {
                 ui.set_tab(ui.tab.next());
+                queue_issues_first_load(ui);
                 return DeckAction::Handled;
             }
             KeyCode::BackTab => {
                 ui.set_tab(ui.tab.prev());
+                queue_issues_first_load(ui);
                 return DeckAction::Handled;
             }
             KeyCode::Char('?') if composer_empty => {
@@ -1084,6 +1436,7 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         DeckTab::Graph => handle_graph_key(key, ui, composer_empty),
         DeckTab::Files => handle_files_key(key, model, ui, composer_empty),
         DeckTab::Mcp => handle_mcp_key(key, ui, composer_empty),
+        DeckTab::Issues => handle_issues_browse_key(key, ui, composer_empty),
         DeckTab::Session => handle_session_key(key, model, ui),
         // The SKILLS tab claims its keys earlier (before the composer), so a
         // key that reaches here fell through on purpose — leave it to the
@@ -1650,6 +2003,404 @@ fn handle_pick_version_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
             })
         }
         _ => DeckAction::Handled,
+    }
+}
+
+// ── ISSUES tab ──────────────────────────────────────────────────────────────
+
+/// First visit to the ISSUES tab loads the list without a keypress — the
+/// same first-visit affordance as the INSTALLED AGENTS pane. Rides
+/// [`DeckUi::pending_inputs`] because the tab switch itself already is the
+/// key's returned action.
+fn queue_issues_first_load(ui: &mut DeckUi) {
+    if ui.tab == DeckTab::Issues && !ui.issues.loaded && !ui.issues.busy {
+        let seq = ui.issues.bump_seq();
+        ui.issues.list_wait = seq;
+        ui.issues.busy = true;
+        ui.issues.notice = Some("loading issues…".into());
+        ui.pending_inputs.push(WorkspaceInput::IssuesRefresh {
+            query: None,
+            state: None,
+            seq,
+        });
+    }
+}
+
+/// The ISSUES sub-modes' keys, dispatched by the modal gate in
+/// [`handle_deck_key`]. Every key is consumed — nothing leaks to the
+/// composer or the tab views while a sub-mode is open.
+fn handle_issues_modal_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    match ui.issues.mode {
+        IssuesMode::SearchTracker => handle_issues_search_key(key, ui),
+        IssuesMode::Create => handle_issue_form_key(key, ui),
+        IssuesMode::Comment | IssuesMode::SetStatus => handle_issue_prompt_key(key, ui),
+        // Unreachable — the gate only fires for non-Browse modes.
+        IssuesMode::Browse => DeckAction::Ignored,
+    }
+}
+
+/// The tracker-search query line (`/`): type the query, ⏎ fires the
+/// tracker-side search, Esc returns to browse.
+fn handle_issues_search_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    match key.code {
+        KeyCode::Esc => {
+            ui.issues.mode = IssuesMode::Browse;
+            DeckAction::Handled
+        }
+        KeyCode::Enter => {
+            let query = ui.issues.search_query.trim().to_string();
+            let seq = ui.issues.bump_seq();
+            ui.issues.list_wait = seq;
+            ui.issues.busy = true;
+            ui.issues.mode = IssuesMode::Browse;
+            ui.issues.notice = Some(if query.is_empty() {
+                "refreshing…".to_string()
+            } else {
+                format!("searching “{query}”…")
+            });
+            DeckAction::Send(WorkspaceInput::IssuesRefresh {
+                query: (!query.is_empty()).then_some(query),
+                state: None,
+                seq,
+            })
+        }
+        KeyCode::Backspace => {
+            ui.issues.search_query.pop();
+            DeckAction::Handled
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META) =>
+        {
+            ui.issues.search_query.push(c);
+            DeckAction::Handled
+        }
+        _ => DeckAction::Handled,
+    }
+}
+
+/// The one-line Comment / SetStatus prompts: type, ⏎ dispatches the
+/// [`WorkspaceInput::IssueAct`] for the selected issue, Esc cancels.
+fn handle_issue_prompt_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    match key.code {
+        KeyCode::Esc => {
+            ui.issues.mode = IssuesMode::Browse;
+            ui.issues.input.clear();
+            DeckAction::Handled
+        }
+        KeyCode::Enter => {
+            let text = ui.issues.input.trim().to_string();
+            if text.is_empty() {
+                ui.issues.notice = Some(match ui.issues.mode {
+                    IssuesMode::Comment => "type the comment first".into(),
+                    _ => "type a status word first".into(),
+                });
+                return DeckAction::Handled;
+            }
+            let Some(row) = ui.issues.selected() else {
+                ui.issues.mode = IssuesMode::Browse;
+                return DeckAction::Handled;
+            };
+            let issue_key = row.key.clone();
+            let (action, notice) = match ui.issues.mode {
+                IssuesMode::Comment => (
+                    IssueAction::Comment(text),
+                    format!("commenting on {issue_key}…"),
+                ),
+                _ => (
+                    IssueAction::SetStatus(text.clone()),
+                    format!("setting {issue_key} → {text}…"),
+                ),
+            };
+            let seq = ui.issues.bump_seq();
+            ui.issues.act_wait = seq;
+            ui.issues.busy = true;
+            ui.issues.input.clear();
+            ui.issues.mode = IssuesMode::Browse;
+            ui.issues.notice = Some(notice);
+            DeckAction::Send(WorkspaceInput::IssueAct {
+                key: issue_key,
+                action,
+                seq,
+            })
+        }
+        KeyCode::Backspace => {
+            ui.issues.input.pop();
+            DeckAction::Handled
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META) =>
+        {
+            ui.issues.input.push(c);
+            DeckAction::Handled
+        }
+        _ => DeckAction::Handled,
+    }
+}
+
+/// Validate + submit the create form. Title is required; labels split on
+/// commas; a blank assignee means unassigned. The driver answers with
+/// [`Inbound::IssueActDone`] and then a refreshed [`Inbound::IssuesList`]
+/// under the same seq, so both wait lanes arm here.
+fn submit_issue_form(ui: &mut DeckUi) -> DeckAction {
+    let title = ui.issues.form_title.trim().to_string();
+    if title.is_empty() {
+        ui.issues.notice = Some("the issue needs a title".into());
+        ui.issues.form_field = IssueField::Title;
+        return DeckAction::Handled;
+    }
+    let body = ui.issues.form_body.buffer().to_string();
+    let labels: Vec<String> = ui
+        .issues
+        .form_labels
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let assignee = {
+        let a = ui.issues.form_assignee.trim();
+        (!a.is_empty()).then(|| a.to_string())
+    };
+    let seq = ui.issues.bump_seq();
+    ui.issues.act_wait = seq;
+    ui.issues.list_wait = seq;
+    ui.issues.busy = true;
+    ui.issues.clear_form();
+    ui.issues.mode = IssuesMode::Browse;
+    ui.issues.notice = Some(format!("creating “{title}”…"));
+    DeckAction::Send(WorkspaceInput::IssueCreate {
+        title,
+        body,
+        labels,
+        assignee,
+        seq,
+    })
+}
+
+/// The create form's keys. While the type-ahead popup is open it owns
+/// ↑/↓/Enter/Tab/Esc; every other key keeps editing the active field (and,
+/// on an entity field, re-fires the per-keystroke search).
+fn handle_issue_form_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    if ui.issues.typeahead.open() {
+        match key.code {
+            KeyCode::Esc => {
+                // Close the popup, keep the typed text; a second Esc (popup
+                // now closed) cancels the whole form below.
+                ui.issues.typeahead.close();
+                return DeckAction::Handled;
+            }
+            KeyCode::Up => {
+                ui.issues.typeahead.sel = ui.issues.typeahead.sel.saturating_sub(1);
+                return DeckAction::Handled;
+            }
+            KeyCode::Down => {
+                let n = ui.issues.typeahead.hits.len();
+                if n > 0 {
+                    ui.issues.typeahead.sel = (ui.issues.typeahead.sel + 1).min(n - 1);
+                }
+                return DeckAction::Handled;
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                let picked = ui
+                    .issues
+                    .typeahead
+                    .hits
+                    .get(ui.issues.typeahead.sel)
+                    .cloned();
+                if let Some(hit) = picked
+                    && let Some((text, field)) = ui.issues.entity_text_mut()
+                {
+                    apply_entity_insert(text, field, &hit.insert);
+                }
+                ui.issues.typeahead.close();
+                return DeckAction::Handled;
+            }
+            _ => {}
+        }
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            ui.issues.clear_form();
+            ui.issues.mode = IssuesMode::Browse;
+            ui.issues.notice = Some("create cancelled".into());
+            DeckAction::Handled
+        }
+        // Submit from anywhere in the form — the agent editor's ctrl+s idiom.
+        KeyCode::Char('s') if ctrl => submit_issue_form(ui),
+        KeyCode::Tab => {
+            ui.issues.typeahead.close();
+            ui.issues.form_field = ui.issues.form_field.next();
+            DeckAction::Handled
+        }
+        KeyCode::BackTab => {
+            ui.issues.typeahead.close();
+            ui.issues.form_field = ui.issues.form_field.prev();
+            DeckAction::Handled
+        }
+        // ↑/↓ cycle fields where that is unambiguous — the multi-line body
+        // keeps them for cursor motion (handled by the fallthrough below).
+        KeyCode::Up if ui.issues.form_field != IssueField::Body => {
+            ui.issues.typeahead.close();
+            ui.issues.form_field = ui.issues.form_field.prev();
+            DeckAction::Handled
+        }
+        KeyCode::Down if ui.issues.form_field != IssueField::Body => {
+            ui.issues.typeahead.close();
+            ui.issues.form_field = ui.issues.form_field.next();
+            DeckAction::Handled
+        }
+        KeyCode::Enter => match ui.issues.form_field {
+            IssueField::Title => {
+                ui.issues.form_field = IssueField::Body;
+                DeckAction::Handled
+            }
+            // A textarea's Enter is a line break, never a submit.
+            IssueField::Body => {
+                ui.issues.form_body.insert_newline();
+                DeckAction::Handled
+            }
+            IssueField::Labels => {
+                ui.issues.form_field = IssueField::Assignee;
+                DeckAction::Handled
+            }
+            // The last field: ⏎ with the popup closed submits.
+            IssueField::Assignee => submit_issue_form(ui),
+        },
+        KeyCode::Backspace => {
+            match ui.issues.form_field {
+                IssueField::Title => {
+                    ui.issues.form_title.pop();
+                }
+                IssueField::Body => ui.issues.form_body.backspace(),
+                IssueField::Labels | IssueField::Assignee => {
+                    if let Some((text, _)) = ui.issues.entity_text_mut() {
+                        text.pop();
+                    }
+                    if let Some(input) = typeahead_after_edit(&mut ui.issues) {
+                        ui.pending_inputs.push(input);
+                    }
+                }
+            }
+            DeckAction::Handled
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META) =>
+        {
+            match ui.issues.form_field {
+                IssueField::Title => ui.issues.form_title.push(c),
+                IssueField::Body => ui.issues.form_body.insert_char(c),
+                // THE type-ahead contract: the popup opens the instant the
+                // first character lands (`@` included) and every edit
+                // re-fires the search.
+                IssueField::Labels | IssueField::Assignee => {
+                    if let Some((text, _)) = ui.issues.entity_text_mut() {
+                        text.push(c);
+                    }
+                    if let Some(input) = typeahead_after_edit(&mut ui.issues) {
+                        ui.pending_inputs.push(input);
+                    }
+                }
+            }
+            DeckAction::Handled
+        }
+        _ => {
+            // Cursor motion inside the multi-line body; everything else is
+            // swallowed — the form is modal.
+            if ui.issues.form_field == IssueField::Body {
+                let _ = handle_edit_key(key, &mut ui.issues.form_body);
+            }
+            DeckAction::Handled
+        }
+    }
+}
+
+/// The ISSUES tab's browse keys (non-modal — the composer stays live, so
+/// every letter verb is gated on a blank composer, exactly like the MCP
+/// tab): ↑/↓ select · `r` refresh · `/` tracker search · `n` create ·
+/// `c` comment · `s` set status · `w` start work.
+fn handle_issues_browse_key(
+    key: KeyEvent,
+    ui: &mut DeckUi,
+    composer_empty: bool,
+) -> Option<DeckAction> {
+    let count = ui.issues.rows.len();
+    match key.code {
+        KeyCode::Up => {
+            ui.issues.sel = ui.issues.sel.saturating_sub(1);
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Down => {
+            if count > 0 {
+                ui.issues.sel = (ui.issues.sel + 1).min(count - 1);
+            }
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Char('r') if composer_empty => {
+            let seq = ui.issues.bump_seq();
+            ui.issues.list_wait = seq;
+            ui.issues.busy = true;
+            ui.issues.notice = Some("refreshing…".into());
+            Some(DeckAction::Send(WorkspaceInput::IssuesRefresh {
+                query: None,
+                state: None,
+                seq,
+            }))
+        }
+        KeyCode::Char('/') if composer_empty => {
+            ui.issues.mode = IssuesMode::SearchTracker;
+            ui.issues.search_query.clear();
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Char('n') if composer_empty => {
+            ui.issues.clear_form();
+            ui.issues.mode = IssuesMode::Create;
+            ui.issues.notice = None;
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Char('c') if composer_empty => {
+            if ui.issues.selected().is_some() {
+                ui.issues.input.clear();
+                ui.issues.mode = IssuesMode::Comment;
+            } else {
+                ui.issues.notice = Some("no issue selected — r loads the list".into());
+            }
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Char('s') if composer_empty => {
+            if ui.issues.selected().is_some() {
+                ui.issues.input.clear();
+                ui.issues.mode = IssuesMode::SetStatus;
+            } else {
+                ui.issues.notice = Some("no issue selected — r loads the list".into());
+            }
+            Some(DeckAction::Handled)
+        }
+        KeyCode::Char('w') if composer_empty => {
+            let Some(row) = ui.issues.selected() else {
+                ui.issues.notice = Some("no issue selected — r loads the list".into());
+                return Some(DeckAction::Handled);
+            };
+            let issue_key = row.key.clone();
+            let seq = ui.issues.bump_seq();
+            ui.issues.act_wait = seq;
+            ui.issues.busy = true;
+            ui.issues.notice = Some(format!("starting work on {issue_key}…"));
+            Some(DeckAction::Send(WorkspaceInput::IssueAct {
+                key: issue_key,
+                action: IssueAction::StartWork,
+                seq,
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -5028,6 +5779,418 @@ mod tests {
         // The MCP tab now sits after SKILLS in the cycle, so Tab leaves SKILLS
         // for MCP (still proving SKILLS is not a dead end).
         assert_eq!(ui.tab, DeckTab::Mcp, "Tab cycles Skills → Mcp");
+    }
+
+    // ── ISSUES tab ─────────────────────────────────────────────────────────
+
+    use crate::envelope::{EntityField, EntityHit, IssueAction, IssueRow};
+
+    fn issues_ui() -> DeckUi {
+        let mut ui = ready_ui();
+        ui.set_tab(DeckTab::Issues);
+        ui
+    }
+
+    fn a_issue(key: &str) -> IssueRow {
+        IssueRow {
+            key: key.to_string(),
+            title: format!("title of {key}"),
+            state: "open".into(),
+            labels: vec!["bug".into()],
+            assignee: Some("@octocat".into()),
+            url: format!("https://github.com/o/r/issues/{key}"),
+            updated_at: None,
+        }
+    }
+
+    fn a_hit(kind: &str, label: &str, insert: &str) -> EntityHit {
+        EntityHit {
+            kind: kind.into(),
+            label: label.into(),
+            description: format!("about {label}"),
+            insert: insert.into(),
+        }
+    }
+
+    /// Open the create form and move focus to `field`.
+    fn form_on(ui: &mut DeckUi, model: &WorkspaceModel, field: IssueField) {
+        handle_deck_key(ch('n'), model, ui);
+        assert_eq!(ui.issues.mode, IssuesMode::Create);
+        while ui.issues.form_field != field {
+            handle_deck_key(key(KeyCode::Tab), model, ui);
+        }
+    }
+
+    #[test]
+    fn issues_first_tab_visit_queues_a_refresh() {
+        let model = WorkspaceModel::new();
+        let mut ui = ready_ui();
+        ui.set_tab(DeckTab::Mcp); // ISSUES is Mcp's Tab successor
+        handle_deck_key(key(KeyCode::Tab), &model, &mut ui);
+        assert_eq!(ui.tab, DeckTab::Issues);
+        assert!(ui.issues.busy, "the first visit loads without a keypress");
+        assert!(matches!(
+            ui.pending_inputs.as_slice(),
+            [WorkspaceInput::IssuesRefresh {
+                query: None,
+                state: None,
+                seq: 1,
+            }]
+        ));
+        // A second visit does not re-fetch (busy / loaded gate).
+        handle_deck_key(key(KeyCode::Tab), &model, &mut ui);
+        handle_deck_key(key(KeyCode::BackTab), &model, &mut ui);
+        assert_eq!(ui.pending_inputs.len(), 1, "no duplicate refresh");
+    }
+
+    #[test]
+    fn issues_browse_keys_refresh_and_start_work() {
+        let model = WorkspaceModel::new();
+        let mut ui = issues_ui();
+        ui.issues.rows = vec![a_issue("#7")];
+        ui.issues.loaded = true;
+        let action = handle_deck_key(ch('r'), &model, &mut ui);
+        assert!(matches!(
+            action,
+            DeckAction::Send(WorkspaceInput::IssuesRefresh { query: None, .. })
+        ));
+        let action = handle_deck_key(ch('w'), &model, &mut ui);
+        match action {
+            DeckAction::Send(WorkspaceInput::IssueAct { key, action, .. }) => {
+                assert_eq!(key, "#7");
+                assert_eq!(action, IssueAction::StartWork);
+            }
+            other => panic!("expected IssueAct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issues_tracker_search_fires_on_enter_and_esc_returns() {
+        let model = WorkspaceModel::new();
+        let mut ui = issues_ui();
+        handle_deck_key(ch('/'), &model, &mut ui);
+        assert_eq!(ui.issues.mode, IssuesMode::SearchTracker);
+        for c in "flaky".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        assert!(
+            ui.composer.buffer().is_empty(),
+            "search typing never reaches the composer"
+        );
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        match action {
+            DeckAction::Send(WorkspaceInput::IssuesRefresh { query, .. }) => {
+                assert_eq!(query.as_deref(), Some("flaky"));
+            }
+            other => panic!("expected IssuesRefresh, got {other:?}"),
+        }
+        assert_eq!(ui.issues.mode, IssuesMode::Browse);
+    }
+
+    #[test]
+    fn issues_comment_prompt_sends_the_act_for_the_selected_issue() {
+        let model = WorkspaceModel::new();
+        let mut ui = issues_ui();
+        ui.issues.rows = vec![a_issue("ENG-42")];
+        handle_deck_key(ch('c'), &model, &mut ui);
+        assert_eq!(ui.issues.mode, IssuesMode::Comment);
+        for c in "lgtm".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::IssueAct {
+                key: "ENG-42".into(),
+                action: IssueAction::Comment("lgtm".into()),
+                seq: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn typeahead_opens_on_the_first_char_and_fires_per_keystroke() {
+        let model = WorkspaceModel::new();
+        let mut ui = issues_ui();
+        form_on(&mut ui, &model, IssueField::Assignee);
+        assert!(!ui.issues.typeahead.open(), "closed until the first char");
+
+        // `@` alone opens the popup and searches the EMPTY query (the
+        // backend lists all members for it).
+        handle_deck_key(ch('@'), &model, &mut ui);
+        assert!(ui.issues.typeahead.open(), "first char opens the popup");
+        assert!(matches!(
+            ui.pending_inputs.last(),
+            Some(WorkspaceInput::EntitySearch {
+                field: EntityField::Assignee,
+                query,
+                ..
+            }) if query.is_empty()
+        ));
+
+        // Every subsequent edit re-fires — insert and backspace alike.
+        handle_deck_key(ch('m'), &model, &mut ui);
+        assert!(matches!(
+            ui.pending_inputs.last(),
+            Some(WorkspaceInput::EntitySearch { query, .. }) if query == "m"
+        ));
+        handle_deck_key(key(KeyCode::Backspace), &model, &mut ui);
+        assert!(matches!(
+            ui.pending_inputs.last(),
+            Some(WorkspaceInput::EntitySearch { query, .. }) if query.is_empty()
+        ));
+        assert_eq!(ui.pending_inputs.len(), 3, "one request per keystroke");
+
+        // Deleting the last character closes the popup entirely.
+        handle_deck_key(key(KeyCode::Backspace), &model, &mut ui);
+        assert!(!ui.issues.typeahead.open(), "empty field ⇒ popup closed");
+    }
+
+    #[test]
+    fn typeahead_drops_stale_hits_and_applies_the_newest() {
+        let model = WorkspaceModel::new();
+        let mut ui = issues_ui();
+        form_on(&mut ui, &model, IssueField::Assignee);
+        handle_deck_key(ch('m'), &model, &mut ui); // seq 1
+        handle_deck_key(ch('a'), &model, &mut ui); // seq 2
+        let newest_seq = ui.issues.typeahead.seq;
+        let mut m = WorkspaceModel::new();
+
+        // The keystroke-1 reply lands late: stale, dropped.
+        ingest_inbound(
+            &Inbound::EntityHits {
+                field: EntityField::Assignee,
+                seq: newest_seq - 1,
+                query: "m".into(),
+                hits: vec![a_hit("Person", "stale", "@stale")],
+            },
+            &mut m,
+            &mut ui,
+        );
+        assert!(ui.issues.typeahead.hits.is_empty(), "stale reply dropped");
+
+        // The newest reply applies.
+        ingest_inbound(
+            &Inbound::EntityHits {
+                field: EntityField::Assignee,
+                seq: newest_seq,
+                query: "ma".into(),
+                hits: vec![a_hit("Person", "macanderson", "@macanderson")],
+            },
+            &mut m,
+            &mut ui,
+        );
+        assert_eq!(ui.issues.typeahead.hits.len(), 1);
+        assert!(!ui.issues.typeahead.loading);
+
+        // A reply for the WRONG field never lands either.
+        ingest_inbound(
+            &Inbound::EntityHits {
+                field: EntityField::Label,
+                seq: newest_seq + 5,
+                query: "ma".into(),
+                hits: vec![a_hit("Label", "major", "major")],
+            },
+            &mut m,
+            &mut ui,
+        );
+        assert_eq!(ui.issues.typeahead.hits[0].label, "macanderson");
+    }
+
+    #[test]
+    fn typeahead_enter_replaces_the_assignee_and_esc_keeps_typed_text() {
+        let model = WorkspaceModel::new();
+        let mut ui = issues_ui();
+        form_on(&mut ui, &model, IssueField::Assignee);
+        for c in "mac".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        ui.issues.typeahead.hits = vec![a_hit("Person", "macanderson", "@macanderson")];
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            ui.issues.form_assignee, "@macanderson",
+            "enter REPLACES the assignee field with the hit's insert"
+        );
+        assert!(!ui.issues.typeahead.open(), "picking closes the popup");
+        assert_eq!(ui.issues.mode, IssuesMode::Create, "still in the form");
+
+        // Esc with the popup open closes it but keeps the field text.
+        handle_deck_key(ch('x'), &model, &mut ui);
+        assert!(ui.issues.typeahead.open());
+        handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
+        assert!(!ui.issues.typeahead.open());
+        assert_eq!(ui.issues.form_assignee, "@macandersonx", "text kept");
+        assert_eq!(ui.issues.mode, IssuesMode::Create, "form still open");
+    }
+
+    #[test]
+    fn typeahead_tab_appends_labels_comma_separated() {
+        let model = WorkspaceModel::new();
+        let mut ui = issues_ui();
+        form_on(&mut ui, &model, IssueField::Labels);
+        for c in "bug, urg".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        // The query is the segment being typed, not the whole field.
+        assert!(matches!(
+            ui.pending_inputs.last(),
+            Some(WorkspaceInput::EntitySearch {
+                field: EntityField::Label,
+                query,
+                ..
+            }) if query == "urg"
+        ));
+        ui.issues.typeahead.hits = vec![a_hit("Label", "urgent", "urgent")];
+        handle_deck_key(key(KeyCode::Tab), &model, &mut ui);
+        assert_eq!(
+            ui.issues.form_labels, "bug, urgent",
+            "the picked label replaces the partial segment, comma-appended"
+        );
+    }
+
+    #[test]
+    fn entity_query_and_insert_helpers_cover_both_fields() {
+        assert_eq!(entity_query(EntityField::Assignee, "@mac"), "mac");
+        assert_eq!(entity_query(EntityField::Assignee, "@"), "");
+        assert_eq!(entity_query(EntityField::Label, "bug, ur"), "ur");
+        assert_eq!(entity_query(EntityField::Label, "bug"), "bug");
+
+        let mut assignee = "mac".to_string();
+        apply_entity_insert(&mut assignee, EntityField::Assignee, "@macanderson");
+        assert_eq!(assignee, "@macanderson");
+
+        let mut labels = "ur".to_string();
+        apply_entity_insert(&mut labels, EntityField::Label, "urgent");
+        assert_eq!(labels, "urgent", "a lone partial segment is replaced");
+        labels.push_str(", b");
+        apply_entity_insert(&mut labels, EntityField::Label, "bug");
+        assert_eq!(labels, "urgent, bug");
+    }
+
+    #[test]
+    fn issue_form_ctrl_s_submits_the_parsed_fields() {
+        let model = WorkspaceModel::new();
+        let mut ui = issues_ui();
+        form_on(&mut ui, &model, IssueField::Title);
+        for c in "Fix the flake".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui); // → Body
+        assert_eq!(ui.issues.form_field, IssueField::Body);
+        for c in "line one".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui); // newline in body
+        for c in "line two".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        handle_deck_key(key(KeyCode::Tab), &model, &mut ui); // → Labels
+        for c in "bug".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        // Close the popup the typing opened, then Tab to Assignee.
+        handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
+        handle_deck_key(key(KeyCode::Tab), &model, &mut ui);
+        assert_eq!(ui.issues.form_field, IssueField::Assignee);
+
+        let action = handle_deck_key(ctrl('s'), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::IssueCreate {
+                title: "Fix the flake".into(),
+                body: "line one\nline two".into(),
+                labels: vec!["bug".into()],
+                assignee: None,
+                seq: 4, // the three label keystrokes consumed seqs 1–3
+            }),
+        );
+        assert_eq!(ui.issues.mode, IssuesMode::Browse);
+        assert!(ui.issues.busy);
+    }
+
+    #[test]
+    fn issues_list_ingest_folds_rows_clears_busy_and_drops_stale() {
+        let mut model = WorkspaceModel::new();
+        let mut ui = issues_ui();
+        ui.issues.busy = true;
+        ui.issues.list_wait = 3;
+        ui.issues.sel = 9;
+
+        // A stale reply (an older request) is ignored outright.
+        ingest_inbound(
+            &Inbound::IssuesList {
+                seq: 2,
+                outcome: Ok(vec![a_issue("#1")]),
+            },
+            &mut model,
+            &mut ui,
+        );
+        assert!(ui.issues.rows.is_empty(), "stale list dropped");
+        assert!(ui.issues.busy, "…and the newer request is still awaited");
+
+        // The awaited reply folds in: rows, clamped selection, notice.
+        ingest_inbound(
+            &Inbound::IssuesList {
+                seq: 3,
+                outcome: Ok(vec![a_issue("#1"), a_issue("#2")]),
+            },
+            &mut model,
+            &mut ui,
+        );
+        assert_eq!(ui.issues.rows.len(), 2);
+        assert_eq!(ui.issues.sel, 1, "selection clamped to the new list");
+        assert!(!ui.issues.busy);
+        assert!(ui.issues.loaded);
+        assert_eq!(
+            model.agents.len(),
+            0,
+            "the model fold ignores the out-of-band list"
+        );
+
+        // An error outcome lands in the notice line (the no-tracker hint).
+        ui.issues.list_wait = 4;
+        ingest_inbound(
+            &Inbound::IssuesList {
+                seq: 4,
+                outcome: Err("no tracker connected — run `stella connect github`".into()),
+            },
+            &mut model,
+            &mut ui,
+        );
+        assert!(
+            ui.issues
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("no tracker connected")),
+            "{:?}",
+            ui.issues.notice
+        );
+    }
+
+    #[test]
+    fn issue_act_done_ingest_reports_the_outcome() {
+        let mut model = WorkspaceModel::new();
+        let mut ui = issues_ui();
+        ui.issues.act_wait = 2;
+        ui.issues.busy = true;
+        ingest_inbound(
+            &Inbound::IssueActDone {
+                seq: 2,
+                key: "#7".into(),
+                outcome: Ok("created #7 — https://github.com/o/r/issues/7".into()),
+            },
+            &mut model,
+            &mut ui,
+        );
+        assert!(!ui.issues.busy);
+        assert!(
+            ui.issues
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("created #7")),
+            "{:?}",
+            ui.issues.notice
+        );
     }
 
     // ── Help overlay ───────────────────────────────────────────────────────
