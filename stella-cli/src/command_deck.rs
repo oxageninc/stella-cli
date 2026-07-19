@@ -113,6 +113,16 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// An ephemeral transcript notice for DIRECT deck sends (`deck_tx`), never
+/// the journaled `in_tx` path: boot narration, hints, and guidance that must
+/// not replay (and pile up) every time the session is resumed.
+fn chrome_note(text: String) -> Inbound {
+    Inbound::Event {
+        agent: LEAD.to_string(),
+        event: AgentEvent::Text { delta: text },
+    }
+}
+
 /// `OXAGEN_DEBUG=1` → the structured deck log path (L-T8), mirroring the
 /// location `stella_tui::shell::RunOptions` documents. `None` otherwise, and
 /// on any failure to create the directory — a lost debug log never gates the
@@ -215,7 +225,7 @@ impl HoldState {
 /// (`Inbound::PromptRequeued` is the exact inverse of `PromptStarted`'s
 /// front-pop), so the two queues never drift.
 fn requeue_front(
-    queue: &mut VecDeque<String>,
+    queue: &mut crate::session_persist::DurableQueue,
     in_tx: &UnboundedSender<Inbound>,
     texts: Vec<String>,
 ) {
@@ -235,6 +245,7 @@ pub async fn run_deck_session(
     cfg: &Config,
     budget_limit: Option<f64>,
     no_anim: bool,
+    resume: Option<crate::session_persist::ResumeRequest>,
 ) -> Result<(), String> {
     // ── Session assembly (still on the normal screen — prints are fine) ────
     // MCP connect is NOT here: it can block up to 10s per server, so it runs
@@ -263,13 +274,106 @@ pub async fn run_deck_session(
     // session — the SKILLS tab's ops route through it (see `handle_skills_input`).
     let skill_registry = SkillRegistry::from_env(cfg.workspace_root.clone());
 
+    // ── Durable session identity (still on the normal screen) ──────────────
+    // This session announces itself in the machine-wide registry, and every
+    // fold-relevant envelope it produces is journaled to the record's sidecar
+    // (`session_persist`) — quit / crash / power cut, the session reopens
+    // where it stood. A resume request resolves HERE so its errors print on
+    // the normal screen instead of dying behind the alternate one.
+    let session_registry = stella_store::SessionRegistry::open_default();
+    let _ = session_registry.prune(SESSION_RECORD_MAX_AGE_MS);
+    let _ = stella_store::NotificationStore::open_default().prune(NOTIFICATION_MAX_AGE_MS);
+    let workspace_path = cfg.workspace_root.display().to_string();
+    let workspace_name = cfg
+        .workspace_root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| workspace_path.clone());
+    let mut resume_state = match &resume {
+        Some(request) => {
+            let target = crate::session_persist::resolve_resume_target(
+                &session_registry,
+                &workspace_path,
+                request,
+            )?;
+            Some(crate::session_persist::load_resume(
+                &session_registry,
+                &target.id,
+                &workspace_path,
+            )?)
+        }
+        None => None,
+    };
+    let mut session_record = match &mut resume_state {
+        // Re-own the stored record: same id (the registry never forks a
+        // resumed session's identity), this process's pid, back to waiting.
+        Some(rs) => crate::session_persist::adopt_record(
+            rs.record.clone(),
+            stella_store::SessionStatus::NeedsInput,
+        ),
+        None => stella_store::SessionRecord::new(workspace_path.clone(), workspace_name.clone()),
+    };
+    let _ = session_registry.upsert(&session_record);
+    // What the record's terminal status will be at exit (last turn wins);
+    // quitting with a pending backlog overrides to Paused below — the work
+    // is durable now, so an exit with prompts waiting is a pause, not loss.
+    let mut session_exit = stella_store::SessionStatus::Complete;
+    let mut sidecar_dir = session_registry.sidecar_dir(&session_record.id);
+    if let Some(rs) = &mut resume_state {
+        messages = crate::session_persist::restore_messages(
+            std::mem::take(&mut rs.history).unwrap_or_default(),
+            &system_prompt,
+        );
+        // Session spend stays monotone across interruptions, and a
+        // `--budget` keeps meaning "this session" — the guard resumes from
+        // what the session had already spent.
+        if let Some(spent) = rs.spent_usd {
+            let _ = budget.record_spend(spent);
+        }
+    }
+
     // ── Channels: engine → deck (Inbound) and deck → driver (WorkspaceInput)
-    let (in_tx, in_rx) = mpsc::unbounded_channel::<Inbound>();
+    // The driver's send side (`in_tx`) reaches the deck through the journal
+    // tee — the single choke point that makes the session durable. Direct
+    // `deck_tx` sends bypass the journal: replay (which must never
+    // re-journal itself) and ephemeral session chrome (boot narration,
+    // hints) that would otherwise pile up in the transcript on every resume.
+    let (in_tx, raw_rx) = mpsc::unbounded_channel::<Inbound>();
+    let (deck_tx, deck_rx) = mpsc::unbounded_channel::<Inbound>();
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<WorkspaceInput>();
     let (ask_tx, ask_rx) = mpsc::unbounded_channel::<String>();
     // The supervisor channel: `task_assign` spawn requests (tap → driver)
     // and sub-session endings (worker → driver). See `crate::subsession`.
     let (sup_tx, mut sup_rx) = mpsc::unbounded_channel::<SupervisorMsg>();
+    let journal_sink = crate::session_persist::SessionSink::shared(
+        match stella_store::journal::SessionJournal::open(&sidecar_dir) {
+            Ok(j) => Some(j),
+            Err(e) => {
+                let _ = deck_tx.send(chrome_note(format!(
+                    "session journaling unavailable — this session will not be resumable ({e})"
+                )));
+                None
+            }
+        },
+    );
+    let _tee = crate::session_persist::spawn_journal_tee(
+        raw_rx,
+        deck_tx.clone(),
+        journal_sink.clone(),
+        LEAD,
+    );
+    // Replay a resumed session's journal straight onto the deck BEFORE the
+    // first live send, so the restored transcript precedes everything this
+    // run adds. (The fresh `Register` below then restamps the lead's meta —
+    // pid, model, clock — over the replayed one.)
+    if let Some(rs) = &mut resume_state {
+        crate::session_persist::replay_session(
+            std::mem::take(&mut rs.records),
+            now_ms(),
+            LEAD,
+            &deck_tx,
+        );
+    }
 
     let title = cfg
         .workspace_root
@@ -284,12 +388,10 @@ pub async fn run_deck_session(
     let _ = in_tx.send(Inbound::Register(lead_meta));
     // Custom definitions that failed to load are reported into the
     // transcript up front — stdout belongs to the alternate screen, and a
-    // silently-missing /command is otherwise undiagnosable.
+    // silently-missing /command is otherwise undiagnosable. Session chrome:
+    // re-checked every boot, so it never journals.
     if let Some(report) = custom.problems_report() {
-        let _ = in_tx.send(Inbound::Event {
-            agent: LEAD.to_string(),
-            event: AgentEvent::Text { delta: report },
-        });
+        let _ = deck_tx.send(chrome_note(report));
     }
     // An idle lead is waiting on the human, not queued behind a supervisor
     // (sent after the problems report — a Text event folds to `Running`).
@@ -297,6 +399,50 @@ pub async fn run_deck_session(
         agent: LEAD.to_string(),
         status: AgentStatus::WaitingInput,
     });
+
+    // ── The durable prompt backlog ──────────────────────────────────────────
+    // Every mutation writes through to the sidecar, so a queued prompt
+    // survives any interruption from the moment it is queued. On resume the
+    // restored backlog (and the prompt an interruption cut short, back at
+    // the FRONT) is mirrored into the deck's queue view, and dispatch parks
+    // until the user's next submission — resuming shows where things stood
+    // and costs nothing until the user says go.
+    let mut queue = crate::session_persist::DurableQueue::fresh(sidecar_dir.clone());
+    let mut resume_hold = false;
+    if let Some(rs) = &mut resume_state {
+        // Interrupted prompts (any lane's unsettled dispatch) go back at the
+        // FRONT, ahead of the stored backlog, in their original order.
+        let mut restored = std::mem::take(&mut rs.interrupted);
+        restored.extend(std::mem::take(&mut rs.queue));
+        if !restored.is_empty() {
+            resume_hold = true;
+            // Front-inserts mirror back-to-front so the view reads in order.
+            for text in restored.iter().rev() {
+                let _ = in_tx.send(Inbound::PromptRequeued {
+                    agent: LEAD.to_string(),
+                    text: text.clone(),
+                });
+            }
+            let _ = deck_tx.send(chrome_note(format!(
+                "session restored — {} prompt(s) waiting, dispatch held. Submit anything to \
+                 run it first (then the backlog), or ctrl+t to edit the queue.",
+                restored.len()
+            )));
+            queue.adopt(sidecar_dir.clone(), restored);
+        } else {
+            let _ = deck_tx.send(chrome_note(
+                "session restored — the conversation continues where it left off.".to_string(),
+            ));
+        }
+    } else if session_registry.latest_resumable(&workspace_path).is_some() {
+        // A fresh session in a workspace that has something to go back to:
+        // one pointer, so "navigate back in" is discoverable.
+        let _ = deck_tx.send(chrome_note(
+            "◂ a previous session is resumable — ← (on an empty prompt) opens SESSIONS, ⏎ \
+             reopens one; or run `stella resume`."
+                .to_string(),
+        ));
+    }
     // Seed the SKILLS tab so it has data the instant it is opened (both scopes),
     // without waiting on a `/skills` round-trip.
     let _ = in_tx.send(skills_snapshot(&cfg.workspace_root, None));
@@ -311,21 +457,25 @@ pub async fn run_deck_session(
         answers: Arc::new(tokio::sync::Mutex::new(ask_rx)),
     };
 
+    // The deck drives turns through the staged pipeline by default (triage →
+    // recall → plan → scope → witness → execute → verify → judge); `/pipeline`
+    // toggles back to the raw `Engine::run_turn` loop (`run_lead_turn`). A
+    // resumed session keeps whatever it last had.
+    let pipeline_init = resume_state
+        .as_ref()
+        .and_then(|rs| rs.pipeline)
+        .unwrap_or(true);
     let opts = DeckOptions {
         debug_log_path: debug_log_path(),
         slash_commands: deck_slash_commands(&custom),
         initial_graph: agent::graph_snapshot(&cfg.workspace_root),
         no_anim,
-        // The deck drives turns through the staged pipeline by default (triage
-        // → recall → plan → scope → witness → execute → verify → judge), so
-        // PIPELINE reads ON here. `/pipeline` toggles back to the raw
-        // `Engine::run_turn` loop (`run_lead_turn`).
-        pipeline: true,
+        pipeline: pipeline_init,
         ..Default::default()
     };
     // The deck owns its channel ends and runs on its own task so rendering
     // never waits on the driver (and vice versa).
-    let deck = tokio::spawn(run_deck(opts, in_rx, sub_tx));
+    let deck = tokio::spawn(run_deck(opts, deck_rx, sub_tx));
 
     // The launch cinematic: hold the splash's battle loop open over session
     // init and release it once BOTH async legs — the background code-graph
@@ -352,17 +502,17 @@ pub async fn run_deck_session(
     // `◈ indexing…`/`✓ …` lines render as transcript events; non-blocking, and
     // the watcher stops when `_session_graph` drops at session end. `_graph_build`
     // (the setup task's JoinHandle) is detached — freshness outlives it.
-    let status_tx = in_tx.clone();
-    let ready_tx = in_tx.clone();
+    // Indexing narration is session chrome (direct `deck_tx`): it re-runs at
+    // every boot, so journaling it would replay stale "indexing…" lines on
+    // top of every resumed transcript.
+    let status_tx = deck_tx.clone();
+    let ready_tx = deck_tx.clone();
     let ready_root = cfg.workspace_root.clone();
     let (_session_graph, _graph_build) = agent::spawn_session_graph(
         &cfg.workspace_root,
         registry.clone(),
         Box::new(move |line| {
-            let _ = status_tx.send(Inbound::Event {
-                agent: LEAD.to_string(),
-                event: AgentEvent::Text { delta: line },
-            });
+            let _ = status_tx.send(chrome_note(line));
         }),
         Box::new(move || {
             // Populate the Graph tab now the index exists (it opened on the
@@ -405,41 +555,26 @@ pub async fn run_deck_session(
         mcp_disabled.clone(),
         mcp_slot.clone(),
         in_tx.clone(),
+        deck_tx.clone(),
         release_splash.clone(),
     );
     // Whether the "still connecting" note has been narrated (once, on the
     // first turn that dispatches before the slot fills).
     let mut mcp_pending_noted = false;
 
-    // ── Cross-process session registry + persist-until-read notifications ──
-    // This session announces itself machine-wide (every deck's SESSIONS
-    // overlay reads the same registry), and a poller keeps the inbox badge
-    // live as other sessions produce notifications. Registry hygiene runs
-    // opportunistically at startup; both stores are best-effort — a failed
-    // write never disturbs the session.
-    let session_registry = stella_store::SessionRegistry::open_default();
-    let _ = session_registry.prune(SESSION_RECORD_MAX_AGE_MS);
-    let _ = stella_store::NotificationStore::open_default().prune(NOTIFICATION_MAX_AGE_MS);
-    let workspace_name = cfg
-        .workspace_root
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| cfg.workspace_root.display().to_string());
-    let mut session_record = stella_store::SessionRecord::new(
-        cfg.workspace_root.display().to_string(),
-        workspace_name.clone(),
-    );
-    let _ = session_registry.upsert(&session_record);
-    // What the record's terminal status will be at exit (last turn wins);
-    // quitting with an abandoned backlog overrides to Cancelled below.
-    let mut session_exit = stella_store::SessionStatus::Complete;
-    // Claim-on-first-write identity for the lead's turns, and crash hygiene
-    // for the whole workspace: sweep claims old enough that their process is
-    // surely gone (a crashed writer cannot release its own).
-    let lead_holder = format!("{}/lead", session_record.id);
+    // The registry record and hygiene ran during assembly (the durable
+    // session identity block). Claim-on-first-write identity for the lead's
+    // turns, and crash hygiene for the whole workspace: sweep claims old
+    // enough that their process is surely gone (a crashed writer cannot
+    // release its own). The holder is remade whenever the deck navigates to
+    // another session (`SessionResume` below) — claims must name the session
+    // actually doing the writing.
+    let mut lead_holder = format!("{}/lead", session_record.id);
     if let Some(store) = &store {
         let _ = store.prune_stale_file_locks(crate::claims::STALE_CLAIM_MAX_AGE_SECS);
     }
+    // The inbox poller keeps the badge live as other sessions produce
+    // persist-until-read notifications.
     spawn_notification_poller(in_tx.clone());
 
     // The ISSUES tab's lazily-detected tracker backend (see
@@ -447,15 +582,20 @@ pub async fn run_deck_session(
     let issue_backend_cache: IssueBackendCache = Arc::new(tokio::sync::Mutex::new(None));
 
     // ── The driver loop ─────────────────────────────────────────────────────
-    let mut queue: VecDeque<String> = VecDeque::new();
+    // (`queue` — the durable backlog — was constructed with the session
+    // identity above, restored contents and all.)
     // Double-Esc bookkeeping: parks dispatch and retains what the pair's
-    // first press cancelled (see [`HoldState`]).
+    // first press cancelled (see [`HoldState`]). A resumed backlog starts
+    // parked — reopening a session shows where it stood; the user's next
+    // submission is what sets it moving (and runs first).
     let mut dispatch = HoldState::new();
+    dispatch.held = resume_hold;
     // `/pipeline`: route lead turns through the staged pipeline (triage →
     // witness → execute → verify → judge) instead of the raw engine loop.
-    // Session-local, ON at start (the deck loads with the pipeline active) —
-    // mirrored to the PIPELINE stat box via `Inbound::Pipeline`.
-    let mut pipeline_on = true;
+    // Session-local, ON at start (the deck loads with the pipeline active)
+    // unless a resumed session had toggled it — mirrored to the PIPELINE
+    // stat box via `Inbound::Pipeline`.
+    let mut pipeline_on = pipeline_init;
     // An agent-creation request that arrived mid-turn: drafting needs the
     // provider (borrowed by the running turn), so it parks here and runs
     // right after the turn settles.
@@ -473,9 +613,14 @@ pub async fn run_deck_session(
     // failing-CI inbox notifications. The nudge skips the wait after turns
     // and worker endings — the moments a PR most plausibly just changed.
     let pr_nudge = Arc::new(tokio::sync::Notify::new());
+    // The monitor attributes PR rows and CI notifications to a session id;
+    // shared + mutable because an in-deck `SessionResume` re-keys it to the
+    // adopted session (the monitor follows the deck, not the process's
+    // first session).
+    let pr_session_id = Arc::new(std::sync::Mutex::new(session_record.id.clone()));
     spawn_pr_monitor(
         cfg.workspace_root.clone(),
-        session_record.id.clone(),
+        pr_session_id.clone(),
         store.clone(),
         workspace_name.clone(),
         pr_nudge.clone(),
@@ -613,6 +758,157 @@ pub async fn run_deck_session(
                         handle_agent_create(&description, scope, cfg, &*provider, &in_tx).await;
                         continue 'session;
                     }
+                    // ⏎ on a resumable row in the SESSIONS overlay: navigate into
+                    // that session. Only serviced HERE, between turns and with no
+                    // live workers — running work is never torn down by a
+                    // navigation (the mid-turn arm answers with guidance
+                    // instead, and live sub-sessions stream into THIS session's
+                    // lanes and settle against its records). The current
+                    // session's durable state is already on disk, so switching
+                    // away loses nothing.
+                    Some(WorkspaceInput::SessionResume { id }) => {
+                        let loaded = if id == session_record.id {
+                            Err("that is this session — you are already in it".to_string())
+                        } else if subs.live() > 0 {
+                            Err(format!(
+                                "{} worker(s) are still running — stop them (s on the lane) \
+                                 or wait for them to finish, then press ⏎ on the session \
+                                 again",
+                                subs.live()
+                            ))
+                        } else {
+                            crate::session_persist::load_resume(
+                                &session_registry,
+                                &id,
+                                &workspace_path,
+                            )
+                        };
+                        match loaded {
+                            Err(reason) => {
+                                let _ = deck_tx
+                                    .send(chrome_note(format!("cannot resume `{id}`: {reason}")));
+                            }
+                            Ok(mut rs) => {
+                                // Park the CURRENT session: sync the journal,
+                                // snapshot the conversation, and either mark it
+                                // Paused — or, if nothing ever happened in it,
+                                // remove the empty shell instead of littering
+                                // the registry with it.
+                                journal_sink
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .sync();
+                                let _ = crate::session_persist::snapshot_history(
+                                    &sidecar_dir,
+                                    &messages,
+                                );
+                                if session_record.summary.is_empty() && queue.is_empty() {
+                                    let _ = session_registry.remove(&session_record.id);
+                                } else {
+                                    session_record.status = stella_store::SessionStatus::Paused;
+                                    let _ = session_registry.upsert(&session_record);
+                                }
+
+                                // Adopt the target: same id, this pid, waiting.
+                                // Re-key everything that names the session —
+                                // the lead's claim holder and the PR monitor's
+                                // store/notification attribution follow the
+                                // deck, not the process's first session.
+                                session_record = crate::session_persist::adopt_record(
+                                    rs.record.clone(),
+                                    stella_store::SessionStatus::NeedsInput,
+                                );
+                                let _ = session_registry.upsert(&session_record);
+                                sidecar_dir = session_registry.sidecar_dir(&session_record.id);
+                                lead_holder = format!("{}/lead", session_record.id);
+                                *pr_session_id.lock().unwrap_or_else(|p| p.into_inner()) =
+                                    session_record.id.clone();
+                                {
+                                    let mut sink =
+                                        journal_sink.lock().unwrap_or_else(|p| p.into_inner());
+                                    match stella_store::journal::SessionJournal::open(&sidecar_dir)
+                                    {
+                                        Ok(j) => sink.swap(Some(j)),
+                                        Err(e) => {
+                                            sink.swap(None);
+                                            let _ = deck_tx.send(chrome_note(format!(
+                                                "session journaling unavailable — this session \
+                                                 will no longer be resumable ({e})"
+                                            )));
+                                        }
+                                    }
+                                }
+
+                                // Blank the lead pane, replay the adopted
+                                // transcript in its place (direct sends — a
+                                // replay must never re-journal itself), then
+                                // restore conversation, backlog, and pipeline.
+                                // (Terminal worker rows from the session left
+                                // behind keep their lanes on the dashboard —
+                                // there is no unregister envelope — as visible
+                                // residue of where the process has been.)
+                                let _ = deck_tx.send(Inbound::SessionReset {
+                                    agent: LEAD.to_string(),
+                                });
+                                crate::session_persist::replay_session(
+                                    std::mem::take(&mut rs.records),
+                                    now_ms(),
+                                    LEAD,
+                                    &deck_tx,
+                                );
+                                messages = crate::session_persist::restore_messages(
+                                    rs.history.take().unwrap_or_default(),
+                                    &system_prompt,
+                                );
+                                // Interrupted prompts (any lane's unsettled
+                                // dispatch) go back at the FRONT, ahead of the
+                                // stored backlog, in their original order.
+                                let mut restored = std::mem::take(&mut rs.interrupted);
+                                restored.extend(std::mem::take(&mut rs.queue));
+                                dispatch = HoldState::new();
+                                dispatch.held = !restored.is_empty();
+                                for text in restored.iter().rev() {
+                                    let _ = in_tx.send(Inbound::PromptRequeued {
+                                        agent: LEAD.to_string(),
+                                        text: text.clone(),
+                                    });
+                                }
+                                queue.adopt(sidecar_dir.clone(), restored);
+                                pipeline_on = rs.pipeline.unwrap_or(true);
+                                let _ = in_tx.send(Inbound::Pipeline(pipeline_on));
+
+                                // Fresh meta over the replayed one (pid, model,
+                                // clock), back to waiting-on-you, and a fresh
+                                // overlay snapshot reflecting the handover.
+                                let mut meta =
+                                    AgentMeta::new(LEAD, workspace_name.clone(), now_ms())
+                                        .with_role("lead")
+                                        .with_pid(std::process::id());
+                                meta.model = Some(format!("{}/{}", cfg.provider.id, cfg.model_id));
+                                let _ = in_tx.send(Inbound::Register(meta));
+                                let _ = in_tx.send(Inbound::Status {
+                                    agent: LEAD.to_string(),
+                                    status: AgentStatus::WaitingInput,
+                                });
+                                let _ = deck_tx.send(chrome_note(match queue.len() {
+                                    0 => "session restored — the conversation continues where \
+                                          it left off."
+                                        .to_string(),
+                                    n => format!(
+                                        "session restored — {n} prompt(s) waiting, dispatch \
+                                         held. Submit anything to run it first, or ctrl+t to \
+                                         edit the queue."
+                                    ),
+                                }));
+                                let _ = in_tx.send(sessions_inbound(
+                                    &session_registry,
+                                    &session_record.id,
+                                    &workspace_path,
+                                ));
+                            }
+                        }
+                        continue 'session;
+                    }
                     // Fallthrough for everything else, serviced between turns
                     // (install/search hit the network, so they must not stall a
                     // live turn): MCP tab actions first, then the session-registry
@@ -627,6 +923,7 @@ pub async fn run_deck_session(
                                 &other,
                                 &session_registry,
                                 &session_record.id,
+                                &workspace_path,
                                 &in_tx,
                             )
                             && !handle_agents_input(&other, cfg, &in_tx)
@@ -668,10 +965,15 @@ pub async fn run_deck_session(
             // A handled command emits its answer as `Text`, which flips the
             // lead to `Running` in the deck's fold — but no turn is in flight.
             // Return it to `WaitingInput` so the dashboard reflects reality.
+            // (That status is also the journal's settle marker for this
+            // prompt — a resume must not re-run `/clear`.)
             let _ = in_tx.send(Inbound::Status {
                 agent: LEAD.to_string(),
                 status: AgentStatus::WaitingInput,
             });
+            // `/clear` (and friends) may have rewritten the conversation —
+            // keep the boundary snapshot current before the next dispatch.
+            let _ = crate::session_persist::snapshot_history(&sidecar_dir, &messages);
         }
         let prompt = match command {
             DeckCommand::Prompt => prompt,
@@ -1015,8 +1317,19 @@ pub async fn run_deck_session(
                                 &input,
                                 &session_registry,
                                 &session_record.id,
+                                &workspace_path,
                                 &in_tx,
                             );
+                        }
+                        // Navigation waits for the road to clear: switching
+                        // sessions mid-turn would tear down live work, so the
+                        // deck is told how to proceed instead.
+                        Some(WorkspaceInput::SessionResume { .. }) => {
+                            let _ = deck_tx.send(chrome_note(
+                                "a turn is running — esc stops it (esc esc holds the queue \
+                                 too), then press ⏎ on the session again."
+                                    .to_string(),
+                            ));
                         }
                         // The ENGINE overlay stays live while a turn runs —
                         // settings reads/writes are cheap local filesystem
@@ -1197,7 +1510,31 @@ pub async fn run_deck_session(
                 session_record.status = stella_store::SessionStatus::NeedsInput;
                 let _ = session_registry.upsert(&session_record);
             }
-            TurnEnd::Quit => break 'session,
+            // Quit landing mid-turn: erase the partial turn from the
+            // conversation before the boundary snapshot below — a dangling
+            // assistant tool call with no result is a broken history, and
+            // the journal's unsettled `PromptStarted` puts this prompt back
+            // at the front of the queue on resume anyway.
+            TurnEnd::Quit => {
+                messages.truncate(turn_base);
+                break 'session;
+            }
+        }
+
+        // Durable turn boundary: the conversation as committed (post-turn or
+        // post-cancel-truncation) — what a resume continues from. The queue
+        // is write-through already; its one-time failure warning surfaces
+        // here, on the same cadence as every other persistence warning.
+        if let Some(warning) = crate::session_persist::snapshot_history(&sidecar_dir, &messages)
+            .or_else(|| queue.take_warning())
+        {
+            let _ = in_tx.send(Inbound::Event {
+                agent: LEAD.to_string(),
+                event: AgentEvent::Error {
+                    message: warning,
+                    retryable: true,
+                },
+            });
         }
 
         // A creation request parked during the turn: the provider is free
@@ -1207,18 +1544,29 @@ pub async fn run_deck_session(
         }
     }
 
-    // The session is over — leave the registry record in its terminal state.
-    // (A crash never reaches here; readers downgrade a dead pid to Error.)
-    // Quitting with prompts still queued means the work was abandoned.
+    // The session is over — leave the registry record in its terminal state
+    // and the durable state current. (A crash never reaches here; readers
+    // downgrade a dead pid to Error — and the journal makes even that
+    // resumable.) Quitting with prompts still queued is a PAUSE now, not an
+    // abandonment: the backlog is durable and reopens intact. The journal
+    // syncs HERE, not just in the tee's own teardown — background senders
+    // (the inbox poller) keep the tee alive past this point, and runtime
+    // teardown must never be what a buffered tail was waiting on.
+    journal_sink
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .sync();
+    let _ = crate::session_persist::snapshot_history(&sidecar_dir, &messages);
     session_record.status = if queue.is_empty() {
         session_exit
     } else {
-        stella_store::SessionStatus::Cancelled
+        stella_store::SessionStatus::Paused
     };
     let _ = session_registry.upsert(&session_record);
 
     // Closing our inbound sender ends the deck's stream if the user hasn't
-    // already quit; then wait for it to restore the terminal.
+    // already quit (the journal tee drains, fsyncs, and forwards the close);
+    // then wait for it to restore the terminal.
     drop(in_tx);
     let deck_result = deck.await;
     if let Some(set) = mcp_slot.get() {
@@ -1236,12 +1584,18 @@ pub async fn run_deck_session(
 /// configured at all (`false` = the slot will stay empty forever, so no
 /// "still connecting" note is ever warranted). Always seeds the MCP tab and
 /// releases the splash leg, whatever the plan resolves to.
+///
+/// Connect narration is session chrome (`chrome_tx`, the direct deck path):
+/// it re-runs at every boot, so journaling it would pile stale "connecting…"
+/// lines onto every resumed transcript. The status flips ride the journaled
+/// `in_tx` — `waiting_input` is also the journal's settle marker.
 fn spawn_mcp_connect(
     cfg: Config,
     registry: Arc<ToolRegistry>,
     disabled: stella_mcp::DisabledServers,
     slot: Arc<tokio::sync::OnceCell<stella_mcp::McpToolSet>>,
     in_tx: UnboundedSender<Inbound>,
+    chrome_tx: UnboundedSender<Inbound>,
     release_splash: impl FnOnce() + Send + 'static,
 ) -> bool {
     let plan = agent::load_mcp_plan(&cfg);
@@ -1250,22 +1604,17 @@ fn spawn_mcp_connect(
         match plan {
             agent::McpPlan::None => {}
             agent::McpPlan::Invalid(reason) => {
-                let _ = in_tx.send(Inbound::Event {
-                    agent: LEAD.to_string(),
-                    event: AgentEvent::Text { delta: reason },
-                });
+                let _ = chrome_tx.send(chrome_note(reason));
                 let _ = in_tx.send(Inbound::Status {
                     agent: LEAD.to_string(),
                     status: AgentStatus::WaitingInput,
                 });
             }
             agent::McpPlan::Servers(servers) => {
-                let _ = in_tx.send(Inbound::Event {
-                    agent: LEAD.to_string(),
-                    event: AgentEvent::Text {
-                        delta: format!("connecting {} MCP server(s)…", servers.len()),
-                    },
-                });
+                let _ = chrome_tx.send(chrome_note(format!(
+                    "connecting {} MCP server(s)…",
+                    servers.len()
+                )));
                 let set = agent::connect_mcp_servers(
                     &servers,
                     registry.clone(),
@@ -1274,12 +1623,10 @@ fn spawn_mcp_connect(
                     Some(crate::mcp_cmd::oauth_manager(&cfg.workspace_root)),
                 )
                 .await;
-                let _ = in_tx.send(Inbound::Event {
-                    agent: LEAD.to_string(),
-                    event: AgentEvent::Text {
-                        delta: mcp_outcome_report(&set.connected_names(), set.failed_servers()),
-                    },
-                });
+                let _ = chrome_tx.send(chrome_note(mcp_outcome_report(
+                    &set.connected_names(),
+                    set.failed_servers(),
+                )));
                 // The Text events above fold the lead to `Running`, but no
                 // turn is in flight — restore the idle status or the
                 // dashboard would show a busy lead forever.
@@ -1539,18 +1886,19 @@ fn service_registry_action(
     input: &WorkspaceInput,
     registry: &stella_store::SessionRegistry,
     my_session_id: &str,
+    workspace: &str,
     in_tx: &mpsc::UnboundedSender<Inbound>,
 ) -> bool {
     match input {
         WorkspaceInput::SessionsRefresh => {
-            let _ = in_tx.send(sessions_inbound(registry, my_session_id));
+            let _ = in_tx.send(sessions_inbound(registry, my_session_id, workspace));
         }
         WorkspaceInput::SessionOpen { id } => {
             spawn_session_replay(id.clone(), registry.list(), in_tx.clone());
         }
         WorkspaceInput::SessionArchive { id } => {
             let _ = registry.set_status(id, stella_store::SessionStatus::Archived);
-            let _ = in_tx.send(sessions_inbound(registry, my_session_id));
+            let _ = in_tx.send(sessions_inbound(registry, my_session_id, workspace));
         }
         WorkspaceInput::SessionDelete { id } => {
             // The deck refuses to delete its own record UI-side too; this is
@@ -1558,7 +1906,7 @@ fn service_registry_action(
             if id != my_session_id {
                 let _ = registry.remove(id);
             }
-            let _ = in_tx.send(sessions_inbound(registry, my_session_id));
+            let _ = in_tx.send(sessions_inbound(registry, my_session_id, workspace));
         }
         WorkspaceInput::NotificationRead { id } => {
             let store = stella_store::NotificationStore::open_default();
@@ -1576,13 +1924,20 @@ fn service_registry_action(
 }
 
 /// The SESSIONS overlay snapshot: every registry record mapped to the deck's
-/// [`stella_tui::SessionInfo`], flagging this process's own record.
-fn sessions_inbound(registry: &stella_store::SessionRegistry, mine: &str) -> Inbound {
+/// [`stella_tui::SessionInfo`], flagging this process's own record and the
+/// rows that can be reopened HERE (no live owner, this workspace, durable
+/// state on disk — ⏎ navigates into those).
+fn sessions_inbound(
+    registry: &stella_store::SessionRegistry,
+    mine: &str,
+    workspace: &str,
+) -> Inbound {
     let sessions = registry
         .list()
         .into_iter()
         .map(|r| stella_tui::SessionInfo {
             mine: r.id == mine,
+            resumable: r.id != mine && r.workspace == workspace && registry.resumable(&r.id),
             phase: session_phase(r.status),
             id: r.id,
             title: r.title,
@@ -1601,6 +1956,7 @@ fn session_phase(status: stella_store::SessionStatus) -> stella_tui::SessionPhas
     match status {
         stella_store::SessionStatus::InProgress => stella_tui::SessionPhase::InProgress,
         stella_store::SessionStatus::NeedsInput => stella_tui::SessionPhase::NeedsInput,
+        stella_store::SessionStatus::Paused => stella_tui::SessionPhase::Paused,
         stella_store::SessionStatus::Cancelled => stella_tui::SessionPhase::Cancelled,
         stella_store::SessionStatus::Complete => stella_tui::SessionPhase::Complete,
         stella_store::SessionStatus::Archived => stella_tui::SessionPhase::Archived,
@@ -1636,7 +1992,7 @@ fn handle_supervisor_msg(
     msg: SupervisorMsg,
     subs: &mut SubSessions,
     pending_spawns: &mut VecDeque<stella_core::tasks::SpawnRequest>,
-    queue: &mut VecDeque<String>,
+    queue: &mut crate::session_persist::DurableQueue,
     dispatch_held: bool,
     registry: &ToolRegistry,
     store: &Option<Arc<Store>>,
@@ -1756,7 +2112,11 @@ fn spawn_session_replay(
             });
             return;
         };
-        let lane = format!("replay:{id}");
+        // The prefix is the journal tee's filter key
+        // (`session_persist::REPLAY_LANE_PREFIX`): everything on this lane
+        // rides the ordinary inbound channel but must never be journaled as
+        // the CURRENT session's history.
+        let lane = format!("{}{id}", crate::session_persist::REPLAY_LANE_PREFIX);
         let meta = AgentMeta::new(lane.clone(), format!("replay — {}", record.title), now_ms())
             .with_role("replay");
         let _ = in_tx.send(Inbound::Register(meta));
@@ -1838,7 +2198,7 @@ struct PrObservation {
 /// hidden rather than wrong.
 fn spawn_pr_monitor(
     root: PathBuf,
-    session_id: String,
+    session_id: Arc<std::sync::Mutex<String>>,
     store: Option<Arc<Store>>,
     workspace_name: String,
     nudge: Arc<tokio::sync::Notify>,
@@ -1869,6 +2229,9 @@ fn spawn_pr_monitor(
                     .as_ref()
                     .is_none_or(|l| l.ci != Some(CiStatus::Failing));
             last = Some(observed.clone());
+            // Resolved per observation: an in-deck session switch re-keys
+            // which session this PR activity belongs to.
+            let session_id = session_id.lock().unwrap_or_else(|p| p.into_inner()).clone();
             let _ = in_tx.send(Inbound::Event {
                 agent: LEAD.to_string(),
                 event: AgentEvent::Pr {
@@ -4635,12 +4998,19 @@ mod tests {
     #[test]
     fn requeue_front_mirrors_each_front_insert_to_the_deck() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut queue: VecDeque<String> = VecDeque::from(["c".to_string()]);
+        let dir = std::env::temp_dir().join(format!("stella-requeue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut queue = crate::session_persist::DurableQueue::fresh(dir.clone());
+        queue.push_back("c".to_string());
         requeue_front(&mut queue, &tx, vec!["b".to_string(), "a".to_string()]);
+        // The backlog is durable + write-through: the authoritative order is
+        // ON DISK the moment the inserts return.
+        assert_eq!(queue.len(), 3);
         assert_eq!(
-            queue,
-            VecDeque::from(["a".to_string(), "b".to_string(), "c".to_string()])
+            stella_store::journal::read_queue(&dir),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+        let _ = std::fs::remove_dir_all(&dir);
         for expected in ["b", "a"] {
             match rx.try_recv() {
                 Ok(Inbound::PromptRequeued { agent, text }) => {

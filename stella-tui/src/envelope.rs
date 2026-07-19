@@ -341,6 +341,9 @@ pub enum IssueAction {
 pub enum SessionPhase {
     InProgress,
     NeedsInput,
+    /// Set aside with its durable state intact — quit (or switched away
+    /// from) with work still pending; the first thing resume looks for.
+    Paused,
     Cancelled,
     Complete,
     Archived,
@@ -349,9 +352,10 @@ pub enum SessionPhase {
 
 impl SessionPhase {
     /// Display/grouping order: attention-worthy first.
-    pub const ALL: [SessionPhase; 6] = [
+    pub const ALL: [SessionPhase; 7] = [
         SessionPhase::InProgress,
         SessionPhase::NeedsInput,
+        SessionPhase::Paused,
         SessionPhase::Cancelled,
         SessionPhase::Complete,
         SessionPhase::Archived,
@@ -362,6 +366,7 @@ impl SessionPhase {
         match self {
             SessionPhase::InProgress => "In Progress",
             SessionPhase::NeedsInput => "Needs Input",
+            SessionPhase::Paused => "Paused",
             SessionPhase::Cancelled => "Cancelled",
             SessionPhase::Complete => "Complete",
             SessionPhase::Archived => "Archived",
@@ -389,6 +394,11 @@ pub struct SessionInfo {
     /// True for the record of THIS deck process (rendered with a marker and
     /// protected from delete).
     pub mine: bool,
+    /// True when the session can be reopened here: no live process owns it,
+    /// it belongs to this deck's workspace, and its durable state (journal /
+    /// history) is on disk. `⏎` on such a row sends
+    /// [`WorkspaceInput::SessionResume`].
+    pub resumable: bool,
 }
 
 /// One persist-until-read notification as the inbox overlay lists it. A
@@ -593,6 +603,15 @@ pub enum WorkspaceInput {
     /// SESSIONS overlay: delete a session record from the registry.
     /// Answered with a fresh [`Inbound::Sessions`].
     SessionDelete { id: String },
+    /// SESSIONS overlay: reopen a resumable session (⏎ on a
+    /// [`SessionInfo::resumable`] row) — the deck-native "navigate back
+    /// into a session". The driver parks the current session (its durable
+    /// state is already on disk; its record flips to Paused), replays the
+    /// chosen session's journal through the fold, restores its conversation
+    /// and prompt backlog, and re-owns its registry record. Only serviced
+    /// between turns — mid-turn the driver answers with a transcript notice
+    /// instead of tearing down live work.
+    SessionResume { id: String },
     /// Inbox overlay: mark one notification read (it may then be pruned —
     /// "persists until read" is the store's contract). Answered with a fresh
     /// [`Inbound::Notifications`].

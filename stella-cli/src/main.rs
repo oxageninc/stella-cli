@@ -38,6 +38,7 @@ mod model_catalog;
 mod ocp;
 mod rules;
 mod runtime;
+mod session_persist;
 mod settings;
 mod skill_manager;
 mod stats;
@@ -178,6 +179,20 @@ enum Command {
 
     /// Start an interactive REPL session
     Chat,
+
+    /// Reopen a previous session exactly where it stood — transcript,
+    /// conversation, pending prompts. Sessions are durable (quit, crash, and
+    /// power loss included); the deck's SESSIONS overlay (`←` on an empty
+    /// prompt, `⏎` on a row) is the same navigation from inside a session.
+    Resume {
+        /// Registry id (`ses-…`) of the session to reopen. Omitted: the most
+        /// recently active resumable session of this workspace.
+        id: Option<String>,
+
+        /// List this machine's sessions (resumable ones marked) and exit.
+        #[arg(long)]
+        list: bool,
+    },
 
     /// Analyze this workspace and infer its domain taxonomy
     /// (.stella/domains.toml) — the tagging vocabulary for memories,
@@ -475,6 +490,48 @@ fn use_deck(plain_flag: bool) -> bool {
     !plain_flag && !plain_env && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+/// `stella resume --list`: every session in the machine-wide registry,
+/// newest activity first, with the rows resumable from THIS directory
+/// marked `↩`. Local reads only — works with zero API keys.
+fn run_resume_list() -> Result<(), String> {
+    let registry = stella_store::SessionRegistry::open_default();
+    let mut sessions = registry.list();
+    if sessions.is_empty() {
+        println!("no stella sessions recorded on this machine yet");
+        return Ok(());
+    }
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at_ms));
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    println!("{:2} {:<24} {:<12} SESSION", "", "ID", "STATUS");
+    for s in &sessions {
+        let resumable = registry.resumable(&s.id);
+        let marker = if resumable && s.workspace == cwd {
+            "↩"
+        } else if resumable {
+            "·"
+        } else {
+            " "
+        };
+        let title = if s.title.is_empty() {
+            s.workspace.clone()
+        } else {
+            s.title.clone()
+        };
+        println!(
+            "{marker:2} {:<24} {:<12} {title}",
+            s.id,
+            stella_store::SessionRegistry::presented_status(s).label(),
+        );
+    }
+    println!(
+        "\n↩ resumable here (`stella resume [ID]`) · resumable from its own workspace\n\
+         inside the deck: `←` on an empty prompt opens SESSIONS, `⏎` reopens a session"
+    );
+    Ok(())
+}
+
 /// The five code-graph queries, mirroring the `graph_query` agent tool's ops
 /// one-for-one so a human at the CLI and the model inside a turn see the
 /// same frames for the same question.
@@ -658,6 +715,10 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("stella v{}", version_string());
             return Ok(());
         }
+        Some(Command::Resume { list: true, .. }) => {
+            // Listing reads the local registry only — no provider required.
+            return run_resume_list();
+        }
         _ => {}
     }
 
@@ -751,10 +812,35 @@ fn run(cli: Cli) -> Result<(), String> {
                     &cfg,
                     cli.budget,
                     cli.no_anim,
+                    None,
                 ))?;
             } else {
                 rt()?.block_on(agent::run_interactive(&cfg, cli.budget))?;
             }
+        }
+        Command::Resume { id, list } => {
+            // `--list` returned before provider resolution; this arm is the
+            // actual reopen, which is a full deck session (durable state is
+            // a deck feature — the plain REPL has no session to restore).
+            debug_assert!(!list, "handled before provider resolution");
+            if !use_deck(cli.plain) {
+                return Err(
+                    "`stella resume` reopens a Command Deck session and needs a real \
+                     terminal (it cannot combine with --plain / STELLA_PLAIN / a piped \
+                     stream). `stella resume --list` works anywhere."
+                        .to_string(),
+                );
+            }
+            let request = match id {
+                Some(id) => session_persist::ResumeRequest::Id(id),
+                None => session_persist::ResumeRequest::Latest,
+            };
+            rt()?.block_on(command_deck::run_deck_session(
+                &cfg,
+                cli.budget,
+                cli.no_anim,
+                Some(request),
+            ))?;
         }
         // Models/Version (and Tools) short-circuit in the first match at the
         // top of `run` before a provider is resolved; Init is handled by the

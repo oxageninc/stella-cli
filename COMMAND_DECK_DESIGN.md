@@ -178,6 +178,50 @@ impl WorkspaceModel {
   folds or a labeled exception. (The focused-agent index is ephemeral view
   state in `DeckUi`, never in the model.)
 
+## Durable sessions (pause / resume / crash-safety)
+
+Every deck session is durable by construction, riding the same L-T1 fold the
+deck renders from: because the screen is a pure function of the inbound
+envelope stream, persisting the session is journaling that stream, and
+resuming is replaying it.
+
+- **Journal tee** (`stella-cli::session_persist`): the driver's `in_tx` reaches
+  the deck through one interception task that mirrors every fold-relevant
+  `Inbound` into `data_dir()/sessions/<id>/journal.jsonl`
+  (`stella-store::journal`, append-only JSONL, torn-tail tolerant). Adjacent
+  `Text`/`Reasoning` deltas coalesce per run; conversation transitions
+  (`PromptStarted`, `Complete`, `Error`, status, reset, pipeline) fsync.
+  Out-of-band view snapshots never journal; ephemeral chrome (boot narration,
+  hints) is sent DIRECTLY to the deck so it never replays. `replay:<id>`
+  lanes (`SessionOpen`'s read-only streams) are filtered at the tee — another
+  session's past must never journal as this session's history. Sub-session
+  lanes (`req:<n>`/`sub:<task-id>`) DO journal: they are the session's real
+  history and replay with it.
+- **Sidecar snapshots**: `history.json` (the LLM `Vec<CompletionMessage>`,
+  atomic temp+fsync+rename at every turn boundary and `/clear`) and
+  `queue.json` (the prompt backlog, write-through on every mutation).
+- **Recovery rule**: every `PromptStarted` with no settle record after it on
+  its own lane (`Complete` / non-retryable `Error` / `waiting_input` or a
+  terminal lane status) was interrupted mid-turn — the lead's and any
+  `req:<n>` worker's alike. Resume puts those prompts back at the FRONT of
+  the queue in dispatch order and **parks dispatch** (the existing
+  `HoldState`), so reopening a session shows where it stood and spends
+  nothing until the user says go.
+- **Navigation**: `stella resume [id|--list]` from the CLI;  `⏎` on a
+  resumable row in the SESSIONS overlay (`WorkspaceInput::SessionResume`,
+  serviced between turns and only while no workers are live) switches THIS
+  deck to that session (`⏎` on any other row opens a read-only
+  `SessionOpen` replay instead) — the
+  current one parks as `Paused` (an untouched shell is removed instead), the
+  target's journal replays behind a `SessionReset`, and its registry record
+  is re-owned (same id, new pid). Quitting with a pending backlog is a
+  `Paused` exit, not a cancellation — the work is durable.
+- **Guarantee shape**: user input (prompts, queue) and completed turns survive
+  anything up to power loss (fsynced); the worst case loses only the
+  in-flight turn's streamed tail, which re-runs from its re-queued prompt.
+  Session spend stays monotone: the budget guard reseeds from the journal's
+  last `BudgetTick`.
+
 ## Backend seams (what's live vs. seam-fed today)
 
 - Live now: per-agent event fold, file +/- from diffs, routing from

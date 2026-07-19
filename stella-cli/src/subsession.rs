@@ -22,7 +22,7 @@
 //! skipped in favor of latency, and delegation is not recursive — a worker's
 //! own `task_assign` requests are reported on its lane instead of spawning.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use stella_core::Engine;
 use stella_core::tasks::SpawnRequest;
@@ -112,6 +112,14 @@ impl SubSessions {
             Some(tx) => tx.send(()).is_ok(),
             None => false,
         }
+    }
+
+    /// How many workers are live right now. The driver refuses to
+    /// navigate to another session (`SessionResume`) while this is nonzero —
+    /// live workers stream into the current session's lanes and settle
+    /// against its records.
+    pub(crate) fn live(&self) -> usize {
+        self.active
     }
 
     /// The next prompt-worker lane id (`req:1`, `req:2`, …).
@@ -394,7 +402,7 @@ async fn run_worker(
 /// prompt it takes, exactly like lead dispatch does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drain_queue(
-    queue: &mut VecDeque<String>,
+    queue: &mut crate::session_persist::DurableQueue,
     subs: &mut SubSessions,
     dispatch_held: bool,
     cfg: &Config,
@@ -535,7 +543,8 @@ mod tests {
         // itself needs a provider key + threads — exercised in integration,
         // not here — so this asserts the *refusals*, which are what protect
         // the deck's FIFO view.)
-        let queue: VecDeque<String> = VecDeque::from(["/models".to_string()]);
+        let queue: std::collections::VecDeque<String> =
+            std::collections::VecDeque::from(["/models".to_string()]);
         let subs = SubSessions::new();
         assert!(subs.has_slot());
         assert!(

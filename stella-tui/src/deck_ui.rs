@@ -1724,10 +1724,11 @@ pub fn grouped_session_rows(ui: &DeckUi) -> Vec<&crate::envelope::SessionInfo> {
     rows
 }
 
-/// The SESSIONS overlay key map: ↑/↓ select, `⏎` open (replay) the selected
-/// session, `a` archive, `x` delete (another session's record only — never
-/// this session's own), `r` refresh, Esc/`←`/`q` close. Modal: everything
-/// else is swallowed.
+/// The SESSIONS overlay key map: ↑/↓ select, `⏎` resume the selected session
+/// when its row is resumable (the durable-state sessions of THIS workspace
+/// with no live owner) or open it read-only (replay) otherwise, `a` archive,
+/// `x` delete (another session's record only — never this session's own),
+/// `r` refresh, Esc/`←`/`q` close. Modal: everything else is swallowed.
 fn handle_sessions_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
     let count = grouped_session_rows(ui).len();
     ui.sessions_sel = ui.sessions_sel.min(count.saturating_sub(1));
@@ -1747,15 +1748,22 @@ fn handle_sessions_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
             DeckAction::Handled
         }
         KeyCode::Enter => {
-            // Open the selected session: the driver answers by registering a
-            // `replay:<id>` lane and streaming the persisted events (see
-            // [`WorkspaceInput::SessionOpen`] — replay IS the fold). The
-            // overlay closes so the replayed lane is immediately visible.
-            match grouped_session_rows(ui)
-                .get(ui.sessions_sel)
-                .map(|row| row.id.clone())
-            {
-                Some(id) => {
+            match grouped_session_rows(ui).get(ui.sessions_sel).copied() {
+                // Navigate INTO the chosen session live: close the overlay
+                // and hand over to the driver, which adopts the durable
+                // state and continues the session in this deck (see
+                // [`WorkspaceInput::SessionResume`]).
+                Some(row) if row.resumable && !row.mine => {
+                    let id = row.id.clone();
+                    ui.sessions_open = false;
+                    DeckAction::Send(WorkspaceInput::SessionResume { id })
+                }
+                // Every other row opens read-only: the driver registers a
+                // `replay:<id>` lane and streams the persisted events (see
+                // [`WorkspaceInput::SessionOpen`] — replay IS the fold). The
+                // overlay closes so the replayed lane is immediately visible.
+                Some(row) => {
+                    let id = row.id.clone();
                     ui.sessions_open = false;
                     DeckAction::Send(WorkspaceInput::SessionOpen { id })
                 }
@@ -3993,6 +4001,7 @@ mod tests {
             started_ms: 0,
             updated_ms: 0,
             mine: false,
+            resumable: false,
         }
     }
 
@@ -4194,6 +4203,78 @@ mod tests {
             ui.splash.is_done(),
             "a no-anim session never replays the cinematic"
         );
+    }
+
+    fn session_row(
+        id: &str,
+        phase: crate::envelope::SessionPhase,
+        mine: bool,
+        resumable: bool,
+    ) -> crate::envelope::SessionInfo {
+        crate::envelope::SessionInfo {
+            id: id.into(),
+            title: format!("ws: {id}"),
+            summary: String::new(),
+            workspace: "/w".into(),
+            phase,
+            started_ms: 0,
+            updated_ms: 0,
+            mine,
+            resumable,
+        }
+    }
+
+    #[test]
+    fn sessions_overlay_enter_resumes_resumable_rows_and_opens_the_rest() {
+        use crate::envelope::SessionPhase;
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.sessions_open = true;
+        ui.sessions = vec![
+            session_row("ses-mine", SessionPhase::InProgress, true, false),
+            session_row("ses-paused", SessionPhase::Paused, false, true),
+            session_row("ses-foreign", SessionPhase::Complete, false, false),
+        ];
+
+        // Grouped order: InProgress (mine) · Paused (resumable) · Complete.
+        // ⏎ on the resumable row navigates into it LIVE: the overlay closes
+        // and the driver is told to resume exactly that session.
+        ui.sessions_sel = 1;
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Enter), &model, &mut ui),
+            DeckAction::Send(WorkspaceInput::SessionResume {
+                id: "ses-paused".into()
+            })
+        );
+        assert!(!ui.sessions_open, "the overlay closes on navigation");
+
+        // ⏎ on any non-resumable row — this deck's own included — opens a
+        // read-only replay instead (the `replay:<id>` lane).
+        for (sel, id) in [(0, "ses-mine"), (2, "ses-foreign")] {
+            ui.sessions_open = true;
+            ui.sessions_sel = sel;
+            assert_eq!(
+                handle_deck_key(key(KeyCode::Enter), &model, &mut ui),
+                DeckAction::Send(WorkspaceInput::SessionOpen { id: id.into() })
+            );
+            assert!(!ui.sessions_open, "the overlay closes on open too");
+        }
+    }
+
+    #[test]
+    fn paused_sessions_group_between_needs_input_and_cancelled() {
+        use crate::envelope::SessionPhase;
+        let mut ui = DeckUi::default();
+        ui.sessions = vec![
+            session_row("c", SessionPhase::Cancelled, false, true),
+            session_row("p", SessionPhase::Paused, false, true),
+            session_row("n", SessionPhase::NeedsInput, false, false),
+        ];
+        let order: Vec<&str> = grouped_session_rows(&ui)
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(order, ["n", "p", "c"]);
     }
 
     #[test]
