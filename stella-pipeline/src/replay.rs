@@ -241,6 +241,12 @@ pub fn event_signature(event: &AgentEvent) -> String {
         AgentEvent::GoalVerdict { met, .. } => format!("goal_verdict:met={met}"),
         AgentEvent::Error { retryable, .. } => format!("error:retryable={retryable}"),
         AgentEvent::Complete { .. } => "complete".to_string(),
+        // Task subjects/descriptions are volatile content; the board's shape
+        // (how many tasks, how many resolved) is the structural part.
+        AgentEvent::TaskUpdate { tasks } => {
+            let done = tasks.iter().filter(|t| !t.status.is_open()).count();
+            format!("task_update:tasks={},resolved={done}", tasks.len())
+        }
     }
 }
 

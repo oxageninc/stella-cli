@@ -189,11 +189,18 @@ impl WorkspaceModel {
   scope review **auto-approves** in the deck (the `ScopeReview` event is
   narrated in the transcript, not gated) — a deck-native scope-review card is
   the follow-up, same seam as the driver's `ScopeDecision` no-op.
-- Seam-fed (no backend supervisor yet — build UI against the seam, drive with
-  the scenario feed): multi-agent `Register`/`Status` envelopes and
-  `AgentControl` (Pause/Stop/Restart). `Stop` maps to `UserInput::Cancel`
-  today; deep per-agent pause/kill needs a new `stella-fleet` abort API (noted
-  as the follow-up integration).
+- Live now: **sub-session workers** (`stella-cli/src/subsession.rs`) — the
+  first real producer of multi-agent `Register`/`Status` envelopes. Prompts
+  submitted mid-turn dispatch to dedicated `req:<n>` worker sessions instead
+  of waiting; `task_assign` spawns `sub:<task-id>` workers; `SessionOpen`
+  streams a dead session's persisted journal into a `replay:<id>` lane. The
+  task board (`task_*` tools) folds as `AgentEvent::TaskUpdate` snapshots
+  into a session-view checklist card, and a `gh`-backed monitor feeds the
+  footer's PR cell (`⇢ #183 open ✓`).
+- Still seam-fed: `AgentControl` beyond `Stop` (Pause/Resume/Restart) and
+  per-worker abort. `Stop` maps to `UserInput::Cancel` on the lead only; deep
+  per-agent pause/kill needs a new `stella-fleet` abort API (noted as the
+  follow-up integration), as does fleet-worktree isolation for workers.
 
 ## ISSUES tab
 

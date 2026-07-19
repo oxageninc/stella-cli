@@ -29,12 +29,13 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use stella_protocol::{FileChangeKind, PrStatus};
+use stella_protocol::{CiStatus, FileChangeKind, PrStatus};
 
 use crate::composer::{ComposerLayout, SlashMenu, layout as composer_layout, split_row_at};
 use crate::model::{AskUserPrompt, FileState, Hud, SessionModel, TranscriptEntry};
 use crate::textline::{
-    self, budget_mode_label, media_kind_label, media_state_label, pr_status_label, stage_label,
+    self, budget_mode_label, ci_status_label, media_kind_label, media_state_label, pr_status_label,
+    stage_label,
 };
 use crate::ui::{PanelFocus, UiState, ViewportMetrics};
 use crate::{diff, theme};
@@ -1267,20 +1268,45 @@ pub(crate) fn entry_lines(
                 out,
             );
         }
-        TranscriptEntry::Pr { url, status } => {
+        TranscriptEntry::Pr {
+            url,
+            status,
+            number,
+            ci,
+        } => {
             let style = Style::new()
                 .fg(pr_status_color(*status))
                 .add_modifier(Modifier::BOLD);
-            push_labeled(
-                "⇢ pr",
+            let mut spans = vec![Span::styled(
+                format!("[{}] ", pr_status_label(*status)),
                 style,
-                vec![
-                    Span::styled(format!("[{}] ", pr_status_label(*status)), style),
-                    Span::styled(url.clone(), Style::new().fg(Color::DarkGray)),
-                ],
-                width,
-                out,
-            );
+            )];
+            if let Some(n) = number {
+                spans.push(Span::styled(format!("#{n} "), style));
+            }
+            if let Some(ci) = ci {
+                spans.push(Span::styled(
+                    format!("ci {} ", ci_status_label(*ci)),
+                    Style::new().fg(ci_status_color(*ci)),
+                ));
+            }
+            spans.push(Span::styled(url.clone(), Style::new().fg(Color::DarkGray)));
+            push_labeled("⇢ pr", style, spans, width, out);
+        }
+        TranscriptEntry::TaskUpdate {
+            done,
+            total,
+            active,
+        } => {
+            let style = Style::new().fg(theme::VIOLET).add_modifier(Modifier::BOLD);
+            let mut spans = vec![Span::styled(format!("{done}/{total}"), style)];
+            if let Some(subject) = active {
+                spans.push(Span::styled(
+                    format!(" · {subject}"),
+                    Style::new().fg(theme::TEXT_SECONDARY),
+                ));
+            }
+            push_labeled("☰ tasks", style, spans, width, out);
         }
         TranscriptEntry::Error { message, retryable } => {
             let tag = if *retryable { " (retryable)" } else { "" };
@@ -1319,6 +1345,15 @@ fn pr_status_color(status: PrStatus) -> Color {
         PrStatus::Open => theme::AURORA_AZURE,
         PrStatus::Merged => theme::AURORA_CYAN,
         PrStatus::Closed => theme::AURORA_MAGENTA,
+    }
+}
+
+fn ci_status_color(status: CiStatus) -> Color {
+    match status {
+        CiStatus::Pending => theme::TEXT_TERTIARY,
+        CiStatus::Running => theme::WARNING_BRIGHT,
+        CiStatus::Passing => theme::OK,
+        CiStatus::Failing => theme::BAD,
     }
 }
 
@@ -1508,6 +1543,13 @@ mod tests {
             TranscriptEntry::Pr {
                 url: "https://example.test/pr/1".into(),
                 status: PrStatus::Open,
+                number: Some(1),
+                ci: Some(CiStatus::Passing),
+            },
+            TranscriptEntry::TaskUpdate {
+                done: 2,
+                total: 5,
+                active: Some("wire the task board".into()),
             },
             TranscriptEntry::Error {
                 message: "boom".into(),
@@ -1546,6 +1588,7 @@ mod tests {
                 | TranscriptEntry::AskUser { .. }
                 | TranscriptEntry::Commit { .. }
                 | TranscriptEntry::Pr { .. }
+                | TranscriptEntry::TaskUpdate { .. }
                 | TranscriptEntry::Error { .. }
                 | TranscriptEntry::Complete { .. } => {}
             }

@@ -26,8 +26,8 @@
 //! and unifying them is a behavior change out of scope for #66).
 
 use stella_protocol::{
-    AgentEvent, BudgetMode, FileChangeKind, MediaJobState, MediaKind, PrStatus, ProviderShare,
-    StageKind,
+    AgentEvent, BudgetMode, CiStatus, FileChangeKind, MediaJobState, MediaKind, PrStatus,
+    ProviderShare, StageKind, TaskItem, TaskStatus,
 };
 
 /// Semantic weight of an annotation line. Each surface owns the mapping to
@@ -307,13 +307,43 @@ pub fn commit(sha: &str, message: &str) -> EventLine {
     }
 }
 
-pub fn pr(url: &str, status: PrStatus) -> EventLine {
+pub fn pr(url: &str, status: PrStatus, number: Option<u64>, ci: Option<CiStatus>) -> EventLine {
+    let ident = match number {
+        Some(n) => format!("PR #{n}"),
+        None => "PR".to_string(),
+    };
+    let ci_suffix = match ci {
+        Some(ci) => format!(" · ci {}", ci_status_label(ci)),
+        None => String::new(),
+    };
     EventLine {
         glyph: "⇡",
         tone: Tone::Info,
         strong: false,
-        body: format!("PR {}: {url}", pr_status_label(status)),
+        body: format!("{ident} {}{ci_suffix}: {url}", pr_status_label(status)),
         detail: None,
+    }
+}
+
+/// One-line task-board digest: progress counts plus the subject the agent
+/// is currently on (the full checklist is a deck surface; the plain REPL
+/// gets the digest).
+pub fn task_board(tasks: &[TaskItem]) -> EventLine {
+    let done = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Completed)
+        .count();
+    let total = tasks.len();
+    let active = tasks
+        .iter()
+        .find(|t| t.status == TaskStatus::InProgress)
+        .map(|t| t.subject.clone());
+    EventLine {
+        glyph: "☰",
+        tone: Tone::Info,
+        strong: false,
+        body: format!("tasks {done}/{total}"),
+        detail: active.map(|subject| format!("· {subject}")),
     }
 }
 
@@ -440,7 +470,13 @@ pub fn event_line(event: &AgentEvent) -> Option<EventLine> {
         )),
         AgentEvent::AskUser { question, .. } => Some(ask_user(question)),
         AgentEvent::Commit { sha, message } => Some(commit(sha, message)),
-        AgentEvent::Pr { url, status } => Some(pr(url, *status)),
+        AgentEvent::Pr {
+            url,
+            status,
+            number,
+            ci,
+        } => Some(pr(url, *status, *number, *ci)),
+        AgentEvent::TaskUpdate { tasks } => Some(task_board(tasks)),
         AgentEvent::Error { message, retryable } => Some(error(message, *retryable)),
         AgentEvent::Complete { model, cost_usd } => Some(complete(model, *cost_usd)),
     }
@@ -486,6 +522,16 @@ pub fn pr_status_label(status: PrStatus) -> &'static str {
         PrStatus::Open => "open",
         PrStatus::Merged => "merged",
         PrStatus::Closed => "closed",
+    }
+}
+
+/// A flat display label for a PR's aggregate CI verdict.
+pub fn ci_status_label(status: CiStatus) -> &'static str {
+    match status {
+        CiStatus::Pending => "pending",
+        CiStatus::Running => "running",
+        CiStatus::Passing => "passing",
+        CiStatus::Failing => "failing",
     }
 }
 
@@ -655,8 +701,18 @@ mod tests {
             "● committed abc short sha"
         );
         assert_eq!(
-            pr("https://x/pr/1", PrStatus::Open).text(),
+            pr("https://x/pr/1", PrStatus::Open, None, None).text(),
             "⇡ PR open: https://x/pr/1"
+        );
+        assert_eq!(
+            pr(
+                "https://x/pr/183",
+                PrStatus::Open,
+                Some(183),
+                Some(CiStatus::Failing)
+            )
+            .text(),
+            "⇡ PR #183 open · ci failing: https://x/pr/183"
         );
         assert_eq!(error("boom", false).text(), "✗ error: boom");
         assert_eq!(error("blip", true).text(), "✗ warning: blip");
@@ -809,6 +865,8 @@ mod tests {
             AgentEvent::Pr {
                 url: "u".into(),
                 status: PrStatus::Open,
+                number: Some(1),
+                ci: Some(CiStatus::Passing),
             },
             AgentEvent::Error {
                 message: "e".into(),

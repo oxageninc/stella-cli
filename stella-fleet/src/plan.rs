@@ -27,20 +27,27 @@ use serde::{Deserialize, Serialize};
 /// directory name.
 pub type TaskId = String;
 
-/// How a task's workspace is provisioned. **Isolate by default**: unless a
-/// plan author deliberately chooses [`SharedTree`](Isolation::SharedTree), a
-/// task runs in its own git worktree so nothing it writes is visible to (or
-/// clobberable by) a concurrently-running sibling.
+/// How a task's workspace is provisioned. **Share by default**: every
+/// worker runs in the one repository root, coordinated by cooperative
+/// claims — declared upfront (`claims`) plus claim-on-first-write at the
+/// tool layer — so conflicts surface in under a second at write time with
+/// the rival named, commits interleave on one branch (no merge-back), and
+/// the build cache stays warm. The claim table lives in the workspace
+/// store, so coordination spans processes: multiple fleets (and the deck's
+/// own sub-sessions) safely share one tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Isolation {
-    /// A dedicated git worktree on a fresh branch (the default). Sibling
-    /// tasks in the same wave cannot see each other's uncommitted changes.
-    #[default]
+    /// A dedicated git worktree on a fresh branch — the explicit opt-in for
+    /// genuinely DIVERGENT work: best-of-N attempts producing competing
+    /// versions of the same files, or tasks that mutate checkout state.
+    /// Claims cannot help there (the conflict is the point), and the costs
+    /// are real: a cold build cache per tree and conflicts deferred to
+    /// integration time.
     Isolated,
-    /// Runs directly in the shared repository root. Only for tasks a plan
-    /// author has explicitly decided are safe to interleave in one tree
-    /// (e.g. strictly-sequential tasks, or read-only ones).
+    /// Run directly in the shared repository root (the default) under the
+    /// cooperative claim discipline.
+    #[default]
     SharedTree,
 }
 
@@ -79,7 +86,7 @@ impl Task {
             title: title.into(),
             prompt: prompt.into(),
             depends_on: Vec::new(),
-            isolation: Isolation::Isolated,
+            isolation: Isolation::SharedTree,
             claims: Vec::new(),
         }
     }
@@ -97,11 +104,18 @@ impl Task {
         self
     }
 
-    /// Opt this task into running in the shared tree instead of an isolated
-    /// worktree (builder style). The deliberate exception to isolate-by-
-    /// default.
+    /// Opt this task into running in the shared tree (builder style). A
+    /// no-op since share-by-default landed; kept for plan-construction code
+    /// that states the intent explicitly.
     pub fn shared_tree(mut self) -> Self {
         self.isolation = Isolation::SharedTree;
+        self
+    }
+
+    /// Opt this task into a dedicated git worktree (builder style) — the
+    /// deliberate exception for divergent work (see [`Isolation::Isolated`]).
+    pub fn isolated(mut self) -> Self {
+        self.isolation = Isolation::Isolated;
         self
     }
 }
@@ -485,13 +499,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_json_roundtrips_with_isolation_defaulting_to_isolated() {
+    fn plan_json_roundtrips_with_isolation_defaulting_to_shared_tree() {
         // A task serialized without an `isolation` field deserializes as
-        // Isolated (isolate-by-default), and one without `depends_on` gets an
-        // empty edge list.
+        // SharedTree (share-by-default: one tree, cooperative claims), and
+        // one without `depends_on` gets an empty edge list.
         let json = r#"{"tasks":[{"id":"a","title":"t","prompt":"p"}]}"#;
         let plan: Plan = serde_json::from_str(json).unwrap();
-        assert_eq!(plan.tasks[0].isolation, Isolation::Isolated);
+        assert_eq!(plan.tasks[0].isolation, Isolation::SharedTree);
         assert!(plan.tasks[0].depends_on.is_empty());
         assert!(plan.tasks[0].claims.is_empty(), "claims default to none");
 

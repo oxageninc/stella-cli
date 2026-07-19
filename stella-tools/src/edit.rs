@@ -47,6 +47,18 @@ impl Tool for EditFile {
                 };
             }
         };
+        // An empty `old_string` is destructive: `"".matches("")` reports
+        // char_count+1 hits, so the tool would tell the model to set
+        // replace_all=true and then `replace("", new)` interleaves `new` at
+        // every char boundary — shredding the file (and allocating O(len^2)).
+        // On an empty file it would silently overwrite. Refuse it outright.
+        if old_string.is_empty() {
+            return ToolOutput::Error {
+                message: "old_string must not be empty — use write_file to create or replace a \
+                          whole file"
+                    .into(),
+            };
+        }
         let new_string = match input.get("new_string").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => {

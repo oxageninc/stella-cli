@@ -402,6 +402,10 @@ pub struct NotificationInfo {
     pub source: String,
     pub created_ms: u64,
     pub read: bool,
+    /// The session this notification is about, when it has one — what lets
+    /// the inbox's `Enter` open the session (replaying it if it is no longer
+    /// live) via [`WorkspaceInput::SessionOpen`].
+    pub session_id: Option<String>,
 }
 
 /// Driver → deck cues for the launch cinematic ([`crate::splash`]).
@@ -574,6 +578,15 @@ pub enum WorkspaceInput {
     /// SESSIONS overlay opened (or `r`): read the machine-wide session
     /// registry and answer with [`Inbound::Sessions`].
     SessionsRefresh,
+    /// SESSIONS overlay / inbox: open a session in a replay lane. The driver
+    /// loads the session's persisted event journal from the store (linked by
+    /// `session_id` since store schema v8), then answers with a normal
+    /// [`Inbound::Register`] (a `replay:<id>` lane) followed by every
+    /// persisted event as ordinary [`Inbound::Event`]s and a terminal
+    /// [`Inbound::Status`] — replay IS the fold, so a session dead for 12
+    /// hours reconstructs to exactly the state it died in, with no second
+    /// rendering path.
+    SessionOpen { id: String },
     /// SESSIONS overlay: tuck a session record away (status → Archived).
     /// Answered with a fresh [`Inbound::Sessions`].
     SessionArchive { id: String },

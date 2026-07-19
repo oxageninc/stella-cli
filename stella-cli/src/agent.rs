@@ -382,7 +382,10 @@ async fn run_pipeline_one_shot(
 
     let turn_start = Instant::now();
     let started_unix = crate::memory::unix_now_secs();
-    let execution = begin_execution(&store, "pipeline", prompt, cfg);
+    // Machine-wide presence: the deck's SESSIONS overlay sees this run live
+    // and can replay its journal after it ends.
+    let mut presence = SessionPresence::announce(cfg, prompt);
+    let execution = begin_execution(&store, "pipeline", prompt, cfg, Some(presence.id()));
 
     let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let renderer = spawn_renderer(rx, format, execution.clone(), cfg.provider.id.to_string());
@@ -562,6 +565,27 @@ async fn run_pipeline_one_shot(
     if let Some(set) = &mcp {
         set.close_all().await;
     }
+
+    // Terminal registry status + the headless → `/inbox` flow: a failed run
+    // always lands a notification; a successful one only when it ran long
+    // enough that the user has plausibly looked away. `Enter` on the
+    // notification (or the SESSIONS overlay) replays the journal.
+    let run_ok = matches!(&result, Ok(o) if matches!(o.status, PipelineStatus::Completed));
+    let run_secs = turn_start.elapsed().as_secs();
+    let notify = if !run_ok {
+        Some((
+            format!("{}: run FAILED", presence.name()),
+            crate::command_deck::prompt_line(prompt, 160),
+        ))
+    } else if run_secs >= 60 {
+        Some((
+            format!("{}: run finished ({run_secs}s)", presence.name()),
+            crate::command_deck::prompt_line(prompt, 160),
+        ))
+    } else {
+        None
+    };
+    presence.finish(run_ok, notify);
 
     match &result {
         Ok(outcome) => {
@@ -1073,6 +1097,9 @@ async fn run_raw_one_shot(
     }
 
     let started_unix = crate::memory::unix_now_secs();
+    // Machine-wide presence: findable in the deck's SESSIONS overlay and
+    // replayable from its journal after this process exits.
+    let mut presence = SessionPresence::announce(cfg, prompt);
     let outcome = run_turn(
         &*provider,
         base_tools,
@@ -1086,6 +1113,7 @@ async fn run_raw_one_shot(
         &store,
         "run",
         prompt,
+        Some(presence.id()),
     )
     .await;
     // Episodic memory first (works even for a failed turn — failures are
@@ -1125,6 +1153,23 @@ async fn run_raw_one_shot(
     if let Some(set) = &mcp {
         set.close_all().await;
     }
+    // Terminal registry status + the headless → `/inbox` flow (failure
+    // always notifies; success only past the looked-away threshold).
+    let run_secs = crate::memory::unix_now_secs().saturating_sub(started_unix);
+    let notify = if outcome.is_err() {
+        Some((
+            format!("{}: run FAILED", presence.name()),
+            crate::command_deck::prompt_line(prompt, 160),
+        ))
+    } else if run_secs >= 60 {
+        Some((
+            format!("{}: run finished ({run_secs}s)", presence.name()),
+            crate::command_deck::prompt_line(prompt, 160),
+        ))
+    } else {
+        None
+    };
+    presence.finish(outcome.is_ok(), notify);
     outcome
 }
 
@@ -1189,6 +1234,9 @@ pub async fn run_goal_cmd(
     }
 
     let started_unix = crate::memory::unix_now_secs();
+    // Machine-wide presence: a goal run is exactly the long-lived headless
+    // session the SESSIONS overlay + replay exist for.
+    let mut presence = SessionPresence::announce(cfg, goal);
     let outcome = if use_pipeline {
         run_goal_pipeline_turn(
             &*provider,
@@ -1201,6 +1249,7 @@ pub async fn run_goal_cmd(
             cfg,
             &store,
             goal,
+            Some(presence.id()),
         )
         .await
     } else {
@@ -1215,6 +1264,7 @@ pub async fn run_goal_cmd(
             cfg,
             &store,
             goal,
+            Some(presence.id()),
         )
         .await
     };
@@ -1240,6 +1290,18 @@ pub async fn run_goal_cmd(
     if let Some(set) = &mcp {
         set.close_all().await;
     }
+    // Goal runs are long by construction — always land the inbox
+    // notification (Enter on it replays this session's journal).
+    let goal_secs = crate::memory::unix_now_secs().saturating_sub(started_unix);
+    let notify = if outcome.is_ok() {
+        format!("{}: goal met ({goal_secs}s)", presence.name())
+    } else {
+        format!("{}: goal run FAILED", presence.name())
+    };
+    presence.finish(
+        outcome.is_ok(),
+        Some((notify, crate::command_deck::prompt_line(goal, 160))),
+    );
     outcome
 }
 
@@ -1315,6 +1377,11 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         }
         println!();
     }
+
+    // Machine-wide presence: the plain REPL registers like the deck does,
+    // so its sessions are findable in every SESSIONS overlay and replayable
+    // from their journals. No inbox notifications — the user is right here.
+    let mut presence = SessionPresence::announce(cfg, "interactive session");
 
     loop {
         print!("{} ", ">".bright_cyan().bold());
@@ -1441,6 +1508,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             let turn_start = messages.len();
             let files_before = registry.files_touched().len();
             let started_unix = crate::memory::unix_now_secs();
+            presence.update_prompt(goal);
             let result = run_goal_turn(
                 &*provider,
                 base_tools,
@@ -1452,8 +1520,10 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                 cfg,
                 &store,
                 goal,
+                Some(presence.id()),
             )
             .await;
+            presence.needs_input();
             record_turn_episode(
                 &memory,
                 goal,
@@ -1504,6 +1574,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         let turn_start = messages.len();
         let files_before = registry.files_touched().len();
         let started_unix = crate::memory::unix_now_secs();
+        presence.update_prompt(input);
         let result = run_turn(
             &*provider,
             base_tools,
@@ -1517,8 +1588,10 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             &store,
             "chat",
             input,
+            Some(presence.id()),
         )
         .await;
+        presence.needs_input();
         record_turn_episode(
             &memory,
             input,
@@ -1542,6 +1615,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     if let Some(set) = &mcp {
         set.close_all().await;
     }
+    presence.finish(true, None);
     println!("\n  {}", "Goodbye! ✦".magenta());
     Ok(())
 }
@@ -2050,6 +2124,20 @@ pub(crate) fn load_mcp_plan(cfg: &Config) -> McpPlan {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return McpPlan::None;
     };
+    // Trust gate. A cloned repo's `.stella/mcp.toml` can name an arbitrary
+    // stdio `command` (executed at session start — RCE on `git clone && stella`)
+    // or an attacker-controlled http endpoint (egress + a would-be-whitelisted
+    // phone-home). This is the same code-execution risk as project hooks, so it
+    // is gated by the same flag: untrusted, we do not connect and say why once.
+    // (Project settings.json hooks/credential-routing are already gated in
+    // settings.rs; this closes the parallel .stella/mcp.toml hole.)
+    if !crate::settings::project_code_execution_trusted() {
+        return McpPlan::Invalid(format!(
+            "{} was NOT loaded — set STELLA_TRUST_PROJECT=1 to let this repo start its \
+             MCP servers (they run commands / open connections on your machine)",
+            path.display()
+        ));
+    }
     let parsed = match McpConfig::from_toml_str(&text) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -2395,11 +2483,105 @@ pub(crate) fn begin_execution(
     kind: &str,
     prompt: &str,
     cfg: &Config,
+    session: Option<&str>,
 ) -> Option<(Arc<Store>, i64)> {
     let store = store.as_ref()?;
     match store.begin_execution(kind, prompt, cfg.provider.id, &cfg.model_id) {
-        Ok(id) => Some((store.clone(), id)),
+        Ok(id) => {
+            // Link the execution to its session (store schema v8) — what
+            // lets the deck's SESSIONS overlay reassemble and replay the
+            // session's full journal later. Best-effort like every other
+            // store write: a failed link degrades replay, never the turn.
+            if let Some(session) = session {
+                let _ = store.set_execution_session(id, session);
+            }
+            Some((store.clone(), id))
+        }
         Err(_) => None,
+    }
+}
+
+/// A headless/plain session's presence in the machine-wide registry: the
+/// deck's SESSIONS overlay finds it live and — because every execution links
+/// back via [`begin_execution`]'s `session` — can replay it long after it
+/// ended. Registration is best-effort throughout: a failed registry write
+/// never disturbs the run.
+pub(crate) struct SessionPresence {
+    registry: stella_store::SessionRegistry,
+    record: stella_store::SessionRecord,
+    name: String,
+}
+
+impl SessionPresence {
+    /// Announce the session (status In Progress), titled from the workspace
+    /// and the prompt/goal that started it.
+    pub(crate) fn announce(cfg: &Config, prompt: &str) -> Self {
+        let name = cfg
+            .workspace_root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| cfg.workspace_root.display().to_string());
+        let mut record = stella_store::SessionRecord::new(
+            cfg.workspace_root.display().to_string(),
+            name.clone(),
+        );
+        record.title = format!("{name}: {}", crate::command_deck::prompt_line(prompt, 48));
+        record.summary = crate::command_deck::prompt_line(prompt, 240);
+        let registry = stella_store::SessionRegistry::open_default();
+        let _ = registry.upsert(&record);
+        Self {
+            registry,
+            record,
+            name,
+        }
+    }
+
+    /// The registry id — what executions link to and notifications carry.
+    pub(crate) fn id(&self) -> &str {
+        &self.record.id
+    }
+
+    /// The workspace's display name (notification titles).
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// A new prompt is running: refresh the summary (and the title, if the
+    /// session was announced before its first real prompt).
+    pub(crate) fn update_prompt(&mut self, prompt: &str) {
+        self.record.summary = crate::command_deck::prompt_line(prompt, 240);
+        self.record.status = stella_store::SessionStatus::InProgress;
+        self.record.title = format!(
+            "{}: {}",
+            self.name,
+            crate::command_deck::prompt_line(prompt, 48)
+        );
+        let _ = self.registry.upsert(&self.record);
+    }
+
+    /// Between turns an interactive session waits on the human.
+    pub(crate) fn needs_input(&mut self) {
+        self.record.status = stella_store::SessionStatus::NeedsInput;
+        let _ = self.registry.upsert(&self.record);
+    }
+
+    /// Terminal status, plus an optional persist-until-read inbox
+    /// notification linked to this session — the headless → `/inbox` flow:
+    /// a finished `stella run` surfaces in every deck's inbox, and `Enter`
+    /// replays it.
+    pub(crate) fn finish(&mut self, ok: bool, notify: Option<(String, String)>) {
+        self.record.status = if ok {
+            stella_store::SessionStatus::Complete
+        } else {
+            stella_store::SessionStatus::Error
+        };
+        let _ = self.registry.upsert(&self.record);
+        if let Some((title, body)) = notify {
+            let _ = stella_store::NotificationStore::open_default().push(
+                &stella_store::Notification::new(title, body, self.record.id.clone())
+                    .with_session_id(self.record.id.clone()),
+            );
+        }
     }
 }
 
@@ -2428,10 +2610,11 @@ async fn run_turn(
     store: &Option<Arc<Store>>,
     kind: &str,
     prompt: &str,
+    session: Option<&str>,
 ) -> Result<(), String> {
     budget.begin_turn();
     let turn_start = Instant::now();
-    let execution = begin_execution(store, kind, prompt, cfg);
+    let execution = begin_execution(store, kind, prompt, cfg, session);
 
     let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let renderer = spawn_renderer(rx, format, execution.clone(), cfg.provider.id.to_string());
@@ -2818,9 +3001,10 @@ async fn run_goal_turn(
     cfg: &Config,
     store: &Option<Arc<Store>>,
     goal: &str,
+    session: Option<&str>,
 ) -> Result<(), String> {
     let turn_start = Instant::now();
-    let execution = begin_execution(store, "goal", goal, cfg);
+    let execution = begin_execution(store, "goal", goal, cfg, session);
 
     // Route the JUDGE role. `Some` only when a distinct-family judge was
     // selected AND built; the boxed provider must outlive the `run_goal`
@@ -2944,9 +3128,10 @@ async fn run_goal_pipeline_turn(
     cfg: &Config,
     store: &Option<Arc<Store>>,
     goal: &str,
+    session: Option<&str>,
 ) -> Result<(), String> {
     let turn_start = Instant::now();
-    let execution = begin_execution(store, "goal", goal, cfg);
+    let execution = begin_execution(store, "goal", goal, cfg, session);
     let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
 
     // Role wiring from `agent_engine_config` — the pinned/auto judge (when

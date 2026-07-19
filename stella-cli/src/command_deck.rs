@@ -9,13 +9,19 @@
 //! ## Shape
 //!
 //! One session = one **lead agent** (`"lead"`) holding one conversation, plus
-//! a FIFO prompt queue. The deck's contract is "input never blocks": a prompt
-//! submitted while a turn is in flight is queued (the deck shows it in the
-//! status bar) and dispatched when the turn finishes — [`Inbound::PromptStarted`]
-//! pops the deck's queue display at that moment. Multi-agent fan-out stays a
-//! supervisor seam (`COMMAND_DECK_DESIGN.md` → "Backend seams"): the deck
-//! already folds N agents, but this driver deliberately runs one until
-//! `stella-fleet` grows a real spawn/abort API.
+//! a FIFO prompt queue and a bounded pool of **sub-session workers**
+//! (`crate::subsession`). The deck's contract is "input never blocks", and
+//! dispatch now honors it too: a prompt submitted while the lead's turn is in
+//! flight goes straight to a dedicated worker session (`req:<n>`) instead of
+//! waiting the turn out — [`Inbound::PromptStarted`] pops the deck's queue
+//! display the moment whichever lane picks it up. `task_assign` spawns task
+//! workers (`sub:<task-id>`) the same way, and every worker reports back via
+//! its live event lane, an inbox notification, and (for task workers) the
+//! board task auto-completing. Prompts queue only past the worker cap, on a
+//! dispatch hold, or when they are slash commands (the lead's dispatcher owns
+//! those). Deep pause/resume and fleet-worktree isolation for workers remain
+//! follow-ups on the `stella-fleet` seam (`COMMAND_DECK_DESIGN.md` →
+//! "Backend seams").
 //!
 //! ## The three engine seams handled here
 //!
@@ -63,8 +69,8 @@ use stella_pipeline::{
     PipelineStatus,
 };
 use stella_protocol::{
-    AgentEvent, CompletionMessage, CompletionRequest, FileChangeKind, ModelRef, ToolOutput,
-    ToolSchema,
+    AgentEvent, CiStatus, CompletionMessage, CompletionRequest, FileChangeKind, ModelRef, PrStatus,
+    TaskItem, ToolOutput, ToolSchema,
 };
 use stella_store::Store;
 use stella_tools::ToolRegistry;
@@ -80,10 +86,12 @@ use stella_tui::{
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::agent;
+use crate::claims::ClaimTap;
 use crate::config::Config;
 use crate::interactive::{AskUserIo, FREE_TEXT_LABEL, InteractiveToolSet, SkillRegistry};
 use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
 use crate::runtime::{SystemClock, TokioSleeper};
+use crate::subsession::{self, SubSessions, SupervisorMsg};
 
 /// The lead agent's id — the one conversation this driver runs.
 const LEAD: &str = "lead";
@@ -98,7 +106,7 @@ static NEXT_DECK_ASK: AtomicU64 = AtomicU64::new(0);
 /// write must not balloon the event log the deck folds.
 const PSEUDO_DIFF_MAX_LINES: usize = 200;
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -259,6 +267,9 @@ pub async fn run_deck_session(
     let (in_tx, in_rx) = mpsc::unbounded_channel::<Inbound>();
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<WorkspaceInput>();
     let (ask_tx, ask_rx) = mpsc::unbounded_channel::<String>();
+    // The supervisor channel: `task_assign` spawn requests (tap → driver)
+    // and sub-session endings (worker → driver). See `crate::subsession`.
+    let (sup_tx, mut sup_rx) = mpsc::unbounded_channel::<SupervisorMsg>();
 
     let title = cfg
         .workspace_root
@@ -369,15 +380,15 @@ pub async fn run_deck_session(
         }),
     );
 
-    // ── MCP connect, behind the live deck (#98) ─────────────────────────────
-    // This await used to run during assembly, before the deck spawned — a
-    // slow or unreachable server meant a blank terminal for up to the 10s
-    // per-server timeout. The deck is up now, so its splash absorbs the wait
-    // and the attempt is narrated in the transcript. Failure semantics are
-    // the plain REPL's: the session continues on native tools only. Prompts
-    // submitted while this await runs are never lost — the deck's input
-    // never blocks, and everything it sends buffers in `sub_rx` until the
-    // driver loop below starts reading.
+    // ── MCP connect, OFF the first prompt's critical path (#98 continued) ──
+    // The connect used to run inline here: the deck was live, but the driver
+    // loop — and therefore the FIRST prompt's dispatch — waited up to 10s
+    // per server. It now runs on its own task and lands the connected set in
+    // `mcp_slot`; every turn resolves its tool executor from the slot at
+    // dispatch, so servers join the session the moment they connect and the
+    // first prompt starts immediately (on native tools when connect is still
+    // running — narrated once, never silent). Prompts are never lost either
+    // way: the deck's input never blocks and `sub_rx` buffers.
     // Session-scoped MCP management state, shared with the MCP tab:
     //   • `mcp_disabled` — server names disabled this session; toggling it
     //     hides a server's tools from the model on the next call (live, no
@@ -386,59 +397,19 @@ pub async fn run_deck_session(
     //     `mcp_usage` telemetry table.
     let mcp_disabled: stella_mcp::DisabledServers =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-    let mcp = match agent::load_mcp_plan(cfg) {
-        agent::McpPlan::None => None,
-        agent::McpPlan::Invalid(reason) => {
-            let _ = in_tx.send(Inbound::Event {
-                agent: LEAD.to_string(),
-                event: AgentEvent::Text { delta: reason },
-            });
-            let _ = in_tx.send(Inbound::Status {
-                agent: LEAD.to_string(),
-                status: AgentStatus::WaitingInput,
-            });
-            None
-        }
-        agent::McpPlan::Servers(servers) => {
-            let _ = in_tx.send(Inbound::Event {
-                agent: LEAD.to_string(),
-                event: AgentEvent::Text {
-                    delta: format!("connecting {} MCP server(s)…", servers.len()),
-                },
-            });
-            let set = agent::connect_mcp_servers(
-                &servers,
-                registry.clone(),
-                Some(registry.mcp_usage_ledger()),
-                Some(mcp_disabled.clone()),
-                Some(crate::mcp_cmd::oauth_manager(&cfg.workspace_root)),
-            )
-            .await;
-            let _ = in_tx.send(Inbound::Event {
-                agent: LEAD.to_string(),
-                event: AgentEvent::Text {
-                    delta: mcp_outcome_report(&set.connected_names(), set.failed_servers()),
-                },
-            });
-            // The Text events above fold the lead to `Running`, but no turn
-            // is in flight — restore the idle status or the dashboard would
-            // show a busy lead forever.
-            let _ = in_tx.send(Inbound::Status {
-                agent: LEAD.to_string(),
-                status: AgentStatus::WaitingInput,
-            });
-            Some(set)
-        }
-    };
-    let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
-        None => &*registry,
-    };
-    // Seed the MCP tab with the configured servers and their live state.
-    send_mcp_snapshot(cfg, &mcp, &mcp_disabled, &in_tx).await;
-    // MCP connect settled (or there was nothing to connect) — the other init
-    // leg the launch splash waits on.
-    release_splash();
+    let mcp_slot: Arc<tokio::sync::OnceCell<stella_mcp::McpToolSet>> =
+        Arc::new(tokio::sync::OnceCell::new());
+    let mcp_configured = spawn_mcp_connect(
+        cfg.clone(),
+        registry.clone(),
+        mcp_disabled.clone(),
+        mcp_slot.clone(),
+        in_tx.clone(),
+        release_splash.clone(),
+    );
+    // Whether the "still connecting" note has been narrated (once, on the
+    // first turn that dispatches before the slot fills).
+    let mut mcp_pending_noted = false;
 
     // ── Cross-process session registry + persist-until-read notifications ──
     // This session announces itself machine-wide (every deck's SESSIONS
@@ -462,6 +433,13 @@ pub async fn run_deck_session(
     // What the record's terminal status will be at exit (last turn wins);
     // quitting with an abandoned backlog overrides to Cancelled below.
     let mut session_exit = stella_store::SessionStatus::Complete;
+    // Claim-on-first-write identity for the lead's turns, and crash hygiene
+    // for the whole workspace: sweep claims old enough that their process is
+    // surely gone (a crashed writer cannot release its own).
+    let lead_holder = format!("{}/lead", session_record.id);
+    if let Some(store) = &store {
+        let _ = store.prune_stale_file_locks(crate::claims::STALE_CLAIM_MAX_AGE_SECS);
+    }
     spawn_notification_poller(in_tx.clone());
 
     // The ISSUES tab's lazily-detected tracker backend (see
@@ -482,7 +460,35 @@ pub async fn run_deck_session(
     // provider (borrowed by the running turn), so it parks here and runs
     // right after the turn settles.
     let mut pending_create: Option<(String, AgentScope)> = None;
+    // Sub-session bookkeeping: live-worker slots, and `task_assign` requests
+    // waiting for one (drained oldest-first as workers end).
+    let mut subs = SubSessions::new();
+    let mut pending_spawns: VecDeque<stella_core::tasks::SpawnRequest> = VecDeque::new();
+    // Worker spend not yet metered into the session budget guard — applied
+    // at the loop top, where the guard is free (budget aborts happen at
+    // safe boundaries only).
+    let mut unmetered_spend: f64 = 0.0;
+    // PR/CI reconcile: polls `gh` for the workspace's current-branch PR and
+    // its checks, feeding the footer's PR cell, the store mirror, and
+    // failing-CI inbox notifications. The nudge skips the wait after turns
+    // and worker endings — the moments a PR most plausibly just changed.
+    let pr_nudge = Arc::new(tokio::sync::Notify::new());
+    spawn_pr_monitor(
+        cfg.workspace_root.clone(),
+        session_record.id.clone(),
+        store.clone(),
+        workspace_name.clone(),
+        pr_nudge.clone(),
+        in_tx.clone(),
+    );
     'session: loop {
+        // Meter accumulated worker spend into the session guard at this
+        // safe boundary — the engine's own budget checks then see the true
+        // session total on the next turn.
+        if unmetered_spend > 0.0 {
+            let _ = budget.record_spend(unmetered_spend);
+            unmetered_spend = 0.0;
+        }
         // Take the next prompt: backlog first (unless held), else wait for
         // deck input.
         let next = if dispatch.held() {
@@ -490,98 +496,148 @@ pub async fn run_deck_session(
         } else {
             queue.pop_front()
         };
+        // Between prompts the driver waits on BOTH channels: deck input and
+        // the supervisor (a sub-session ending or a stray spawn request must
+        // not wait for the user's next keystroke to be serviced).
+        enum IdleWake {
+            Input(Option<WorkspaceInput>),
+            Sup(Option<SupervisorMsg>),
+        }
         let prompt = match next {
             Some(text) => text,
-            None => match sub_rx.recv().await {
-                None => break 'session,
-                Some(WorkspaceInput::Quit) => break 'session,
-                // Any submission releases a hold and runs NOW — ahead of the
-                // parked backlog. `EnqueueFront` is the deck's explicit
-                // front-insert (sent while it knows dispatch is held); a
-                // plain `Enqueue` behaves identically here because running
-                // the text immediately IS the front of the queue.
-                Some(WorkspaceInput::Enqueue { text })
-                | Some(WorkspaceInput::EnqueueFront { text })
-                | Some(WorkspaceInput::ToAgent {
-                    input: UserInput::Prompt { text, .. },
-                    ..
-                }) => {
-                    dispatch.release();
-                    text
-                }
-                // While a hold parks a non-empty backlog at this recv, the
-                // user can still edit it from the queue popup — mirror the
-                // edits exactly like the in-turn arm does. (Before holds
-                // existed the queue was always empty by the time this recv
-                // ran, so these inputs had nothing to act on here.)
-                Some(WorkspaceInput::QueueRemove { index }) => {
-                    if index < queue.len() {
-                        queue.remove(index);
-                    }
-                    continue 'session;
-                }
-                Some(WorkspaceInput::QueueClear) => {
-                    queue.clear();
-                    continue 'session;
-                }
-                // The double-Esc escalation, landing AFTER its pair's plain
-                // `Stop` already dropped the turn — with an empty backlog
-                // this recv is exactly where it lands (the channel is FIFO,
-                // so the escalation can never reach the turn the pair
-                // targeted). Requeue what that cancel dropped and park
-                // dispatch; with nothing retained there is nothing to hold
-                // and a stray escalation stays a no-op.
-                Some(WorkspaceInput::StopAndHold { .. }) => {
-                    requeue_front(&mut queue, &in_tx, dispatch.stop_and_hold(None));
-                    continue 'session;
-                }
-                // The Graph tab's file picker asked to re-root on a file:
-                // requery its neighborhood and push a fresh snapshot back, the
-                // same out-of-band refresh `/init` uses. The loop is idle here,
-                // so the read runs inline.
-                Some(WorkspaceInput::FocusGraphFile { file }) => {
-                    if let Some(snapshot) =
-                        agent::graph_snapshot_focus(&cfg.workspace_root, Some(&file))
-                    {
-                        let _ = in_tx.send(Inbound::GraphSnapshot(snapshot));
-                    }
-                    continue 'session;
-                }
-                // SKILLS-tab ops work whether or not a turn is running — handled
-                // at both recv sites so the manager is live mid-turn too.
-                Some(WorkspaceInput::Skill(op)) => {
-                    handle_skills_input(&op, cfg, &in_tx, &skill_registry);
-                    continue 'session;
-                }
-                // LLM-assisted agent creation needs the provider, which is
-                // free here (no turn in flight) — draft, install, refresh.
-                Some(WorkspaceInput::AgentCreate { description, scope }) => {
-                    handle_agent_create(&description, scope, cfg, &*provider, &in_tx).await;
-                    continue 'session;
-                }
-                // Fallthrough for everything else, serviced between turns
-                // (install/search hit the network, so they must not stall a
-                // live turn): MCP tab actions first, then the session-registry
-                // / inbox verbs, then the INSTALLED AGENTS pane's synchronous
-                // filesystem ops, then the ISSUES tab's spawned tracker ops.
-                // A stray answer/decision/control with no turn in flight
-                // falls through all four no-ops.
-                Some(other) => {
-                    if !service_mcp_action(&other, cfg, &mcp, &mcp_disabled, &in_tx).await
-                        && !service_registry_action(
-                            &other,
-                            &session_registry,
+            None => {
+                let wake = tokio::select! {
+                    input = sub_rx.recv() => IdleWake::Input(input),
+                    msg = sup_rx.recv() => IdleWake::Sup(msg),
+                };
+                let input = match wake {
+                    // The driver holds a live `sup_tx`, so `None` cannot
+                    // occur; treat it as a spurious wake regardless.
+                    IdleWake::Sup(None) => continue 'session,
+                    IdleWake::Sup(Some(msg)) => {
+                        handle_supervisor_msg(
+                            msg,
+                            &mut subs,
+                            &mut pending_spawns,
+                            &mut queue,
+                            dispatch.held(),
+                            &registry,
+                            &store,
                             &session_record.id,
+                            &workspace_name,
+                            cfg,
+                            budget_limit,
+                            &mut unmetered_spend,
+                            &pr_nudge,
                             &in_tx,
-                        )
-                        && !handle_agents_input(&other, cfg, &in_tx)
-                        && !handle_issues_input(&other, cfg, &issue_backend_cache, &in_tx)
-                    {
-                        handle_engine_config_input(&other, cfg, &in_tx);
+                            &sup_tx,
+                        );
+                        continue 'session;
                     }
-                    continue 'session;
+                    IdleWake::Input(input) => input,
+                };
+                match input {
+                    None => break 'session,
+                    Some(WorkspaceInput::Quit) => break 'session,
+                    // Stopping a worker lane works between lead turns too —
+                    // the lead being idle says nothing about a running
+                    // worker.
+                    Some(WorkspaceInput::Control {
+                        agent,
+                        control: stella_tui::AgentControl::Stop,
+                    }) if agent != LEAD => {
+                        subs.stop(&agent);
+                        continue 'session;
+                    }
+                    // Any submission releases a hold and runs NOW — ahead of the
+                    // parked backlog. `EnqueueFront` is the deck's explicit
+                    // front-insert (sent while it knows dispatch is held); a
+                    // plain `Enqueue` behaves identically here because running
+                    // the text immediately IS the front of the queue.
+                    Some(WorkspaceInput::Enqueue { text })
+                    | Some(WorkspaceInput::EnqueueFront { text })
+                    | Some(WorkspaceInput::ToAgent {
+                        input: UserInput::Prompt { text, .. },
+                        ..
+                    }) => {
+                        dispatch.release();
+                        text
+                    }
+                    // While a hold parks a non-empty backlog at this recv, the
+                    // user can still edit it from the queue popup — mirror the
+                    // edits exactly like the in-turn arm does. (Before holds
+                    // existed the queue was always empty by the time this recv
+                    // ran, so these inputs had nothing to act on here.)
+                    Some(WorkspaceInput::QueueRemove { index }) => {
+                        if index < queue.len() {
+                            queue.remove(index);
+                        }
+                        continue 'session;
+                    }
+                    Some(WorkspaceInput::QueueClear) => {
+                        queue.clear();
+                        continue 'session;
+                    }
+                    // The double-Esc escalation, landing AFTER its pair's plain
+                    // `Stop` already dropped the turn — with an empty backlog
+                    // this recv is exactly where it lands (the channel is FIFO,
+                    // so the escalation can never reach the turn the pair
+                    // targeted). Requeue what that cancel dropped and park
+                    // dispatch; with nothing retained there is nothing to hold
+                    // and a stray escalation stays a no-op.
+                    Some(WorkspaceInput::StopAndHold { .. }) => {
+                        requeue_front(&mut queue, &in_tx, dispatch.stop_and_hold(None));
+                        continue 'session;
+                    }
+                    // The Graph tab's file picker asked to re-root on a file:
+                    // requery its neighborhood and push a fresh snapshot back, the
+                    // same out-of-band refresh `/init` uses. The loop is idle here,
+                    // so the read runs inline.
+                    Some(WorkspaceInput::FocusGraphFile { file }) => {
+                        if let Some(snapshot) =
+                            agent::graph_snapshot_focus(&cfg.workspace_root, Some(&file))
+                        {
+                            let _ = in_tx.send(Inbound::GraphSnapshot(snapshot));
+                        }
+                        continue 'session;
+                    }
+                    // SKILLS-tab ops work whether or not a turn is running — handled
+                    // at both recv sites so the manager is live mid-turn too.
+                    Some(WorkspaceInput::Skill(op)) => {
+                        handle_skills_input(&op, cfg, &in_tx, &skill_registry);
+                        continue 'session;
+                    }
+                    // LLM-assisted agent creation needs the provider, which is
+                    // free here (no turn in flight) — draft, install, refresh.
+                    Some(WorkspaceInput::AgentCreate { description, scope }) => {
+                        handle_agent_create(&description, scope, cfg, &*provider, &in_tx).await;
+                        continue 'session;
+                    }
+                    // Fallthrough for everything else, serviced between turns
+                    // (install/search hit the network, so they must not stall a
+                    // live turn): MCP tab actions first, then the session-registry
+                    // / inbox verbs, then the INSTALLED AGENTS pane's synchronous
+                    // filesystem ops, then the ISSUES tab's spawned tracker ops.
+                    // A stray answer/decision/control with no turn in flight
+                    // falls through all four no-ops.
+                    Some(other) => {
+                        if !service_mcp_action(&other, cfg, mcp_slot.get(), &mcp_disabled, &in_tx)
+                            .await
+                            && !service_registry_action(
+                                &other,
+                                &session_registry,
+                                &session_record.id,
+                                &in_tx,
+                            )
+                            && !handle_agents_input(&other, cfg, &in_tx)
+                            && !handle_issues_input(&other, cfg, &issue_backend_cache, &in_tx)
+                        {
+                            handle_engine_config_input(&other, cfg, &in_tx);
+                        }
+                        continue 'session;
+                    }
                 }
-            },
+            }
         };
 
         let _ = in_tx.send(Inbound::PromptStarted {
@@ -685,11 +741,15 @@ pub async fn run_deck_session(
 
         // The execution record outlives the turn future so a cancelled turn
         // can still be closed out in the store.
+        // The session link (store schema v8) is what lets the SESSIONS
+        // overlay's `Enter` reassemble and replay the full journal long
+        // after this process is gone.
         let execution = agent::begin_execution(
             &store,
             if pipeline_on { "deck-pipeline" } else { "deck" },
             &prompt,
             cfg,
+            Some(&session_record.id),
         );
         let files_before = registry.files_touched().len();
         let started_unix = crate::memory::unix_now_secs();
@@ -715,6 +775,26 @@ pub async fn run_deck_session(
             }
         }
 
+        // Resolve the turn's tool executor from the MCP slot at dispatch:
+        // connected servers join the session the moment the background
+        // connect lands, and a turn that beats it runs on native tools —
+        // narrated once, never silently degraded.
+        let base_tools: &dyn ToolExecutor = match mcp_slot.get() {
+            Some(set) => set,
+            None => &*registry,
+        };
+        if mcp_configured && mcp_slot.get().is_none() && !mcp_pending_noted {
+            mcp_pending_noted = true;
+            let _ = in_tx.send(Inbound::Event {
+                agent: LEAD.to_string(),
+                event: AgentEvent::Text {
+                    delta: "MCP servers are still connecting — this turn runs with native \
+                            tools; connected servers join from the next turn"
+                        .to_string(),
+                },
+            });
+        }
+
         let end = {
             // Both arms return `Result<(), String>`, so one pinned future
             // drives either path through the same select loop.
@@ -733,6 +813,8 @@ pub async fn run_deck_session(
                         execution.clone(),
                         &in_tx,
                         &ask_io,
+                        &sup_tx,
+                        &lead_holder,
                     )
                     .await
                 } else {
@@ -748,6 +830,8 @@ pub async fn run_deck_session(
                         execution.clone(),
                         &in_tx,
                         &ask_io,
+                        &sup_tx,
+                        &lead_holder,
                     )
                     .await
                 }
@@ -756,12 +840,54 @@ pub async fn run_deck_session(
             loop {
                 tokio::select! {
                     outcome = &mut turn => break TurnEnd::Finished(outcome),
+                    // Supervisor traffic is serviced while the lead works —
+                    // that is the point: a task_assign spawns its worker
+                    // mid-turn, and a worker ending frees its slot for the
+                    // next backlogged prompt without waiting for the lead.
+                    Some(msg) = sup_rx.recv() => {
+                        handle_supervisor_msg(
+                            msg,
+                            &mut subs,
+                            &mut pending_spawns,
+                            &mut queue,
+                            dispatch.held(),
+                            &registry,
+                            &store,
+                            &session_record.id,
+                            &workspace_name,
+                            cfg,
+                            budget_limit,
+                            &mut unmetered_spend,
+                            &pr_nudge,
+                            &in_tx,
+                            &sup_tx,
+                        );
+                    }
                     input = sub_rx.recv() => match input {
                         None | Some(WorkspaceInput::Quit) => break TurnEnd::Quit,
+                        // The lead is busy — the prompt does NOT wait for it.
+                        // It backlogs and immediately drains to a dedicated
+                        // sub-session if a worker slot is free ("the agent's
+                        // job is to spawn a sub-session just for that
+                        // request"); only slot exhaustion or a slash command
+                        // leaves it queued for the lead.
                         Some(WorkspaceInput::Enqueue { text })
                         | Some(WorkspaceInput::ToAgent {
                             input: UserInput::Prompt { text, .. }, ..
-                        }) => queue.push_back(text),
+                        }) => {
+                            queue.push_back(text);
+                            subsession::drain_queue(
+                                &mut queue,
+                                &mut subs,
+                                dispatch.held(),
+                                cfg,
+                                budget_limit,
+                                &session_record.id,
+                                &workspace_name,
+                                &in_tx,
+                                &sup_tx,
+                            );
+                        }
                         // An explicit front-insert stays a front-insert even
                         // if a turn started before it arrived — the deck's
                         // queue view already shows it first.
@@ -780,10 +906,18 @@ pub async fn run_deck_session(
                         }) => {
                             let _ = ask_tx.send(answer);
                         }
-                        Some(WorkspaceInput::ToAgent { input: UserInput::Cancel, .. })
+                        // Stop routes by lane: aimed at the lead it cancels
+                        // this turn; aimed at a worker it stops THAT worker
+                        // and the lead's turn keeps running.
+                        Some(WorkspaceInput::ToAgent { input: UserInput::Cancel, agent })
                         | Some(WorkspaceInput::Control {
-                            control: stella_tui::AgentControl::Stop, ..
-                        }) => break TurnEnd::Cancelled { hold: false },
+                            control: stella_tui::AgentControl::Stop, agent,
+                        }) => {
+                            if agent == LEAD {
+                                break TurnEnd::Cancelled { hold: false };
+                            }
+                            subs.stop(&agent);
+                        }
                         // Double-Esc: cancel AND park dispatch — the
                         // interrupted prompt returns to the front of the
                         // backlog and the user's next submission runs first.
@@ -871,6 +1005,7 @@ pub async fn run_deck_session(
                         // like the INSTALLED AGENTS pane above.
                         Some(
                             input @ (WorkspaceInput::SessionsRefresh
+                            | WorkspaceInput::SessionOpen { .. }
                             | WorkspaceInput::SessionArchive { .. }
                             | WorkspaceInput::SessionDelete { .. }
                             | WorkspaceInput::NotificationRead { .. }
@@ -963,23 +1098,59 @@ pub async fn run_deck_session(
                 let turn_secs = crate::memory::unix_now_secs().saturating_sub(started_unix);
                 let inbox = stella_store::NotificationStore::open_default();
                 if let Err(reason) = &outcome {
-                    let _ = inbox.push(&stella_store::Notification::new(
-                        format!("{workspace_name}: turn failed"),
-                        format!("{} — {reason}", prompt_line(&submitted, 80)),
-                        session_record.id.clone(),
-                    ));
+                    let _ = inbox.push(
+                        &stella_store::Notification::new(
+                            format!("{workspace_name}: turn failed"),
+                            format!("{} — {reason}", prompt_line(&submitted, 80)),
+                            session_record.id.clone(),
+                        )
+                        .with_session_id(session_record.id.clone()),
+                    );
                 } else if turn_secs >= LONG_TURN_NOTIFY_SECS {
-                    let _ = inbox.push(&stella_store::Notification::new(
-                        format!("{workspace_name}: work finished ({turn_secs}s)"),
-                        prompt_line(&submitted, 160),
-                        session_record.id.clone(),
-                    ));
+                    let _ = inbox.push(
+                        &stella_store::Notification::new(
+                            format!("{workspace_name}: work finished ({turn_secs}s)"),
+                            prompt_line(&submitted, 160),
+                            session_record.id.clone(),
+                        )
+                        .with_session_id(session_record.id.clone()),
+                    );
+                }
+                // The turn may have committed / pushed / opened a PR —
+                // reconcile now instead of waiting out the poll interval.
+                pr_nudge.notify_one();
+                // Mirror the lead's final board into the store's `tasks`
+                // table — cross-session findability for what this turn
+                // planned and finished (the event-log copy already rode the
+                // forwarder for replay).
+                if let Some((store, id)) = &execution {
+                    let board = registry.task_board();
+                    let items: Vec<TaskItem> = board
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .items()
+                        .to_vec();
+                    if !items.is_empty() {
+                        let _ = store.record_task_board(
+                            *id,
+                            Some(&session_record.id),
+                            &items,
+                            now_ms(),
+                        );
+                    }
                 }
             }
             TurnEnd::Cancelled { hold } => {
                 // Erase the partial turn: the next prompt continues from the
                 // last committed conversation state.
                 messages.truncate(turn_base);
+                // The dropped turn future never reached its own claim
+                // release — free the lead's write claims by holder so
+                // workers (and other sessions) aren't blocked on a turn
+                // that no longer exists.
+                if let Some(store) = &store {
+                    let _ = store.release_file_locks_for_holder(&lead_holder);
+                }
                 if hold {
                     // Double-Esc landing mid-turn: this turn is the NEXT
                     // prompt, auto-dispatched in the gap between the pair's
@@ -1050,7 +1221,7 @@ pub async fn run_deck_session(
     // already quit; then wait for it to restore the terminal.
     drop(in_tx);
     let deck_result = deck.await;
-    if let Some(set) = &mcp {
+    if let Some(set) = mcp_slot.get() {
         set.close_all().await;
     }
     match deck_result {
@@ -1058,6 +1229,77 @@ pub async fn run_deck_session(
         Ok(Err(e)) => Err(format!("deck terminal error: {e}")),
         Err(e) => Err(format!("deck task failed: {e}")),
     }
+}
+
+/// Run the MCP connect on its own task, landing the connected set in `slot`
+/// for turns to pick up at dispatch. Returns whether any servers are
+/// configured at all (`false` = the slot will stay empty forever, so no
+/// "still connecting" note is ever warranted). Always seeds the MCP tab and
+/// releases the splash leg, whatever the plan resolves to.
+fn spawn_mcp_connect(
+    cfg: Config,
+    registry: Arc<ToolRegistry>,
+    disabled: stella_mcp::DisabledServers,
+    slot: Arc<tokio::sync::OnceCell<stella_mcp::McpToolSet>>,
+    in_tx: UnboundedSender<Inbound>,
+    release_splash: impl FnOnce() + Send + 'static,
+) -> bool {
+    let plan = agent::load_mcp_plan(&cfg);
+    let configured = matches!(plan, agent::McpPlan::Servers(_));
+    tokio::spawn(async move {
+        match plan {
+            agent::McpPlan::None => {}
+            agent::McpPlan::Invalid(reason) => {
+                let _ = in_tx.send(Inbound::Event {
+                    agent: LEAD.to_string(),
+                    event: AgentEvent::Text { delta: reason },
+                });
+                let _ = in_tx.send(Inbound::Status {
+                    agent: LEAD.to_string(),
+                    status: AgentStatus::WaitingInput,
+                });
+            }
+            agent::McpPlan::Servers(servers) => {
+                let _ = in_tx.send(Inbound::Event {
+                    agent: LEAD.to_string(),
+                    event: AgentEvent::Text {
+                        delta: format!("connecting {} MCP server(s)…", servers.len()),
+                    },
+                });
+                let set = agent::connect_mcp_servers(
+                    &servers,
+                    registry.clone(),
+                    Some(registry.mcp_usage_ledger()),
+                    Some(disabled.clone()),
+                    Some(crate::mcp_cmd::oauth_manager(&cfg.workspace_root)),
+                )
+                .await;
+                let _ = in_tx.send(Inbound::Event {
+                    agent: LEAD.to_string(),
+                    event: AgentEvent::Text {
+                        delta: mcp_outcome_report(&set.connected_names(), set.failed_servers()),
+                    },
+                });
+                // The Text events above fold the lead to `Running`, but no
+                // turn is in flight — restore the idle status or the
+                // dashboard would show a busy lead forever.
+                let _ = in_tx.send(Inbound::Status {
+                    agent: LEAD.to_string(),
+                    status: AgentStatus::WaitingInput,
+                });
+                // `set` is infallible here (the cell is set exactly once,
+                // by this task); an in-flight turn keeps its resolved
+                // executor and the NEXT turn picks the servers up.
+                let _ = slot.set(set);
+            }
+        }
+        // Seed the MCP tab with the configured servers and their live state.
+        send_mcp_snapshot(&cfg, slot.get(), &disabled, &in_tx).await;
+        // MCP connect settled (or there was nothing to connect) — the other
+        // init leg the launch splash waits on.
+        release_splash();
+    });
+    configured
 }
 
 /// The transcript report for a finished MCP connect attempt: the connected
@@ -1087,12 +1329,11 @@ fn mcp_outcome_report(connected: &[&str], failed: &[(String, String)]) -> String
 /// configured credential field names, and total recorded tool calls.
 async fn mcp_snapshot(
     cfg: &Config,
-    mcp: &Option<stella_mcp::McpToolSet>,
+    mcp: Option<&stella_mcp::McpToolSet>,
     disabled: &stella_mcp::DisabledServers,
 ) -> Vec<stella_tui::McpServerInfo> {
     let config = crate::mcp_cmd::load_config(&cfg.workspace_root).unwrap_or_default();
     let connected: std::collections::HashSet<String> = mcp
-        .as_ref()
         .map(|s| {
             s.connected_names()
                 .into_iter()
@@ -1104,7 +1345,7 @@ async fn mcp_snapshot(
         Some(s) => s.health().await,
         None => Vec::new(),
     };
-    let schemas = mcp.as_ref().map(|s| s.schemas()).unwrap_or_default();
+    let schemas = mcp.map(|s| s.schemas()).unwrap_or_default();
     let usage = crate::mcp_cmd::usage_stats(&cfg.workspace_root).unwrap_or_default();
     let disabled_set = disabled.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let oauth_logins: std::collections::HashSet<String> =
@@ -1159,7 +1400,7 @@ async fn mcp_snapshot(
 /// Build and push a fresh MCP tab snapshot.
 async fn send_mcp_snapshot(
     cfg: &Config,
-    mcp: &Option<stella_mcp::McpToolSet>,
+    mcp: Option<&stella_mcp::McpToolSet>,
     disabled: &stella_mcp::DisabledServers,
     in_tx: &mpsc::UnboundedSender<Inbound>,
 ) {
@@ -1216,7 +1457,7 @@ async fn run_mcp_search(cfg: &Config, query: &str) -> stella_tui::McpSearchOutco
 async fn service_mcp_action(
     input: &WorkspaceInput,
     cfg: &Config,
-    mcp: &Option<stella_mcp::McpToolSet>,
+    mcp: Option<&stella_mcp::McpToolSet>,
     disabled: &stella_mcp::DisabledServers,
     in_tx: &mpsc::UnboundedSender<Inbound>,
 ) -> bool {
@@ -1282,7 +1523,7 @@ const LONG_TURN_NOTIFY_SECS: i64 = 60;
 
 /// One prompt flattened to a single display line, char-safe-truncated — the
 /// session registry's title/summary shape.
-fn prompt_line(prompt: &str, max_chars: usize) -> String {
+pub(crate) fn prompt_line(prompt: &str, max_chars: usize) -> String {
     let flat: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max_chars {
         return flat;
@@ -1303,6 +1544,9 @@ fn service_registry_action(
     match input {
         WorkspaceInput::SessionsRefresh => {
             let _ = in_tx.send(sessions_inbound(registry, my_session_id));
+        }
+        WorkspaceInput::SessionOpen { id } => {
+            spawn_session_replay(id.clone(), registry.list(), in_tx.clone());
         }
         WorkspaceInput::SessionArchive { id } => {
             let _ = registry.set_status(id, stella_store::SessionStatus::Archived);
@@ -1376,9 +1620,373 @@ fn notifications_inbound(store: &stella_store::NotificationStore) -> Inbound {
             source: n.source,
             created_ms: n.created_at_ms,
             read: n.read,
+            session_id: n.session_id,
         })
         .collect();
     Inbound::Notifications(items)
+}
+
+/// Service one supervisor message: dispatch or park a `task_assign` spawn,
+/// and on a worker's end free its slot, close the delegation loop (a task
+/// worker succeeding completes its board task), meter the worker's spend
+/// toward the session budget, nudge the PR monitor, then drain whatever the
+/// freed slot can take — parked spawns first, then the prompt backlog.
+#[allow(clippy::too_many_arguments)]
+fn handle_supervisor_msg(
+    msg: SupervisorMsg,
+    subs: &mut SubSessions,
+    pending_spawns: &mut VecDeque<stella_core::tasks::SpawnRequest>,
+    queue: &mut VecDeque<String>,
+    dispatch_held: bool,
+    registry: &ToolRegistry,
+    store: &Option<Arc<Store>>,
+    session_id: &str,
+    workspace_name: &str,
+    cfg: &Config,
+    budget_limit: Option<f64>,
+    unmetered_spend: &mut f64,
+    pr_nudge: &Arc<tokio::sync::Notify>,
+    in_tx: &UnboundedSender<Inbound>,
+    sup_tx: &UnboundedSender<SupervisorMsg>,
+) {
+    match msg {
+        SupervisorMsg::SpawnTask(request) => {
+            if subs.has_slot() {
+                subsession::spawn_task_worker(
+                    &request,
+                    subs,
+                    cfg,
+                    budget_limit,
+                    session_id,
+                    workspace_name,
+                    in_tx,
+                    sup_tx,
+                );
+            } else {
+                pending_spawns.push_back(request);
+            }
+        }
+        SupervisorMsg::Ended {
+            lane,
+            execution_id,
+            cost_usd,
+            end,
+        } => {
+            subs.ended(&lane);
+            // Worker spend reaches the session's parent budget guard (the
+            // L-E9 discipline). The guard is mutably borrowed by any in-
+            // flight lead turn, so the driver accumulates here and meters at
+            // the loop top, the next safe boundary — budget aborts happen at
+            // boundaries only, never mid-flight.
+            *unmetered_spend += cost_usd;
+            // A worker may have just pushed a branch / opened a PR — observe
+            // now, not at the next 45s tick.
+            pr_nudge.notify_one();
+            // A task worker finishing successfully completes its board task
+            // — the delegation loop closes without the lead's involvement. A
+            // failed or stopped worker leaves the task in progress: the
+            // board must not claim done what wasn't (the inbox notification
+            // names a failure; a stop was the user's own act).
+            if let Some(task_id) = lane.strip_prefix("sub:") {
+                let board = registry.task_board();
+                let items: Vec<TaskItem> = {
+                    let mut guard = board.lock().unwrap_or_else(|p| p.into_inner());
+                    if matches!(end, subsession::WorkerEnd::Done) {
+                        let _ = guard.set_status(task_id, stella_protocol::TaskStatus::Completed);
+                    }
+                    guard.items().to_vec()
+                };
+                let _ = in_tx.send(Inbound::Event {
+                    agent: LEAD.to_string(),
+                    event: AgentEvent::TaskUpdate {
+                        tasks: items.clone(),
+                    },
+                });
+                if let (Some(store), Some(exec)) = (store.as_ref(), execution_id) {
+                    let _ = store.record_task_board(exec, Some(session_id), &items, now_ms());
+                }
+            }
+            while subs.has_slot()
+                && let Some(request) = pending_spawns.pop_front()
+            {
+                subsession::spawn_task_worker(
+                    &request,
+                    subs,
+                    cfg,
+                    budget_limit,
+                    session_id,
+                    workspace_name,
+                    in_tx,
+                    sup_tx,
+                );
+            }
+            subsession::drain_queue(
+                queue,
+                subs,
+                dispatch_held,
+                cfg,
+                budget_limit,
+                session_id,
+                workspace_name,
+                in_tx,
+                sup_tx,
+            );
+        }
+    }
+}
+
+/// Open a session in a replay lane ([`WorkspaceInput::SessionOpen`]): load
+/// its persisted journal from the session's own workspace store (linked via
+/// `executions.session_id`, store schema v8) and stream it through the
+/// deck's ordinary fold. Replay IS the fold — a session dead for 12 hours
+/// reconstructs to exactly the state it reached, through the same rendering
+/// path a live session uses. Heavy reads run on the blocking pool.
+fn spawn_session_replay(
+    id: String,
+    records: Vec<stella_store::SessionRecord>,
+    in_tx: mpsc::UnboundedSender<Inbound>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let Some(record) = records.into_iter().find(|r| r.id == id) else {
+            let _ = in_tx.send(Inbound::Event {
+                agent: LEAD.to_string(),
+                event: AgentEvent::Text {
+                    delta: format!("session {id} is no longer in the registry"),
+                },
+            });
+            return;
+        };
+        let lane = format!("replay:{id}");
+        let meta = AgentMeta::new(lane.clone(), format!("replay — {}", record.title), now_ms())
+            .with_role("replay");
+        let _ = in_tx.send(Inbound::Register(meta));
+        let lane_text = |delta: String| Inbound::Event {
+            agent: lane.clone(),
+            event: AgentEvent::Text { delta },
+        };
+        let Some(store) = agent::open_store(std::path::Path::new(&record.workspace)) else {
+            let _ = in_tx.send(lane_text(format!(
+                "no store found at {} — nothing to replay",
+                record.workspace
+            )));
+            let _ = in_tx.send(Inbound::Status {
+                agent: lane,
+                status: AgentStatus::Failed,
+            });
+            return;
+        };
+        match store.session_events(&id) {
+            Ok(journal) => {
+                if journal.events.is_empty() {
+                    let _ = in_tx.send(lane_text(
+                        "no persisted events for this session (it predates session-linked \
+                         journals, store schema v8)"
+                            .to_string(),
+                    ));
+                }
+                for rec in journal.events {
+                    let _ = in_tx.send(Inbound::Event {
+                        agent: lane.clone(),
+                        event: rec.event,
+                    });
+                }
+                if journal.skipped > 0 {
+                    let _ = in_tx.send(lane_text(format!(
+                        "{} event(s) could not be decoded and were skipped",
+                        journal.skipped
+                    )));
+                }
+                let _ = in_tx.send(Inbound::Status {
+                    agent: lane,
+                    status: match record.status {
+                        stella_store::SessionStatus::Error => AgentStatus::Failed,
+                        _ => AgentStatus::Done,
+                    },
+                });
+            }
+            Err(e) => {
+                let _ = in_tx.send(lane_text(format!(
+                    "failed to read the session journal: {e}"
+                )));
+                let _ = in_tx.send(Inbound::Status {
+                    agent: lane,
+                    status: AgentStatus::Failed,
+                });
+            }
+        }
+    });
+}
+
+/// How often the PR monitor re-reads `gh` (live reconcile, L-V3 — nothing
+/// renders from cache; every push is a fresh observation).
+const PR_POLL_MS: u64 = 45_000;
+
+/// One reconciled PR observation, as compared for change detection.
+#[derive(PartialEq, Clone)]
+struct PrObservation {
+    url: String,
+    number: Option<u64>,
+    status: PrStatus,
+    ci: Option<CiStatus>,
+}
+
+/// Poll `gh` for the workspace's current-branch PR and its checks. On every
+/// change: a `Pr` event on the lead lane (the deck folds it into the
+/// footer's PR cell and the transcript), a store mirror row, and — when CI
+/// flips to failing — a persist-until-read inbox notification linked to
+/// this session. No PR (or no `gh`) is quietly nothing: the cell stays
+/// hidden rather than wrong.
+fn spawn_pr_monitor(
+    root: PathBuf,
+    session_id: String,
+    store: Option<Arc<Store>>,
+    workspace_name: String,
+    nudge: Arc<tokio::sync::Notify>,
+    in_tx: mpsc::UnboundedSender<Inbound>,
+) {
+    tokio::spawn(async move {
+        let mut last: Option<PrObservation> = None;
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(PR_POLL_MS));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            // The tick paces routine reconciles; a nudge (turn settled,
+            // worker ended) skips straight to one.
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = nudge.notified() => {}
+            }
+            if in_tx.is_closed() {
+                break;
+            }
+            let Some(observed) = observe_pr(&root).await else {
+                continue;
+            };
+            if last.as_ref() == Some(&observed) {
+                continue;
+            }
+            let ci_flipped_to_failing = observed.ci == Some(CiStatus::Failing)
+                && last
+                    .as_ref()
+                    .is_none_or(|l| l.ci != Some(CiStatus::Failing));
+            last = Some(observed.clone());
+            let _ = in_tx.send(Inbound::Event {
+                agent: LEAD.to_string(),
+                event: AgentEvent::Pr {
+                    url: observed.url.clone(),
+                    status: observed.status,
+                    number: observed.number,
+                    ci: observed.ci,
+                },
+            });
+            if let Some(store) = &store {
+                let _ = store.upsert_pull_request(
+                    Some(&session_id),
+                    &observed.url,
+                    observed.number,
+                    pr_status_token(observed.status),
+                    observed.ci.map(ci_status_token),
+                    now_ms(),
+                );
+            }
+            if ci_flipped_to_failing {
+                let number = observed
+                    .number
+                    .map(|n| format!("#{n}"))
+                    .unwrap_or_else(|| observed.url.clone());
+                let _ = stella_store::NotificationStore::open_default().push(
+                    &stella_store::Notification::new(
+                        format!("{workspace_name}: CI failing on PR {number}"),
+                        observed.url.clone(),
+                        session_id.clone(),
+                    )
+                    .with_session_id(session_id.clone()),
+                );
+            }
+        }
+    });
+}
+
+/// Stable store tokens for PR/CI states (schema strings, not display).
+fn pr_status_token(status: PrStatus) -> &'static str {
+    match status {
+        PrStatus::Draft => "draft",
+        PrStatus::Open => "open",
+        PrStatus::Merged => "merged",
+        PrStatus::Closed => "closed",
+    }
+}
+
+fn ci_status_token(ci: CiStatus) -> &'static str {
+    match ci {
+        CiStatus::Pending => "pending",
+        CiStatus::Running => "running",
+        CiStatus::Passing => "passing",
+        CiStatus::Failing => "failing",
+    }
+}
+
+/// One `gh` JSON read in `root`. For `gh pr checks`, pending checks exit
+/// non-zero (code 8) while still printing the JSON — so parse whatever
+/// stdout holds instead of gating on exit status.
+async fn gh_json(root: &std::path::Path, args: &[&str]) -> Option<Value> {
+    let output = tokio::process::Command::new("gh")
+        .args(args)
+        .current_dir(root)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+/// Reconcile the workspace's current-branch PR: `gh pr view` for identity
+/// and state, `gh pr checks` for the aggregate CI verdict. `None` when no
+/// PR exists for the branch (or `gh` is absent/unauthenticated).
+async fn observe_pr(root: &std::path::Path) -> Option<PrObservation> {
+    let view = gh_json(root, &["pr", "view", "--json", "url,number,state,isDraft"]).await?;
+    let url = view.get("url")?.as_str()?.to_string();
+    let number = view.get("number").and_then(Value::as_u64);
+    let is_draft = view
+        .get("isDraft")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let status = match view.get("state").and_then(Value::as_str).unwrap_or("") {
+        "MERGED" => PrStatus::Merged,
+        "CLOSED" => PrStatus::Closed,
+        _ if is_draft => PrStatus::Draft,
+        _ => PrStatus::Open,
+    };
+    let ci = match gh_json(root, &["pr", "checks", "--json", "bucket"]).await {
+        Some(Value::Array(rows)) => aggregate_ci(
+            &rows
+                .iter()
+                .filter_map(|r| r.get("bucket").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    };
+    Some(PrObservation {
+        url,
+        number,
+        status,
+        ci,
+    })
+}
+
+/// Fold `gh pr checks` buckets into one verdict. Any failure wins; then
+/// anything still moving; a fully-settled green set is passing. An empty
+/// set is `None` — absence of checks must never render as passing.
+fn aggregate_ci(buckets: &[&str]) -> Option<CiStatus> {
+    if buckets.is_empty() {
+        return None;
+    }
+    if buckets.iter().any(|b| matches!(*b, "fail" | "cancel")) {
+        return Some(CiStatus::Failing);
+    }
+    if buckets.contains(&"pending") {
+        return Some(CiStatus::Running);
+    }
+    Some(CiStatus::Passing)
 }
 
 /// Poll the machine-wide notification store and push a fresh snapshot when
@@ -2801,6 +3409,8 @@ async fn run_lead_turn(
     execution: Option<(Arc<Store>, i64)>,
     in_tx: &UnboundedSender<Inbound>,
     ask_io: &DeckAskUserIo,
+    sup_tx: &UnboundedSender<SupervisorMsg>,
+    claim_holder: &str,
 ) -> Result<(), String> {
     budget.begin_turn();
 
@@ -2810,16 +3420,24 @@ async fn run_lead_turn(
         execution.clone(),
         cfg.provider.id.to_string(),
         in_tx.clone(),
+        LEAD.to_string(),
+    );
+
+    // Claim-on-first-write over the shared tree (crate::claims): wraps the
+    // base executor, so a refused write surfaces as the tool's own error —
+    // FileChangeTap's is_error early-return keeps phantom events out.
+    // Released after the turn settles, cancel included.
+    let claims = ClaimTap::new(
+        base_tools,
+        execution.as_ref().map(|(store, _)| store.clone()),
+        claim_holder,
     );
 
     // Same structural drop-order rule as `agent::run_turn`: every tx clone
     // lives in this scope so dropping `tx` after it closes the channel.
     let outcome = {
-        let customs = CustomToolSet::new(
-            base_tools,
-            custom_tools.to_vec(),
-            cfg.workspace_root.clone(),
-        );
+        let customs =
+            CustomToolSet::new(&claims, custom_tools.to_vec(), cfg.workspace_root.clone());
         // The AskUser event channel is a stub: the deck io presents its own
         // card (it must — `install_skill` confirms through the io without any
         // event), so the tool set's own emission would double the card.
@@ -2830,6 +3448,12 @@ async fn run_lead_turn(
             inner: &tools,
             events: tx.clone(),
             root: cfg.workspace_root.clone(),
+        };
+        let tapped = TaskTap {
+            inner: &tapped,
+            events: tx.clone(),
+            registry,
+            supervisor: Some(sup_tx.clone()),
         };
         let hook_runner = ShellHookRunner;
         let mut engine = Engine::with_sleeper(
@@ -2846,6 +3470,7 @@ async fn run_lead_turn(
     };
     drop(tx);
     let _ = forwarder.await;
+    claims.release_all();
 
     if let Some((store, id)) = &execution {
         let (outcome_label, cost) = match &outcome {
@@ -2914,6 +3539,8 @@ async fn run_lead_pipeline_turn(
     execution: Option<(Arc<Store>, i64)>,
     in_tx: &UnboundedSender<Inbound>,
     ask_io: &DeckAskUserIo,
+    sup_tx: &UnboundedSender<SupervisorMsg>,
+    claim_holder: &str,
 ) -> Result<(), String> {
     budget.begin_turn();
 
@@ -2923,14 +3550,20 @@ async fn run_lead_pipeline_turn(
         execution.clone(),
         cfg.provider.id.to_string(),
         in_tx.clone(),
+        LEAD.to_string(),
+    );
+
+    // Claim-on-first-write over the shared tree — same wiring as
+    // `run_lead_turn` (see the comment there).
+    let claims = ClaimTap::new(
+        base_tools,
+        execution.as_ref().map(|(store, _)| store.clone()),
+        claim_holder,
     );
 
     let result = {
-        let customs = CustomToolSet::new(
-            base_tools,
-            custom_tools.to_vec(),
-            cfg.workspace_root.clone(),
-        );
+        let customs =
+            CustomToolSet::new(&claims, custom_tools.to_vec(), cfg.workspace_root.clone());
         let (stub_tx, _) = mpsc::unbounded_channel();
         let tools = InteractiveToolSet::new(&customs, stub_tx, Box::new(ask_io.clone()))
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
@@ -2938,6 +3571,12 @@ async fn run_lead_pipeline_turn(
             inner: &tools,
             events: tx.clone(),
             root: cfg.workspace_root.clone(),
+        };
+        let tapped = TaskTap {
+            inner: &tapped,
+            events: tx.clone(),
+            registry,
+            supervisor: Some(sup_tx.clone()),
         };
 
         let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
@@ -2997,6 +3636,7 @@ async fn run_lead_pipeline_turn(
     };
     drop(tx);
     let _ = forwarder.await;
+    claims.release_all();
 
     if let Some((store, id)) = &execution {
         let (outcome_label, cost) = match &result {
@@ -3043,17 +3683,19 @@ async fn run_lead_pipeline_turn(
 }
 
 /// Drain one turn's engine events: persist each (via the shared
-/// [`agent::persist_event`] write path) and forward it to the deck as the
-/// lead agent's `Inbound::Event`. The deck-mode replacement for
-/// [`agent::spawn_renderer`]. stderr belongs to the alternate screen here,
-/// so a persistence failure warns *through the deck* instead — once — as a
-/// transcript-visible error event; silently losing the audit trail (disk
-/// full, DB locked) is not acceptable.
-fn spawn_forwarder(
+/// [`agent::persist_event`] write path) and forward it to the deck as
+/// `agent`'s `Inbound::Event`. The deck-mode replacement for
+/// [`agent::spawn_renderer`], shared by the lead's turns and every
+/// sub-session worker (`crate::subsession`). stderr belongs to the alternate
+/// screen here, so a persistence failure warns *through the deck* instead —
+/// once — as a transcript-visible error event; silently losing the audit
+/// trail (disk full, DB locked) is not acceptable.
+pub(crate) fn spawn_forwarder(
     mut rx: UnboundedReceiver<AgentEvent>,
     execution: Option<(Arc<Store>, i64)>,
     provider_id: String,
     inbound: UnboundedSender<Inbound>,
+    lane: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut seq = 0u64;
@@ -3063,7 +3705,7 @@ fn spawn_forwarder(
                 if !agent::persist_event(store, *id, seq, &event, &provider_id) && !store_warned {
                     store_warned = true;
                     let _ = inbound.send(Inbound::Event {
-                        agent: LEAD.to_string(),
+                        agent: lane.clone(),
                         event: AgentEvent::Error {
                             message: "store write failed — the persisted event/telemetry \
                                       record for this session is incomplete"
@@ -3075,7 +3717,7 @@ fn spawn_forwarder(
                 seq += 1;
             }
             let _ = inbound.send(Inbound::Event {
-                agent: LEAD.to_string(),
+                agent: lane.clone(),
                 event,
             });
         }
@@ -3205,6 +3847,45 @@ impl ToolExecutor for FileChangeTap<'_> {
             let _ = self
                 .events
                 .send(AgentEvent::FileChange { path, kind, diff });
+        }
+        output
+    }
+}
+
+/// Mirrors the task board into the event stream: after any `task_*` tool
+/// call the FULL board snapshot rides the turn's channel as
+/// `AgentEvent::TaskUpdate` — persisted by the forwarder, so replay shows
+/// the checklist exactly as it moved — and `task_assign`'s spawn requests
+/// are handed to the driver's supervisor channel. `supervisor: None` is the
+/// worker configuration (v1 delegation runs from the lead only; a worker's
+/// stranded requests are reported on its lane by `crate::subsession`).
+pub(crate) struct TaskTap<'a> {
+    pub(crate) inner: &'a dyn ToolExecutor,
+    pub(crate) events: UnboundedSender<AgentEvent>,
+    pub(crate) registry: &'a ToolRegistry,
+    pub(crate) supervisor: Option<UnboundedSender<SupervisorMsg>>,
+}
+
+#[async_trait]
+impl ToolExecutor for TaskTap<'_> {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        self.inner.schemas()
+    }
+
+    async fn execute(&self, name: &str, input: &Value) -> ToolOutput {
+        let output = self.inner.execute(name, input).await;
+        if name.starts_with("task_") {
+            let tasks: Vec<TaskItem> = {
+                let board = self.registry.task_board();
+                let guard = board.lock().unwrap_or_else(|p| p.into_inner());
+                guard.items().to_vec()
+            };
+            let _ = self.events.send(AgentEvent::TaskUpdate { tasks });
+            if let Some(sup) = &self.supervisor {
+                for request in self.registry.take_spawn_requests() {
+                    let _ = sup.send(SupervisorMsg::SpawnTask(request));
+                }
+            }
         }
         output
     }

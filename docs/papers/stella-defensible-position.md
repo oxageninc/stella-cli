@@ -299,11 +299,15 @@ model. This makes the trust perimeter **structurally defensible**: no
 commercial competitor can match it without ceasing to be commercial.
 
 The enforcement is architectural, not policy-based. The `stella-core` engine
-has no network code. The only crate that makes outbound HTTP calls is
-`stella-model` (to the user's chosen provider) and `stella-mcp` (to
-user-configured MCP servers, which are explicitly opt-in). There is no
-telemetry SDK, no analytics endpoint, no update checker. A code audit can
-verify this in minutes.
+has no network code. Outbound HTTP is confined to a small, enumerable set of
+crates, and every call targets an endpoint the user chose or configured:
+`stella-model` (your model provider), `stella-mcp` (MCP servers you configure,
+plus the MCP registry when you run `stella mcp search`), `stella-tools` (your
+issue tracker — GitHub or Linear — only when you invoke the issue tools), and
+`stella-media` (your image/video provider, only when you invoke the media
+tools). There is no telemetry SDK, no analytics endpoint, and no update checker.
+A code audit can verify this in minutes — `grep -rl reqwest` names every crate
+above and no others.
 
 ### The specific advantage
 

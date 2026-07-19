@@ -21,7 +21,7 @@
 
 use std::collections::VecDeque;
 
-use stella_protocol::{AgentEvent, FileChangeKind};
+use stella_protocol::{AgentEvent, CiStatus, FileChangeKind, PrStatus};
 
 use crate::envelope::{AgentId, AgentMeta, AgentStatus, Inbound};
 use crate::model::SessionModel;
@@ -200,6 +200,21 @@ impl AgentEntry {
     }
 }
 
+/// The deck's PR read-model: the latest `AgentEvent::Pr` observation, from
+/// whichever agent emitted it. A session tells one PR story at a time — the
+/// newest event wins outright, so a CI update on the same PR simply replaces
+/// the snapshot in place. Drives the statline's PR cell.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrInfo {
+    pub url: String,
+    /// The PR number (`#183`), when the monitor parsed one from the URL.
+    pub number: Option<u64>,
+    pub status: PrStatus,
+    /// The head commit's aggregate CI verdict — `None` means "not polled
+    /// yet", never "passing".
+    pub ci: Option<CiStatus>,
+}
+
 /// The whole derived deck state, folded from the [`Inbound`] stream.
 #[derive(Clone, Debug, Default)]
 pub struct WorkspaceModel {
@@ -222,6 +237,10 @@ pub struct WorkspaceModel {
     /// `DeckOptions::pipeline` and toggled live by [`Inbound::Pipeline`]
     /// (the driver's `/pipeline` command).
     pub pipeline: bool,
+    /// The latest PR observation across all agents (`AgentEvent::Pr` from the
+    /// fleet PR/CI monitor) — the statline's PR cell. Latest event wins;
+    /// `None` until a PR has been seen this session.
+    pub pr: Option<PrInfo>,
 }
 
 impl WorkspaceModel {
@@ -484,6 +503,22 @@ impl WorkspaceModel {
         // Cross-agent read-models.
         if let AgentEvent::FileChange { path, kind, diff } = event {
             self.ledger.record(agent, path, *kind, diff);
+        }
+        if let AgentEvent::Pr {
+            url,
+            status,
+            number,
+            ci,
+        } = event
+        {
+            // Latest wins, any agent — the statline tells one PR story, and a
+            // CI re-poll on the same PR replaces the snapshot in place.
+            self.pr = Some(PrInfo {
+                url: url.clone(),
+                number: *number,
+                status: *status,
+                ci: *ci,
+            });
         }
         if let AgentEvent::StepUsage { model, .. } = event {
             self.routes.record(now, agent.clone(), model.clone());
@@ -856,6 +891,10 @@ fn trace_of(ev: &AgentEvent) -> (TraceKind, String) {
         AgentEvent::MediaComplete { artifact } => (TraceKind::Media, artifact.label.clone()),
         AgentEvent::Commit { message, .. } => (TraceKind::Vcs, snip(message)),
         AgentEvent::Pr { status, .. } => (TraceKind::Vcs, format!("pr {status:?}").to_lowercase()),
+        AgentEvent::TaskUpdate { tasks } => {
+            let done = tasks.iter().filter(|t| !t.status.is_open()).count();
+            (TraceKind::Other, format!("tasks {done}/{}", tasks.len()))
+        }
         AgentEvent::ProviderFallback { from, to, .. } => {
             (TraceKind::Other, format!("fallback {from}→{to}"))
         }
@@ -1496,6 +1535,55 @@ mod tests {
         assert_eq!(q.remove(9), None, "out of range is a no-op");
         q.clear();
         assert_eq!(q.pending(), 0);
+    }
+
+    #[test]
+    fn pr_events_fold_into_the_read_model_latest_wins_and_ci_updates_in_place() {
+        let mut w = WorkspaceModel::new();
+        assert_eq!(w.pr, None, "no PR story before any Pr event");
+        w.apply_inbound(&reg("lead"));
+        w.apply_inbound(&ev(
+            "lead",
+            AgentEvent::Pr {
+                url: "https://github.com/x/y/pull/183".into(),
+                status: PrStatus::Open,
+                number: Some(183),
+                ci: None,
+            },
+        ));
+        let pr = w.pr.as_ref().expect("the Pr event folded");
+        assert_eq!(pr.number, Some(183));
+        assert_eq!(pr.status, PrStatus::Open);
+        assert_eq!(pr.ci, None, "not polled yet");
+
+        // A CI re-poll on the same PR replaces the snapshot in place.
+        w.apply_inbound(&ev(
+            "lead",
+            AgentEvent::Pr {
+                url: "https://github.com/x/y/pull/183".into(),
+                status: PrStatus::Open,
+                number: Some(183),
+                ci: Some(CiStatus::Failing),
+            },
+        ));
+        let pr = w.pr.as_ref().expect("still present");
+        assert_eq!(pr.ci, Some(CiStatus::Failing));
+        assert_eq!(pr.number, Some(183), "same PR, updated verdict");
+
+        // A later Pr event from ANY agent wins outright — latest wins.
+        w.apply_inbound(&ev(
+            "sub",
+            AgentEvent::Pr {
+                url: "https://github.com/x/y/pull/184".into(),
+                status: PrStatus::Merged,
+                number: Some(184),
+                ci: Some(CiStatus::Passing),
+            },
+        ));
+        let pr = w.pr.as_ref().expect("still present");
+        assert_eq!(pr.number, Some(184));
+        assert_eq!(pr.status, PrStatus::Merged);
+        assert_eq!(pr.ci, Some(CiStatus::Passing));
     }
 
     #[test]

@@ -55,7 +55,7 @@ pub fn render(_model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Bu
                     ui.issues.search_query.clone(),
                     Style::default().fg(theme::INK),
                 ),
-                Span::styled("▏", Style::default().fg(theme::EMBER_GOLD)),
+                Span::styled("▏", Style::default().fg(theme::AURORA_CYAN)),
             ]));
             lines.push(Line::default());
             render_list(&ui.issues, inner, &mut lines);
@@ -77,7 +77,7 @@ pub fn render(_model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Bu
                 Span::styled(target, Style::default().fg(theme::INK)),
                 Span::styled(": ", theme::muted()),
                 Span::styled(ui.issues.input.clone(), Style::default().fg(theme::INK)),
-                Span::styled("▏", Style::default().fg(theme::EMBER_GOLD)),
+                Span::styled("▏", Style::default().fg(theme::AURORA_CYAN)),
             ]));
             lines.push(Line::default());
             render_list(&ui.issues, inner, &mut lines);
@@ -90,7 +90,7 @@ pub fn render(_model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Bu
     if let Some(notice) = &ui.issues.notice {
         lines.push(Line::from(Span::styled(
             format!("  {}{notice}", if ui.issues.busy { "◌ " } else { "" }),
-            Style::default().fg(theme::EMBER_GOLD),
+            Style::default().fg(theme::AURORA_CYAN),
         )));
     }
     lines.push(footer(ui.issues.mode));
@@ -189,7 +189,7 @@ fn render_form(issues: &IssuesPanel, width: usize, lines: &mut Vec<Line<'static>
             ),
         ];
         if focused {
-            spans.push(Span::styled("▏", Style::default().fg(theme::EMBER_GOLD)));
+            spans.push(Span::styled("▏", Style::default().fg(theme::AURORA_CYAN)));
         }
         lines.push(Line::from(spans));
     };

@@ -5,10 +5,18 @@
 //!
 //! What lives here:
 //! - **executions** — one row per run/goal/turn: prompt, provider/model,
-//!   outcome, total cost.
+//!   outcome, total cost, and (since v8) the nullable cross-process session
+//!   registry id ([`SessionRecord::id`]) stamping which session the turn ran
+//!   under, so [`Store::session_events`] can reassemble a session's full
+//!   journal across executions.
 //! - **events** — the COMPLETE `AgentEvent` stream per execution, one JSON
 //!   row per event in order, including `Reasoning` deltas — the full chain
 //!   of thought is replayable against its execution.
+//! - **tasks** — the latest task-board snapshot per session, mirrored from
+//!   `TaskUpdate` events: one row per (session, task id), upserted whole by
+//!   [`Store::record_task_board`] so the board is re-openable cross-process.
+//! - **pull_requests** — tracked pull requests keyed by URL: lifecycle
+//!   status, CI verdict, and the session that produced them.
 //! - **telemetry** — one row per committed model call (from `StepUsage`):
 //!   provider, model, tokens in/out, the engine's pre-call input estimate
 //!   (the drift sample [`Store::drift_samples`] serves back to calibrate
@@ -71,7 +79,7 @@ use std::sync::Mutex;
 use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use stella_protocol::{AgentEvent, ToolOutput};
+use stella_protocol::{AgentEvent, TaskItem, TaskStatus, ToolOutput};
 
 pub mod catalog;
 pub mod notify;
@@ -340,6 +348,61 @@ pub struct ReflectionRow {
     pub occurred_at: i64,
 }
 
+/// One tracked pull request, as stored ([`Store::upsert_pull_request`]):
+/// keyed by URL, carrying the latest observed lifecycle `status` and CI
+/// verdict strings, the last-update time in epoch millis, and the session
+/// that produced it (when known).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestRecord {
+    pub url: String,
+    /// The PR number (e.g. 183 for `…/pull/183`); `None` when the producer
+    /// could not parse one from the URL.
+    pub number: Option<u64>,
+    pub status: String,
+    pub ci_status: Option<String>,
+    pub updated_at: u64,
+    pub session_id: Option<String>,
+}
+
+/// One replayable event from a session's cross-execution journal
+/// ([`Store::session_events`]): which execution it belongs to, its position
+/// in that execution's stream, and the deserialized payload.
+#[derive(Debug, Clone)]
+pub struct SessionEventRecord {
+    pub execution_id: i64,
+    pub seq: i64,
+    pub event: AgentEvent,
+}
+
+/// A session's full event journal, reassembled across every execution
+/// stamped with its session id. `skipped` counts rows whose stored JSON no
+/// longer parses as an [`AgentEvent`] (streams persisted before a variant
+/// existed) — replay proceeds without them instead of failing the read.
+#[derive(Debug, Clone, Default)]
+pub struct SessionJournal {
+    pub events: Vec<SessionEventRecord>,
+    pub skipped: usize,
+}
+
+/// The protocol's serde snake_case token for a task status — the exact
+/// string `tasks.status` stores (e.g. `"in_progress"`).
+fn task_status_to_string(status: TaskStatus) -> Result<String> {
+    match serde_json::to_value(status) {
+        Ok(serde_json::Value::String(s)) => Ok(s),
+        Ok(other) => Err(StoreError(format!(
+            "task status serialized to non-string JSON: {other}"
+        ))),
+        Err(e) => Err(StoreError(format!("cannot serialize task status: {e}"))),
+    }
+}
+
+/// Inverse of [`task_status_to_string`]: parse a stored snake_case token
+/// back into the protocol enum.
+fn task_status_from_string(s: &str) -> Result<TaskStatus> {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .map_err(|e| StoreError(format!("unknown task status `{s}`: {e}")))
+}
+
 /// One aggregated analytics row per (provider, model): the numbers behind
 /// "$-per-resolved-task" receipts, straight from local telemetry.
 ///
@@ -443,7 +506,7 @@ type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// a file at `user_version` i to i + 1. Fresh files never run these — they
 /// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
 /// directly.
-const MIGRATIONS: [Migration; 7] = [
+const MIGRATIONS: [Migration; 8] = [
     // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
     // their write paths have always assumed.
     migrate_v0_to_v1,
@@ -471,6 +534,10 @@ const MIGRATIONS: [Migration; 7] = [
     // (normalized per-call log), `execution_reflection` (per-turn self-review
     // tied to the prompt), and `reflections` (unified durable lessons).
     migrate_v6_to_v7,
+    // v7 → v8: the session plane — `executions` grows the nullable
+    // `session_id` link (+ its by-session index), plus the additive `tasks`
+    // (per-session task-board snapshot) and `pull_requests` tables.
+    migrate_v7_to_v8,
 ];
 
 /// The schema version this build writes — the `PRAGMA user_version` of
@@ -481,7 +548,7 @@ const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// Every table the store owns — the allowlist for [`Store::count`] and the
 /// fresh-file probe in [`Store::migrate`].
-const TABLES: [&str; 15] = [
+const TABLES: [&str; 17] = [
     "executions",
     "events",
     "telemetry",
@@ -497,12 +564,21 @@ const TABLES: [&str; 15] = [
     "tool_calls",
     "execution_reflection",
     "reflections",
+    "tasks",
+    "pull_requests",
 ];
 
-/// Tables whose shape has not changed since v0. `IF NOT EXISTS` keeps one
-/// batch usable both for fresh files and for filling gaps in partial legacy
-/// files (a v0 file only holds what its era's code created).
-const UNCHANGED_TABLES: &str = "CREATE TABLE IF NOT EXISTS executions (
+/// `executions` DDL at [`SCHEMA_VERSION`] — the spine every other table
+/// keys off, one row per run/goal/turn. `session_id` (v8) is the nullable
+/// cross-process session registry id ([`SessionRecord::id`]) stamped by
+/// [`Store::set_execution_session`] right after the row is opened, linking
+/// per-turn executions back to their session so
+/// [`Store::session_events`] can reassemble the full journal; NULL for rows
+/// persisted before v8 or for runs outside a registered session. The
+/// by-session index is that reader's access path (filter on session_id,
+/// scan in id order). `IF NOT EXISTS` on both so the batch also tolerates a
+/// partial file that already grew them.
+const EXECUTIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS executions (
        id INTEGER PRIMARY KEY AUTOINCREMENT,
        kind TEXT NOT NULL,
        prompt TEXT NOT NULL,
@@ -511,9 +587,16 @@ const UNCHANGED_TABLES: &str = "CREATE TABLE IF NOT EXISTS executions (
        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
        finished_at TEXT,
        outcome TEXT,
-       cost_usd REAL NOT NULL DEFAULT 0
+       cost_usd REAL NOT NULL DEFAULT 0,
+       session_id TEXT
      );
-     CREATE TABLE IF NOT EXISTS file_locks (
+     CREATE INDEX IF NOT EXISTS executions_by_session
+       ON executions(session_id, id);";
+
+/// Tables whose shape has not changed since v0. `IF NOT EXISTS` keeps one
+/// batch usable both for fresh files and for filling gaps in partial legacy
+/// files (a v0 file only holds what its era's code created).
+const UNCHANGED_TABLES: &str = "CREATE TABLE IF NOT EXISTS file_locks (
        path TEXT PRIMARY KEY,
        holder TEXT NOT NULL,
        acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -765,10 +848,51 @@ const REFLECTIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS reflections (
      );
      CREATE INDEX IF NOT EXISTS reflections_by_kind ON reflections(kind);";
 
+/// `tasks` DDL at [`SCHEMA_VERSION`] — the latest task-board snapshot per
+/// session, one row per (session, task id), mirrored from the protocol's
+/// `TaskUpdate` snapshots by [`Store::record_task_board`]. UNIQUE
+/// (session_id, task_id) is the upsert key: each snapshot REPLACES a task's
+/// row (board state, not history — the `events` stream already keeps every
+/// snapshot). NOTE: SQL NULLs are pairwise distinct, so rows recorded
+/// without a session id never conflict — dedup only holds per session.
+/// `status`/`owner` carry the protocol's serde snake_case strings (e.g.
+/// `"in_progress"`); `task_id` is the board's per-session ordinal id
+/// ("1", "2", …), read back in `CAST(task_id AS INTEGER)` order.
+const TASKS_DDL: &str = "CREATE TABLE IF NOT EXISTS tasks (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       execution_id INTEGER NOT NULL,
+       session_id TEXT,
+       task_id TEXT NOT NULL,
+       subject TEXT NOT NULL,
+       description TEXT,
+       status TEXT NOT NULL,
+       owner TEXT,
+       updated_at INTEGER NOT NULL,
+       UNIQUE(session_id, task_id)
+     );";
+
+/// `pull_requests` DDL at [`SCHEMA_VERSION`] — one row per tracked pull
+/// request, keyed by URL (the one stable identity across forks/renames).
+/// UNIQUE (url) is the upsert key for [`Store::upsert_pull_request`]: a
+/// later observation of the same PR updates its status/CI verdict in place.
+/// `session_id` is the producing session's registry id, NULL when unknown;
+/// `updated_at` is epoch millis of the latest observation.
+const PULL_REQUESTS_DDL: &str = "CREATE TABLE IF NOT EXISTS pull_requests (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       session_id TEXT,
+       url TEXT NOT NULL,
+       number INTEGER,
+       status TEXT NOT NULL,
+       ci_status TEXT,
+       updated_at INTEGER NOT NULL,
+       UNIQUE(url)
+     );";
+
 /// The full latest schema, applied in one shot to fresh databases only.
 /// Existing files never see this — [`MIGRATIONS`] upgrades them shape by
 /// shape, so this can always describe the CURRENT shape.
 fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(EXECUTIONS_DDL)?;
     tx.execute_batch(UNCHANGED_TABLES)?;
     tx.execute_batch(&events_ddl("events"))?;
     tx.execute_batch(&telemetry_ddl("telemetry"))?;
@@ -782,6 +906,8 @@ fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(TOOL_CALLS_DDL)?;
     tx.execute_batch(EXECUTION_REFLECTION_DDL)?;
     tx.execute_batch(REFLECTIONS_DDL)?;
+    tx.execute_batch(TASKS_DDL)?;
+    tx.execute_batch(PULL_REQUESTS_DDL)?;
     Ok(())
 }
 
@@ -845,6 +971,23 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 /// created fresh in the v1 shape: empty, nothing to dedupe.
 fn migrate_v0_to_v1(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(UNCHANGED_TABLES)?;
+    // executions changed shape in v8 (the session_id column), so it left
+    // UNCHANGED_TABLES — but a v1 database has its ERA's shape, which this
+    // step must keep producing (the v8 ALTER later in the chain runs
+    // against it).
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS executions (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           kind TEXT NOT NULL,
+           prompt TEXT NOT NULL,
+           provider TEXT NOT NULL,
+           model TEXT NOT NULL,
+           started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           finished_at TEXT,
+           outcome TEXT,
+           cost_usd REAL NOT NULL DEFAULT 0
+         );",
+    )?;
     // files_touched changed shape again in v2, so it left UNCHANGED_TABLES —
     // but a v1 database has its ERA's shape, which this step must keep
     // producing (the v2 rebuild right after runs against it).
@@ -1005,6 +1148,26 @@ fn migrate_v6_to_v7(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(TOOL_CALLS_DDL)?;
     tx.execute_batch(EXECUTION_REFLECTION_DDL)?;
     tx.execute_batch(REFLECTIONS_DDL)?;
+    Ok(())
+}
+
+/// v7 → v8: the session plane. `executions` grows the nullable `session_id`
+/// column linking each per-turn row to the cross-process session registry id
+/// (a plain ADD COLUMN — nullable, no default rewrite, so no §7 rebuild),
+/// plus the `executions_by_session` index and the additive `tasks` and
+/// `pull_requests` tables. The ALTER is guarded by a column probe, matching
+/// the house `IF NOT EXISTS` tolerance for partial files that somehow
+/// already grew the shape.
+fn migrate_v7_to_v8(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    if !column_exists(tx, "executions", "session_id")? {
+        tx.execute_batch("ALTER TABLE executions ADD COLUMN session_id TEXT;")?;
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS executions_by_session
+           ON executions(session_id, id);",
+    )?;
+    tx.execute_batch(TASKS_DDL)?;
+    tx.execute_batch(PULL_REQUESTS_DDL)?;
     Ok(())
 }
 
@@ -1173,6 +1336,19 @@ impl Store {
             params![kind, prompt, provider, model],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Stamp the cross-process session registry id ([`SessionRecord::id`])
+    /// onto an execution row — called right after
+    /// [`Store::begin_execution`] when the turn runs inside a registered
+    /// session, so [`Store::session_events`] can reassemble that session's
+    /// full journal across executions.
+    pub fn set_execution_session(&self, execution_id: i64, session_id: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE executions SET session_id = ? WHERE id = ?",
+            params![session_id, execution_id],
+        )?;
+        Ok(())
     }
 
     /// Append one event to the execution's stream. `seq` is the caller's
@@ -1824,6 +2000,181 @@ impl Store {
         Ok(())
     }
 
+    /// Mirror one task-board snapshot into `tasks`: every item is upserted
+    /// on (session_id, task_id), so the table always holds each task's
+    /// LATEST state (the `events` stream keeps the full snapshot history).
+    /// `status`/`owner` are stored as the protocol's serde snake_case
+    /// strings (e.g. `"in_progress"`); `description` is stored as-is.
+    /// NOTE: with `session_id` `None` the UNIQUE key never conflicts (SQL
+    /// NULLs are pairwise distinct), so session-less rows append rather than
+    /// replace — dedup is a per-session guarantee.
+    pub fn record_task_board(
+        &self,
+        execution_id: i64,
+        session_id: Option<&str>,
+        tasks: &[TaskItem],
+        now_ms: u64,
+    ) -> Result<()> {
+        let conn = self.lock();
+        for item in tasks {
+            let status = task_status_to_string(item.status)?;
+            conn.execute(
+                "INSERT INTO tasks \
+                 (execution_id, session_id, task_id, subject, description, status, owner, \
+                  updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT (session_id, task_id) DO UPDATE SET \
+                 execution_id = excluded.execution_id, subject = excluded.subject, \
+                 description = excluded.description, status = excluded.status, \
+                 owner = excluded.owner, updated_at = excluded.updated_at",
+                params![
+                    execution_id,
+                    session_id,
+                    item.id,
+                    item.subject,
+                    item.description,
+                    status,
+                    item.owner,
+                    now_ms as i64,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Read back a session's task board — each task's latest recorded state,
+    /// ordered numerically by the board's ordinal task id (`CAST(task_id AS
+    /// INTEGER)`, so "10" sorts after "2"). A stored status that no longer
+    /// parses as a [`TaskStatus`] is an error: the store wrote it, so a bad
+    /// token is corruption, not drift.
+    pub fn list_session_tasks(&self, session_id: &str) -> Result<Vec<TaskItem>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT task_id, subject, description, status, owner FROM tasks \
+             WHERE session_id = ? ORDER BY CAST(task_id AS INTEGER) ASC, task_id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let mut board = Vec::new();
+        for row in rows {
+            let (task_id, subject, description, status, owner) = row?;
+            board.push(TaskItem {
+                id: task_id,
+                subject,
+                description,
+                status: task_status_from_string(&status)?,
+                owner,
+            });
+        }
+        Ok(board)
+    }
+
+    /// Upsert one tracked pull request, keyed by URL: a later observation of
+    /// the same PR updates its `number`/`status`/`ci_status`/`updated_at` in
+    /// place. A `session_id` of `None` never ERASES an existing session
+    /// link (COALESCE keeps the stored value) — a monitor that only knows
+    /// the URL must not orphan the PR from its producing session.
+    pub fn upsert_pull_request(
+        &self,
+        session_id: Option<&str>,
+        url: &str,
+        number: Option<u64>,
+        status: &str,
+        ci_status: Option<&str>,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO pull_requests (session_id, url, number, status, ci_status, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (url) DO UPDATE SET \
+             session_id = COALESCE(excluded.session_id, session_id), \
+             number = excluded.number, status = excluded.status, \
+             ci_status = excluded.ci_status, updated_at = excluded.updated_at",
+            params![
+                session_id,
+                url,
+                number.map(|n| n as i64),
+                status,
+                ci_status,
+                now_ms as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Tracked pull requests, freshest first (ties broken by URL for
+    /// determinism). `Some(session_id)` filters to one session's PRs;
+    /// `None` returns them all.
+    pub fn list_pull_requests(&self, session_id: Option<&str>) -> Result<Vec<PullRequestRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT url, number, status, ci_status, updated_at, session_id \
+             FROM pull_requests \
+             WHERE ?1 IS NULL OR session_id = ?1 \
+             ORDER BY updated_at DESC, url ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(PullRequestRecord {
+                url: row.get(0)?,
+                number: row.get::<_, Option<i64>>(1)?.map(|n| n as u64),
+                status: row.get(2)?,
+                ci_status: row.get(3)?,
+                updated_at: row.get::<_, i64>(4)? as u64,
+                session_id: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The replay reader: a session's COMPLETE event journal, reassembled
+    /// across every execution stamped with `session_id`
+    /// ([`Store::set_execution_session`]), ordered by (execution_id, seq) —
+    /// execution ids are AUTOINCREMENT, so this is turn order, and seq is
+    /// stream order within a turn. A row whose stored payload no longer
+    /// parses as an [`AgentEvent`] (an old stream predating a variant) is
+    /// SKIPPED and counted in [`SessionJournal::skipped`] rather than
+    /// failing the whole read.
+    pub fn session_events(&self, session_id: &str) -> Result<SessionJournal> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT e.execution_id, e.seq, e.payload FROM events e \
+             JOIN executions x ON x.id = e.execution_id \
+             WHERE x.session_id = ? \
+             ORDER BY e.execution_id ASC, e.seq ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut journal = SessionJournal::default();
+        for row in rows {
+            let (execution_id, seq, payload) = row?;
+            match serde_json::from_str::<AgentEvent>(&payload) {
+                Ok(event) => journal.events.push(SessionEventRecord {
+                    execution_id,
+                    seq,
+                    event,
+                }),
+                Err(_) => journal.skipped += 1,
+            }
+        }
+        Ok(journal)
+    }
+
     /// Cooperative file lock: succeeds only if `path` is unclaimed or
     /// already held by `holder` (re-entrant). Returns whether the lock is
     /// now held.
@@ -1872,6 +2223,30 @@ impl Store {
             params![path, holder],
         )?;
         Ok(())
+    }
+
+    /// Release every lock `holder` still holds — one statement for the whole
+    /// claim set, so a worker/session ending (or its supervisor cleaning up
+    /// after it) never has to enumerate what was claimed. Returns how many
+    /// locks were released.
+    pub fn release_file_locks_for_holder(&self, holder: &str) -> Result<usize> {
+        let released = self
+            .lock()
+            .execute("DELETE FROM file_locks WHERE holder = ?", params![holder])?;
+        Ok(released)
+    }
+
+    /// Crash hygiene: release claims older than `max_age_secs` regardless of
+    /// holder. A crashed process cannot release its own claims, and a stale
+    /// claim would block every future writer of that path forever — age is
+    /// the one signal that works across processes and reboots (mirroring the
+    /// session registry's dead-pid downgrade). Returns how many were swept.
+    pub fn prune_stale_file_locks(&self, max_age_secs: u64) -> Result<usize> {
+        let swept = self.lock().execute(
+            "DELETE FROM file_locks WHERE acquired_at < datetime('now', ?)",
+            params![format!("-{max_age_secs} seconds")],
+        )?;
+        Ok(swept)
     }
 
     /// Upsert one extension-authored workspace rule — the write seam an
@@ -2840,6 +3215,274 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A task-board item with just the fields the mirror stores.
+    fn task(id: &str, subject: &str, status: TaskStatus, owner: Option<&str>) -> TaskItem {
+        TaskItem {
+            id: id.into(),
+            subject: subject.into(),
+            description: None,
+            status,
+            owner: owner.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn v8_migration_adds_the_session_plane_to_a_legacy_database() {
+        // The chain's final step is v7 → v8: a legacy file upgraded through
+        // the whole migration list must end at user_version 8 with
+        // executions.session_id, its by-session index, and the tasks /
+        // pull_requests tables present and writable.
+        let root = temp_root("v8_session_plane");
+        {
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
+            conn.execute_batch(LEGACY_V0_SCHEMA).unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+        assert_eq!(store.count("tasks").unwrap(), 0);
+        assert_eq!(store.count("pull_requests").unwrap(), 0);
+
+        // The migrated executions table took the session link and its index.
+        let id = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store.set_execution_session(id, "ses-8-1").unwrap();
+        {
+            let conn = store.lock();
+            let session: Option<String> = conn
+                .query_row(
+                    "SELECT session_id FROM executions WHERE id = ?",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(session.as_deref(), Some("ses-8-1"));
+            let index_count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master \
+                     WHERE type = 'index' AND name = 'executions_by_session'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(index_count, 1);
+        }
+        // The new write paths work on the migrated file.
+        store
+            .record_task_board(
+                id,
+                Some("ses-8-1"),
+                &[task("1", "t", TaskStatus::Pending, None)],
+                1,
+            )
+            .unwrap();
+        store
+            .upsert_pull_request(
+                Some("ses-8-1"),
+                "https://example.com/pr/1",
+                Some(1),
+                "open",
+                None,
+                1,
+            )
+            .unwrap();
+        assert_eq!(store.count("tasks").unwrap(), 1);
+        assert_eq!(store.count("pull_requests").unwrap(), 1);
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn task_board_upserts_the_latest_snapshot_per_session() {
+        let store = Store::in_memory().unwrap();
+        let turn_one = store
+            .begin_execution("deck", "plan", "zai", "glm-5.2")
+            .unwrap();
+        store.set_execution_session(turn_one, "ses-1-9").unwrap();
+        store
+            .record_task_board(
+                turn_one,
+                Some("ses-1-9"),
+                &[
+                    task("1", "read the code", TaskStatus::InProgress, Some("lead")),
+                    task("2", "write the tests", TaskStatus::Pending, None),
+                    task("10", "ship it", TaskStatus::Pending, None),
+                ],
+                1_000,
+            )
+            .unwrap();
+
+        // A later snapshot from a later turn: task 1 done, task 2 claimed
+        // and elaborated — rows are REPLACED, never appended.
+        let turn_two = store
+            .begin_execution("deck", "do", "zai", "glm-5.2")
+            .unwrap();
+        store.set_execution_session(turn_two, "ses-1-9").unwrap();
+        let mut claimed = task(
+            "2",
+            "write the tests",
+            TaskStatus::InProgress,
+            Some("worker-1"),
+        );
+        claimed.description = Some("unit tests for the board mirror".into());
+        store
+            .record_task_board(
+                turn_two,
+                Some("ses-1-9"),
+                &[
+                    task("1", "read the code", TaskStatus::Completed, Some("lead")),
+                    claimed,
+                    task("10", "ship it", TaskStatus::Pending, None),
+                ],
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(store.count("tasks").unwrap(), 3, "upsert, not append");
+
+        let board = store.list_session_tasks("ses-1-9").unwrap();
+        assert_eq!(
+            board.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["1", "2", "10"],
+            "numeric task-id order, not lexicographic (10 after 2)"
+        );
+        assert_eq!(board[0].status, TaskStatus::Completed);
+        assert_eq!(board[1].status, TaskStatus::InProgress);
+        assert_eq!(board[1].owner.as_deref(), Some("worker-1"));
+        assert_eq!(
+            board[1].description.as_deref(),
+            Some("unit tests for the board mirror")
+        );
+
+        // The stored status is the protocol's serde snake_case token, and
+        // the newest snapshot's timestamp won the upsert.
+        {
+            let conn = store.lock();
+            let (status, updated_at): (String, i64) = conn
+                .query_row(
+                    "SELECT status, updated_at FROM tasks \
+                     WHERE session_id = 'ses-1-9' AND task_id = '2'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "in_progress");
+            assert_eq!(updated_at, 2_000);
+        }
+        // Another session's board is invisible here.
+        assert!(store.list_session_tasks("ses-other").unwrap().is_empty());
+    }
+
+    #[test]
+    fn pull_request_upsert_is_keyed_by_url() {
+        let store = Store::in_memory().unwrap();
+        let url = "https://github.com/o/r/pull/7";
+        store
+            .upsert_pull_request(Some("ses-1"), url, Some(7), "open", None, 1_000)
+            .unwrap();
+        // A later observation of the SAME url updates status/CI in place —
+        // and a session-less update must not erase the stored session link.
+        store
+            .upsert_pull_request(None, url, Some(7), "merged", Some("passing"), 2_000)
+            .unwrap();
+        store
+            .upsert_pull_request(
+                Some("ses-2"),
+                "https://github.com/o/r/pull/8",
+                None,
+                "open",
+                Some("running"),
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(store.count("pull_requests").unwrap(), 2, "upsert by url");
+
+        let all = store.list_pull_requests(None).unwrap();
+        assert_eq!(
+            all.iter().map(|p| p.url.as_str()).collect::<Vec<_>>(),
+            ["https://github.com/o/r/pull/8", url],
+            "freshest first"
+        );
+        let seven = &all[1];
+        assert_eq!(seven.number, Some(7));
+        assert_eq!(seven.status, "merged");
+        assert_eq!(seven.ci_status.as_deref(), Some("passing"));
+        assert_eq!(seven.updated_at, 2_000);
+        assert_eq!(
+            seven.session_id.as_deref(),
+            Some("ses-1"),
+            "COALESCE keeps the session link across a session-less update"
+        );
+
+        let ses2 = store.list_pull_requests(Some("ses-2")).unwrap();
+        assert_eq!(ses2.len(), 1);
+        assert_eq!(ses2[0].number, None);
+    }
+
+    #[test]
+    fn session_events_reassembles_the_journal_and_skips_corrupt_payloads() {
+        let store = Store::in_memory().unwrap();
+        let turn_one = store
+            .begin_execution("run", "one", "zai", "glm-5.2")
+            .unwrap();
+        store.set_execution_session(turn_one, "ses-j").unwrap();
+        store
+            .record_event(
+                turn_one,
+                0,
+                &AgentEvent::Reasoning {
+                    delta: "think".into(),
+                },
+            )
+            .unwrap();
+        store
+            .record_event(turn_one, 1, &AgentEvent::Text { delta: "a".into() })
+            .unwrap();
+        let turn_two = store
+            .begin_execution("run", "two", "zai", "glm-5.2")
+            .unwrap();
+        store.set_execution_session(turn_two, "ses-j").unwrap();
+        store
+            .record_event(turn_two, 0, &AgentEvent::Text { delta: "b".into() })
+            .unwrap();
+        // Another session's execution stays out of this journal.
+        let elsewhere = store.begin_execution("run", "x", "zai", "glm-5.2").unwrap();
+        store.set_execution_session(elsewhere, "ses-other").unwrap();
+        store
+            .record_event(elsewhere, 0, &AgentEvent::Text { delta: "z".into() })
+            .unwrap();
+        // A payload whose variant this build no longer knows — inserted raw,
+        // exactly as an older stream would have left it on disk.
+        {
+            let conn = store.lock();
+            conn.execute(
+                "INSERT INTO events (execution_id, seq, event_type, payload) \
+                 VALUES (?, 2, 'ghost', '{\"type\":\"ghost\",\"volume\":11}')",
+                params![turn_one],
+            )
+            .unwrap();
+        }
+
+        let journal = store.session_events("ses-j").unwrap();
+        assert_eq!(
+            journal.skipped, 1,
+            "an unparseable row is counted, never fatal"
+        );
+        assert_eq!(
+            journal
+                .events
+                .iter()
+                .map(|r| (r.execution_id, r.seq))
+                .collect::<Vec<_>>(),
+            vec![(turn_one, 0), (turn_one, 1), (turn_two, 0)],
+            "ordered by (execution_id, seq) across the session's turns"
+        );
+        match &journal.events[0].event {
+            AgentEvent::Reasoning { delta } => assert_eq!(delta, "think"),
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        let empty = store.session_events("ses-unknown").unwrap();
+        assert!(empty.events.is_empty());
+        assert_eq!(empty.skipped, 0);
+    }
+
     #[test]
     fn v2_migration_rebuilds_files_touched_with_dedupe_and_backfill() {
         let root = temp_root("v2_files_touched");
@@ -2983,9 +3626,10 @@ mod tests {
         let store = Store::in_memory().unwrap();
         assert_eq!(user_version(&store), SCHEMA_VERSION);
         // skill_usage lands at v5; mcp_usage takes v6; the data-plane tables
-        // (tool_calls / execution_reflection / reflections) take v7, so
-        // SCHEMA_VERSION is now 7.
-        assert_eq!(SCHEMA_VERSION, 7);
+        // (tool_calls / execution_reflection / reflections) take v7; the
+        // session plane (executions.session_id / tasks / pull_requests)
+        // takes v8, so SCHEMA_VERSION is now 8.
+        assert_eq!(SCHEMA_VERSION, 8);
 
         let id = store
             .begin_execution("deck", "format the sql", "zai", "glm-5.2")
@@ -3560,6 +4204,49 @@ mod tests {
         );
         store.release_file_lock("src/a.rs", "agent-1").unwrap();
         assert_eq!(store.file_lock_holder("src/a.rs").unwrap(), None);
+    }
+
+    #[test]
+    fn holder_wide_release_drops_only_that_holders_claims() {
+        let store = Store::in_memory().unwrap();
+        store.acquire_file_lock("src/a.rs", "run-1/t1").unwrap();
+        store.acquire_file_lock("src/b.rs", "run-1/t1").unwrap();
+        store.acquire_file_lock("src/c.rs", "run-2/t9").unwrap();
+        assert_eq!(store.release_file_locks_for_holder("run-1/t1").unwrap(), 2);
+        assert!(
+            store.acquire_file_lock("src/a.rs", "run-2/t9").unwrap(),
+            "released paths are claimable again"
+        );
+        assert_eq!(
+            store.file_lock_holder("src/c.rs").unwrap(),
+            Some("run-2/t9".to_string()),
+            "the other holder's claim survives"
+        );
+    }
+
+    #[test]
+    fn stale_lock_sweep_releases_old_claims_only() {
+        let store = Store::in_memory().unwrap();
+        store.acquire_file_lock("src/fresh.rs", "live").unwrap();
+        // A crashed process's leftover: backdate the claim past the sweep age.
+        store
+            .lock()
+            .execute(
+                "INSERT INTO file_locks (path, holder, acquired_at) \
+                 VALUES ('src/stale.rs', 'dead', datetime('now', '-2 hours'))",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.prune_stale_file_locks(3600).unwrap(), 1);
+        assert!(
+            store.acquire_file_lock("src/stale.rs", "live").unwrap(),
+            "the swept path is claimable"
+        );
+        assert_eq!(
+            store.file_lock_holder("src/fresh.rs").unwrap(),
+            Some("live".to_string()),
+            "fresh claims survive the sweep"
+        );
     }
 
     #[test]

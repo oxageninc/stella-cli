@@ -691,6 +691,15 @@ fn project_trust() -> ProjectTrust {
     }
 }
 
+/// Whether this process trusts the current project to run code it configures.
+/// Governs project-scope lifecycle hooks and the MCP servers declared in
+/// `.stella/mcp.toml` — both spawn processes / open connections that a cloned
+/// repo must not be able to start silently. Same gate as project hooks:
+/// `STELLA_TRUST_PROJECT=1` (or the legacy hooks-only `STELLA_PROJECT_HOOKS=1`).
+pub(crate) fn project_code_execution_trusted() -> bool {
+    project_trust().hooks
+}
+
 /// The org-managed scope path. `STELLA_MANAGED_SETTINGS` overrides the
 /// platform default so fleets can mount it anywhere (and tests can point at
 /// a fixture instead of `/etc`).
