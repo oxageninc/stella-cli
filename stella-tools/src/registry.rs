@@ -179,7 +179,6 @@ impl ToolRegistry {
             Arc::new(crate::write::WriteFile),
             Arc::new(crate::edit::EditFile),
             Arc::new(crate::delete::DeleteFile),
-            // Arc::new(crate::bash::Bash),  // @todo revisit and determine if bash should be in this list or not.
             // One shared tip latch: the session's first mapped search —
             // grep or glob, whichever comes first — carries the graph_query
             // pointer; every later footer is map-only.
