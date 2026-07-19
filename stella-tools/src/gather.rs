@@ -157,20 +157,6 @@ fn age_human(created_at_ms: u64) -> String {
     }
 }
 
-async fn git_head(root: &Path) -> Option<String> {
-    let output = tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(root)
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let head = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if head.is_empty() { None } else { Some(head) }
-}
-
 /// Same slug rule as the exploration store: path-safe, predictable.
 fn valid_slug(slug: &str) -> bool {
     !slug.is_empty()
@@ -624,7 +610,7 @@ async fn gather(
         sections,
         manifest,
         created_at_ms: now_ms(),
-        git_head: git_head(root).await,
+        git_head: crate::staleness::git_head(root).await,
     };
 
     // Persist — best-effort: a pack that can't be written still returns its
@@ -654,6 +640,17 @@ async fn gather(
 }
 
 async fn read_pack(root: &Path, slug: &str) -> ToolOutput {
+    // Same gate as the save path: the slug becomes a path component of
+    // `pack_path`, so an unvalidated one (`../../…`) reads .json files
+    // outside the workspace — the confinement break resolve_within_root
+    // exists to prevent.
+    if !valid_slug(slug) {
+        return ToolOutput::Error {
+            message: format!(
+                "invalid pack slug `{slug}` — use 1-64 lowercase letters, digits, - or _"
+            ),
+        };
+    }
     let Some(pack) = load_pack(root, slug).await else {
         let listing = match list_packs(root).await {
             ToolOutput::Ok { content } => content,
@@ -755,6 +752,25 @@ fn render_pack(pack: &ContextPack, status: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The read path builds `pack_path` from the slug, so it must refuse
+    /// path-shaped slugs — otherwise `../../…` reads .json files outside
+    /// the workspace root.
+    #[tokio::test]
+    async fn pack_read_rejects_traversal_slugs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for slug in ["../escape", "a/b", "..", "UPPER", ""] {
+            let out = GatherContext
+                .execute(&serde_json::json!({ "pack": slug }), dir.path())
+                .await;
+            match out {
+                ToolOutput::Error { message } => {
+                    assert!(message.contains("invalid pack slug"), "{slug}: {message}")
+                }
+                other => panic!("slug `{slug}` must be rejected, got {other:?}"),
+            }
+        }
+    }
 
     fn workspace() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");

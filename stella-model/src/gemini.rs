@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use stella_protocol::{
-    CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, MessageRole,
-    ProviderError, ReasoningEffort, ToolCall,
+    CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, FinishReason,
+    MessageRole, ProviderError, ReasoningEffort, ToolCall,
 };
 
 use crate::catalog::{Catalog, Pricing};
@@ -300,6 +300,10 @@ impl GoogleApiError {
 pub(crate) struct GeminiCandidate {
     #[serde(default)]
     pub(crate) content: Option<GeminiCandidateContent>,
+    /// Why generation ended (`STOP`, `MAX_TOKENS`, `SAFETY`, …) — reported
+    /// on the final chunk's candidate; absent on interim chunks.
+    #[serde(default, rename = "finishReason")]
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -592,7 +596,8 @@ impl Provider for GeminiProvider {
             return Err(classify_google_error("Gemini", response).await);
         }
 
-        let (text, tool_calls, usage) = aggregate_gemini_stream("Gemini", response).await?;
+        let (text, tool_calls, usage, finish_reason) =
+            aggregate_gemini_stream("Gemini", response).await?;
         let cost_usd = self.pricing.map(|p| p.cost_usd(&usage)).unwrap_or(0.0);
         Ok(CompletionResult {
             text,
@@ -600,7 +605,7 @@ impl Provider for GeminiProvider {
             usage,
             model: self.model.clone(),
             cost_usd,
-            finish_reason: None,
+            finish_reason,
         })
     }
 }
@@ -614,11 +619,13 @@ impl Provider for GeminiProvider {
 pub(crate) async fn aggregate_gemini_stream(
     label: &str,
     response: reqwest::Response,
-) -> Result<(String, Vec<ToolCall>, CompletionUsage), ProviderError> {
+) -> Result<(String, Vec<ToolCall>, CompletionUsage, Option<FinishReason>), ProviderError> {
     let mut decoder = SseDecoder::new();
     let mut text = String::new();
     let mut usage = CompletionUsage::default();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    // Reported on the final chunk's candidate; last assignment wins.
+    let mut finish_raw: Option<String> = None;
     let mut stream = response.bytes_stream();
 
     // `next_with_timeout` bounds each read by `STREAM_IDLE_TIMEOUT` (a silent
@@ -648,6 +655,9 @@ pub(crate) async fn aggregate_gemini_stream(
                 usage.cached_input_tokens = u.cached_content_token_count;
             }
             for candidate in parsed.candidates {
+                if let Some(reason) = candidate.finish_reason {
+                    finish_raw = Some(reason);
+                }
                 let Some(content) = candidate.content else {
                     continue;
                 };
@@ -685,7 +695,24 @@ pub(crate) async fn aggregate_gemini_stream(
         }
     }
 
-    Ok((text, tool_calls, usage))
+    let finish_reason = map_gemini_finish_reason(finish_raw.as_deref(), !tool_calls.is_empty());
+    Ok((text, tool_calls, usage, finish_reason))
+}
+
+/// Normalize Gemini's `finishReason` vocabulary onto the provider-neutral
+/// [`FinishReason`]. Gemini reports `STOP` even for function-calling turns,
+/// so tool presence disambiguates. Unknown values stay `None` per the
+/// `CompletionResult` contract.
+fn map_gemini_finish_reason(raw: Option<&str>, has_tool_calls: bool) -> Option<FinishReason> {
+    match raw? {
+        "STOP" if has_tool_calls => Some(FinishReason::ToolCalls),
+        "STOP" => Some(FinishReason::Stop),
+        "MAX_TOKENS" => Some(FinishReason::Length),
+        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" => {
+            Some(FinishReason::ContentFilter)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

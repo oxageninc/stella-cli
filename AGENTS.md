@@ -54,13 +54,18 @@ make watch-lint          # re-run clippy on every save
 
 ### The gate — run before every push
 
-CI (`/.github/workflows/ci.yml`) runs exactly these three plus a release
+CI (`/.github/workflows/ci.yml`) runs exactly these four plus a release
 smoke build (thin LTO) in the same required job, and a red gate is an
 automatic "not yet":
 
 ```bash
-make gate                # = fmt --check + clippy -D warnings + test --workspace
+make gate                # = fmt --check + file-size ratchet + clippy -D warnings + test --workspace
 ```
+
+The file-size ratchet (`make sizes`, `scripts/check-file-sizes.sh`) caps new
+`.rs` files at 1500 lines and pins the legacy giants listed in
+`scripts/file-size-ratchet.txt` at their recorded size (+50 lines slack) —
+shrinking is always welcome; growing them is not.
 
 For a faster pre-push sanity check (no tests): `make check`.
 

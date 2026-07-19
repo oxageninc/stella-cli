@@ -905,7 +905,8 @@ impl<'a> Pipeline<'a> {
                 .observe_touched_tests(effective_cmd, &mut state.oracle)
                 .await;
             // Tamper exclusion: a flip is credited only while the witness
-            // files are byte-identical to what the witness author wrote. A
+            // files' fingerprints (size + mtime) match what the witness
+            // author wrote. A
             // tampered witness degrades the flip to inconclusive — the judge
             // then decides, told exactly which paths were touched — it never
             // silently passes and never hard-fails work that may still be

@@ -1,14 +1,12 @@
-//! Loop detection — pure synchronous analysis of recent tool calls
-//! ( design principle 3: "loop detection... plain
-//! synchronous functions over owned data — easy to property-test";
-//! Phase 2 step 4 names loop detection as a step-driver
-//! responsibility alongside compaction and budget eviction).
+//! Loop detection — pure synchronous analysis of recent tool calls:
+//! plain synchronous functions over owned data, easy to property-test,
+//! run by the step-driver alongside compaction and budget eviction.
 //!
-//! The interim CLI loop (`stella-cli/src/agent.rs::run_turn`) only has a
-//! flat `MAX_TOOL_ITERATIONS` counter — it burns the *entire* iteration
-//! budget before giving up, even when the model got stuck after three
-//! steps. This module gives the step-driver a real, typed verdict it can
-//! act on early: abort with a clear reason instead of grinding to the cap.
+//! A flat iteration cap alone burns the *entire* step budget before
+//! giving up, even when the model got stuck after three steps. This
+//! module gives the step-driver (`driver.rs`, which every CLI path
+//! drives) a real, typed verdict it can act on early: abort with a clear
+//! reason instead of grinding to the cap.
 //!
 //! Two failure modes are detected, matching real agent stuck-loop
 //! signatures:

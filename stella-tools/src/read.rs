@@ -69,7 +69,7 @@ impl Tool for ReadFile {
                 "properties": {
                     "path": { "type": "string", "description": "File path relative to workspace root" },
                     "offset": { "type": "integer", "description": "1-based start line (optional)" },
-                    "limit": { "type": "integer", "description": "Max lines to return (optional, default 2000)" },
+                    "limit": { "type": "integer", "description": "Max lines to return (optional; default and ceiling 2000)" },
                     "reason": { "type": "string", "description": "Why you are reading this file — recorded in the session's file-touch audit log" }
                 },
                 "required": ["path"]
@@ -92,10 +92,12 @@ impl Tool for ReadFile {
             .get("offset")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize);
+        // MAX_LINES is a ceiling, not just the default: the flood protection
+        // the module header promises must hold for explicit limits too.
         let limit = input
             .get("limit")
             .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
+            .map(|n| (n as usize).min(MAX_LINES))
             .unwrap_or(MAX_LINES);
 
         let full_path = match crate::resolve_within_root(root, path) {
@@ -115,7 +117,7 @@ impl Tool for ReadFile {
                 let reads = self.tally(root, path);
                 let lines: Vec<&str> = content.lines().collect();
                 let start = offset.unwrap_or(1).saturating_sub(1);
-                let end = (start + limit).min(lines.len());
+                let end = start.saturating_add(limit).min(lines.len());
 
                 if start >= lines.len() {
                     return ToolOutput::Ok {

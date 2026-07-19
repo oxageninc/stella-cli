@@ -2,10 +2,11 @@
 //! `.stella/screenshots/`, for work verification: a judge or reviewer can
 //! demand visual evidence that a UI change actually rendered.
 //!
-//! The capture lands on disk and the tool returns its path + size. Vision
-//! (attaching the image bytes to a model call) arrives with multimodal
-//! message support; until then the artifact is
-//! still valuable — humans open it, and agents cite it as evidence.
+//! The capture lands on disk and the tool returns its path + size. With
+//! multimodal attachments shipped end-to-end (protocol `Attachment`,
+//! adapter media blocks, deck image paste), the path can be re-attached
+//! for vision review — and the artifact stands on its own as evidence
+//! humans open and agents cite.
 
 use async_trait::async_trait;
 use serde_json::Value;

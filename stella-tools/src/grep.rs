@@ -12,17 +12,26 @@ const MAX_RESULTS: usize = 200;
 
 /// Does this rg/grep stderr describe a broken *pattern* (bad regex or a flag
 /// the pattern got mistaken for) rather than benign per-file walk warnings?
-/// Both tools exit 2 either way, so the message text is the only signal:
-/// pattern failures carry `regex parse error` / `error:` (rg) or
-/// `invalid`/`unbalanced` (grep); per-path IO warnings read `rg: <path>:
-/// <os reason>` with none of those.
+/// Both tools exit 2 either way, so the message text is the only signal —
+/// read per line, anchored right after the `rg:`/`grep:` prefix: pattern
+/// failures put the diagnostic there (`regex parse error`, `error: …`,
+/// `invalid …`, `unbalanced …`), while per-path IO warnings put a path
+/// there (`rg: <path>: <os reason>`). A bare substring scan mistook any
+/// warning whose *path* contained a keyword (`…/invalid/…`) for a broken
+/// pattern, turning a legitimate zero-match walk into a failure.
 fn is_pattern_error(stderr: &str) -> bool {
-    let s = stderr.to_ascii_lowercase();
-    s.contains("regex parse error")
-        || s.contains("error:")
-        || s.contains("invalid")
-        || s.contains("unbalanced")
-        || s.contains("unmatched")
+    stderr.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        let rest = line
+            .strip_prefix("rg:")
+            .or_else(|| line.strip_prefix("grep:"))
+            .unwrap_or(&line)
+            .trim_start();
+        rest.starts_with("regex parse error")
+            || ["error:", "invalid", "unbalanced", "unmatched"]
+                .iter()
+                .any(|kw| rest.starts_with(kw))
+    })
 }
 
 /// The most informative single line of an rg/grep error, for a compact tool
@@ -237,6 +246,25 @@ impl Tool for Grep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exit-2 stderr is a pattern error only when the diagnostic follows the
+    /// tool prefix — a keyword inside a warned-about *path* must not turn a
+    /// zero-match walk into a failure.
+    #[test]
+    fn pattern_errors_are_distinguished_from_path_warnings() {
+        assert!(is_pattern_error(
+            "rg: regex parse error:\n    (foo\n    ^\nerror: unclosed group"
+        ));
+        assert!(is_pattern_error("grep: Invalid regular expression"));
+        assert!(is_pattern_error("grep: Unmatched ( or \\("));
+        assert!(!is_pattern_error(
+            "rg: src/invalid/notes.txt: Permission denied (os error 13)"
+        ));
+        assert!(!is_pattern_error(
+            "grep: ./error:pages/dump.log: Is a directory"
+        ));
+        assert!(!is_pattern_error(""));
+    }
 
     #[tokio::test]
     async fn finds_matching_lines() {

@@ -1,8 +1,8 @@
 //! THE dispatch seam (L-E9). Subagent fan-out goes through exactly one
 //! API — [`Fleet::dispatch`] — that claims the task's declared paths
 //! (cooperative file locks in the workspace [`Store`], held for the
-//! attempt's duration), allocates the task's workspace (a git worktree per
-//! [`Isolation`], isolate-by-default), records the attempt in the
+//! attempt's duration), allocates the task's workspace (shared tree by
+//! default; a git worktree when the task opts into isolation), records the attempt in the
 //! [`Ledger`], invokes the [`FleetWorker`] port, stamps the resulting commits
 //! and parent→child lineage into the ledger, and **meters the child's spend
 //! into the parent [`BudgetGuard`]**. No ad-hoc process spawning for agents:
@@ -335,7 +335,8 @@ where
 
     /// [`dispatch`](Self::dispatch) after the task's claims are held.
     async fn dispatch_claimed(&self, task: &Task) -> Result<TaskHandle, FleetError> {
-        // 1. Allocate the workspace. Isolate by default.
+        // 1. Allocate the workspace: a worktree only for tasks that opted
+        //    into isolation; the shared tree (default) allocates nothing.
         let worktree = match task.isolation {
             Isolation::Isolated => Some(
                 self.worktrees

@@ -1,10 +1,9 @@
-//! `stella-fleet` — the multi-agent fleet layer (
-//! Phase 5 item 2).
+//! `stella-fleet` — the multi-agent fleet layer.
 //!
 //! Four pieces, one seam:
 //!
 //! - [`plan`] — the **planner DAG**: [`Plan`]/[`Task`] with dependency edges,
-//!   isolate-by-default, wave scheduling ([`Plan::ready_tasks`]), topological
+//!   share-by-default isolation, wave scheduling ([`Plan::ready_tasks`]), topological
 //!   order, and cycle detection.
 //! - [`git`] — **git-worktree isolation** over the [`GitCli`] port: a
 //!   dedicated worktree per task, plus commit helpers that *always* use

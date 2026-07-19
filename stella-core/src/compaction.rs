@@ -1,13 +1,22 @@
 //! Context compaction — pure synchronous logic over owned data
-//! Two mechanisms, applied in order:
+//! Four mechanisms, applied least-lossy first:
 //!
-//! 1. **Tool-output eviction**: oldest large tool outputs are replaced with
-//!    a stub once the conversation exceeds the budget. A tool result whose
-//!    call is still the most recent one is never evicted (the property test
-//!    below: compaction never drops a still-referenced tool result).
-//! 2. **Dedup of repeated identical tool outputs** (L-E3): a byte-identical
+//! 1. **Dedup of repeated identical tool outputs** (L-E3): a byte-identical
 //!    tool output appearing more than once keeps only its latest copy; the
 //!    older ones are stubbed with a pointer.
+//! 2. **Supersession**: when the SAME call (same tool name, byte-identical
+//!    input) ran more than once, only the latest result reflects current
+//!    state — the older ones are stale by construction (a re-read after an
+//!    edit, a re-listed directory) and are stubbed even though their
+//!    content differs.
+//! 3. **Aging**: still over budget, old large outputs are middle-out
+//!    truncated to head+tail before anything is dropped whole — error
+//!    lines and file headers survive where full eviction would lose them.
+//! 4. **Tool-output eviction**: oldest large tool outputs are replaced with
+//!    a stub once the conversation still exceeds the budget. A tool result
+//!    whose call is still the most recent one is never evicted (the
+//!    property test below: compaction never drops a still-referenced tool
+//!    result).
 //!
 //! The system message and the latest user message are never touched.
 
@@ -16,22 +25,59 @@ use stella_protocol::{CompletionMessage, MessageRole, ToolOutput};
 use crate::estimator::{estimate_conversation_tokens, estimate_message_tokens};
 
 /// What a compaction pass did, for the `Compaction` event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CompactionReport {
     pub before_tokens: u64,
     pub after_tokens: u64,
     pub evicted: usize,
     pub deduped: usize,
+    /// Older results of a repeated identical call, stubbed as stale.
+    pub superseded: usize,
+    /// Large old outputs middle-out truncated instead of dropped whole.
+    pub aged: usize,
 }
 
 const EVICTION_STUB: &str =
     "[tool output evicted to fit context — re-run the tool if you need it again]";
+
+/// Aging only touches outputs big enough that head+tail plus the marker is
+/// a real saving; below this it would churn bytes for nothing.
+const AGE_THRESHOLD_CHARS: usize = 2_000;
+/// What aging keeps from each end. Head carries the tool's framing (the
+/// PASSED/FAILED line, file headers); tail carries the errors.
+const AGE_KEEP_CHARS: usize = 800;
 
 fn dedup_stub() -> String {
     // Models can't see message indices — point at the surviving copy in
     // terms they can act on.
     "[identical output repeated — the full content appears again in a more recent tool result]"
         .to_string()
+}
+
+fn supersession_stub() -> String {
+    "[stale result of a repeated call — the same tool ran again with identical input; the \
+     current output appears in a more recent tool result]"
+        .to_string()
+}
+
+/// Middle-out truncate `content` on char boundaries, keeping
+/// [`AGE_KEEP_CHARS`] from each end. Caller guarantees
+/// `content.len() > AGE_THRESHOLD_CHARS`, which the keep windows never
+/// overlap.
+fn age_content(content: &str) -> String {
+    let mut head_end = AGE_KEEP_CHARS.min(content.len());
+    while !content.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = content.len() - AGE_KEEP_CHARS.min(content.len());
+    while !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n[… middle elided during compaction — re-run the tool for the full output …]\n{}",
+        &content[..head_end],
+        &content[tail_start..]
+    )
 }
 
 /// Evict + dedup until the conversation fits `budget_tokens`, or until
@@ -46,6 +92,8 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
     }
 
     let mut deduped = 0usize;
+    let mut superseded = 0usize;
+    let mut aged = 0usize;
     let mut evicted = 0usize;
 
     // Index of the last Tool message — its results answer the most recent
@@ -88,13 +136,106 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
         }
     }
 
-    // Pass 2: evict oldest large tool outputs until under budget. The running
+    // Pass 2: supersession — when the SAME invocation (tool name +
+    // byte-identical input) produced results more than once, older results
+    // are stale by construction: the newer run reflects newer workspace
+    // state. Unlike pass 1 this fires even when the CONTENT differs (a
+    // re-read after an edit). Keyed through the assistant messages' tool
+    // calls because results themselves only carry a call_id.
+    {
+        use std::collections::HashMap;
+        // call_id -> invocation key. Input serialization is deterministic
+        // for a given call because it round-trips the same serde_json Value.
+        let mut invocation: HashMap<&str, String> = HashMap::new();
+        for message in messages.iter() {
+            for call in &message.tool_calls {
+                invocation.insert(
+                    call.call_id.as_str(),
+                    format!("{}\u{0}{}", call.name, call.input),
+                );
+            }
+        }
+        // Latest tool-message index per invocation key.
+        let mut latest: HashMap<&str, usize> = HashMap::new();
+        for (idx, message) in messages.iter().enumerate() {
+            if message.role != MessageRole::Tool {
+                continue;
+            }
+            for result in &message.tool_results {
+                if let Some(key) = invocation.get(result.call_id.as_str()) {
+                    latest.insert(key.as_str(), idx);
+                }
+            }
+        }
+        let mut stale: Vec<(usize, String)> = Vec::new();
+        for (idx, message) in messages.iter().enumerate() {
+            if Some(idx) == last_tool_idx || message.role != MessageRole::Tool {
+                continue;
+            }
+            for result in &message.tool_results {
+                let Some(key) = invocation.get(result.call_id.as_str()) else {
+                    continue;
+                };
+                // Errors stay: a superseding success makes the old error
+                // history, but errors are small + diagnostic (same posture
+                // as eviction below).
+                let ToolOutput::Ok { content } = &result.output else {
+                    continue;
+                };
+                if content.len() > 200 && latest.get(key.as_str()).copied() > Some(idx) {
+                    stale.push((idx, result.call_id.clone()));
+                }
+            }
+        }
+        for (idx, call_id) in stale {
+            for result in &mut messages[idx].tool_results {
+                if result.call_id == call_id {
+                    result.output = ToolOutput::Ok {
+                        content: supersession_stub(),
+                    };
+                    superseded += 1;
+                }
+            }
+        }
+    }
+
+    // Pass 3: aging — before dropping anything whole, shrink old large
+    // outputs to head+tail. Oldest first, incremental accounting, stop as
+    // soon as the budget fits; what aging saves, eviction never has to
+    // destroy.
+    let mut current_tokens = estimate_conversation_tokens(messages);
+    if current_tokens > budget_tokens {
+        for (idx, message) in messages.iter_mut().enumerate() {
+            if Some(idx) == last_tool_idx || message.role != MessageRole::Tool {
+                continue;
+            }
+            let before = estimate_message_tokens(message);
+            for result in &mut message.tool_results {
+                if let ToolOutput::Ok { content } = &result.output
+                    && content.len() > AGE_THRESHOLD_CHARS
+                {
+                    result.output = ToolOutput::Ok {
+                        content: age_content(content),
+                    };
+                    aged += 1;
+                }
+            }
+            let after = estimate_message_tokens(message);
+            current_tokens = current_tokens.saturating_sub(before.saturating_sub(after));
+            if current_tokens <= budget_tokens {
+                break;
+            }
+        }
+    }
+
+    // Pass 4: evict oldest large tool outputs until under budget. The running
     // total is tracked incrementally (diffing one message's estimate before
     // and after mutation) rather than by re-scanning the whole conversation
     // on every eviction — the borrow checker won't allow an immutable
     // whole-slice re-scan while a mutable borrow of one message is live, and
-    // an O(n) rescan per eviction would be wasteful besides.
-    let mut current_tokens = estimate_conversation_tokens(messages);
+    // an O(n) rescan per eviction would be wasteful besides. (Re-scanned
+    // once here so aging's incremental drift can't leak into eviction.)
+    current_tokens = estimate_conversation_tokens(messages);
     if current_tokens > budget_tokens {
         for (idx, message) in messages.iter_mut().enumerate() {
             if Some(idx) == last_tool_idx || message.role != MessageRole::Tool {
@@ -121,7 +262,7 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
         }
     }
 
-    if evicted == 0 && deduped == 0 {
+    if evicted == 0 && deduped == 0 && superseded == 0 && aged == 0 {
         // Over budget but nothing compactable — don't report a no-op.
         return None;
     }
@@ -131,6 +272,8 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
         after_tokens,
         evicted,
         deduped,
+        superseded,
+        aged,
     })
 }
 
@@ -152,6 +295,23 @@ mod tests {
         }
     }
 
+    fn assistant_with_call_on(call_id: &str, path: &str) -> CompletionMessage {
+        CompletionMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                call_id: call_id.into(),
+                name: "read_file".into(),
+                input: serde_json::json!({ "path": path }),
+            }],
+            tool_results: vec![],
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Distinct target per call id, so tests exercising dedup/eviction in
+    /// isolation don't also trip the supersession pass (which keys on
+    /// identical name+input).
     fn assistant_with_call(call_id: &str) -> CompletionMessage {
         CompletionMessage {
             role: MessageRole::Assistant,
@@ -159,7 +319,7 @@ mod tests {
             tool_calls: vec![ToolCall {
                 call_id: call_id.into(),
                 name: "read_file".into(),
-                input: serde_json::json!({"path": "x"}),
+                input: serde_json::json!({ "path": call_id }),
             }],
             tool_results: vec![],
             attachments: Vec::new(),
@@ -271,6 +431,74 @@ mod tests {
             estimate_conversation_tokens(&tight) <= estimate_conversation_tokens(&generous),
             "tighter budget must not leave more tokens"
         );
+    }
+
+    #[test]
+    fn repeated_identical_call_supersedes_older_differing_results() {
+        // Same tool, same input, run twice with DIFFERENT outputs (a
+        // re-read after an edit): the older result is stale by
+        // construction and must be stubbed even though byte-dedup can't
+        // touch it. A third call on a DIFFERENT target must be untouched.
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            assistant_with_call_on("c1", "src/lib.rs"),
+            tool_msg("c1", "pre-edit contents ".repeat(100)),
+            assistant_with_call_on("c2", "src/other.rs"),
+            tool_msg("c2", "unrelated file ".repeat(100)),
+            assistant_with_call_on("c3", "src/lib.rs"),
+            tool_msg("c3", "post-edit contents ".repeat(100)),
+        ];
+        // Below the raw total (~1300 tokens) but above what supersession
+        // alone leaves (~900), so eviction never has to fire and the
+        // untouched-neighbors assertions below stay meaningful.
+        let report = compact(&mut messages, 1_100).expect("should compact");
+        assert!(report.superseded >= 1, "{report:?}");
+        match &messages[2].tool_results[0].output {
+            ToolOutput::Ok { content } => {
+                assert!(content.contains("stale result"), "got: {content}")
+            }
+            _ => panic!("expected supersession stub"),
+        }
+        // The different-target read keeps its full content…
+        match &messages[4].tool_results[0].output {
+            ToolOutput::Ok { content } => {
+                assert!(content.starts_with("unrelated file"), "got: {content}")
+            }
+            _ => panic!("different invocation must not be superseded"),
+        }
+        // …and the superseding (latest) result is intact.
+        match &messages[6].tool_results[0].output {
+            ToolOutput::Ok { content } => {
+                assert!(content.starts_with("post-edit"), "got: {content}")
+            }
+            _ => panic!("latest result must survive"),
+        }
+    }
+
+    #[test]
+    fn aging_shrinks_old_outputs_keeping_head_and_tail_before_eviction() {
+        let body = format!("HEADLINE\n{}\nTAILLINE", "filler ".repeat(6000));
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            assistant_with_call("c1"),
+            tool_msg("c1", body),
+            assistant_with_call("c2"),
+            tool_msg("c2", "recent ".repeat(50)),
+        ];
+        // Budget below the raw size but comfortably above the aged size:
+        // aging alone must satisfy it, so nothing gets evicted whole.
+        let report = compact(&mut messages, 2_000).expect("should compact");
+        assert!(report.aged >= 1, "{report:?}");
+        assert_eq!(report.evicted, 0, "aging must run before eviction");
+        match &messages[2].tool_results[0].output {
+            ToolOutput::Ok { content } => {
+                assert!(content.starts_with("HEADLINE"), "head lost: {content:.40}");
+                assert!(content.ends_with("TAILLINE"), "tail lost");
+                assert!(content.contains("middle elided"));
+                assert!(content.len() < 2_000, "aged output still huge");
+            }
+            _ => panic!("expected aged content"),
+        }
     }
 
     #[test]

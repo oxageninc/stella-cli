@@ -2,12 +2,11 @@
 //! a distinct concern from `crate::compaction`'s *token*-budget eviction:
 //! compaction manages context-window pressure, `budget` manages dollars
 //! spent against a turn and/or session cap. Ported from the TS per-turn
-//! budget (PR #625), now generalized to also cover a session scope and
-//! future media spend.
+//! budget, generalized to also cover a session scope and media spend.
 //!
 //! # The mid-tool-kill lesson
 //!
-//! Per, `enforced` mode is "a hard stop with a
+//! `enforced` mode is "a hard stop with a
 //! clean turn abort — never a mid-tool kill." This module cannot enforce
 //! *when* the caller checks the outcome — that discipline belongs to the
 //! `driver.rs` step-driver, which only consults
@@ -24,15 +23,14 @@
 //!
 //! [`BudgetGuard::record_spend`] takes a bare `cost_usd: f64` and does not
 //! care what produced it — a text completion, an image job, or a video job
-//! all settle through the same call ("media counts").
-//! `stella-media` does not exist yet; no special-casing is needed here for
-//! that to fall out for free later.
+//! all settle through the same call ("media counts"), which is what lets
+//! `stella-media`'s spend meter into the same guard with no special-casing.
 //!
 //! # Precision
 //!
 //! Spend accumulates via plain `f64` addition. This guard is an in-memory
-//! running total for gating and HUD display (`BudgetTick`,
-//!) — it is not the billing system of record (that
+//! running total for gating and HUD display (`BudgetTick`) — it is not the
+//! billing system of record (that
 //! lives in adapter-reported usage plus, for the platform's own metered
 //! products, ClickHouse/Stripe). Summation drift across a session-length
 //! number of calls is negligible at USD-cent granularity; callers needing
@@ -135,8 +133,8 @@ impl BudgetGuard {
     }
 
     /// Evaluate the current spend against the configured limits without
-    /// recording anything new. This is the "safe boundary" check the future
-    /// `driver.rs` calls between steps — see module docs.
+    /// recording anything new. This is the "safe boundary" check the
+    /// `driver.rs` step-driver runs between steps — see module docs.
     pub fn evaluate(&self) -> BudgetOutcome {
         self.check_axis(BudgetAxis::Turn, self.turn_spent_usd, self.turn_limit_usd)
             .or_else(|| {

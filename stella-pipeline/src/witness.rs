@@ -12,9 +12,10 @@
 //! The witness is deliberately **visible to the worker**: iterating against a
 //! failing test is where convergence comes from, and a test file on disk is
 //! discoverable by any worker with a shell anyway. Integrity comes instead
-//! from *tamper exclusion* — the fingerprints of the files the witness turn
-//! created are snapshotted, and a flip is only credited if those files are
-//! byte-identical at verify time ([`tampered_paths`]). A worker that edits or
+//! from *tamper exclusion* — the fingerprints (size + mtime, not content
+//! hashes) of the files the witness turn created are snapshotted, and a
+//! flip is only credited if those fingerprints are unchanged at verify
+//! time ([`tampered_paths`]). A worker that edits or
 //! deletes the witness loses the deterministic flip credit and the evidence
 //! reaching the judge names the tampered paths. This mirrors how SWE-bench
 //! itself scores (the scored test patch is applied outside the worker's

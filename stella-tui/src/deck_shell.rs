@@ -52,8 +52,10 @@ const SHELL_OUTPUT_CAP: usize = 4000;
 /// Configuration for one deck session.
 #[derive(Debug, Clone, Default)]
 pub struct DeckOptions {
-    /// Enable mouse capture (comfy-tabs click/scroll/reorder). Off by default so
-    /// native terminal selection keeps working (L-T2).
+    /// Enable mouse capture. Off by default so native terminal selection
+    /// keeps working (L-T2). NOTE: no mouse events are handled yet — the
+    /// event loop discards them — so turning this on currently only costs
+    /// selection; it exists as the seam for click/scroll/reorder to land.
     pub mouse_capture: bool,
     /// Structured debug log path (`OXAGEN_DEBUG=1`), or `None` for a no-op sink.
     pub debug_log_path: Option<PathBuf>,

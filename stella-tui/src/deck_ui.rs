@@ -3543,6 +3543,15 @@ fn handle_files_key(
                 ui.files_diff_scroll.scroll_down(1, total, height);
                 return Some(DeckAction::Handled);
             }
+            KeyCode::PageUp => {
+                ui.files_diff_scroll.scroll_up(height.max(1), total, height);
+                return Some(DeckAction::Handled);
+            }
+            KeyCode::PageDown => {
+                ui.files_diff_scroll
+                    .scroll_down(height.max(1), total, height);
+                return Some(DeckAction::Handled);
+            }
             _ => {}
         }
     }

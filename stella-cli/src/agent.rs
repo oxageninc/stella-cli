@@ -277,6 +277,21 @@ fn tuned_engine_config(cfg: &Config, kind: crate::settings::EngineAgentKind) -> 
         cwd: cfg.workspace_root.display().to_string(),
         ..EngineConfig::default()
     };
+    // Compaction must fire BEFORE the provider's context window overflows:
+    // the engine default (150k) exceeds some catalog windows (deepseek-chat
+    // is 128k), where provider-side overflow would land before compaction
+    // ever triggered. The window only ever LOWERS the default — 3/4 leaves
+    // headroom for the estimator's error band plus the next step's output.
+    if let Ok(entry) =
+        stella_model::catalog::Catalog::current().resolve_for(cfg.provider.id, &cfg.model_id)
+    {
+        let window = entry.context_window as u64;
+        if window > 0 {
+            engine.compaction_budget_tokens = engine
+                .compaction_budget_tokens
+                .min(window.saturating_mul(3) / 4);
+        }
+    }
     if let Some(settings) = &cfg.engine_settings {
         let tuning = crate::engine_config::tuning_for(settings, kind);
         if tuning.temperature.is_some() {

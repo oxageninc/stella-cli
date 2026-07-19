@@ -5,8 +5,8 @@
 //! wiring together every other module in this crate.
 //!
 //! `Engine` drives through `&dyn Provider` (`stella_protocol`) and
-//! `&dyn ToolExecutor` (`crate::ports`) — no adapter-specific code, no
-//! filesystem call, lives here. Everything
+//! `&dyn ToolExecutor` (`crate::ports`) — no adapter-specific code and no
+//! direct filesystem access live here. Everything
 //! *inside* one step (compaction, loop detection, budget evaluation) is the
 //! plain synchronous logic from the other modules in this crate; `run_turn`
 //! is the one place that sequences them against real I/O.
@@ -95,6 +95,16 @@ pub struct EngineConfig {
     /// drift-corrected estimate, so this budget is honored in the model's
     /// own observed tokens rather than raw heuristic tokens.
     pub compaction_budget_tokens: u64,
+    /// When eviction/dedup/aging alone cannot reach the compaction budget
+    /// (the oversized content is protected user/assistant text, or already
+    /// stubbed), replace the oldest span of the conversation with a
+    /// model-written summary instead of letting the next call overflow the
+    /// provider's context window. Costs one cheap completion, metered into
+    /// the same [`BudgetGuard`] as every other call.
+    pub summarize_overflow: bool,
+    /// Messages at the conversation tail the summarizer never touches —
+    /// the recent work the model is actively reasoning over.
+    pub summarize_keep_recent: usize,
     /// Hard backstop on step count, independent of loop detection — belt
     /// and suspenders, never the *primary* stuck-loop defense (that's
     /// `crate::loop_detect`).
@@ -125,6 +135,8 @@ impl Default for EngineConfig {
             retry_policy: RetryPolicy::standard(),
             loop_detection: LoopDetectionConfig::default(),
             compaction_budget_tokens: 150_000,
+            summarize_overflow: true,
+            summarize_keep_recent: 8,
             max_steps: 200,
             cwd: ".".to_string(),
         }
@@ -324,7 +336,9 @@ impl<'a> Engine<'a> {
             if let Some(gate) = self.gate {
                 gate.wait_if_paused().await;
             }
-            self.run_compaction_pass(messages, calibration_model.as_deref(), events);
+            total_cost_usd += self
+                .run_compaction_pass(messages, calibration_model.as_deref(), budget, events)
+                .await;
 
             if let Some(aborted) = self.check_loop_detection(messages, events) {
                 return aborted;
@@ -379,12 +393,16 @@ impl<'a> Engine<'a> {
     /// under-estimate this model's tokenizer) shrinks the effective budget
     /// and compacts earlier; the factor's clamp (`crate::estimator`)
     /// bounds how far either way a noisy sample can move this.
-    fn run_compaction_pass(
+    ///
+    /// Returns the summarizer's spend (0.0 on the overwhelmingly common
+    /// no-summarization path) so `run_turn` folds it into the turn total.
+    async fn run_compaction_pass(
         &self,
-        messages: &mut [CompletionMessage],
+        messages: &mut Vec<CompletionMessage>,
         calibration_model: Option<&str>,
+        budget: &mut BudgetGuard,
         events: &UnboundedSender<AgentEvent>,
-    ) {
+    ) -> f64 {
         let compaction_budget = match self.calibration {
             Some(calibration) => {
                 (self.config.compaction_budget_tokens as f64
@@ -398,8 +416,108 @@ impl<'a> Engine<'a> {
                 after_tokens: report.after_tokens,
                 evicted: report.evicted,
                 deduped: report.deduped,
+                superseded: report.superseded,
+                aged: report.aged,
+                summarized: 0,
             });
         }
+        // Overflow fallback: still over budget after every pure pass means
+        // the weight is in PROTECTED content (user/assistant text, the
+        // latest tool result) — without this, the next provider call
+        // eventually hard-fails on context overflow.
+        if self.config.summarize_overflow
+            && crate::estimator::estimate_conversation_tokens(messages) > compaction_budget
+        {
+            return self.summarize_overflow_span(messages, budget, events).await;
+        }
+        0.0
+    }
+
+    /// Replace the oldest replaceable span of the conversation with one
+    /// model-written summary message. Best-effort by contract: any failure
+    /// (no viable span, provider error, empty summary) leaves the
+    /// conversation untouched and the turn proceeds exactly as before this
+    /// mechanism existed. Returns the summarizer call's spend.
+    async fn summarize_overflow_span(
+        &self,
+        messages: &mut Vec<CompletionMessage>,
+        budget: &mut BudgetGuard,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> f64 {
+        let before_tokens = crate::estimator::estimate_conversation_tokens(messages);
+        // Span start: after the system prompt and the FIRST user message —
+        // the task statement anchors every later step and must survive
+        // verbatim. A Tool message can't open the kept tail either side of
+        // the span (its assistant partner would be summarized away and the
+        // provider rejects orphaned tool results), so both bounds walk off
+        // Tool messages.
+        let first_user = messages
+            .iter()
+            .position(|m| m.role == MessageRole::User)
+            .unwrap_or(0);
+        let mut start = first_user + 1;
+        while start < messages.len() && messages[start].role == MessageRole::Tool {
+            start += 1;
+        }
+        let mut end = messages
+            .len()
+            .saturating_sub(self.config.summarize_keep_recent);
+        while end > start && messages[end].role == MessageRole::Tool {
+            end -= 1;
+        }
+        // A tiny span isn't worth a model call — and this guard is also the
+        // convergence backstop: once a summary message occupies the span,
+        // the next over-budget step finds nothing left to replace and skips
+        // instead of summarizing its own summary every step.
+        if end <= start || end - start < 4 {
+            return 0.0;
+        }
+        let rendered = render_span_for_summary(&messages[start..end]);
+        let request = CompletionRequest {
+            messages: vec![
+                CompletionMessage::system(SUMMARIZE_SYSTEM),
+                CompletionMessage::user(&rendered),
+            ],
+            max_output_tokens: Some(1_200),
+            temperature: Some(0.0),
+            effort: Some(ReasoningEffort::Low),
+            tools: vec![],
+            reasoning: None,
+            params: None,
+        };
+        let result = match self.provider.complete(request).await {
+            Ok(result) => result,
+            // Best-effort: a summarizer outage must never fail the turn.
+            Err(_) => return 0.0,
+        };
+        let cost_usd = result.cost_usd;
+        // The call happened — meter it honestly even if the text is unusable.
+        budget.record_spend(cost_usd);
+        let _ = events.send(AgentEvent::BudgetTick {
+            spent_usd: budget.spent_usd(),
+            limit_usd: budget.turn_limit_usd(),
+            mode: budget.mode(),
+        });
+        if result.text.trim().is_empty() {
+            return cost_usd;
+        }
+        let replaced = end - start;
+        let summary = CompletionMessage::user(format!(
+            "[earlier history summarized to fit context — full detail was compacted away; \
+             re-read files or re-run tools for specifics]\n\n{}",
+            result.text.trim()
+        ));
+        messages.splice(start..end, std::iter::once(summary));
+        let _ = events.send(AgentEvent::Compaction {
+            before_tokens,
+            after_tokens: crate::estimator::estimate_conversation_tokens(messages),
+            evicted: 0,
+            deduped: 0,
+            superseded: 0,
+            aged: 0,
+            summarized: replaced,
+        });
+        cost_usd
     }
 
     /// Loop detection, before spending a model call on a step that's
@@ -1016,6 +1134,80 @@ fn recent_tool_calls(messages: &[CompletionMessage]) -> Vec<ToolCall> {
         .collect()
 }
 
+/// System prompt of the overflow summarizer. Byte-stable const: the
+/// summarizer's own request is tiny, but stability costs nothing and keeps
+/// its prefix cacheable across repeated overflow events in one session.
+const SUMMARIZE_SYSTEM: &str = "You are compacting an agent work log. Write a dense summary of \
+    the work so far that a coding agent can resume from: the goal, key decisions and why, files \
+    touched (exact paths) and what changed in each, commands run with outcomes, errors seen and \
+    how they were resolved, and anything explicitly left unresolved. Short bullet lines. No \
+    preamble — the summary text only.";
+
+/// Per-item caps for [`render_span_for_summary`]. The summarizer needs the
+/// shape of the work, not the bytes: full file dumps in tool results are
+/// exactly what overflowed in the first place.
+const SUMMARY_TEXT_CAP: usize = 600;
+const SUMMARY_RESULT_CAP: usize = 300;
+/// Whole-render cap — half of a typical small-model context, leaving room
+/// for the summarizer's own output.
+const SUMMARY_RENDER_CAP: usize = 60_000;
+
+/// Truncate `s` to `cap` chars on a char boundary with an elision marker.
+fn cap_chars(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut end = cap;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}[…]", &s[..end])
+}
+
+/// Flatten a message span into the summarizer's input: roles, text, tool
+/// calls with their inputs, and truncated results — enough to reconstruct
+/// WHAT happened without re-shipping the content that overflowed.
+fn render_span_for_summary(span: &[CompletionMessage]) -> String {
+    let mut out = String::new();
+    for message in span {
+        let role = match message.role {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        };
+        if !message.content.trim().is_empty() {
+            out.push_str(&format!(
+                "{role}: {}\n",
+                cap_chars(message.content.trim(), SUMMARY_TEXT_CAP)
+            ));
+        }
+        for call in &message.tool_calls {
+            out.push_str(&format!(
+                "{role} → {}({})\n",
+                call.name,
+                cap_chars(&call.input.to_string(), SUMMARY_RESULT_CAP)
+            ));
+        }
+        for result in &message.tool_results {
+            let (tag, body) = match &result.output {
+                ToolOutput::Ok { content } => ("ok", content),
+                ToolOutput::Error { message } => ("error", message),
+            };
+            out.push_str(&format!(
+                "  ← {tag}: {}\n",
+                cap_chars(body.trim(), SUMMARY_RESULT_CAP)
+            ));
+        }
+        if out.len() > SUMMARY_RENDER_CAP {
+            out = cap_chars(&out, SUMMARY_RENDER_CAP);
+            out.push_str("\n[span truncated]");
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1403,6 +1595,250 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::Complete { .. }))
         );
+    }
+
+    /// ~900 chars of protected assistant text — compaction's pure passes
+    /// only touch tool outputs, so weight parked here can ONLY be reclaimed
+    /// by the summarization fallback.
+    fn big_assistant_text(tag: &str) -> CompletionMessage {
+        CompletionMessage {
+            role: MessageRole::Assistant,
+            content: format!("{tag}: {}", "analysis ".repeat(100)),
+            tool_calls: vec![],
+            tool_results: vec![],
+            attachments: Vec::new(),
+        }
+    }
+
+    fn overflow_config() -> EngineConfig {
+        EngineConfig {
+            compaction_budget_tokens: 500,
+            summarize_keep_recent: 2,
+            ..EngineConfig::default()
+        }
+    }
+
+    /// Every tool result's call_id must be answered by a PRECEDING
+    /// assistant tool_call — the provider-side pairing invariant that a
+    /// careless span cut would break.
+    fn assert_tool_pairing(messages: &[CompletionMessage]) {
+        let mut seen_calls: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for message in messages {
+            for call in &message.tool_calls {
+                seen_calls.insert(call.call_id.as_str());
+            }
+            for result in &message.tool_results {
+                assert!(
+                    seen_calls.contains(result.call_id.as_str()),
+                    "orphaned tool result `{}` after summarization",
+                    result.call_id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_of_protected_content_is_summarized_and_metered() {
+        let provider = ScriptedProvider {
+            id: "scripted".into(),
+            script: TokioMutex::new(vec![
+                Ok(text_result("SUMMARY: earlier steps established the plan")),
+                Ok(text_result("done!")),
+            ]),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let tools = CountingTools {
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let sleeper = NoopSleeper;
+        let engine = Engine::with_sleeper(&provider, &tools, overflow_config(), &sleeper);
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("the task"),
+        ];
+        for i in 0..6 {
+            messages.push(big_assistant_text(&format!("t{i}")));
+        }
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        match outcome {
+            TurnOutcome::Completed { text, cost_usd } => {
+                assert_eq!(text, "done!");
+                // Turn cost folds the summarizer's call in (0.0001 each).
+                assert!(
+                    (cost_usd - 0.0002).abs() < 1e-9,
+                    "summarizer spend missing from turn cost: {cost_usd}"
+                );
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+        let markers = messages
+            .iter()
+            .filter(|m| m.content.starts_with("[earlier history summarized"))
+            .count();
+        assert_eq!(markers, 1, "exactly one summary message");
+        assert_eq!(
+            messages[1].content, "the task",
+            "the task statement must survive verbatim"
+        );
+        assert!(
+            budget.spent_usd() >= 0.0001,
+            "summarizer spend must be metered into the guard"
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Compaction { summarized, .. } if *summarized > 0
+            )),
+            "summarization must be reported: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::BudgetTick { .. })),
+            "summarizer spend must tick the budget stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarization_disabled_leaves_history_untouched() {
+        let provider = ScriptedProvider {
+            id: "scripted".into(),
+            script: TokioMutex::new(vec![Ok(text_result("done!"))]),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let calls = provider.calls.clone();
+        let tools = CountingTools {
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let sleeper = NoopSleeper;
+        let config = EngineConfig {
+            summarize_overflow: false,
+            ..overflow_config()
+        };
+        let engine = Engine::with_sleeper(&provider, &tools, config, &sleeper);
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("the task"),
+        ];
+        for i in 0..6 {
+            messages.push(big_assistant_text(&format!("t{i}")));
+        }
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no summarizer call");
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.starts_with("[earlier history summarized")),
+        );
+    }
+
+    #[tokio::test]
+    async fn summarizer_failure_is_non_fatal_and_leaves_history() {
+        let provider = ScriptedProvider {
+            id: "scripted".into(),
+            script: TokioMutex::new(vec![
+                Err(ProviderError::Terminal("summarizer down".into())),
+                Ok(text_result("done!")),
+            ]),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let tools = CountingTools {
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let sleeper = NoopSleeper;
+        let engine = Engine::with_sleeper(&provider, &tools, overflow_config(), &sleeper);
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("the task"),
+        ];
+        for i in 0..6 {
+            messages.push(big_assistant_text(&format!("t{i}")));
+        }
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        assert!(
+            matches!(outcome, TurnOutcome::Completed { .. }),
+            "a summarizer outage must never fail the turn: {outcome:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.starts_with("[earlier history summarized")),
+            "failed summarization must leave the conversation untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarization_never_orphans_tool_results_at_the_span_edge() {
+        let provider = ScriptedProvider {
+            id: "scripted".into(),
+            script: TokioMutex::new(vec![
+                Ok(text_result("SUMMARY of the early exploration")),
+                Ok(text_result("done!")),
+            ]),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let tools = CountingTools {
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let sleeper = NoopSleeper;
+        let engine = Engine::with_sleeper(&provider, &tools, overflow_config(), &sleeper);
+        // The naive span end (len - keep_recent) lands ON the tool-result
+        // message; the summarizer must walk back so the assistant call and
+        // its result stay together in the kept tail.
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            CompletionMessage::user("the task"),
+        ];
+        for i in 0..4 {
+            messages.push(big_assistant_text(&format!("t{i}")));
+        }
+        messages.push(CompletionMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                call_id: "edge".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"cmd": "ls"}),
+            }],
+            tool_results: vec![],
+            attachments: Vec::new(),
+        });
+        messages.push(CompletionMessage {
+            role: MessageRole::Tool,
+            content: String::new(),
+            tool_calls: vec![],
+            tool_results: vec![stella_protocol::ToolResult {
+                call_id: "edge".into(),
+                output: ToolOutput::Ok {
+                    content: "small".into(),
+                },
+            }],
+            attachments: Vec::new(),
+        });
+        messages.push(big_assistant_text("tail"));
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+        assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content.starts_with("[earlier history summarized")),
+            "summarization should have fired"
+        );
+        assert_tool_pairing(&messages);
     }
 
     fn empty_result(finish_reason: Option<FinishReason>) -> CompletionResultAlias {
