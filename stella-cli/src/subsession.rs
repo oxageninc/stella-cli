@@ -307,10 +307,19 @@ async fn run_worker(
         Outcome(stella_core::TurnOutcome),
         Stopped,
     }
+    // Claim-on-first-write over the shared tree: workers coordinate with the
+    // lead, each other, and any other process in this workspace through the
+    // store's lock table — no coordinator, sub-millisecond acquire, rivals
+    // named in the refusal (crate::claims).
+    let claims = crate::claims::ClaimTap::new(
+        &registry,
+        execution.as_ref().map(|(store, _)| store.clone()),
+        format!("{session_id}/{}", spec.lane),
+    );
     let raced = {
         let engine = Engine::with_sleeper(
             &*provider,
-            &registry,
+            &claims,
             agent::engine_config_for(cfg),
             &TokioSleeper,
         )
@@ -331,6 +340,9 @@ async fn run_worker(
     };
     drop(tx);
     let _ = forwarder.await;
+    // Release the worker's whole claim set — the stop path included (the
+    // dropped turn future cannot release for itself).
+    claims.release_all();
 
     // Honesty over silence: a worker's own task_assign calls have no
     // supervisor to spawn them (delegation is the lead's, v1) — say so on

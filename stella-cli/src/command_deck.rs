@@ -86,6 +86,7 @@ use stella_tui::{
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::agent;
+use crate::claims::ClaimTap;
 use crate::config::Config;
 use crate::interactive::{AskUserIo, FREE_TEXT_LABEL, InteractiveToolSet, SkillRegistry};
 use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
@@ -432,6 +433,13 @@ pub async fn run_deck_session(
     // What the record's terminal status will be at exit (last turn wins);
     // quitting with an abandoned backlog overrides to Cancelled below.
     let mut session_exit = stella_store::SessionStatus::Complete;
+    // Claim-on-first-write identity for the lead's turns, and crash hygiene
+    // for the whole workspace: sweep claims old enough that their process is
+    // surely gone (a crashed writer cannot release its own).
+    let lead_holder = format!("{}/lead", session_record.id);
+    if let Some(store) = &store {
+        let _ = store.prune_stale_file_locks(crate::claims::STALE_CLAIM_MAX_AGE_SECS);
+    }
     spawn_notification_poller(in_tx.clone());
 
     // The ISSUES tab's lazily-detected tracker backend (see
@@ -806,6 +814,7 @@ pub async fn run_deck_session(
                         &in_tx,
                         &ask_io,
                         &sup_tx,
+                        &lead_holder,
                     )
                     .await
                 } else {
@@ -822,6 +831,7 @@ pub async fn run_deck_session(
                         &in_tx,
                         &ask_io,
                         &sup_tx,
+                        &lead_holder,
                     )
                     .await
                 }
@@ -1134,6 +1144,13 @@ pub async fn run_deck_session(
                 // Erase the partial turn: the next prompt continues from the
                 // last committed conversation state.
                 messages.truncate(turn_base);
+                // The dropped turn future never reached its own claim
+                // release — free the lead's write claims by holder so
+                // workers (and other sessions) aren't blocked on a turn
+                // that no longer exists.
+                if let Some(store) = &store {
+                    let _ = store.release_file_locks_for_holder(&lead_holder);
+                }
                 if hold {
                     // Double-Esc landing mid-turn: this turn is the NEXT
                     // prompt, auto-dispatched in the gap between the pair's
@@ -3393,6 +3410,7 @@ async fn run_lead_turn(
     in_tx: &UnboundedSender<Inbound>,
     ask_io: &DeckAskUserIo,
     sup_tx: &UnboundedSender<SupervisorMsg>,
+    claim_holder: &str,
 ) -> Result<(), String> {
     budget.begin_turn();
 
@@ -3405,14 +3423,21 @@ async fn run_lead_turn(
         LEAD.to_string(),
     );
 
+    // Claim-on-first-write over the shared tree (crate::claims): wraps the
+    // base executor, so a refused write surfaces as the tool's own error —
+    // FileChangeTap's is_error early-return keeps phantom events out.
+    // Released after the turn settles, cancel included.
+    let claims = ClaimTap::new(
+        base_tools,
+        execution.as_ref().map(|(store, _)| store.clone()),
+        claim_holder,
+    );
+
     // Same structural drop-order rule as `agent::run_turn`: every tx clone
     // lives in this scope so dropping `tx` after it closes the channel.
     let outcome = {
-        let customs = CustomToolSet::new(
-            base_tools,
-            custom_tools.to_vec(),
-            cfg.workspace_root.clone(),
-        );
+        let customs =
+            CustomToolSet::new(&claims, custom_tools.to_vec(), cfg.workspace_root.clone());
         // The AskUser event channel is a stub: the deck io presents its own
         // card (it must — `install_skill` confirms through the io without any
         // event), so the tool set's own emission would double the card.
@@ -3445,6 +3470,7 @@ async fn run_lead_turn(
     };
     drop(tx);
     let _ = forwarder.await;
+    claims.release_all();
 
     if let Some((store, id)) = &execution {
         let (outcome_label, cost) = match &outcome {
@@ -3514,6 +3540,7 @@ async fn run_lead_pipeline_turn(
     in_tx: &UnboundedSender<Inbound>,
     ask_io: &DeckAskUserIo,
     sup_tx: &UnboundedSender<SupervisorMsg>,
+    claim_holder: &str,
 ) -> Result<(), String> {
     budget.begin_turn();
 
@@ -3526,12 +3553,17 @@ async fn run_lead_pipeline_turn(
         LEAD.to_string(),
     );
 
+    // Claim-on-first-write over the shared tree — same wiring as
+    // `run_lead_turn` (see the comment there).
+    let claims = ClaimTap::new(
+        base_tools,
+        execution.as_ref().map(|(store, _)| store.clone()),
+        claim_holder,
+    );
+
     let result = {
-        let customs = CustomToolSet::new(
-            base_tools,
-            custom_tools.to_vec(),
-            cfg.workspace_root.clone(),
-        );
+        let customs =
+            CustomToolSet::new(&claims, custom_tools.to_vec(), cfg.workspace_root.clone());
         let (stub_tx, _) = mpsc::unbounded_channel();
         let tools = InteractiveToolSet::new(&customs, stub_tx, Box::new(ask_io.clone()))
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
@@ -3604,6 +3636,7 @@ async fn run_lead_pipeline_turn(
     };
     drop(tx);
     let _ = forwarder.await;
+    claims.release_all();
 
     if let Some((store, id)) = &execution {
         let (outcome_label, cost) = match &result {

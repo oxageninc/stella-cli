@@ -2225,6 +2225,30 @@ impl Store {
         Ok(())
     }
 
+    /// Release every lock `holder` still holds — one statement for the whole
+    /// claim set, so a worker/session ending (or its supervisor cleaning up
+    /// after it) never has to enumerate what was claimed. Returns how many
+    /// locks were released.
+    pub fn release_file_locks_for_holder(&self, holder: &str) -> Result<usize> {
+        let released = self
+            .lock()
+            .execute("DELETE FROM file_locks WHERE holder = ?", params![holder])?;
+        Ok(released)
+    }
+
+    /// Crash hygiene: release claims older than `max_age_secs` regardless of
+    /// holder. A crashed process cannot release its own claims, and a stale
+    /// claim would block every future writer of that path forever — age is
+    /// the one signal that works across processes and reboots (mirroring the
+    /// session registry's dead-pid downgrade). Returns how many were swept.
+    pub fn prune_stale_file_locks(&self, max_age_secs: u64) -> Result<usize> {
+        let swept = self.lock().execute(
+            "DELETE FROM file_locks WHERE acquired_at < datetime('now', ?)",
+            params![format!("-{max_age_secs} seconds")],
+        )?;
+        Ok(swept)
+    }
+
     /// Upsert one extension-authored workspace rule — the write seam an
     /// extension provider uses to publish a rule without touching
     /// `.stella/rules/`. `contents` is the full rule markdown in the
@@ -4180,6 +4204,49 @@ mod tests {
         );
         store.release_file_lock("src/a.rs", "agent-1").unwrap();
         assert_eq!(store.file_lock_holder("src/a.rs").unwrap(), None);
+    }
+
+    #[test]
+    fn holder_wide_release_drops_only_that_holders_claims() {
+        let store = Store::in_memory().unwrap();
+        store.acquire_file_lock("src/a.rs", "run-1/t1").unwrap();
+        store.acquire_file_lock("src/b.rs", "run-1/t1").unwrap();
+        store.acquire_file_lock("src/c.rs", "run-2/t9").unwrap();
+        assert_eq!(store.release_file_locks_for_holder("run-1/t1").unwrap(), 2);
+        assert!(
+            store.acquire_file_lock("src/a.rs", "run-2/t9").unwrap(),
+            "released paths are claimable again"
+        );
+        assert_eq!(
+            store.file_lock_holder("src/c.rs").unwrap(),
+            Some("run-2/t9".to_string()),
+            "the other holder's claim survives"
+        );
+    }
+
+    #[test]
+    fn stale_lock_sweep_releases_old_claims_only() {
+        let store = Store::in_memory().unwrap();
+        store.acquire_file_lock("src/fresh.rs", "live").unwrap();
+        // A crashed process's leftover: backdate the claim past the sweep age.
+        store
+            .lock()
+            .execute(
+                "INSERT INTO file_locks (path, holder, acquired_at) \
+                 VALUES ('src/stale.rs', 'dead', datetime('now', '-2 hours'))",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.prune_stale_file_locks(3600).unwrap(), 1);
+        assert!(
+            store.acquire_file_lock("src/stale.rs", "live").unwrap(),
+            "the swept path is claimable"
+        );
+        assert_eq!(
+            store.file_lock_holder("src/fresh.rs").unwrap(),
+            Some("live".to_string()),
+            "fresh claims survive the sweep"
+        );
     }
 
     #[test]
