@@ -104,11 +104,8 @@ where
 fn render_file(hood: &stella_graph::FileNeighborhood) -> Option<String> {
     // Columns are per-table detail (SQL files index one symbol per column);
     // at file granularity they drown the tables they belong to.
-    let symbols: Vec<&stella_graph::NeighborhoodSymbol> = hood
-        .symbols
-        .iter()
-        .filter(|s| s.kind != "column")
-        .collect();
+    let symbols: Vec<&stella_graph::NeighborhoodSymbol> =
+        hood.symbols.iter().filter(|s| s.kind != "column").collect();
     if symbols.is_empty() && hood.imports.is_empty() && hood.importers.is_empty() {
         return None;
     }
