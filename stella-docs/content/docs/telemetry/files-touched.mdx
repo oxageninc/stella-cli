@@ -6,8 +6,9 @@ description: Stella records every file it reads, creates, updates, or deletes �
 Every time Stella touches a file through one of its file tools, it records the touch in a
 per-session **file-touch ledger**: which file, what happened (**C**reate / **R**ead /
 **U**pdate / **D**elete), *why*, and how many lines it added and removed. The ledger is
-surfaced live in the TUI, included in `--output-format json` output, and persisted to the
-local store — so you always have an auditable record of exactly what a run changed.
+surfaced live in the TUI, included in `--output-format json` output on raw
+(`--no-pipeline`) runs, and persisted to the local store on **every** run — so you always
+have an auditable record of exactly what a run changed.
 
 ## What gets recorded
 
@@ -95,11 +96,20 @@ showing each path with its compact CRUD string (e.g. `src/router.rs  RU`).
 
 ### In JSON output
 
-`stella --output-format json run` includes the full telemetry payload under `files_touched`, so a
-script can assert on exactly what a run changed:
+Which keys the final JSON object carries depends on which execution path ran:
+
+- **Default runs** go through the staged pipeline (triage, plan, execute, verify, judge).
+  The pipeline's summary object has `status`, `text`, `cost_usd`, `reason`, `task_class`,
+  `verdict` (`passed` / `deterministic` / `summary`), `revisions`, `candidates_run`,
+  `model`, and `events` — there is **no top-level `files_touched`**.
+- **Raw runs** (`--no-pipeline`) fall back to the direct step-loop, whose summary has
+  `status`, `text`, `cost_usd`, `reason`, `model`, and `events` — plus the full telemetry
+  payload under `files_touched`.
+
+So a script that asserts on exactly what a run changed must pass `--no-pipeline`:
 
 ```bash
-stella --output-format json run "add a --health flag and wire the readiness probe" \
+stella --output-format json run --no-pipeline "add a --health flag and wire the readiness probe" \
   | jq '.files_touched[] | {path, crud_events, lines_added, lines_removed}'
 ```
 
@@ -107,6 +117,13 @@ stella --output-format json run "add a --health flag and wire the readiness prob
 { "path": "src/router.rs", "crud_events": ["R","U"], "lines_added": 18, "lines_removed": 4 }
 { "path": "src/health.rs",  "crud_events": ["C"],     "lines_added": 22, "lines_removed": 0 }
 ```
+
+<Callout type="warn">
+  On a default (pipeline) run, `.files_touched` is absent from the JSON —
+  `jq '.files_touched[]'` errors out, and a CI gate built on it fails every run. Add
+  `--no-pipeline`, or read the ledger back from the store: it is persisted on **both**
+  paths.
+</Callout>
 
 ### Persisted to the local store
 
@@ -120,14 +137,14 @@ it stays entirely on your machine.
 **Fail CI when a run edits files outside a directory.**
 
 ```bash
-touched=$(stella --output-format json run "$TASK" | jq -r '.files_touched[].path')
+touched=$(stella --output-format json run --no-pipeline "$TASK" | jq -r '.files_touched[].path')
 echo "$touched" | grep -qv '^src/' && { echo "run touched files outside src/"; exit 1; }
 ```
 
 **Get a one-line change summary of a run.**
 
 ```bash
-stella --output-format json run "$TASK" \
+stella --output-format json run --no-pipeline "$TASK" \
   | jq -r '.files_touched[] | "\(.crud_events|join("")) \(.path) (+\(.lines_added) -\(.lines_removed))"'
 # CU src/router.rs (+18 -4)
 # C  src/health.rs (+22 -0)

@@ -13,9 +13,9 @@ engine — see [Agent Engine Paths](/docs/agent-engine-paths).)
 | Interactive chat | `stella` / `stella chat` | Exploring, iterating, supervising | You, live |
 | One-shot run | `stella run "…"` | Scripts, CI, a single well-defined task | The [staged pipeline](/docs/inference-pipeline) |
 | Raw step loop | `stella run --no-pipeline "…"` | Quick questions, cheap tasks | The model stops when done |
-| Goal mode | `stella goal "…"` | An outcome, not a task list | An independent [judge](#outcome-driven-goal-mode), in rounds |
+| Goal mode | `stella goal "…"` | An outcome, not a task list | An independent [judge](/docs/agent-modes/goal-mode) over staged-pipeline rounds (`--no-pipeline` for raw) |
 | CI monitor | `stella monitor` | "Make CI green and keep it green" | The latest CI run, all-green |
-| Fleet | `stella fleet …` | Many tasks in parallel | Per-task, in isolated [worktrees](/docs/agent-fleets) |
+| Fleet | `stella fleet …` | Many tasks in parallel | Per task, in one shared tree with cooperative [claims](/docs/agent-fleets) (worktrees on opt-in) |
 
 ## Interactive: the Command Deck
 
@@ -62,9 +62,13 @@ stella run "add a --json flag to the export command and update the tests" \
 
 ## Outcome-driven: goal mode
 
-`stella goal` doesn't take a task — it takes an **objective**, and turns
-Stella loose on it until the goal is actually met, as judged by an
-independent model rather than the worker's own say-so.
+`stella goal` doesn't take a task — it takes an **objective**, and works in
+judged rounds until an independent judge (routed to a different model family
+than the worker whenever possible) confirms the objective is met *from
+evidence*. Each round is a full [staged pipeline](/docs/inference-pipeline)
+run by default (`--no-pipeline` for raw step-loop rounds). Backstops — a
+round cap, `--budget`, worker aborts — end the run honestly as "not met"
+rather than optimistically.
 
 ```bash
 stella goal "the test suite passes and there are no clippy warnings"
@@ -152,9 +156,10 @@ mode, with "all CI checks pass" as the objective.
 ## Parallel: fleets
 
 When the work is many tasks rather than one, [`stella fleet`](/docs/agent-fleets)
-fans a dependency-ordered task DAG out to parallel workers, each in its own
-git worktree on its own branch — with cooperative file claims so two agents
-never fight over the same file.
+fans a dependency-ordered task DAG out to parallel workers in one shared
+tree — cooperative file claims mean two agents never fight over the same
+file — with `isolation = "isolated"` opting a task into its own git worktree
+on its own branch.
 
 ## Choosing
 

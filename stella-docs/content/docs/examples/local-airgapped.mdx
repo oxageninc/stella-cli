@@ -1,0 +1,112 @@
+---
+title: "Local & air-gapped"
+description: Run Stella entirely against local model servers — Ollama, vLLM, LM Studio, llama.cpp — with no API key, no metering, and (if you want) no network calls at all.
+---
+
+Stella is BYOK with no phone-home — which means it also runs happily with **no key and no
+cloud at all**. Point it at any OpenAI-compatible local server and everything (the agent,
+telemetry, memories, the code graph) stays on your machine.
+
+## Quick: the `local` pseudo-provider
+
+```bash
+# Ollama
+stella --model local/llama3.3 --base-url http://localhost:11434/v1 chat
+
+# vLLM / LM Studio / llama.cpp server — same shape, different port
+stella --model local/qwen2.5-coder --base-url http://localhost:8000/v1 run "…"
+```
+
+`local` is never auto-detected and requires `--base-url` every time — export
+`STELLA_BASE_URL` to stop retyping it. No key is needed; if your server enforces one,
+set `LOCAL_API_KEY` (Stella always sends a bearer token — the placeholder `local` when
+unset, so key-checking servers fail loudly rather than mysteriously). Local slugs are
+exempt from catalog validation: any model name your server knows is accepted.
+
+## Durable: a named custom provider
+
+Retyping `--base-url` is for experiments. For a daily setup, define the endpoint once as
+a config-defined provider in **user scope** and it behaves like a built-in — selectable,
+default-model'd, even auto-detected:
+
+```json title="~/.config/stella/settings.json"
+{
+  "providers": {
+    "ollama": {
+      "base_url": "http://localhost:11434/v1",
+      "default_model": "llama3.3",
+      "api_key": "local"
+    }
+  }
+}
+```
+
+```bash
+stella --model ollama/llama3.3 run "add unit tests for the parser"
+stella run "…"   # auto-detects ollama if no other provider key is present
+```
+
+Three details that matter:
+
+- The `api_key: "local"` placeholder gives the provider a **resolvable credential**,
+  which is what auto-detection and per-agent judge/triage pins check for. A server that
+  ignores auth ignores the placeholder; a config-defined provider can also read a real
+  key from the derived env var `OLLAMA_API_KEY` (uppercased id + `_API_KEY`).
+- `dialect` defaults to `openai-compatible` — right for Ollama/vLLM/LM Studio. The
+  `anthropic`, `gemini`, and `openai-responses` dialects are also available for
+  compatible gateways; `vertex`/`bedrock` are reserved to built-ins.
+- A config-defined provider **auto-detects** (after all built-ins) only when it has a
+  `default_model` — the example above qualifies.
+
+## A two-model local pipeline
+
+With two endpoints (or one server hosting two models), the pipeline's roles split just
+like in the cloud — a big worker and a fast judge:
+
+```json title="~/.config/stella/settings.json"
+{
+  "providers": {
+    "ollama": {
+      "base_url": "http://localhost:11434/v1",
+      "default_model": "qwen2.5-coder:32b",
+      "api_key": "local"
+    }
+  },
+  "agent_engine_config": {
+    "default_model": "ollama/qwen2.5-coder:32b",
+    "pipeline_judge_model": "ollama/llama3.3",
+    "agents": {
+      "judge": { "prompt": "You are a strict, evidence-first code judge.", "effort": "high" }
+    }
+  }
+}
+```
+
+Local judges are same-family by definition — lean on
+[`--test-command`](/docs/inference-pipeline) for deterministic verification, exactly as
+in the [single-key setup](/docs/examples/single-key).
+
+## Fully air-gapped
+
+Stella's only self-initiated network call is the model-catalog refresh from
+`models.dev` (at most once per 24h). Turn it off and the machine's traffic is exactly
+your model server's:
+
+```bash
+export STELLA_CATALOG_AUTO_REFRESH=0
+```
+
+Everything else is already local: telemetry lands in `.stella/store.db`, the
+[Observatory](/docs/telemetry/dashboard) binds `127.0.0.1`, memories and the code graph
+are files in your workspace. `stella init` works offline with a heuristic fallback.
+
+<Callout type="info">
+  Local models have no catalog prices, so `stella stats` dollar columns read zero —
+  tokens, steps, and $/resolved comparisons still work. `--budget` has nothing to
+  meter against; bound runs with `--test-command` and goal-mode round caps instead.
+</Callout>
+
+## Related
+
+- [Local provider reference](/docs/api-providers/local)
+- [Dirt-cheap profile](/docs/examples/dirt-cheap) — the metered path to the same instinct

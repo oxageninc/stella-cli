@@ -17,7 +17,7 @@ The optional `target` is a branch or PR to watch. When omitted, it defaults to `
 
 `stella monitor` uses the `ci_status` tool to watch the CI runs for the given `target`. It works iteratively — inspecting each failure, fixing its root cause, then **committing and pushing the fix** before re-checking — and treats the job as a goal that is met **only when the latest CI run is all-green**.
 
-Because it is goal-shaped, `monitor` keeps working across CI runs until the pipeline passes, then exits.
+Under the hood, `monitor` is [goal mode](/docs/agent-modes/goal-mode) with a fixed CI objective, so it inherits goal mode's mechanics wholesale: a cross-family judge confirms the green run from evidence, and the same backstops apply — the default hard cap of **8** judged rounds (it stops there and reports the goal as not met even if CI is still red), the `--budget` limit, and a worker-turn abort. It is not an unbounded daemon; re-run it to keep going.
 
 <Callout type="warn">
 `monitor` commits and pushes its fixes to the target branch between CI runs. Because the default target is `main`, a bare `stella monitor` will push commits directly to `main` — pass a feature branch or PR as the `target` if that is not what you want.

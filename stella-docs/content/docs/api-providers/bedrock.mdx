@@ -25,6 +25,15 @@ export AWS_REGION="us-east-1"           # or AWS_DEFAULT_REGION; us-east-1 is th
 accompanies them. Your IAM principal needs Bedrock invoke permissions for the models you
 call, and the models must be enabled in your account's Bedrock console.
 
+<Callout type="warn">
+  Stella reads **only these explicit env vars** — it does not consult the AWS credential
+  chain. `AWS_PROFILE`, `~/.aws/credentials`, the SSO token cache, and IMDS/instance
+  roles are never read. If your setup is profile- or SSO-based, materialize static keys
+  into the environment first — e.g. `eval "$(aws configure export-credentials --format
+  env)"` after `aws sso login` — or a run fails with missing credentials even though
+  `aws` CLI calls succeed in the same shell.
+</Callout>
+
 ## Selecting models
 
 The provider id is `bedrock`; the default model is the **cross-region inference profile**
@@ -49,7 +58,19 @@ Vertex), deliberately: `AWS_ACCESS_KEY_ID` is present in effectively every AWS
 practitioner's shell, almost always for reasons unrelated to LLM inference. A generic
 cloud credential must never hijack provider selection — if you want Bedrock, pin it with
 `--model bedrock/…` or set it as a default in
-[`settings.json`](/docs/configuration/settings).
+[`settings.json`](/docs/configuration/settings):
+
+```json title="~/.config/stella/settings.json"
+{
+  "agent_engine_config": {
+    "default_model": "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+  }
+}
+```
+
+The pin sits between the `--model` flag and auto-detection — an explicit flag still
+wins, but with the pin in place Bedrock no longer loses to whichever direct-vendor key
+happens to be in the shell.
 
 ## In the pipeline
 
@@ -64,6 +85,7 @@ direct Anthropic API out — same family strengths, AWS wrapping. It slots into 
 | --- | --- | --- | --- | --- |
 | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | 200k | 3.00 | 15.00 | 0.30 |
 
-List prices from Stella's seed catalog (v0.3.0) — actual Bedrock billing is set by AWS
-and your agreements; verify in the AWS console. See the
+List prices from Stella's seed catalog — actual Bedrock billing is set by AWS and your
+agreements; verify in the AWS console. Your local catalog re-syncs from
+[models.dev](https://models.dev) via `stella models refresh`. See the
 [Model guide](/docs/api-providers/models) for the full cross-provider table.

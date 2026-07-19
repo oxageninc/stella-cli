@@ -8,12 +8,12 @@ Give Stella a goal and let it work in **judged rounds** until a judge model conf
 ## Synopsis
 
 ```bash
-stella goal <goal> [global flags]
+stella goal <goal> [--no-pipeline] [global flags]
 ```
 
 ## What it does
 
-`stella goal` runs the agent step loop in rounds. At the end of each round, a **judge model** independently assesses whether the goal is met — reading the changed files, tests, and CI with read-only tools, not just the worker's narration. The loop ends when the judge confirms success, or when a backstop trips: a hard round cap (default **8** rounds), the `--budget` limit, or a worker-turn abort. Reaching a backstop ends the run reporting the goal as **not met**.
+`stella goal` works in rounds, each run through the [staged pipeline](/docs/inference-pipeline) by default — pass `--no-pipeline` for raw step-loop rounds instead. At the end of each round, a **judge model** independently assesses whether the goal is met — reading the changed files, tests, and CI with read-only tools, not just the worker's narration. The loop ends when the judge confirms success, or when a backstop trips: a hard round cap (default **8** rounds), the `--budget` limit, or a worker-turn abort. Reaching a backstop ends the run reporting the goal as **not met**.
 
 Crucially, the judge is routed **cross-family** — it is a different model family than the worker, to avoid same-model bias. If only one provider family is configured, the worker doubles as its own judge.
 
@@ -23,10 +23,11 @@ For the full explanation of judged rounds, the cross-family judge, and the defin
 
 ## Flags
 
-`stella goal` takes the [global flags](/docs/commands). The most relevant ones:
+`stella goal` takes the [global flags](/docs/commands), plus one of its own:
 
 | Flag | Why it matters here |
 | --- | --- |
+| `--no-pipeline` | Each working round runs the raw step loop instead of the staged pipeline (triage, plan, witness, execute, verify). The pipeline is the default. |
 | `--model <provider/model_id>` | Pin the worker model. The judge is routed to a different family automatically when one is available. |
 | `--budget <usd>` | Cap total spend across all rounds; work aborts cleanly once the cap is exceeded. |
 
@@ -51,6 +52,12 @@ Pin the worker model and cap spend across all rounds (global flags go before the
 ```bash
 stella --model anthropic/claude-fable-5 --budget 10.00 \
   goal "Make the CLI exit with a non-zero code on invalid input"
+```
+
+Run raw step-loop rounds instead of the staged pipeline:
+
+```bash
+stella goal --no-pipeline "Silence the deprecation warnings in the build"
 ```
 
 You can also run a goal-driven turn from the plain line REPL (`stella chat --plain`) with the `/goal <goal>` command.

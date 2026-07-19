@@ -1,0 +1,80 @@
+---
+title: "One gateway key (OpenRouter)"
+description: Every model family through a single OpenRouter key — cross-family judging with one billing relationship, and how the family logic sees through the gateway.
+---
+
+<ProviderMark id="openrouter" size={30} />
+
+The cross-family profiles usually cost you a keyring: an Anthropic key, an OpenAI key, a
+Z.ai key. A gateway inverts that — **one `OPENROUTER_API_KEY`, any model family**, one
+invoice. This is the setup for people who want the [balanced](/docs/examples/balanced)
+architecture without three billing relationships.
+
+## The profile
+
+```json title="~/.config/stella/settings.json"
+{
+  "agent_engine_config": {
+    "default_model": "openrouter/anthropic/claude-fable-5",
+    "agents": {
+      "judge":  { "provider": "openrouter", "model": "openai/gpt-5.5" },
+      "triage": { "provider": "openrouter", "model": "deepseek/deepseek-chat" }
+    }
+  }
+}
+```
+
+Two routing forms, deliberately shown side by side:
+
+- **`default_model: "openrouter/<vendor>/<slug>"`** — `--model` grammar. The string
+  splits on the *first* slash: provider `openrouter`, slug `<vendor>/<slug>` sent to it
+  verbatim.
+- **`agents.<agent>.provider: "openrouter"`** — the per-agent gateway pin. The `model`
+  string goes to that provider **verbatim, no splitting** — which is exactly what lets
+  an OpenRouter slug itself contain `/`.
+
+Use OpenRouter's own catalog for slugs — they are vendor-prefixed
+(`openai/gpt-5.5`, `anthropic/claude-fable-5`, …) and OpenRouter adds models without
+Stella needing a catalog update: gateway slugs are **unseeded**, passed through
+unvalidated (typos surface as OpenRouter API errors, not local ones).
+
+## Cross-family judging still works
+
+Stella's judge-diversity logic doesn't see "openrouter" as one family — an OpenRouter
+spec's family is the routed slug's **vendor prefix**, so `openrouter/openai/gpt-5.5`
+counts as OpenAI. Turn on `auto_mode` and the cross-family preference works through the
+gateway exactly as it does across native keys:
+
+```json title="~/.config/stella/settings.json"
+{
+  "agent_engine_config": {
+    "default_model": "openrouter/anthropic/claude-fable-5",
+    "allowed_models": [
+      "openrouter/anthropic/claude-fable-5",
+      "openrouter/openai/gpt-5.5",
+      "openrouter/deepseek/deepseek-chat"
+    ],
+    "auto_mode": "on"
+  }
+}
+```
+
+## What you trade
+
+<Callout type="info">
+  **Cost telemetry moves to the gateway.** Gateway slugs are unseeded, so the local
+  catalog prices them at `$0` — `stella stats` still counts tokens, steps, and
+  resolution, but the dollar column for `openrouter/*` models reads zero. Stella
+  requests OpenRouter's **usage accounting** on every call and sends app-attribution
+  headers, so your authoritative spend lives in the OpenRouter dashboard instead.
+  `--budget` (which prices from the catalog) cannot meaningfully cap gateway runs.
+</Callout>
+
+You also add a hop: your traffic goes through OpenRouter's servers rather than to each
+vendor directly — weigh that against the BYOK-direct posture if your work is sensitive.
+
+## Related
+
+- [OpenRouter provider reference](/docs/api-providers/openrouter)
+- [Agent engine config](/docs/configuration/agent-engine-config) — the `provider` pin in full
+- [Balanced](/docs/examples/balanced) — the same architecture on native keys

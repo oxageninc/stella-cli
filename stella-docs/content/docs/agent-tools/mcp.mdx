@@ -26,9 +26,19 @@ Because the tools are added at session start, connecting a new server takes effe
 transport = "stdio"
 cmd = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+
+[servers.github]
+transport = "http"
+url = "https://mcp.example.com/mcp"
+headers = { Authorization = "Bearer …" }
 ```
 
-A server entry needs a `transport` discriminant (`stdio` or `http`). For a stdio server, `cmd` is the executable and `args` its arguments; Stella launches it and merges the tools it reports for the session.
+A server entry needs a `transport` discriminant — `stdio` or `http`:
+
+- **`stdio`** — `cmd` is the executable and `args` its arguments; Stella launches the child process and speaks JSON-RPC over its stdio.
+- **`http`** — `url` is a streamable-HTTP endpoint Stella POSTs JSON-RPC to; the optional `headers` table holds static headers replayed on every request (an `Authorization` bearer, an API key). Header values are written to `mcp.toml` verbatim but redacted from logs and debug output.
+
+Either way, Stella merges the tools the server reports for the session.
 
 <Callout type="warn">
 A stdio MCP subprocess runs with a **scrubbed environment** — ambient shell variables (including credentials like `ANTHROPIC_API_KEY` or `GITHUB_TOKEN`) are **not** inherited. Any variable the server needs must be listed explicitly in the entry's `env` table, e.g. `env = { GITHUB_TOKEN = "…" }`.

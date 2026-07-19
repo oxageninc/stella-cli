@@ -18,19 +18,10 @@ export OPENAI_API_KEY="sk-..."
 ```
 
 OpenAI sits third in [auto-detection](/docs/api-providers#auto-detection), so the key
-alone is enough. Alternatively, store the key in
-[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or point
-[`settings.json`](/docs/configuration/settings) at an env var of your choosing:
-
-```json title=".stella/settings.json"
-{
-  "providers": {
-    "openai": {
-      "api_key_env": "MY_TEAM_OPENAI_KEY"
-    }
-  }
-}
-```
+alone is enough. Prefer a file? Store the key in
+[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or rename the
+env var Stella reads with `providers.openai.api_key_env` — see
+[overriding the key source](/docs/api-providers#overriding-the-key-source).
 
 ## Selecting models
 
@@ -40,6 +31,30 @@ The provider id is `openai`; the default model is `gpt-5.5`.
 stella --model openai/gpt-5.5 run "add integration tests for the exporter"
 export STELLA_MODEL=openai/gpt-5.5
 ```
+
+## Custom base URL
+
+Route the built-in provider through an Azure OpenAI endpoint or an OpenAI-compatible
+proxy by overriding the base URL:
+
+```json title="~/.config/stella/settings.json"
+{
+  "providers": {
+    "openai": {
+      "base_url": "https://my-resource.openai.azure.com/openai/v1"
+    }
+  }
+}
+```
+
+One constraint: the built-in `openai` provider's dialect is fixed to **OpenAI
+Responses**, so the endpoint must speak it (Azure's `/openai/v1` surface does). For a
+gateway that only speaks legacy chat completions, define a
+[custom provider id](/docs/api-providers/local#skip-the-retyping-a-custom-provider-id)
+with the default `openai-compatible` dialect instead. `--base-url` (env form
+`STELLA_BASE_URL`) does the same for one run and outranks the settings value; in a
+project's `.stella/settings.json`, `base_url` is ignored unless
+`STELLA_TRUST_PROJECT=1`.
 
 ## Reasoning-model parameter rules
 
@@ -73,6 +88,7 @@ first-rate worker in its own right. Wire it per agent with
 | --- | --- | --- | --- | --- |
 | `gpt-5.5` | 400k | 1.25 | 10.00 | 0.125 |
 
-List prices from Stella's seed catalog (v0.3.0) — verify with OpenAI; the cached-input
-rate is what most worker input costs mid-run (see the
+List prices from Stella's seed catalog — verify with OpenAI; your local catalog re-syncs
+from [models.dev](https://models.dev) via `stella models refresh`. The cached-input rate
+is what most worker input costs mid-run (see the
 [Model guide](/docs/api-providers/models)).

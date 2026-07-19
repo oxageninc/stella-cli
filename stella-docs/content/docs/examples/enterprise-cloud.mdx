@@ -1,0 +1,97 @@
+---
+title: "Enterprise cloud (Vertex & Bedrock)"
+description: Stella through your cloud contract — Vertex AI and Amazon Bedrock setups, the env-only credential rule, and org-managed settings your whole team inherits.
+---
+
+When the models must flow through your existing cloud agreement — GCP or AWS billing,
+VPC routing, enterprise data terms — Stella speaks both native dialects. Both providers
+sit **last** in auto-detection on purpose (their credentials are often present for
+unrelated reasons), so pin them explicitly.
+
+## Vertex AI
+
+```bash
+export VERTEX_ACCESS_TOKEN=$(gcloud auth print-access-token)
+export VERTEX_PROJECT_ID=my-gcp-project        # or GOOGLE_CLOUD_PROJECT
+export VERTEX_LOCATION=global                  # optional; default "global"
+
+stella --model vertex/gemini-3-pro run "…"
+```
+
+Access tokens expire hourly — wrap the export in a shell function so a fresh token is a
+keystroke away (the [Vertex page](/docs/api-providers/vertex) has the snippet). Pin it
+as your default so `--model` isn't needed every run:
+
+```json title="~/.config/stella/settings.json"
+{
+  "agent_engine_config": { "default_model": "vertex/gemini-3-pro" }
+}
+```
+
+## Amazon Bedrock
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...                   # when using STS/SSO-derived creds
+export AWS_REGION=us-east-1                    # or AWS_DEFAULT_REGION; default us-east-1
+
+stella --model bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0 run "…"
+```
+
+<Callout type="warn">
+  Stella reads **only these environment variables** — it does not walk the AWS
+  credential chain. `AWS_PROFILE`, `~/.aws/credentials`, SSO caches, and IMDS/instance
+  roles are never consulted. On a profile/SSO setup, materialize env vars first:
+  `eval "$(aws configure export-credentials --profile dev --format env)"`.
+</Callout>
+
+## Org-managed settings: one file, every seat
+
+The **org-managed scope** is the enterprise deployment surface: a `settings.json`
+outside any repo, shipped by MDM/config management, that every Stella on the machine
+inherits — users keep their own keys, projects keep their own overrides:
+
+```json title="/Library/Application Support/stella/settings.json (macOS) · /etc/stella/settings.json (Linux)"
+{
+  "providers": {
+    "vertex": { "name": "Acme Vertex (approved)" },
+    "openai": { "base_url": "https://llm-gateway.acme.internal/v1" }
+  },
+  "agent_engine_config": {
+    "default_model": "vertex/gemini-3-pro",
+    "allowed_models": [
+      "vertex/gemini-3-pro",
+      "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "repo_push",
+        "hooks": [ { "command": "/usr/local/bin/acme-push-policy" } ] }
+    ]
+  }
+}
+```
+
+- `STELLA_MANAGED_SETTINGS=/path/to/settings.json` overrides the platform path — the CI
+  and container route.
+- `allowed_models` constrains the deck's model pickers and `auto_mode`'s choices to the
+  approved list — and it **replaces wholesale** across scopes, so the org list is the
+  list unless a more specific scope replaces it entirely.
+- Org-managed hooks always load (no trust flag needed) — they are your machine's
+  policy, unlike a cloned repo's. Projects can still add their own behind
+  [`STELLA_TRUST_PROJECT=1`](/docs/configuration/settings#the-project-trust-boundary).
+
+## Verify a seat
+
+```bash
+stella models    # ✓ configured rows for vertex/bedrock, org gateway URLs visible
+stella config    # the resolved provider, model, and a redacted key preview
+```
+
+## Related
+
+- [Vertex reference](/docs/api-providers/vertex) · [Bedrock reference](/docs/api-providers/bedrock)
+- [Team-shared settings](/docs/examples/team-settings) — the project/repo half of this story
+- [settings.json](/docs/configuration/settings) — scope semantics in full

@@ -30,6 +30,16 @@ description = "Count the words in a file and print the total."
 # spawned directly with no shell; command[0] resolves against the workspace root.
 command = ["scripts/wordcount.sh"]
 
+# Optional. Default 30000 (30 seconds), hard-capped at 600000 (10 minutes) —
+# a manifest asking for more is clamped. Past the timeout, the script's whole
+# process group is killed and the tool returns a named error.
+timeout_ms = 60000
+
+# Optional extra environment variables for the child process, applied on top
+# of the inherited environment.
+[env]
+WORDCOUNT_LOCALE = "en_US"
+
 # Tool inputs are a JSON Schema, written as TOML under [input_schema].
 [input_schema]
 type = "object"
@@ -43,6 +53,37 @@ description = "Path to the file whose words should be counted."
 <Callout type="warn">
 `command` must be an **argv array** (`["scripts/wordcount.sh"]`), not a bare string — a string fails to parse and the tool never loads. Inputs go under `[input_schema]` (a JSON Schema), not `[parameters]`; an unknown table like `[parameters]` is silently ignored, leaving the tool with an empty schema.
 </Callout>
+
+<Callout type="info">
+The `timeout_ms` default is **30 seconds** — half of the 60-second default that [hooks](/docs/agent-tools/hooks) get. Both share the same 10-minute hard cap.
+</Callout>
+
+## How input reaches your script
+
+When the agent calls a custom tool, Stella spawns `command` **directly** from the argv array — never through a shell, so the tool's input has no injection surface — with the working directory set to the workspace root. The model's input JSON is then delivered **two ways**, so trivial scripts need no JSON parser:
+
+1. The whole input object is written to the script's **stdin** as one JSON document, then stdin is closed — your script sees EOF.
+2. Each top-level **scalar** property (string, number, bool) is exported as `STELLA_INPUT_<UPPER_SNAKE_KEY>` — `path` becomes `STELLA_INPUT_PATH`, `dry_run` becomes `STELLA_INPUT_DRY_RUN`. Nested objects and arrays are delivered on stdin only.
+
+The manifest's `[env]` table is applied on top of the inherited environment, before the `STELLA_INPUT_*` exports. Input keys come from the model but are namespaced under `STELLA_INPUT_`, so they can never clobber `PATH` or your `[env]` values.
+
+A script consuming both channels:
+
+```bash title="scripts/wordcount.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Scalar inputs arrive as environment variables…
+path="$STELLA_INPUT_PATH"
+
+# …and the full input object arrives as one JSON document on stdin —
+# read it (e.g. with jq) when you need nested objects or arrays.
+input="$(cat)"    # {"path": "src/lib.rs"}
+
+wc -w < "$path"
+```
+
+Exit **0** returns the captured stdout as the tool result; a **non-zero** exit returns an error carrying the exit code and the stderr tail. Both streams are truncated middle-out past a byte cap, same as the built-in `bash` tool.
 
 ## Validating manifests
 

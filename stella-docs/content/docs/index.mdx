@@ -53,45 +53,48 @@ ends on a verified outcome rather than the worker's own say-so.
 
 ## The documentation
 
-The sidebar follows the same journey as this list — top to bottom, newcomer to
-expert.
-
 **Start here**
 
-- **[Getting Started](/docs/getting-started)** — install, configure provider keys,
-  initialize a repo.
-- **[API Providers](/docs/api-providers)** — the nine hosted providers + local, model
-  specs, and the live model catalog.
+- **[Getting Started](/docs/getting-started)** — install, initialize a repo, configure
+  provider keys.
 
-**Guides**
+**Providers &amp; configuration**
+
+- **[API Providers](/docs/api-providers)** — per-provider setup, the model catalog, and
+  cross-provider pricing.
+- **[Configuration &amp; Settings](/docs/configuration)** — `settings.json`, per-agent
+  engine config, credentials, and the scope hierarchy.
+- **[Examples &amp; Recipes](/docs/examples)** — complete config files organized by use
+  case: coding-plan subscriptions, single-key setups, gateways, local/air-gapped,
+  enterprise cloud, team-shared settings, and the three cost-tier profiles.
+
+**Using the agent**
 
 - **[Agent Modes](/docs/agent-modes)** — Command Deck chat, one-shot runs, judged goal
   mode, CI monitoring.
-- **[Agent Tools](/docs/agent-tools)** — the built-in toolbelt, permissions, skills, MCP
-  servers, custom tools, and hooks.
-- **[Agent Fleets](/docs/agent-fleets)** — parallel workers in isolated git worktrees.
-- **[Configuration &amp; Settings](/docs/configuration)** — `settings.json`, per-agent
-  engine config, credentials, and the scope hierarchy.
+- **[Agent Fleets](/docs/agent-fleets)** — many workers over one task list: a shared
+  tree with cooperative claims, or per-task worktree isolation on demand.
+- **[Agent Tools](/docs/agent-tools)** — the built-in toolbelt, skills, MCP servers,
+  custom commands, hooks, and permissions.
 - **[Telemetry &amp; Usage Analytics](/docs/telemetry)** — local-only metering, the
-  Observatory dashboard, budgets, and the files-touched ledger.
-- **[Examples](/docs/examples)** — ready-made engine profiles from dirt-cheap to
-  max-quality.
-- **[Scripting](/docs/scripting)** — headless JSON output for CI and automation.
+  dashboard, budgets, and the files-touched ledger.
 
-**Under the hood**
+**How it works**
 
-- **[Inference Pipeline](/docs/inference-pipeline)** — triage → plan → witness → execute →
-  verify → judge: how work gets *proven*, not just done.
+- **[Inference Pipeline](/docs/inference-pipeline)** — triage → recall → plan → scope
+  review → witness → execute → verify → judge: how work gets *proven*, not just done.
 - **[Context Engine](/docs/context-engine)** — memories, the tree-sitter code graph,
   reflections, and the prompt-cache-native recall that makes them cheap.
-- **[Extensions](/docs/extensions)** — the lifecycle event bus observers and policy hooks
-  ride on.
-- **[Engineering Principles](/docs/principles)** — determinism, and the papers behind the
-  design.
+- **[Agent Engine Paths](/docs/agent-engine-paths)** — every entry point into the
+  engine, mapped.
+- **[Principles](/docs/principles)** — the convictions the codebase is built around.
 
 **Reference**
 
 - **[Commands](/docs/commands)** — the full command and flag reference.
+- **[Extensions](/docs/extensions)** &amp; **[Scripting](/docs/scripting)** — the event
+  bus for embedders, and headless/CI usage.
+- **[Donate](/docs/donate)** — keep independent, local-first tooling alive.
 
 **Community**
 

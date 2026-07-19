@@ -1,4 +1,17 @@
 {
-  "title": "Examples",
-  "pages": ["index", "max-quality", "balanced", "dirt-cheap"]
+  "title": "Examples & Recipes",
+  "pages": [
+    "index",
+    "---Setups by use case---",
+    "single-key",
+    "zai-coding-plan",
+    "openrouter-gateway",
+    "local-airgapped",
+    "enterprise-cloud",
+    "team-settings",
+    "---Cost-tier profiles---",
+    "max-quality",
+    "balanced",
+    "dirt-cheap"
+  ]
 }

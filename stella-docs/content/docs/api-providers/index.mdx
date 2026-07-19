@@ -50,6 +50,19 @@ has a resolvable credential, in this preference order:
   them. The `local` pseudo-provider is never auto-detected at all.
 </Callout>
 
+The "configured default" above is a real resolution layer with a name:
+[`agent_engine_config`](/docs/configuration/agent-engine-config)'s `default_model`. It
+sits **between** the `--model` flag and auto-detection — an explicit flag always wins,
+but a settings-configured default beats "first provider with a key":
+
+```json title="~/.config/stella/settings.json"
+{
+  "agent_engine_config": {
+    "default_model": "anthropic/claude-fable-5"
+  }
+}
+```
+
 ## The credential chain
 
 For the selected provider, Stella resolves the API key in this order — **first hit wins**:
@@ -66,6 +79,38 @@ See [Credentials](/docs/configuration/credentials) for the file format and the f
 <Callout type="warn">
   Prefer an env var, `settings.json`, or `credentials.toml` over `--api-key` for anything
   long-lived — a flag value is visible in shell history and in `ps` output.
+</Callout>
+
+### Overriding the key source
+
+Two `settings.json` fields reroute steps 2 and 3 of the chain — every provider page's
+"reference an env var" option is this mechanism, documented once here:
+
+- **`providers.<id>.api_key_env`** renames the provider's primary credential var: the
+  named var becomes the one Stella checks first, and the original (`ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`, …) demotes to an alias — so the standard var keeps working as a
+  fallback.
+- **`providers.<id>.api_key`** embeds the key literal inline — step 3 of the chain.
+  Fine for a scratch machine; `credentials.toml` is the better home for anything
+  long-lived.
+
+```json title="~/.config/stella/settings.json"
+{
+  "providers": {
+    "anthropic": {
+      "api_key_env": "MY_TEAM_ANTHROPIC_KEY"
+    }
+  }
+}
+```
+
+<Callout type="warn">
+  Scope matters. In a project's `.stella/settings.json`, the credential-routing fields —
+  `base_url`, `api_key`, `api_key_env` — are **ignored** (with a stderr notice) unless
+  you export `STELLA_TRUST_PROJECT=1`: a cloned repo must not be able to redirect where
+  your key is sent. User scope (`~/.config/stella/settings.json`) always applies — put
+  personal overrides there. See
+  [the project trust boundary](/docs/configuration/settings#the-project-trust-boundary).
 </Callout>
 
 ## Where to go next

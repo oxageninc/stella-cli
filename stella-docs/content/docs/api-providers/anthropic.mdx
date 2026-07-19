@@ -20,19 +20,10 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 That is the whole setup — Anthropic sits second in
 [auto-detection](/docs/api-providers#auto-detection), so with the key exported Stella
-picks it up on its own (only a `ZAI_API_KEY` outranks it). Alternatively, store the key in
-[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or reference an
-env var of your choosing from [`settings.json`](/docs/configuration/settings):
-
-```json title=".stella/settings.json"
-{
-  "providers": {
-    "anthropic": {
-      "api_key_env": "MY_TEAM_ANTHROPIC_KEY"
-    }
-  }
-}
-```
+picks it up on its own (only a `ZAI_API_KEY` outranks it). Prefer a file? Store the key
+in [`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or rename the
+env var Stella reads with `providers.anthropic.api_key_env` — see
+[overriding the key source](/docs/api-providers#overriding-the-key-source).
 
 ## Selecting models
 
@@ -42,6 +33,26 @@ The provider id is `anthropic`; the default model is `claude-fable-5`.
 stella --model anthropic/claude-fable-5 run "refactor the session store"
 export STELLA_MODEL=anthropic/claude-fable-5   # pin for the whole shell
 ```
+
+## Custom base URL
+
+Anthropic-compatible gateways and proxies — a LiteLLM deployment, a corporate egress
+proxy — work by overriding the base URL; the wire dialect stays Anthropic Messages:
+
+```json title="~/.config/stella/settings.json"
+{
+  "providers": {
+    "anthropic": {
+      "base_url": "https://llm-gateway.internal.example.com"
+    }
+  }
+}
+```
+
+For a one-off run, `--base-url` (env form `STELLA_BASE_URL`) does the same and outranks
+the settings value. User scope shown deliberately: in a project's
+`.stella/settings.json`, `base_url` is ignored unless `STELLA_TRUST_PROJECT=1` — see
+[the project trust boundary](/docs/configuration/settings#the-project-trust-boundary).
 
 ## Reasoning and sampling
 
@@ -75,5 +86,6 @@ judge seat over a `glm-5.2` worker. Route it per agent with
 | --- | --- | --- | --- | --- |
 | `claude-fable-5` | 200k | 3.00 | 15.00 | 0.30 |
 
-List prices from Stella's seed catalog (v0.3.0) — verify with Anthropic; see the
+List prices from Stella's seed catalog — verify with Anthropic; your local catalog
+re-syncs from [models.dev](https://models.dev) via `stella models refresh`. See the
 [Model guide](/docs/api-providers/models) for the full cross-provider table.

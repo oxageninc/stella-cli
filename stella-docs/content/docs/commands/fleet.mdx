@@ -1,9 +1,9 @@
 ---
 title: stella fleet
-description: Fan a batch of tasks out to a fleet of worker agents, each isolated in its own git worktree.
+description: Fan a batch of tasks out to a fleet of worker agents in one shared tree, coordinated by cooperative file claims.
 ---
 
-Run many tasks in parallel, each in its own isolated git worktree, wave-scheduled by dependency. Every attempt, commit, and dollar is recorded in `.stella/fleet.db`, and the worktrees and their `fleet/<slug>-<hash>` branches are left in place for review.
+Run many tasks in parallel in **one shared working tree**, coordinated by cooperative file claims and wave-scheduled by dependency. A task gets its own git worktree only when a plan file opts it in with `isolation = "isolated"`. Every attempt, commit, and dollar is recorded in `.stella/fleet.db`, and any isolated worktrees and their `fleet/<slug>-<hash>` branches are left in place for review.
 
 ## Synopsis
 
@@ -13,19 +13,19 @@ stella fleet <task>... [--plan <FILE>] [--max-concurrency <N>] [--base-ref <ref>
 
 ## What it does
 
-Each task prompt becomes an independent, isolated task. Stella creates one git worktree per task under `.stella/worktrees/<slug>` — branched from the current `HEAD` (or `--base-ref`), pinned to a SHA at start, onto a `fleet/<slug>-<hash>` branch (the hash suffix keeps re-runs from colliding with branches you kept) — and dispatches tasks in dependency-ordered waves, running up to `--max-concurrency` at once within a wave. Each worker is a full engine run through the [staged pipeline](/docs/inference-pipeline) by default. Progress, attempts, commits, and cost are persisted to `.stella/fleet.db` and surface on the [Observatory dashboard](/docs/telemetry/dashboard)'s Fleet runs card.
+Each task prompt becomes an independent task running **in the shared repository root**. Workers coordinate through cooperative file claims — paths declared upfront in a plan (`claims`) plus claim-on-first-write at the tool layer — so a conflict surfaces in under a second at write time with the rival named, and commits interleave on one branch with no merge-back. A task a plan file opts into `isolation = "isolated"` instead gets a dedicated git worktree under `.stella/worktrees/<slug>` — branched from the current `HEAD` (or `--base-ref`), pinned to a SHA at start, onto a `fleet/<slug>-<hash>` branch (the hash suffix keeps re-runs from colliding with branches you kept). Tasks dispatch in dependency-ordered waves, running up to `--max-concurrency` at once within a wave. Each worker is a full engine run through the [staged pipeline](/docs/inference-pipeline) by default. Progress, attempts, commits, and cost are persisted to `.stella/fleet.db` and surface on the [Observatory dashboard](/docs/telemetry/dashboard)'s Fleet runs card.
 
-Worktrees and branches are **not** cleaned up automatically: they stay on disk so you can inspect, test, and merge each result yourself. A failed task is never retried automatically, and its dependents end the run as `skipped`.
+Isolated worktrees and fleet branches are **not** cleaned up automatically: they stay on disk so you can inspect, test, and merge each result yourself. A failed task is never retried automatically, and its dependents end the run as `skipped`.
 
 <Callout type="info">
-For anything beyond a handful of independent prompts, use a plan file (`--plan`). It lets you declare task `id`, `title`, `prompt`, `depends_on` (to order the waves), `isolation` (`isolated` for an own worktree — the default — or `shared_tree` to run in the repo root with no worktree), and `claims` — file paths held as cooperative locks while a task runs, so two tasks never edit the same file at once. See [Agent Fleets](/docs/agent-fleets) for the full plan schema.
+For anything beyond a handful of independent prompts, use a plan file (`--plan`). It lets you declare task `id`, `title`, `prompt`, `depends_on` (to order the waves), `isolation` (`shared_tree` — the default — runs in the repo root under the claim discipline; `isolated` opts a task into its own worktree and branch, for genuinely divergent work like best-of-N attempts on the same files), and `claims` — file paths held as cooperative locks while a task runs, so two tasks never edit the same file at once. See [Agent Fleets](/docs/agent-fleets) for the full plan schema.
 </Callout>
 
 ## Flags
 
 | Flag | Meaning |
 | --- | --- |
-| `<task>...` | One or more task prompts, each an independent isolated task. Required unless `--plan` is given. |
+| `<task>...` | One or more task prompts, each an independent shared-tree task. Required unless `--plan` is given. |
 | `--plan <FILE>` | A `.json` or `.toml` plan file with `[[tasks]]` entries (`id`, `title`, `prompt`, optional `depends_on`, `isolation`, and `claims`) instead of inline prompts. |
 | `--max-concurrency <N>` | Maximum tasks dispatched concurrently within one wave. Default `4`. |
 | `--base-ref <ref>` | Git ref the isolated worktrees branch from. Default: the current `HEAD`, pinned to a SHA at start so mid-run commits can't drift the base. |
@@ -42,7 +42,7 @@ stella --budget 5 fleet --plan release-prep.toml
 
 ## Examples
 
-Fan three independent tasks out across worktrees:
+Run three independent tasks in parallel in the shared tree — claim-on-first-write keeps them off each other's files:
 
 ```bash
 stella fleet \

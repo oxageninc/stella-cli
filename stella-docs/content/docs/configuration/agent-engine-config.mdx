@@ -8,9 +8,9 @@ configures the four engine agents individually:
 
 | Agent | Runs |
 | --- | --- |
-| `default` | The interactive / step-loop agent (`stella chat`, the Command Deck, `--no-pipeline`) |
-| `worker` | The [pipeline](/docs/inference-pipeline)'s execute turns (plan and witness ride its settings) |
-| `judge` | The pipeline's verify judge and [goal mode](/docs/agent-modes#outcome-driven-goal-mode)'s round judge |
+| `default` | The interactive / step-loop agent (`stella chat`, the Command Deck, `--no-pipeline`) — and the **model source for the pipeline's execute turns** (see [Model precedence](#model-precedence)) |
+| `worker` | The [pipeline](/docs/inference-pipeline)'s execute-turn **tuning** — prompt, effort, reasoning, params (plan rides it too) |
+| `judge` | The pipeline's verify judge and [goal mode](/docs/agent-modes/goal-mode)'s round judge — the witness author also rides the judge's model, falling back to the worker when no judge resolves |
 | `triage` | The pipeline's fast task classifier |
 
 Every field is optional, and it merges across the same user → org-managed →
@@ -23,8 +23,9 @@ pin just the judge model while your user scope keeps everything else.
 {
   "agent_engine_config": {
     // Flat per-role models ("provider/slug", or a bare catalog slug).
-    "default_model": "anthropic/claude-fable-5",
-    "pipeline_worker_model": "zai/glm-5.2",
+    // default_model doubles as the WORKER route — the pipeline's execute
+    // turns run the worker/default chain (see Model precedence below).
+    "default_model": "zai/glm-5.2",
     "pipeline_judge_model": "openrouter/openai/gpt-5.5",
     "pipeline_triage_model": "deepseek/deepseek-chat",
 
@@ -36,8 +37,8 @@ pin just the judge model while your user scope keeps everything else.
     // different model family than the worker's, then the highest catalog
     // price tier. You never worry about it.
     "auto_mode": "off",
-    // "on" = per-agent effort chosen for you (judge high, worker medium,
-    // triage low), overriding any per-agent "effort".
+    // "on" = per-agent effort chosen for you (judge high, worker and
+    // default medium, triage low), overriding any per-agent "effort".
     "effort_auto": "off",
     // "on" = thinking mode chosen for you (on everywhere except triage).
     "reasoning_auto": "off",
@@ -66,14 +67,37 @@ pin just the judge model while your user scope keeps everything else.
 
 ## Model precedence
 
-Per agent, first hit wins:
+The chain differs by role — `--model` governs the **worker**, while an explicitly
+configured judge or triage keeps its own model even under a `--model` flag.
 
-1. The `--model` CLI flag (an explicit flag pins the run, always)
-2. `agents.<agent>.model`
-3. The flat field — `pipeline_worker_model` / `pipeline_judge_model` /
-   `pipeline_triage_model` (or `default_model` for the default agent)
-4. `default_model`
-5. The provider's own default / auto-detection
+**Worker &amp; default agent** (one model, shared by the interactive agent and the
+pipeline's execute turns) — first hit wins:
+
+1. The `--model` CLI flag
+2. `agents.default.model`
+3. `default_model`
+4. Auto-detection / the provider's own default
+
+**Judge and triage** — first hit wins:
+
+1. `agents.judge.model` / `agents.triage.model`
+2. `pipeline_judge_model` / `pipeline_triage_model`
+3. `default_model`
+4. No configuration — the role rides the worker's model
+
+`auto_mode: "on"` replaces the judge spec with the cross-family pick from
+`allowed_models` (below). A `--model` flag does **not** override an explicitly
+configured judge or triage — `stella --model anthropic/claude-fable-5 goal "…"` with
+`pipeline_judge_model: openrouter/openai/gpt-5.5` runs a Fable worker under a GPT judge,
+which is usually exactly what you want from a cross-family setup.
+
+<Callout type="warn">
+  `pipeline_worker_model` and `agents.worker.model` are accepted, saved, and shown in the
+  deck's engine panel, but the **executing** worker model follows the worker/default chain
+  above — route the worker with `default_model` (or `--model`), not the worker-specific
+  model fields. The `worker` agent's tuning fields (`prompt`, `effort`, `reasoning`,
+  `params`) do apply to execute turns.
+</Callout>
 
 ## One gateway per agent (BYOK per agent)
 
@@ -84,7 +108,7 @@ one pipeline:
 ```jsonc
 {
   "agent_engine_config": {
-    "pipeline_worker_model": "anthropic/claude-fable-5",     // your Anthropic key
+    "default_model": "anthropic/claude-fable-5",             // worker — your Anthropic key
     "agents": {
       "judge":  { "provider": "openrouter", "model": "openai/gpt-5.5" }, // your OpenRouter key
       "triage": { "provider": "zai", "model": "glm-5.2" }               // your Z.ai key

@@ -1,12 +1,27 @@
 ---
-title: Examples
-description: Ready-to-paste agent_engine_config profiles — maximum quality, balanced, and dirt cheap — plus an honest anatomy of what a pipeline run actually costs.
+title: Examples & recipes
+description: Ready-to-paste configuration files organized by use case — cost-tier pipeline profiles, provider setups from coding-plan subscriptions to air-gapped local servers, and team-shared config.
 ---
+
+Every page in this section is built around a **complete, copy-pasteable configuration
+file** — pick the page that matches your situation, paste, verify, adjust.
+
+## Setups by use case
+
+| Your situation | Recipe |
+| --- | --- |
+| One API key, want the best default setup | [Single provider, single key](/docs/examples/single-key) |
+| Z.ai GLM coding-plan subscriber | [Z.ai coding plan](/docs/examples/zai-coding-plan) |
+| One OpenRouter key for every model family | [One gateway key](/docs/examples/openrouter-gateway) |
+| Ollama / vLLM / LM Studio, or no network at all | [Local &amp; air-gapped](/docs/examples/local-airgapped) |
+| Models must flow through GCP / AWS | [Enterprise cloud](/docs/examples/enterprise-cloud) |
+| Sharing `.stella/` config across a team | [Team-shared settings](/docs/examples/team-settings) |
+
+## Cost-tier profiles
 
 The [inference pipeline](/docs/inference-pipeline) makes several model calls
 per run, and each one is [independently configurable](/docs/configuration/agent-engine-config).
-These pages give you three ready-to-paste profiles — and the cost model to
-reason about your own.
+Three ready-to-paste tiers — and below, the cost model to reason about your own:
 
 | Profile | Worker | Judge | Triage | Typical run* |
 | --- | --- | --- | --- | --- |
@@ -17,7 +32,9 @@ reason about your own.
 *Estimates for a *medium* task (a focused multi-file change, one revision) at
 the catalog's list prices, with prompt caching working normally. A lookup
 costs far less; a long refactor costs more. Your actual numbers live in
-[`stella stats` and the Observatory](/docs/telemetry/dashboard).
+[`stella stats` and the Observatory](/docs/telemetry/dashboard). The three
+profiles assume keys for two or three providers — with one key, start from
+[single-key](/docs/examples/single-key) instead.
 
 ## What a pipeline run is made of
 
@@ -46,9 +63,9 @@ Three consequences worth internalizing:
    worker. Arm `--test-command` and many runs skip the judge entirely.
 3. **Prompt caching is doing heavy lifting.** Stella keeps the system prefix
    byte-stable specifically so most execute-step input bills at the
-   *cached* rate (10–25× cheaper). That is why real runs cost far less than
-   naive `input tokens × list price` math suggests. See
-   [Context Engine](/docs/context-engine).
+   *cached* rate (4–10× cheaper, depending on the model). That is why real
+   runs cost far less than naive `input tokens × list price` math suggests.
+   See [Context Engine](/docs/context-engine).
 
 ## Multipliers
 

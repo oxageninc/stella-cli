@@ -36,6 +36,31 @@ Runs before a tool executes. A **non-zero exit status blocks the tool**: the too
 
 Runs after a tool executes. It is for **side effects only and never blocks** — its exit status cannot stop or undo the tool call that already ran. Use it for logging, formatting, notifications, or similar follow-up work. The matcher is a **glob over the tool name**.
 
+## The stdin payload
+
+Every hook receives one JSON document on stdin. Its shape:
+
+```json
+{
+  "event": "PostToolUse",
+  "cwd": "/path/to/workspace",
+  "tool": {
+    "name": "bash",
+    "input": { "command": "git status" }
+  },
+  "toolResult": "On branch main…"
+}
+```
+
+| Field | Type | Present for | Meaning |
+| --- | --- | --- | --- |
+| `event` | string | Always | `"SessionStart"`, `"PreToolUse"`, or `"PostToolUse"` — the same PascalCase names as the config keys. |
+| `cwd` | string | Always | The workspace root — also the hook's working directory. |
+| `tool` | object | `PreToolUse`, `PostToolUse` | `{ "name": …, "input": … }` — the tool's exact name and the model-produced JSON input it was (or will be) called with. |
+| `toolResult` | string | `PostToolUse` only | The (clipped) result string the tool returned. |
+
+Absent fields are **omitted entirely**, not set to `null` — a `SessionStart` payload is just `{ "event": "SessionStart", "cwd": "…" }`, and `toolResult` never appears on a `PreToolUse` payload.
+
 ## Timeouts
 
 Each hook may set a `timeoutMs`, the maximum time the command is allowed to run:
@@ -66,10 +91,34 @@ The following `settings.json` runs `./scripts/guard.sh` before every `bash` tool
 }
 ```
 
+And the script itself — a complete `PreToolUse` guard that reads the payload with `jq` and vetoes force-pushes:
+
+```bash title="scripts/guard.sh"
+#!/usr/bin/env bash
+# PreToolUse guard for the `bash` tool: block force-pushes.
+# The event payload arrives as one JSON document on stdin.
+set -euo pipefail
+
+command="$(jq -r '.tool.input.command // empty')"
+
+case "$command" in
+  *"git push --force"* | *"git push -f"*)
+    # Any non-zero exit blocks the tool; trimmed stderr (falling back to
+    # stdout) becomes the message the model receives instead of a result.
+    echo "blocked by scripts/guard.sh: force-push is not allowed" >&2
+    exit 2
+    ;;
+esac
+
+exit 0
+```
+
+Blocking is **fail-closed** on `PreToolUse`: a hook that times out or fails to start at all also blocks the tool, with the failure message as the reason — a missing or broken guard script never silently waves a call through. (`PostToolUse` and `SessionStart` never block on either failure mode.)
+
 <Callout type="warn">
 **Project-scope hooks are a trust boundary.** Hooks declared in a repository's project-scope file (`<workspace>/.stella/settings.json`) do **not** load unless you set `STELLA_PROJECT_HOOKS=1` — otherwise the merged hook set is rebuilt from the user and org-managed scopes alone, and a stderr notice names what was skipped. This stops a cloned repo from running arbitrary commands on your machine. Hooks in the user scope (`~/.config/stella/settings.json`) always load.
 </Callout>
 
 <Callout type="info">
-Hooks live in the same `settings.json` that carries your provider configuration. See the [settings documentation](/docs/configuration/settings) for how the file is resolved and merged across scopes.
+Hooks live in the same `settings.json` that carries your provider configuration. See the [settings documentation](/docs/configuration/settings) for how the file is resolved and merged across scopes, and [Team settings](/docs/examples/team-settings) for a worked example of a team-shared settings file with hooks.
 </Callout>

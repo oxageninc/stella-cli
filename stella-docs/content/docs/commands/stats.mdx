@@ -39,7 +39,7 @@ stella stats --provider anthropic --format csv > anthropic-spend.csv
 Emit JSON for a dashboard or a jq pipeline:
 
 ```bash
-stella stats --format json | jq '.[] | {model, cost_usd, resolve_rate}'
+stella stats --format json | jq '.[] | {model, total_cost_usd, resolve_rate}'
 ```
 
 <Callout type="info">

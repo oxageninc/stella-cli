@@ -63,10 +63,13 @@ is the complete map; each row links to its detail page.
 | Output format (text/json/stream-json) | `--output-format` flag · `STELLA_OUTPUT_FORMAT` | `stella --output-format json run "…"` |
 | A hard USD spend cap | `--budget` flag · `STELLA_BUDGET` | `stella --budget 2.00 goal "…"` |
 | Shell commands on lifecycle events | `settings.json` `hooks` key | [Hooks](/docs/agent-tools/hooks) |
+| Per-agent engine models (worker/judge/triage) | `settings.json` `agent_engine_config` | [Agent engine config](/docs/configuration/agent-engine-config) |
+| Enable the raw `bash` tool (off by default) | `settings.json` `tools.bash: "on"` | [settings.json](/docs/configuration/settings#the-tools-section) |
 | Org-managed defaults for a fleet | `STELLA_MANAGED_SETTINGS` → a `settings.json` | [settings hierarchy](#the-settings-hierarchy) |
+| Trust a repo's project-scope hooks &amp; routing | `STELLA_TRUST_PROJECT=1` | [trust boundary](/docs/configuration/settings#the-project-trust-boundary) |
 | MCP servers to connect | `<workspace>/.stella/mcp.toml` | [MCP](/docs/agent-tools/mcp) |
 | Custom script tools | `<workspace>/.stella/tools/*.toml` | [Custom tools](/docs/agent-tools/custom-tools) |
-| Per-tool permission gates | `settings.json` permission model | [Permissions](/docs/agent-tools/permissions) |
+| Per-tool permission gates | `hooks` `PreToolUse` matchers + the `tools` switches | [Permissions](/docs/agent-tools/permissions) |
 | Force the plain REPL (no TUI) | `--plain` flag · `STELLA_PLAIN=1` | `stella --plain chat` |
 | Freeze TUI animation (CI/recordings) | `--no-anim` flag · `STELLA_NO_ANIM` · `NO_COLOR` | `stella --no-anim chat` |
 
@@ -78,11 +81,14 @@ is the complete map; each row links to its detail page.
 
 ### Common tasks
 
-**Point a Z.ai coding-plan subscription at its endpoint** (project scope):
+**Point a Z.ai coding-plan subscription at its endpoint** (user scope — a subscription is
+personal, and project scope would need [`STELLA_TRUST_PROJECT=1`](/docs/configuration/settings#the-project-trust-boundary)):
 
-```json title=".stella/settings.json"
+```json title="~/.config/stella/settings.json"
 { "providers": { "zai": { "base_url": "https://api.z.ai/api/coding/paas/v4" } } }
 ```
+
+Full walkthrough: the [coding-plan recipe](/docs/examples/zai-coding-plan).
 
 **Pin a model and a hard budget for an unattended CI run:**
 

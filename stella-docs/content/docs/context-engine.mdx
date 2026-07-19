@@ -129,6 +129,37 @@ Memory in Stella is not write-only. It is a feedback loop:
   of every future recall block. Bad memories don't just rank lower — they
   disappear.
 
+### One memory's arc: from lesson to rule
+
+Concretely, over a few sessions:
+
+1. **Save.** Mid-turn, the agent learns something durable — say, *"the
+   integration suite needs `TEST_DB=memory`; against a real socket it
+   hangs"* — and calls `save_memory` with a slug and the lesson (at most
+   2,000 characters of Markdown). It lands as a file in
+   `.stella/memories/` and, per the cache discipline above, takes effect
+   from the **next** session.
+2. **Recall.** In a later session, a prompt about the integration tests
+   matches; recall surfaces the lesson in the `[auto-recalled context]`
+   block as a frame tagged with its stable id (`nod_` plus 24 hex
+   characters) — competing with everything else relevant for the default
+   cap of 5 frames / ~1,200 tokens.
+3. **Cite.** The lesson actually informs the turn, so the model calls
+   `cite_memory` with that `nod_…` id, a usefulness score (1–5), a
+   truthfulness flag, and a one-line remark. The citation lands in the
+   ledger in `.stella/store.db`.
+4. **Inspect.** `stella memory list` shows the memory climbing the ranking
+   — citation count, average usefulness, truthful rate — and flags it once
+   it has earned promotion.
+5. **Promote.** After **more than 10 consecutive positive citations** (one
+   negative citation resets the streak to zero), the memory is eligible:
+   `stella memory promote <id>` writes it as a durable rule at
+   `.stella/rules/<slug>.md`.
+6. **Graduate.** From the next session on, the promoted rule rides the
+   byte-stable prompt prefix as a Tier-1 rule — standing guidance on every
+   call, at cached-read prices, no longer needing to win recall's 5-frame
+   contest to be seen.
+
 ## Reflections: learning from every working turn
 
 After any turn that did real work (tool calls happened — a pure chat turn is
