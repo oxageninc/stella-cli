@@ -19,9 +19,12 @@
 //! its live event lane, an inbox notification, and (for task workers) the
 //! board task auto-completing. Prompts queue only past the worker cap, on a
 //! dispatch hold, or when they are slash commands (the lead's dispatcher owns
-//! those). Deep pause/resume and fleet-worktree isolation for workers remain
-//! follow-ups on the `stella-fleet` seam (`COMMAND_DECK_DESIGN.md` →
-//! "Backend seams").
+//! those). The fleet layer now carries its own per-task control verbs
+//! (`Fleet::pause_task` / `resume_task` / `stop_task`, riding
+//! `stella_fleet::WorkerControls` through the `FleetWorker` port);
+//! surfacing `stella fleet` tasks as controllable deck lanes and
+//! fleet-worktree isolation for deck workers remain follow-ups on that seam
+//! (`COMMAND_DECK_DESIGN.md` → "Backend seams").
 //!
 //! ## The three engine seams handled here
 //!
@@ -1380,9 +1383,12 @@ pub async fn run_deck_session(
                         ) => {
                             handle_issues_input(&input, cfg, &issue_backend_cache, &in_tx);
                         }
-                        // Scope review is not engine-driven yet, and deep
-                        // pause/resume/restart need the fleet supervisor —
-                        // both named seams, both no-ops here.
+                        // Scope review is not engine-driven yet, and
+                        // lead-lane pause/resume/restart still need a
+                        // staged-pipeline boundary gate (the PipelinePorts
+                        // follow-up; the fleet layer's own per-task verbs
+                        // exist now, but fleet tasks are not deck lanes
+                        // yet) — named seams, no-ops here.
                         Some(WorkspaceInput::ToAgent {
                             input: UserInput::ScopeDecision(_), ..
                         })

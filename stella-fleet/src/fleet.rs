@@ -16,9 +16,20 @@
 //! **remaining waves are not launched** — but in-flight siblings are never
 //! cancelled mid-run (no mid-tool kill; a running worker settles first).
 //!
+//! The seam also carries **per-task control**: every dispatched worker
+//! receives [`WorkerControls`] (a pause watch + a stop oneshot — the exact
+//! channel shapes the deck's sub-sessions use), and the fleet exposes the
+//! matching verbs, [`Fleet::pause_task`] / [`Fleet::resume_task`] /
+//! [`Fleet::stop_task`]. This closes the "fleet supervisor seam"
+//! `COMMAND_DECK_DESIGN.md` and `command_deck.rs` named as the follow-up:
+//! per-worker pause/stop now exists at the fleet layer, not just for deck
+//! sub-session lanes. Restart is deliberately not a fleet verb —
+//! [`Fleet::dispatch`] is re-runnable, so a restart is the caller
+//! re-dispatching the same [`Task`]; the fleet keeps no respawn state.
+//!
 //! [`Isolation`]: crate::plan::Isolation
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -26,6 +37,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use stella_core::{BudgetGuard, BudgetOutcome, Clock};
 use stella_store::Store;
+use tokio::sync::{oneshot, watch};
 
 use crate::git::{GitCli, Worktree, WorktreeError, WorktreeManager};
 use crate::ledger::{
@@ -35,14 +47,51 @@ use crate::plan::{Isolation, Plan, PlanError, Task, TaskId};
 
 /// The port a fleet worker implements — the CLI glue later backs this with
 /// `stella_core::Engine` / `stella_pipeline`; tests back it with fakes. It
-/// receives the task and the workspace root it must operate in (the isolated
-/// worktree, or the shared repo root for a [`Isolation::SharedTree`] task) and
-/// reports what it did.
+/// receives the task, the workspace root it must operate in (the isolated
+/// worktree, or the shared repo root for a [`Isolation::SharedTree`] task),
+/// and its [`WorkerControls`], and reports what it did.
 ///
 /// [`Isolation::SharedTree`]: crate::plan::Isolation::SharedTree
 #[async_trait]
 pub trait FleetWorker: Send + Sync {
-    async fn run(&self, task: &Task, workspace_root: &Path) -> WorkerOutcome;
+    async fn run(
+        &self,
+        task: &Task,
+        workspace_root: &Path,
+        controls: WorkerControls,
+    ) -> WorkerOutcome;
+}
+
+/// The receiver halves of one task's control lines, handed to the
+/// [`FleetWorker`] alongside its task — the fleet-side twin of the deck
+/// sub-sessions' channels (`stella-cli/src/subsession.rs`): a pause watch
+/// and a stop oneshot, driven by [`Fleet::pause_task`] /
+/// [`Fleet::resume_task`] / [`Fleet::stop_task`].
+///
+/// Because the controls ride the [`FleetWorker`] port itself, the
+/// capability is structural: workers run no nested spawns today (a
+/// worker's own `task_assign` requests are reported, not dispatched — the
+/// deck documents that v1 scope), so there is nothing recursive to wire —
+/// but any future nested spawn dispatched back through this port would
+/// receive its own control lines with no new machinery.
+pub struct WorkerControls {
+    /// `true` = park at the next safe step boundary until it flips back
+    /// (the engine's `TurnGate` boundary — never mid-tool). A closed
+    /// channel reads as resumed: a worker must never park forever after
+    /// the fleet dropped its handle.
+    pub pause: watch::Receiver<bool>,
+    /// Fires when [`Fleet::stop_task`] consumes this task's stop line. A
+    /// channel closed *without* firing means no stop will ever come —
+    /// treat it as "run to completion", never as a stop.
+    pub stop: oneshot::Receiver<()>,
+}
+
+/// The sender halves the fleet retains for one live task. `stop` is
+/// `Option` because firing a oneshot consumes it — a second stop on the
+/// same attempt is a stale no-op, exactly the deck sub-session semantics.
+struct TaskControlHandle {
+    pause: watch::Sender<bool>,
+    stop: Option<oneshot::Sender<()>>,
 }
 
 /// What a [`FleetWorker`] reports back for one task attempt.
@@ -172,9 +221,10 @@ pub enum FleetError {
 }
 
 /// The fleet orchestrator. Owns the worker, the worktree manager, the ledger,
-/// and the parent budget guard (the last two behind `Mutex`es so concurrent
-/// wave dispatch serializes their fast synchronous writes — a lock is never
-/// held across an `.await`). Optionally owns the workspace [`Store`] whose
+/// the parent budget guard, and the live tasks' control lines (the last
+/// three behind `Mutex`es so concurrent wave dispatch serializes their fast
+/// synchronous writes — a lock is never held across an `.await`).
+/// Optionally owns the workspace [`Store`] whose
 /// `file_locks` back task claims: workers are in-process, so this single
 /// orchestrator-held store is the multi-process "lock-holder" the store's
 /// concurrency contract prescribes.
@@ -186,6 +236,10 @@ pub struct Fleet<W: FleetWorker, G: GitCli, C: Clock> {
     clock: C,
     config: FleetConfig,
     claims: Option<Store>,
+    /// Live workers' control lines, keyed by task id — registered by
+    /// `dispatch_claimed` for exactly the span its worker runs, so the
+    /// control verbs address live workers only.
+    controls: Mutex<HashMap<TaskId, TaskControlHandle>>,
 }
 
 impl<W, G, C> Fleet<W, G, C>
@@ -218,6 +272,7 @@ where
             clock,
             config,
             claims: None,
+            controls: Mutex::new(HashMap::new()),
         })
     }
 
@@ -240,6 +295,10 @@ where
 
     fn lock_budget(&self) -> MutexGuard<'_, BudgetGuard> {
         self.budget.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_controls(&self) -> MutexGuard<'_, HashMap<TaskId, TaskControlHandle>> {
+        self.controls.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// THE one dispatch entry point (L-E9). Claims the task's declared
@@ -311,9 +370,30 @@ where
             })?
         };
 
-        // 3. Run the worker — the slow part, concurrent across a wave. No lock
-        //    is held here.
-        let outcome = self.worker.run(task, &workspace_root).await;
+        // 3. Run the worker — the slow part, concurrent across a wave. No
+        //    lock is held across the await. Its control lines are registered
+        //    first and deregistered the moment it settles, so the control
+        //    verbs address exactly the tasks with a live worker. (Task ids
+        //    are unique within a plan; an ad-hoc re-dispatch of a still-live
+        //    id would re-key the registration to the newer attempt.)
+        let (pause_tx, pause_rx) = watch::channel(false);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        self.lock_controls().insert(
+            task.id.clone(),
+            TaskControlHandle {
+                pause: pause_tx,
+                stop: Some(stop_tx),
+            },
+        );
+        let controls = WorkerControls {
+            pause: pause_rx,
+            stop: stop_rx,
+        };
+        let outcome = self.worker.run(task, &workspace_root, controls).await;
+        // The worker settled — drop its control handle so a later pause or
+        // stop for this id reports "no live worker" instead of signalling
+        // into the void.
+        self.lock_controls().remove(&task.id);
 
         // 4. Stamp the outcome (attempt close + commits + spend) atomically,
         //    then meter the child's cost into the parent budget (L-E9).
@@ -520,6 +600,43 @@ where
         Ok(report)
     }
 
+    // ---- Per-task control: Pause / Resume / Stop ----------------------
+
+    /// Pause a live worker at its next safe step boundary (the engine's
+    /// `TurnGate` — the same boundary budget aborts use, never mid-tool).
+    /// `false` when no live worker is registered under `id`; a stale pause
+    /// is a no-op, never an error — the deck sub-session semantics.
+    ///
+    /// Restart is deliberately NOT a fleet verb: [`dispatch`](Self::dispatch)
+    /// is already re-runnable, so a restart is the caller re-dispatching the
+    /// same [`Task`] — the fleet keeps no respawn state.
+    pub fn pause_task(&self, id: &TaskId) -> bool {
+        match self.lock_controls().get(id) {
+            Some(handle) => handle.pause.send(true).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Resume a paused worker (flip its pause watch back to `false`).
+    /// `false` when no live worker is registered under `id`.
+    pub fn resume_task(&self, id: &TaskId) -> bool {
+        match self.lock_controls().get(id) {
+            Some(handle) => handle.pause.send(false).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Fire a live worker's stop line (the CLI worker drops its turn future
+    /// at the next await point — the same clean cancel the deck uses).
+    /// Consumes the line: `false` when no live worker is registered under
+    /// `id`, or when this attempt was already stopped.
+    pub fn stop_task(&self, id: &TaskId) -> bool {
+        match self.lock_controls().get_mut(id).and_then(|h| h.stop.take()) {
+            Some(tx) => tx.send(()).is_ok(),
+            None => false,
+        }
+    }
+
     // ---- Read-through accessors (tests + real callers) ----------------
 
     /// The parent budget guard's current state (a `Copy` snapshot).
@@ -636,7 +753,12 @@ mod tests {
     }
     #[async_trait]
     impl FleetWorker for FakeWorker {
-        async fn run(&self, task: &Task, workspace_root: &Path) -> WorkerOutcome {
+        async fn run(
+            &self,
+            task: &Task,
+            workspace_root: &Path,
+            _controls: WorkerControls,
+        ) -> WorkerOutcome {
             self.seen_roots
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -753,7 +875,12 @@ mod tests {
     }
     #[async_trait]
     impl FleetWorker for GatedWorker {
-        async fn run(&self, task: &Task, _workspace_root: &Path) -> WorkerOutcome {
+        async fn run(
+            &self,
+            task: &Task,
+            _workspace_root: &Path,
+            _controls: WorkerControls,
+        ) -> WorkerOutcome {
             if let Ok(permit) = self.gate.acquire().await {
                 permit.forget(); // one permit releases exactly one worker
             }
@@ -1103,5 +1230,159 @@ mod tests {
             .map(|(id, _)| id.as_str())
             .collect();
         assert_eq!(failed, vec!["t1", "t2"], "both failures recorded, sorted");
+    }
+
+    // ---- per-task control: pause / resume / stop ----------------------
+
+    /// A worker that observes its pause line: parks until the fleet flips
+    /// it `true` (announcing the sighting on `saw_pause`), then until it
+    /// flips back `false`, recording each value it saw — proof the
+    /// pause/resume verbs reach the worker through the [`FleetWorker`]
+    /// port.
+    struct PauseProbeWorker {
+        observed: Arc<StdMutex<Vec<bool>>>,
+        /// Fired after the worker observes `true` — the test resumes only
+        /// then, so the pause edge can never be overwritten unseen (a
+        /// `join!` may poll the control arm before re-polling the worker).
+        saw_pause: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl FleetWorker for PauseProbeWorker {
+        async fn run(
+            &self,
+            task: &Task,
+            _workspace_root: &Path,
+            mut controls: WorkerControls,
+        ) -> WorkerOutcome {
+            // `wait_for` errors only if the fleet dropped the sender — then
+            // nothing is recorded and the assertions below fail loudly.
+            if let Ok(v) = controls.pause.wait_for(|paused| *paused).await {
+                self.observed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(*v);
+                self.saw_pause.notify_one();
+            }
+            if let Ok(v) = controls.pause.wait_for(|paused| !*paused).await {
+                self.observed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(*v);
+            }
+            WorkerOutcome {
+                cost_usd: 0.0,
+                commits: Vec::new(),
+                summary: format!("did {}", task.id),
+                success: true,
+            }
+        }
+    }
+
+    /// A worker that runs until its stop line fires — proof `stop_task`
+    /// cancels through the port, and that the line is consumed (a second
+    /// stop on the same attempt is a stale no-op).
+    struct StopProbeWorker;
+    #[async_trait]
+    impl FleetWorker for StopProbeWorker {
+        async fn run(
+            &self,
+            _task: &Task,
+            _workspace_root: &Path,
+            controls: WorkerControls,
+        ) -> WorkerOutcome {
+            let stopped = controls.stop.await.is_ok();
+            WorkerOutcome {
+                cost_usd: 0.0,
+                commits: Vec::new(),
+                summary: if stopped { "stopped" } else { "never stopped" }.to_string(),
+                // A stopped task must not read as success — it would unblock
+                // dependents against work that never landed.
+                success: !stopped,
+            }
+        }
+    }
+
+    fn control_fleet<W: FleetWorker>(worker: W) -> Fleet<W, OkGit, SeqClock> {
+        Fleet::new(
+            worker,
+            WorktreeManager::new(OkGit::new(), "/repo"),
+            Ledger::open_in_memory().unwrap(),
+            BudgetGuard::new(BudgetMode::Observed, None, None),
+            SeqClock::new(),
+            FleetConfig::new("run1", "HEAD"),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_reach_the_worker_through_the_port() {
+        let worker = PauseProbeWorker {
+            observed: Arc::new(StdMutex::new(Vec::new())),
+            saw_pause: Arc::new(tokio::sync::Notify::new()),
+        };
+        let observed = worker.observed.clone();
+        let saw_pause = worker.saw_pause.clone();
+        let f = control_fleet(worker);
+        let task = Task::new("t1", "t1", "p").shared_tree();
+        let id = "t1".to_string();
+
+        // The first `join!` poll drives the dispatch far enough to register
+        // the task's controls and park the worker on its pause watch, so
+        // `pause_task` addresses a live worker; resuming waits for the
+        // worker's own "saw the pause" signal so the `true` edge can never
+        // be overwritten before it was observed.
+        let (handle, ()) = tokio::join!(f.dispatch(&task), async {
+            assert!(f.pause_task(&id), "a live worker accepts pause");
+            saw_pause.notified().await;
+            assert!(f.resume_task(&id), "a live worker accepts resume");
+        });
+        assert!(handle.unwrap().outcome.success);
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[true, false],
+            "the worker observed the pause, then the resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_fires_once_and_a_second_stop_is_a_stale_no_op() {
+        let f = control_fleet(StopProbeWorker);
+        let task = Task::new("t1", "t1", "p").shared_tree();
+        let id = "t1".to_string();
+
+        // The worker parks on its stop line before the verbs run (the
+        // current-thread join polls the dispatch first); both stops land
+        // while it is still parked, so the second exercises the consumed
+        // line — not a deregistered one.
+        let (handle, ()) = tokio::join!(f.dispatch(&task), async {
+            assert!(f.stop_task(&id), "a live worker accepts the stop");
+            assert!(!f.stop_task(&id), "the stop line is consumed");
+        });
+        let handle = handle.unwrap();
+        assert_eq!(handle.outcome.summary, "stopped");
+        assert!(
+            !handle.outcome.success,
+            "a stopped attempt is not a success"
+        );
+    }
+
+    #[test]
+    fn control_verbs_on_an_unknown_task_are_stale_no_ops() {
+        let f = control_fleet(FakeWorker::new(0.0));
+        let ghost = "ghost".to_string();
+        assert!(!f.pause_task(&ghost));
+        assert!(!f.resume_task(&ghost));
+        assert!(!f.stop_task(&ghost));
+    }
+
+    #[tokio::test]
+    async fn control_handles_are_removed_after_the_worker_settles() {
+        let f = control_fleet(FakeWorker::new(0.0));
+        let task = Task::new("t1", "t1", "p").shared_tree();
+        f.dispatch(&task).await.unwrap();
+        let id = "t1".to_string();
+        assert!(!f.pause_task(&id), "a settled task has no live pause line");
+        assert!(!f.resume_task(&id));
+        assert!(!f.stop_task(&id), "a settled task has no live stop line");
     }
 }

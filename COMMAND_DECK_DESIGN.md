@@ -241,10 +241,18 @@ resuming is replaying it.
   task board (`task_*` tools) folds as `AgentEvent::TaskUpdate` snapshots
   into a session-view checklist card, and a `gh`-backed monitor feeds the
   footer's PR cell (`⇢ #183 open ✓`).
-- Still seam-fed: `AgentControl` beyond `Stop` (Pause/Resume/Restart) and
-  per-worker abort. `Stop` maps to `UserInput::Cancel` on the lead only; deep
-  per-agent pause/kill needs a new `stella-fleet` abort API (noted as the
-  follow-up integration), as does fleet-worktree isolation for workers.
+- Live now: **per-worker Pause/Resume/Stop/Restart — at both layers.** Deck
+  sub-session lanes route `AgentControl` through `service_worker_control`
+  (pause parks at the engine's `TurnGate` step boundary, stop is the clean
+  drop-at-await cancel, restart respawns from the lane's retained spec).
+  Fleet tasks carry the same verbs on the dispatch seam itself:
+  `stella_fleet::WorkerControls` ride the `FleetWorker` port, driven by
+  `Fleet::pause_task` / `resume_task` / `stop_task` (restart = re-dispatch;
+  the fleet keeps no respawn state).
+- Still seam-fed: the deck's in-UI hookup to *fleet* tasks (a `stella fleet`
+  run's workers are not deck lanes yet), lead-lane Pause/Resume
+  (boundary-gating the staged pipeline needs a `PipelinePorts` gate), and
+  fleet-worktree isolation for deck workers.
 
 ## ISSUES tab
 
