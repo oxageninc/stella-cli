@@ -110,14 +110,18 @@ impl StorageManifest {
     }
 
     /// The layer whose `paths` globs claim `rel_path` (first match in key
-    /// order), or the implicit SQL layer.
+    /// order), if any. A claim overrides every adapter's own layer hint.
+    pub fn layer_claim(&self, rel_path: &str) -> Option<String> {
+        self.layers
+            .iter()
+            .find(|(_, layer)| layer.paths.iter().any(|p| glob_match(p, rel_path)))
+            .map(|(key, _)| key.clone())
+    }
+
+    /// [`Self::layer_claim`], falling back to the implicit SQL layer.
     pub fn layer_for(&self, rel_path: &str) -> String {
-        for (key, layer) in &self.layers {
-            if layer.paths.iter().any(|p| glob_match(p, rel_path)) {
-                return key.clone();
-            }
-        }
-        DEFAULT_SQL_LAYER.to_string()
+        self.layer_claim(rel_path)
+            .unwrap_or_else(|| DEFAULT_SQL_LAYER.to_string())
     }
 
     fn meaning_for<'a>(
@@ -263,13 +267,19 @@ pub fn merge_snapshot(
     }
 
     // Every layer referenced by a relation exists in the layer list, so the
-    // implicit `sql` fallback renders alongside declared layers.
+    // implicit fallbacks (`sql`, `mongo`, `dynamodb`) render alongside
+    // declared layers with a sensible engine/class.
     for rel in &relations {
         if !layers.iter().any(|l| l.key == rel.layer) {
+            let (engine, class) = match rel.layer.as_str() {
+                crate::storage::DEFAULT_MONGO_LAYER => ("mongodb", "document"),
+                crate::storage::DEFAULT_DYNAMO_LAYER => ("dynamodb", "key-value"),
+                _ => ("sql", "relational"),
+            };
             layers.push(LayerEntry {
                 key: rel.layer.clone(),
-                engine: "sql".into(),
-                class: "relational".into(),
+                engine: engine.into(),
+                class: class.into(),
                 durability: "durable-truth".into(),
                 boundary: None,
             });

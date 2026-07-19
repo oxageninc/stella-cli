@@ -1,20 +1,34 @@
 # Design: The Storage Map — Vendor-Agnostic Storage Layer Indexing for Zero Drift
 
-**Status:** Phases A–C implemented, D partial · **Date:** 2026-07-19
-**Implemented in this pass:** the canonical model, addresses, and deep SQL
-extraction (`stella-graph/src/storage.rs`: types, constraints, defaults,
-PK/FK, `ALTER TABLE … ADD COLUMN`, `COMMENT ON` harvesting); the
+**Status:** Phases A–C implemented, D partial, E adapters implemented ·
+**Date:** 2026-07-19
+**Implemented:** the canonical model, addresses, and deep SQL extraction
+(`stella-graph/src/storage/` — types, constraints, defaults, PK/FK,
+`ALTER TABLE … ADD COLUMN`, `COMMENT ON` harvesting); the
 `stella.storage.toml` manifest with layers/boundaries/redirects/stubs and
 textual append (`stella-graph/src/manifest.rs`); `code_graph_storage_objects`
 persistence and snapshot assembly (`store.rs`, `load_storage_snapshot`);
 gate v2 rings 1–3 with the `storage_intent` declared-justification path
 (`stella-tools/src/schema_gate.rs`, wired in `registry.rs`); embed cards
-(§7a); and the `stella storage tree|show|grep|drift` CLI. **Not yet built:**
-non-SQL adapters (§4a table), context.db embedding of the cards +
+(§7a); the `stella storage tree|show|grep|drift` CLI; and the **schema-as-
+code adapters** (§4a): Prisma (`storage/prisma.rs`, dedicated deterministic
+parser for the line-oriented DSL, `///` doc harvesting, Mongo-provider
+detection), Drizzle + TypeORM + Mongoose + DynamoDB (`storage/ts.rs`,
+marker-gated passes over the TS/JS trees), Django + SQLAlchemy
+(`storage/py.rs`). Relational schema-as-code shares the implicit `sql`
+layer, so an ORM model and the DDL that materializes it resolve to one
+address and ring 1 exempts cross-family same-name pairs (§4a: "DDL wins
+field by field; the ORM definition is kept"); Mongoose and DynamoDB default
+to their own `mongo`/`dynamodb` layers, so the cross-layer conflict fires.
+The gate simulates edit_file's post-edit content, so a model gaining a
+field is checked as a column addition (rings 1–2) with no ALTER anywhere.
+**Not yet built:** ActiveRecord + `$jsonSchema` adapters and the Diesel
+field upgrade (§4a table), context.db embedding of the cards +
 `NodeKind::Storage` recall integration (§7b–c), the LLM inference fold
 (§5c), `stella storage init` discovery (§4c), and the Observatory panel.
 Ring 3 runs on name-token similarity today; embed-card cosine slots in once
-the cards are embedded.
+the cards are embedded. ORM `REFERENCES` targets are naming-derived, so
+orphaned-FK blocking stays SQL-only (a heuristic may warn, never block).
 **Goal:** On very long-horizon tasks in complex projects, the agent (a) always
 knows every storage layer the project uses, what belongs in each, and the full
 schema down to individual fields — retrievable by name *and* by meaning — and
@@ -229,18 +243,24 @@ human manifest edit wins on meaning.
    query pass over languages the graph already parses, plus dedicated grammars
    for schema DSLs:
 
-   | Adapter | Detects | Notes |
+   | Adapter | Detects | Status / notes |
    |---|---|---|
-   | `prisma` | `model` / `enum` blocks, `datasource` (→ layer engine) | own grammar; `.prisma` files |
-   | `drizzle` | `pgTable(...)`, `sqliteTable(...)` calls | TS, already parsed |
-   | `diesel` | `table! { ... }` | shipped detector, upgraded to emit fields |
-   | `django` | `class X(models.Model)` + field attrs | Python, already parsed |
-   | `sqlalchemy` | `__tablename__`, `mapped_column`/`Column(...)` | Python |
+   | `prisma` | `model` / `enum` / `view` blocks, `datasource` (→ layer engine) | **shipped** — dedicated deterministic parser (the DSL is formatter-normalized line-oriented; a grammar crate can slot in later); `@map`/`@@map`/`@@schema`, `@relation` FKs, `///` doc harvesting |
+   | `drizzle` | `pgTable(...)`, `sqliteTable(...)`, `mysqlTable(...)`, `pgSchema(...).table(...)`, `pgEnum` | **shipped** — TS, already parsed; builder-chain decode |
+   | `diesel` | `table! { ... }` | shipped name detector; field emission still pending |
+   | `django` | `class X(models.Model)` + field attrs | **shipped** — `<app>_<model>` naming from the path, `Meta.db_table`, abstract models skipped |
+   | `sqlalchemy` | `__tablename__`, `mapped_column`/`Column(...)`, core `Table(...)` | **shipped** — 2.0 `Mapped[Optional[…]]` nullability derived |
    | `activerecord` | `create_table` in `db/schema.rb`, migrations | needs Ruby grammar (later phase) |
-   | `typeorm` | `@Entity()`/`@Column()` decorators | TS |
-   | `mongoose` | `new Schema({...})` + `model("X", ...)` | document fields incl. nested paths |
-   | `mongo-jsonschema` | `$jsonSchema` validators in setup code | best-effort |
-   | `dynamodb` | `CreateTable` params / CDK `Table` constructs | attributes + GSIs |
+   | `typeorm` | `@Entity()`/`@Column()` decorators | **shipped** — `@ManyToOne`/`@OneToOne`+`@JoinColumn` FKs |
+   | `mongoose` | `new Schema({...})` + `model("X", ...)` | **shipped** — document fields incl. nested dotted paths; implicit `mongo` layer |
+   | `mongo-jsonschema` | `$jsonSchema` validators in setup code | best-effort (pending) |
+   | `dynamodb` | `CreateTable` params / CDK `Table` constructs | **shipped** — attributes + key schema + GSIs; implicit `dynamodb` layer |
+
+   TS/JS and Python files are extraction *candidates* whose adapters are
+   marker-gated (`pgTable(`, `@Entity`, `mongoose`, `partitionKey`,
+   `models.Model`, `__tablename__`, …): a source file with no schema
+   markers costs one substring scan per index or gated write, never a
+   parse.
 
    Adapters emit the same canonical structs. Unknown ecosystems contribute
    nothing rather than garbage — false negatives are repaired by the manifest.

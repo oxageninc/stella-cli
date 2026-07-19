@@ -84,7 +84,9 @@ pub(crate) fn walk_indexable(root: &Path) -> Vec<PathBuf> {
                 }
             } else if file_type.is_file() {
                 let path = entry.path();
-                if Language::from_path(&path).is_some() {
+                if Language::from_path(&path).is_some()
+                    || crate::storage::indexes_without_language(&path)
+                {
                     out.push(path);
                 }
             }

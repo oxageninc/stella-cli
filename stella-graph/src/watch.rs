@@ -50,7 +50,8 @@ type BatchTick = (u64, IndexStats);
 /// recognize, not inside an ignored directory. The single relevance filter
 /// shared by the real `notify` callback and [`WatchInjector::inject`].
 fn is_watch_relevant(root: &Path, path: &Path) -> bool {
-    Language::from_path(path).is_some() && !walk::rel_is_ignored(root, path)
+    (Language::from_path(path).is_some() || crate::storage::indexes_without_language(path))
+        && !walk::rel_is_ignored(root, path)
 }
 
 /// Spawn the consumption side of live indexing: an unbounded path channel

@@ -181,7 +181,7 @@ pub(crate) fn apply_changes(
     let manifest = StorageManifest::load(root).ok().flatten();
     let tx = conn.transaction()?;
     for abs in changed {
-        if Language::from_path(abs).is_none() {
+        if Language::from_path(abs).is_none() && !storage::indexes_without_language(abs) {
             continue;
         }
         if abs.is_file() {
@@ -235,6 +235,19 @@ fn index_one(
         }
     };
     let Some(lang) = Language::from_path(abs) else {
+        // Storage-DSL files no grammar claims (`.prisma`): no symbols or
+        // imports, but the storage adapter still indexes them (spec §4a).
+        if storage::indexes_without_language(abs) {
+            let file_id = upsert_file(tx, &rel, "prisma", &sha, mtime_ns(abs))?;
+            tx.execute(
+                "DELETE FROM code_graph_storage_objects WHERE file_id = ?1",
+                params![file_id],
+            )?;
+            let extract = storage::extract_for_path(grammars, &rel, text);
+            let claim = manifest.and_then(|m| m.layer_claim(&rel));
+            insert_storage_extract(tx, file_id, claim.as_deref(), &extract)?;
+            stats.files_parsed += 1;
+        }
         return Ok(());
     };
     let parsed = match parse_file(grammars, lang, text) {
@@ -280,19 +293,19 @@ fn index_one(
     stats.symbols += parsed.symbols.len();
     stats.imports += edges.len();
 
-    // Storage adapter (deep pass, spec §6): the same transaction that
-    // replaced this file's symbols replaces its storage rows. SQL only
-    // today; further adapters slot in per-language here.
+    // Storage adapters (deep pass, spec §6): the same transaction that
+    // replaced this file's symbols replaces its storage rows. Extraction is
+    // dispatched by path — SQL DDL, Prisma, TS/JS ORMs, Python ORMs — and
+    // marker-gated inside each adapter, so a schema-free source file costs
+    // a substring scan.
     tx.execute(
         "DELETE FROM code_graph_storage_objects WHERE file_id = ?1",
         params![file_id],
     )?;
-    if lang == Language::Sql {
-        let extract = storage::extract_sql(grammars, text);
-        let layer = manifest
-            .map(|m| m.layer_for(&rel))
-            .unwrap_or_else(|| storage::DEFAULT_SQL_LAYER.to_string());
-        insert_storage_extract(tx, file_id, &layer, &extract)?;
+    let extract = storage::extract_for_path(grammars, &rel, text);
+    if !extract.is_empty() {
+        let claim = manifest.and_then(|m| m.layer_claim(&rel));
+        insert_storage_extract(tx, file_id, claim.as_deref(), &extract)?;
     }
     Ok(())
 }
@@ -300,13 +313,19 @@ fn index_one(
 /// Persist one file's extracted storage entities: relation rows with their
 /// field children, plus parentless field rows for `ALTER TABLE … ADD COLUMN`
 /// (attached to their relation by address at snapshot-assembly time).
+/// `claim` is the manifest layer whose `paths` glob claims this file — it
+/// wins over every relation's own `layer_hint`; with neither, relations
+/// land in the implicit relational layer (spec §4a).
 fn insert_storage_extract(
     tx: &Transaction,
     file_id: i64,
-    layer: &str,
+    claim: Option<&str>,
     extract: &storage::StorageExtract,
 ) -> Result<(), GraphError> {
     for rel in &extract.relations {
+        let layer = claim
+            .or(rel.layer_hint.as_deref())
+            .unwrap_or(storage::DEFAULT_SQL_LAYER);
         let address = storage::relation_address(layer, &rel.namespace, &rel.name);
         let rel_id: i64 = tx.query_row(
             "INSERT INTO code_graph_storage_objects(\
@@ -335,6 +354,9 @@ fn insert_storage_extract(
         }
     }
     for addition in &extract.additions {
+        // Additions only come from SQL ALTER statements today, so the
+        // relational fallback applies when no manifest layer claims the file.
+        let layer = claim.unwrap_or(storage::DEFAULT_SQL_LAYER);
         let address = storage::relation_address(layer, &addition.namespace, &addition.relation);
         let rel = storage::RelationDef {
             name: addition.relation.clone(),
@@ -343,6 +365,7 @@ fn insert_storage_extract(
             fields: Vec::new(),
             enum_values: Vec::new(),
             comment: None,
+            layer_hint: None,
             start_line: addition.field.line,
             end_line: addition.field.line,
         };
@@ -889,6 +912,69 @@ mod tests {
         let rows = storage_rows(&conn).unwrap();
         assert_eq!(rows[0].fields.len(), 3);
         assert!(!rows[0].fields.iter().any(|f| f.name == "refunded_at"));
+    }
+
+    #[test]
+    fn schema_as_code_files_index_through_their_adapters() {
+        let ws = tempdir().unwrap();
+        let dbdir = tempdir().unwrap();
+        let root = canon(&ws);
+        let db = dbdir.path().join("context.db");
+        // A grammar-less Prisma DSL file: reached by the walker, indexed by
+        // the prisma adapter, no symbols expected.
+        fs::write(
+            root.join("schema.prisma"),
+            "model Payment {\n  id Int @id\n  amount Decimal\n  @@map(\"payments\")\n}\n",
+        )
+        .unwrap();
+        // A Drizzle table in TS: relational, so it shares the implicit sql
+        // layer with DDL.
+        fs::write(
+            root.join("schema.ts"),
+            "export const users = pgTable(\"users\", {\n\
+                 id: serial(\"id\").primaryKey(),\n\
+             });\n",
+        )
+        .unwrap();
+        // A Mongoose collection in JS: its own storage technology, so it
+        // lands in the implicit mongo layer.
+        fs::write(
+            root.join("session.js"),
+            "const mongoose = require('mongoose');\n\
+             const s = new mongoose.Schema({ token: String });\n\
+             mongoose.model('Session', s);\n",
+        )
+        .unwrap();
+        let grammars = Grammars::load().unwrap();
+        let mut conn = open(&db).unwrap();
+        index_tree(&mut conn, &root, &grammars).unwrap();
+
+        let rows = storage_rows(&conn).unwrap();
+        let payments = rows.iter().find(|r| r.name == "payments").unwrap();
+        assert_eq!(payments.address, "sql/default/payments");
+        assert_eq!(payments.fields.len(), 2);
+        assert!(
+            payments
+                .source
+                .as_deref()
+                .unwrap()
+                .starts_with("schema.prisma:"),
+            "{:?}",
+            payments.source
+        );
+
+        let users = rows.iter().find(|r| r.name == "users").unwrap();
+        assert_eq!(users.layer, "sql", "drizzle shares the relational layer");
+
+        let sessions = rows.iter().find(|r| r.name == "sessions").unwrap();
+        assert_eq!(sessions.layer, "mongo");
+        assert_eq!(sessions.kind, "collection");
+
+        // Removing the prisma file prunes its relation like any source file.
+        fs::remove_file(root.join("schema.prisma")).unwrap();
+        index_tree(&mut conn, &root, &grammars).unwrap();
+        let rows = storage_rows(&conn).unwrap();
+        assert!(!rows.iter().any(|r| r.name == "payments"), "{rows:?}");
     }
 
     #[test]

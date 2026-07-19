@@ -466,25 +466,56 @@ impl ToolRegistry {
             && crate::schema_gate::is_schema_file(path)
             && let Some(extractor) = crate::schema_gate::extractor()
         {
-            // write_file carries the full file in `content`; edit_file
-            // introduces new schema only through `new_string`.
-            let proposed_src = match name {
-                "write_file" => input.get("content").and_then(|v| v.as_str()),
-                _ => input.get("new_string").and_then(|v| v.as_str()),
+            // write_file carries the full file in `content`. For edit_file
+            // the post-edit file is simulated (current content with the
+            // replacement applied) so whole-file adapters see the resulting
+            // definitions — a Prisma model gaining a field is invisible in
+            // `new_string` alone. Falls back to the fragment when the edit
+            // cannot be simulated (the tool itself will then error anyway).
+            let current = crate::resolve_within_root(&self.root, path)
+                .and_then(|p| std::fs::read_to_string(p).ok());
+            let proposed_src: Option<String> = match name {
+                "write_file" => input
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                _ => {
+                    let new_string = input.get("new_string").and_then(|v| v.as_str());
+                    let old_string = input.get("old_string").and_then(|v| v.as_str());
+                    match (new_string, old_string, &current) {
+                        (Some(new), Some(old), Some(cur))
+                            if !old.is_empty() && cur.contains(old) =>
+                        {
+                            let replace_all = input
+                                .get("replace_all")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            Some(if replace_all {
+                                cur.replace(old, new)
+                            } else {
+                                cur.replacen(old, new, 1)
+                            })
+                        }
+                        (Some(new), _, _) => Some(new.to_string()),
+                        _ => None,
+                    }
+                }
             };
             let proposed = proposed_src
-                .map(|src| extractor.extract_sql(src))
+                .as_deref()
+                .map(|src| extractor.extract(path, src))
                 .unwrap_or_default();
             if !proposed.is_empty() {
-                let own = crate::resolve_within_root(&self.root, path)
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .map(|current| extractor.extract_sql(&current))
+                let own = current
+                    .as_deref()
+                    .map(|content| extractor.extract(path, content))
                     .unwrap_or_default();
                 let snapshot = self.storage_snapshot();
-                let layer = crate::schema_gate::layer_for(&self.root, path);
+                let manifest_layer = crate::schema_gate::manifest_layer_for(&self.root, path);
                 let intent = input.get("storage_intent").and_then(|v| v.as_str());
                 match crate::schema_gate::check(&crate::schema_gate::GateRequest {
-                    layer: &layer,
+                    path,
+                    manifest_layer: manifest_layer.as_deref(),
                     proposed: &proposed,
                     own: &own,
                     snapshot: &snapshot,
