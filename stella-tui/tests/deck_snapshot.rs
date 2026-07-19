@@ -119,7 +119,10 @@ fn help_overlay_shows_only_the_active_tabs_shortcuts() {
     };
 
     let traces = render_help(DeckTab::Traces);
-    assert!(traces.contains("TRACES tab"), "titled for the tab:\n{traces}");
+    assert!(
+        traces.contains("TRACES tab"),
+        "titled for the tab:\n{traces}"
+    );
     assert!(traces.contains("cycle the per-agent filter"), "{traces}");
     // Deck-wide keys are always present…
     assert!(traces.contains("switch tabs"), "{traces}");
