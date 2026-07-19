@@ -192,7 +192,6 @@ pub struct SyncOutcome {
     /// summary's "N already present" rather than named individually.
     /// Deliberately excludes `NotLoadable` skips, which are named
     /// individually in `unloadable` instead (see its doc).
-    #[allow(dead_code)]
     pub skipped: usize,
     /// One human-readable line per entry skipped as `NotLoadable` (a
     /// namespace directory with no nested definition file — see issue

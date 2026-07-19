@@ -61,7 +61,7 @@ plane.
 | **BYOK, model-agnostic** | Nine hosted providers (Anthropic, OpenAI, Gemini, xAI, DeepSeek, Z.ai, OpenRouter, Vertex, Bedrock) plus **any** OpenAI-compatible local server (Ollama, vLLM, LM Studio, llama.cpp). No account, no gateway. Pin per run with `--model provider/id`. |
 | **No phone-home** | The only network traffic Stella emits goes to the provider *you* chose. Executions, the full event stream, per-call token/cost telemetry, and a `[C·R·U·D] path` files-touched ledger land in a local `.stella/store.db` you can open with any SQLite client — and the store is never a dependency of a turn. |
 | **Budget you can trust** | `--budget <usd>` aborts cleanly **between** steps, never mid-tool, so a cap can't corrupt a half-written edit. |
-| **Bounded blast radius** | File tools are workspace-root-pinned; an opt-in `bash` sandbox (Seatbelt / bubblewrap) contains prompt-injection damage and **fails closed**; a cloned repo's own hooks never auto-execute (`STELLA_PROJECT_HOOKS=1` to opt in). |
+| **Bounded blast radius** | File tools are workspace-root-pinned; the `bash` tool is **off by default** (settings `tools.bash: "on"` to opt in — the default surface is enumerable argv, no shell); an opt-in `bash` sandbox (Seatbelt / bubblewrap) contains prompt-injection damage and **fails closed**; a cloned repo's own hooks never auto-execute (`STELLA_PROJECT_HOOKS=1` to opt in). |
 
 ## Also in the box
 

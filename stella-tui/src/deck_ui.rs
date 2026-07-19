@@ -1099,6 +1099,25 @@ pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut De
         }
         return;
     }
+    // A deregister removes a dashboard row, shifting every index after it:
+    // fold it, then repair the focus so the focused AGENT stays focused when
+    // an earlier row vanishes. When the focused row itself is removed, its
+    // successor inherits focus (clamped into range below) and the transcript
+    // selection drops — it indexed the removed agent's transcript.
+    if let Inbound::Deregister { agent } = inbound {
+        let removed = model.index_of(agent);
+        model.apply_inbound(inbound);
+        match removed {
+            Some(idx) if idx < ui.focused => ui.focused -= 1,
+            Some(idx) if idx == ui.focused && ui.session_selected.take().is_some() => {
+                ui.session_pending_scroll = None;
+                ui.session_scroll.follow = true;
+            }
+            _ => {}
+        }
+        clamp(model, ui);
+        return;
+    }
     model.apply_inbound(inbound);
     clamp(model, ui);
 }
@@ -4000,6 +4019,62 @@ mod tests {
             "selection cleared on focus change"
         );
         assert!(ui.session_scroll.follow, "…and tail-follow re-arms");
+    }
+
+    #[test]
+    fn deregister_keeps_focus_in_bounds_and_on_the_same_agent() {
+        let mut model = model_with(&["lead", "req:1", "req:2"]);
+        let mut ui = ready_ui();
+        ui.focused = 2; // req:2
+
+        // An EARLIER row vanishing shifts indexes down: the focused AGENT
+        // stays focused at its new index.
+        ingest_inbound(
+            &Inbound::Deregister {
+                agent: "req:1".into(),
+            },
+            &mut model,
+            &mut ui,
+        );
+        assert_eq!(ui.focused, 1);
+        assert_eq!(model.agents[ui.focused].meta.id, "req:2");
+
+        // The focused LAST row vanishing clamps focus back into range.
+        ingest_inbound(
+            &Inbound::Deregister {
+                agent: "req:2".into(),
+            },
+            &mut model,
+            &mut ui,
+        );
+        assert_eq!(ui.focused, 0, "focus stays in bounds");
+        assert_eq!(model.agents[ui.focused].meta.id, "lead");
+    }
+
+    #[test]
+    fn deregister_of_the_focused_row_drops_the_stale_selection() {
+        let mut model = model_with(&["lead", "req:1", "req:2"]);
+        with_tool_exchange(&mut model, "req:1");
+        with_tool_exchange(&mut model, "req:2");
+        let mut ui = ready_ui();
+        ui.focused = 1; // req:1
+        ui.session_selected = Some(1); // a row of req:1's transcript
+
+        ingest_inbound(
+            &Inbound::Deregister {
+                agent: "req:1".into(),
+            },
+            &mut model,
+            &mut ui,
+        );
+        // The successor (req:2) slides into the focused index…
+        assert_eq!(ui.focused, 1);
+        assert_eq!(model.agents[1].meta.id, "req:2");
+        // …but the selection indexed the REMOVED agent's transcript, so it
+        // must not re-attach to the successor's (which is long enough that
+        // range-clamping alone would have kept it).
+        assert_eq!(ui.session_selected, None);
+        assert!(ui.session_scroll.follow, "tail-follow re-arms");
     }
 
     fn ready_ui() -> DeckUi {

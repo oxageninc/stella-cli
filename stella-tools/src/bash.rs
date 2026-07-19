@@ -1,6 +1,14 @@
 //! `bash` — run a shell command in the workspace root with a timeout.
 //! Process-group based kill so children don't outlive the timeout.
 //!
+//! **Opt-in, never ambient.** This tool is registered only when the host
+//! enabled it ([`crate::registry::RegistryOptions::bash`], set from the
+//! settings key `tools.bash: "on"`); the default tool surface has no
+//! shell at all. Prefer the structured executors — `run_tests`,
+//! `build_project`, `run_lint`, `format_code`, `run_script`, the process
+//! group, and the `repo_*` tools — which spawn enumerable argv and never
+//! interpret a shell string.
+//!
 //! Opt-in OS sandbox: `STELLA_BASH_SANDBOX=workspace-write|restricted` wraps
 //! the spawn in `sandbox-exec` (macOS, Seatbelt) or `bwrap` (Linux) — file
 //! writes confined to the workspace root + tmp dirs, `restricted` also

@@ -80,8 +80,37 @@ pub fn journal_record(inbound: &Inbound) -> Option<JournalRecord> {
             agent: agent.clone(),
         }),
         Inbound::Pipeline(on) => Some(JournalRecord::Pipeline { on: *on }),
+        // Deregister is visual lifecycle only — a row removal during THIS
+        // process's dashboard handover (session switch), never part of any
+        // session's history. Journaling it would erase the departing
+        // session's worker rows from its OWN future replay.
+        Inbound::Deregister { .. } => None,
         _ => None,
     }
+}
+
+/// Every non-lead lane a journal names, deduplicated in first-appearance
+/// order — the dashboard rows replaying `records` creates (the fold
+/// auto-registers a lane on any envelope naming it, not just `Register`).
+/// The driver remembers these across an adoption so that navigating to
+/// another session can [`Inbound::Deregister`] them — rows of the session
+/// left behind must not linger on the next session's dashboard.
+pub fn journal_lanes(records: &[JournalRecord], lead: &str) -> Vec<String> {
+    let mut lanes: Vec<String> = Vec::new();
+    for record in records {
+        let agent = match record {
+            JournalRecord::Register { agent, .. }
+            | JournalRecord::Event { agent, .. }
+            | JournalRecord::Status { agent, .. }
+            | JournalRecord::PromptStarted { agent, .. }
+            | JournalRecord::SessionReset { agent } => agent,
+            JournalRecord::Pipeline { .. } => continue,
+        };
+        if agent != lead && !lanes.iter().any(|l| l == agent) {
+            lanes.push(agent.clone());
+        }
+    }
+    lanes
 }
 
 /// The lane (agent id) an envelope belongs to, when it has one.
@@ -576,6 +605,54 @@ mod tests {
             })
             .is_none()
         );
+        // Deregister is visual lifecycle only (a session-switch row removal)
+        // — journaling it would erase the departing session's worker rows
+        // from its own future replay.
+        assert!(
+            journal_record(&Inbound::Deregister {
+                agent: "req:1".into(),
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn journal_lanes_names_every_non_lead_lane_once_in_order() {
+        let records = vec![
+            JournalRecord::Register {
+                agent: "lead".into(),
+                title: "t".into(),
+                role: "lead".into(),
+                model: None,
+            },
+            // A lane can first appear on ANY record kind — the fold
+            // auto-registers it either way.
+            JournalRecord::Status {
+                agent: "req:2".into(),
+                status: "running".into(),
+            },
+            JournalRecord::Register {
+                agent: "req:1".into(),
+                title: "worker".into(),
+                role: "sub".into(),
+                model: None,
+            },
+            JournalRecord::Event {
+                agent: "req:1".into(),
+                event: AgentEvent::Text { delta: "x".into() },
+            },
+            JournalRecord::Pipeline { on: true },
+            JournalRecord::PromptStarted {
+                agent: "lead".into(),
+                text: "p".into(),
+            },
+        ];
+        assert_eq!(
+            journal_lanes(&records, "lead"),
+            vec!["req:2".to_string(), "req:1".to_string()],
+            "non-lead lanes, deduplicated, first-appearance order"
+        );
+        assert!(journal_lanes(&[], "lead").is_empty());
     }
 
     #[test]

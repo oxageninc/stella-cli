@@ -40,14 +40,69 @@ fn first_error_line(stderr: &str) -> String {
         .to_string()
 }
 
-pub struct Grep;
+/// The code-map footer for these `path:line:text` matches (see
+/// [`crate::code_map`]), or `None` for a footer-less instance. A directory
+/// search prints an absolute path before the first `:`; a single-file
+/// search omits the filename entirely (rg and grep both do), so there the
+/// search target itself is the mapped file. Non-path prefixes (a bare line
+/// number, a match containing `:`) simply miss in the graph — best-effort
+/// by construction.
+fn code_map_for(
+    tip: Option<&crate::code_map::TipOnce>,
+    search_dir: &std::path::Path,
+    root: &std::path::Path,
+    lines: &[&str],
+) -> Option<String> {
+    let tip = tip?;
+    if search_dir.is_file() {
+        let target = search_dir.to_string_lossy();
+        return crate::code_map::for_files(root, [target.as_ref()], tip);
+    }
+    crate::code_map::for_files(
+        root,
+        lines
+            .iter()
+            .filter_map(|l| l.split(':').next())
+            .filter(|p| std::path::Path::new(p).is_absolute()),
+        tip,
+    )
+}
+
+pub struct Grep {
+    /// Code-map footer state; `None` disables the footer entirely (the
+    /// embedded sweeps in `gather_context`, whose packs run their own graph
+    /// queries — a per-section footer there is duplication, not context).
+    code_map: Option<crate::code_map::TipOnce>,
+}
+
+impl Grep {
+    /// The model-facing tool: footer on, `graph_query` tip latch shared
+    /// with `glob` (the registry passes both clones of one [`TipOnce`]).
+    pub fn with_code_map(tip: crate::code_map::TipOnce) -> Self {
+        Self {
+            code_map: Some(tip),
+        }
+    }
+
+    /// Footer-less instance for embedded use.
+    pub fn bare() -> Self {
+        Self { code_map: None }
+    }
+}
+
+impl Default for Grep {
+    /// Footer on with a private latch — the standalone shape tests use.
+    fn default() -> Self {
+        Self::with_code_map(crate::code_map::TipOnce::default())
+    }
+}
 
 #[async_trait]
 impl Tool for Grep {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "grep".into(),
-            description: "Search file contents with a regex. Returns matching file:line:text. Shells to ripgrep when available.".into(),
+            description: "Search file contents with a regex. Returns matching file:line:text. Shells to ripgrep when available. When the code-graph index exists, matches carry a code-map footer (matched files' symbols and import edges).".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -114,6 +169,10 @@ impl Tool for Grep {
                     if lines.len() == MAX_RESULTS {
                         result.push_str(&format!("\n... (showing first {MAX_RESULTS} matches)"));
                     }
+                    if let Some(map) = code_map_for(self.code_map.as_ref(), &search_dir, root, &lines)
+                    {
+                        result.push_str(&map);
+                    }
                     return ToolOutput::Ok { content: result };
                 }
                 // No results. Exit 2 with a *pattern* error (bad regex, bad
@@ -147,9 +206,13 @@ impl Tool for Grep {
                         let text = String::from_utf8_lossy(&output.stdout);
                         if !text.is_empty() {
                             let lines: Vec<&str> = text.lines().take(MAX_RESULTS).collect();
-                            return ToolOutput::Ok {
-                                content: lines.join("\n"),
-                            };
+                            let mut result = lines.join("\n");
+                            if let Some(map) =
+                                code_map_for(self.code_map.as_ref(), &search_dir, root, &lines)
+                            {
+                                result.push_str(&map);
+                            }
+                            return ToolOutput::Ok { content: result };
                         }
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         if output.status.code() == Some(2) && is_pattern_error(&stderr) {
@@ -182,7 +245,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = Grep
+        let result = Grep::default()
             .execute(&serde_json::json!({"pattern": "hello", "path": path}), &dir)
             .await;
         match result {
@@ -197,7 +260,7 @@ mod tests {
     #[tokio::test]
     async fn no_matches_returns_ok_empty() {
         let dir = std::env::temp_dir();
-        let result = Grep
+        let result = Grep::default()
             .execute(&serde_json::json!({"pattern": "zzz_not_found_xyz"}), &dir)
             .await;
         match result {
@@ -217,7 +280,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = Grep
+        let result = Grep::default()
             .execute(&serde_json::json!({"pattern": "->"}), &dir)
             .await;
         match result {
@@ -244,7 +307,7 @@ mod tests {
             .unwrap();
 
         // Unclosed character class — invalid for both rg and grep.
-        let result = Grep
+        let result = Grep::default()
             .execute(&serde_json::json!({"pattern": "[unclosed"}), &dir)
             .await;
         assert!(
@@ -252,5 +315,79 @@ mod tests {
             "a broken regex must report an error, got: {result:?}"
         );
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A workspace with one indexed source file, exactly what `stella init`
+    /// leaves behind.
+    fn indexed_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn greet() -> &'static str { \"hi\" }\n",
+        )
+        .expect("write source");
+        let db = crate::graph::graph_db_path(dir.path());
+        std::fs::create_dir_all(db.parent().expect("parent")).expect("mkdir");
+        let graph = stella_graph::CodeGraph::open(dir.path(), &db).expect("open graph");
+        graph.index_all().expect("index");
+        graph.shutdown();
+        dir
+    }
+
+    #[tokio::test]
+    async fn matches_carry_a_code_map_footer_when_an_index_exists() {
+        let dir = indexed_workspace();
+        let result = Grep::default()
+            .execute(&serde_json::json!({"pattern": "greet"}), dir.path())
+            .await;
+        match result {
+            ToolOutput::Ok { content } => {
+                assert!(content.contains("lib.rs"), "the raw match stays: {content}");
+                assert!(content.contains("code map"), "footer attached: {content}");
+                assert!(
+                    content.contains("function greet:1"),
+                    "maps the matched file's symbols: {content}"
+                );
+            }
+            ToolOutput::Error { message } => panic!("expected matches, got: {message}"),
+        }
+    }
+
+    /// rg/grep omit the filename when handed a single file, so the footer
+    /// must come from the search target itself, not the match prefix.
+    #[tokio::test]
+    async fn a_single_file_search_still_maps_the_target_file() {
+        let dir = indexed_workspace();
+        let result = Grep::default()
+            .execute(
+                &serde_json::json!({"pattern": "greet", "path": "lib.rs"}),
+                dir.path(),
+            )
+            .await;
+        match result {
+            ToolOutput::Ok { content } => {
+                assert!(
+                    content.contains("function greet:1"),
+                    "single-file searches map the target: {content}"
+                );
+            }
+            ToolOutput::Error { message } => panic!("expected matches, got: {message}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_index_means_no_code_map_footer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn greet() {}\n").expect("write");
+        let result = Grep::default()
+            .execute(&serde_json::json!({"pattern": "greet"}), dir.path())
+            .await;
+        match result {
+            ToolOutput::Ok { content } => assert!(
+                !content.contains("code map"),
+                "no index → the result is exactly the matches: {content}"
+            ),
+            ToolOutput::Error { message } => panic!("expected matches, got: {message}"),
+        }
     }
 }

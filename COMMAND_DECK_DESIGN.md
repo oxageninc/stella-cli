@@ -8,6 +8,11 @@ the model).
 This file is the **frozen contract** leaf-view builders code against. Types
 here are authoritative — do not change signatures without updating this doc.
 
+> **Palette note:** color values named in this contract (e.g. the `#FFAC26`
+> amber accent) predate the aurora-on-navy restyle (#185). For colors,
+> `stella-tui/src/theme.rs` and `docs/brand/BRAND_GUIDELINES.md` are
+> authoritative; this doc remains the contract for structure and types only.
+
 ## Module layout (`stella-tui/src/`)
 
 Existing (kept, reused by the Session tab — do not break):
@@ -228,7 +233,7 @@ resuming is replaying it.
   `StepUsage`/`Complete`, graph via `CodeGraph::neighbors`, CPU/MEM via sysinfo.
 - Live now: **staged pipeline routing** — `/pipeline` toggles the lead's turns
   between the raw `Engine::run_turn` loop and `stella-pipeline`'s staged flow
-  (triage → witness → execute → verify → judge; `docs/pipeline.md`), mirrored
+  (triage → witness → execute → verify → judge; `stella-docs/content/docs/inference-pipeline.mdx`), mirrored
   to the `PIPELINE` stat box via `Inbound::Pipeline`. Named seam inside it:
   scope review **auto-approves** in the deck (the `ScopeReview` event is
   narrated in the transcript, not gated) — a deck-native scope-review card is
@@ -241,10 +246,18 @@ resuming is replaying it.
   task board (`task_*` tools) folds as `AgentEvent::TaskUpdate` snapshots
   into a session-view checklist card, and a `gh`-backed monitor feeds the
   footer's PR cell (`⇢ #183 open ✓`).
-- Still seam-fed: `AgentControl` beyond `Stop` (Pause/Resume/Restart) and
-  per-worker abort. `Stop` maps to `UserInput::Cancel` on the lead only; deep
-  per-agent pause/kill needs a new `stella-fleet` abort API (noted as the
-  follow-up integration), as does fleet-worktree isolation for workers.
+- Live now: **per-worker Pause/Resume/Stop/Restart — at both layers.** Deck
+  sub-session lanes route `AgentControl` through `service_worker_control`
+  (pause parks at the engine's `TurnGate` step boundary, stop is the clean
+  drop-at-await cancel, restart respawns from the lane's retained spec).
+  Fleet tasks carry the same verbs on the dispatch seam itself:
+  `stella_fleet::WorkerControls` ride the `FleetWorker` port, driven by
+  `Fleet::pause_task` / `resume_task` / `stop_task` (restart = re-dispatch;
+  the fleet keeps no respawn state).
+- Still seam-fed: the deck's in-UI hookup to *fleet* tasks (a `stella fleet`
+  run's workers are not deck lanes yet), lead-lane Pause/Resume
+  (boundary-gating the staged pipeline needs a `PipelinePorts` gate), and
+  fleet-worktree isolation for deck workers.
 
 ## ISSUES tab
 

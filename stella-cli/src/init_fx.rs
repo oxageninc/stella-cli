@@ -15,8 +15,10 @@
 //!   `NO_COLOR` → no animation, no cursor control; log lines print plainly,
 //!   exactly as before.
 //!
-//! Colors come from the brand palette (gold / amber / violet) — never blue
-//! or cyan, per the deck's palette law.
+//! Colors are the init cinematic's own retained palette (gold / amber /
+//! violet), enforced by this module's tests. Note this predates the
+//! aurora-on-navy brand restyle (#185): the deck itself now uses cool
+//! cyan/azure accents, so don't cite it as the reason for these hues.
 
 use std::io::{IsTerminal, Write};
 

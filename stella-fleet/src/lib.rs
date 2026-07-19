@@ -18,8 +18,11 @@
 //! and [`fleet`] — **THE dispatch seam** ([`Fleet::dispatch`], L-E9): the one
 //! API subagent fan-out goes through, claiming a task's declared paths as
 //! cooperative file locks (`stella-store`'s `file_locks`) for the attempt's
-//! duration, stamping lineage into the ledger, and metering child spend into
-//! the parent [`stella_core::BudgetGuard`].
+//! duration, stamping lineage into the ledger, metering child spend into
+//! the parent [`stella_core::BudgetGuard`], and handing every worker its
+//! per-task control lines ([`WorkerControls`] through the [`FleetWorker`]
+//! port, driven by [`Fleet::pause_task`] / [`Fleet::resume_task`] /
+//! [`Fleet::stop_task`]; restart = re-dispatch).
 //!
 //! Design constraints (from the task and): we shell out
 //! to the `git`/`gh` binaries via `tokio::process` behind port traits rather
@@ -33,6 +36,11 @@
 //! [`Task`]: plan::Task
 //! [`Plan::ready_tasks`]: plan::Plan::ready_tasks
 //! [`Fleet::dispatch`]: fleet::Fleet::dispatch
+//! [`Fleet::pause_task`]: fleet::Fleet::pause_task
+//! [`Fleet::resume_task`]: fleet::Fleet::resume_task
+//! [`Fleet::stop_task`]: fleet::Fleet::stop_task
+//! [`WorkerControls`]: fleet::WorkerControls
+//! [`FleetWorker`]: fleet::FleetWorker
 
 pub mod fleet;
 pub mod git;
@@ -41,7 +49,8 @@ pub mod monitor;
 pub mod plan;
 
 pub use fleet::{
-    Fleet, FleetConfig, FleetError, FleetRunReport, FleetWorker, TaskHandle, WorkerOutcome,
+    Fleet, FleetConfig, FleetError, FleetRunReport, FleetWorker, TaskHandle, WorkerControls,
+    WorkerOutcome,
 };
 pub use git::{
     GitCli, GitError, GitOutput, RemoveOutcome, SystemGitCli, Worktree, WorktreeEntry,

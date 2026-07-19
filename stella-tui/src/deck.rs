@@ -285,6 +285,14 @@ impl WorkspaceModel {
     pub fn apply_inbound(&mut self, inbound: &Inbound) {
         match inbound {
             Inbound::Register(meta) => self.register(meta.clone()),
+            // The visual-lifecycle inverse of `Register`: the row disappears.
+            // An unknown id is a no-op — a stale deregister (row already
+            // gone, or never seen) must never disturb the fold.
+            Inbound::Deregister { agent } => {
+                if let Some(idx) = self.index_of(agent) {
+                    self.agents.remove(idx);
+                }
+            }
             Inbound::Event { agent, event } => self.apply_event(agent, event),
             Inbound::Status { agent, status } => {
                 // Auto-register an unknown id, exactly like `Event`:
@@ -988,6 +996,41 @@ mod tests {
             !a.model.hud.complete && a.model.hud.stage.is_none(),
             "hud/progress reset to idle"
         );
+    }
+
+    #[test]
+    fn deregister_removes_the_row_and_only_that_row() {
+        let mut w = WorkspaceModel::new();
+        w.apply_inbound(&reg("lead"));
+        w.apply_inbound(&reg("req:1"));
+        w.apply_inbound(&reg("req:2"));
+        assert_eq!(w.agents.len(), 3, "precondition: three rows");
+
+        w.apply_inbound(&Inbound::Deregister {
+            agent: "req:1".into(),
+        });
+
+        assert_eq!(w.agents.len(), 2, "the deregistered row is gone");
+        assert!(w.index_of("req:1").is_none(), "req:1 removed");
+        assert_eq!(w.index_of("lead"), Some(0), "lead untouched");
+        assert_eq!(w.index_of("req:2"), Some(1), "later rows shift down");
+    }
+
+    #[test]
+    fn deregister_of_an_unknown_id_is_a_noop() {
+        let mut w = WorkspaceModel::new();
+        w.apply_inbound(&reg("lead"));
+        w.apply_inbound(&Inbound::Deregister {
+            agent: "req:404".into(),
+        });
+        assert_eq!(w.agents.len(), 1, "unknown id disturbs nothing");
+        assert_eq!(w.index_of("lead"), Some(0));
+
+        // A stale repeat (the row already gone) is equally harmless.
+        w.apply_inbound(&Inbound::Deregister {
+            agent: "req:404".into(),
+        });
+        assert_eq!(w.agents.len(), 1);
     }
 
     #[test]

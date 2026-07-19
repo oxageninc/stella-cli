@@ -147,20 +147,20 @@ The staged pipeline enforces the same contract at runtime: when no
 (the judge's resolution, never the worker) author the failing witness test up
 front, tracks its fail→pass flip in the flip oracle, and refuses to credit the
 flip if the worker modified the witness files (tamper exclusion). See
-`docs/design/pipeline.md` for the full stage flow, the distress-triggered guidance
+`stella-docs/content/docs/inference-pipeline.mdx` for the full stage flow, the distress-triggered guidance
 loop, and the `/pipeline` deck toggle.
 
 ---
 
 ## Workspace layout — where a change goes
 
-Sixteen crates. The one-sentence rule of thumb:
+Fourteen crates. The one-sentence rule of thumb:
 
 | You want to… | Crate | Notes |
 |---|---|---|
 | Change the agent loop (plan / retry / compact / budget / loop-detect / hooks / skills / rules) | `stella-core` | **No I/O allowed.** Decision logic only. |
 | Add/fix a model provider (SSE, tool-call dialect, pricing) | `stella-model` | One file per adapter (`anthropic.rs`, `openai.rs`, `gemini.rs`, `vertex.rs`, `bedrock.rs`, `zai.rs`). Copy an existing adapter's shape. |
-| Add/fix a built-in tool (`read_file`, `bash`, `verify_done`, …) | `stella-tools` | Implement the `Tool` trait, register in `ToolRegistry`. |
+| Add/fix a built-in tool (`read_file`, `verify_done`, the opt-in `bash`, …) | `stella-tools` | Implement the `Tool` trait, register in `ToolRegistry`. |
 | Change CLI commands, flags, or agent wiring | `stella-cli` | This is the shipping binary. |
 | Change REPL rendering / panels / keybindings | `stella-tui` | Pure-fold ratatui REPL — the Command Deck, the default interactive shell on a TTY. |
 | Touch shared types crossing a crate boundary | `stella-protocol` | **Zero logic, zero I/O — types only.** |
@@ -171,6 +171,7 @@ Sixteen crates. The one-sentence rule of thumb:
 | MCP client (external tool servers) | `stella-mcp` | |
 | Multimodal generation | `stella-media` | |
 | Multi-agent fan-out, worktree isolation | `stella-fleet` | |
+| The Observatory telemetry dashboard (`stella observe`) | `stella-observatory` | Loopback-only, read-only, embedded HTML. |
 | Open Context Protocol (wire types / host / conformance) | external repo: [`opencontextprotocol`](https://github.com/macanderson/opencontextprotocol) | Split out of this workspace; Stella depends on it via git. `ocp-types` stays dependency-light by contract. |
 
 **Status — what ships.** The live runtime path is
@@ -194,7 +195,7 @@ editing Stella's own code should know what lives where:
 | `.stella/memories/*.md` | Durable lessons baked into the byte-stable system prompt prefix. Sorted by filename, loaded once per session. (Write side: the `save_memory` tool.) |
 | `.stella/skills/<slug>/SKILL.md` | Auto-promoted skills from recurring reflection lessons. Never enforced — selected and injected as volatile context. |
 | `.stella/tools/*.toml` | Developer-defined custom script tools. Also scanned at `~/.config/stella/tools/`. |
-| `.stella/settings.json` | Project-scope provider config (overrides built-ins or defines new providers). Merged per-field with org-managed and user scopes. |
+| `.stella/settings.json` | Project-scope provider config (overrides built-ins or defines new providers) and tool switches (`tools.bash: "on"` opts the shell tool in — it is off by default in every scope). Merged per-field with org-managed and user scopes. |
 | `.stella/mcp.toml` | MCP server config — extra tools merged into the registry at session start. |
 | `.stella/domains.toml` | Domain taxonomy for memory/reflection tagging, inferred by `stella init`. |
 | `.stella/reflections.jsonl` | Per-turn reflection mining log (one JSON object per line). |

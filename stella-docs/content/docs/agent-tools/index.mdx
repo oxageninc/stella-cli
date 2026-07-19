@@ -19,32 +19,37 @@ This reflects the live session: it accounts for custom tools discovered in `.ste
 
 Each tool is either **read-only** (it only observes your workspace and environment) or **mutating** (it changes files, runs commands, or performs side effects). The read-only marker is the schema's `read_only: true` flag; anything else is treated as capable of side effects.
 
+Read-only also means **speculative-eligible**: the engine executes an all-read-only prefix of a step's tool calls concurrently — while the model is still streaming — and harvests the results at dispatch, so read-only lookups cost almost no wall-clock. A mutating tool is never speculated.
+
 Tool names are their exact identifiers — the agent dispatches by name, and these are the names `stella tools` prints.
 
 ### Always available
 
+These 18 tools register in every session:
+
 | Tool | Description | Access |
 | --- | --- | --- |
-| `read_file` | Read the contents of a file. | Read-only |
-| `grep` | Search file contents for a pattern. | Read-only |
+| `read_file` | Read a file, returned with 1-based line numbers; `offset`/`limit` read a range. | Read-only |
+| `grep` | Search file contents with a regex (ripgrep-backed when available). | Read-only |
 | `glob` | Find files by glob pattern. | Read-only |
-| `explorations` | List saved codebase explorations. | Read-only |
+| `gather_context` | Run one deterministic context sweep — grep patterns + file globs + code-graph symbol lookups + bounded excerpts — in a single call, saved as a reusable context pack. | Read-only |
+| `explorations` | List saved codebase explorations, or read one back by slice. | Read-only |
+| `ci_status` | Inspect CI runs and failure-log tails for a branch, PR, or commit via `gh`; `wait` blocks until the latest run finishes. | Read-only |
 | `write_file` | Create a file or overwrite an existing one. | Mutating |
-| `edit_file` | Apply an in-place edit to an existing file. | Mutating |
+| `edit_file` | Replace an exact substring in a file — exactly-once by default, every occurrence with `replace_all`. | Mutating |
 | `delete_file` | Delete a file. | Mutating |
-| `bash` | Run a shell command. | Mutating |
-| `save_exploration` | Save a structured exploration of the codebase. | Mutating |
-| `save_memory` | Save a durable workspace memory. | Mutating |
-| `cite_memory` | Cite a memory that informed the turn (feeds the citation loop). | Mutating |
-| `build_project` | Build the project. | Mutating |
-| `run_tests` | Run the project's tests. | Mutating |
-| `verify_done` | Run the definition-of-done check for the current work. | Mutating |
-| `ci_status` | Inspect CI status and logs for a branch or pull request. | Read-only |
+| `bash` | Run a shell command in the workspace root, with a timeout backstop. | Mutating |
+| `save_exploration` | Save a structured exploration of the codebase for other agents to reuse. | Mutating |
+| `save_memory` | Save a durable workspace memory to `.stella/memories/` — loaded into every future session's prompt. | Mutating |
+| `cite_memory` | Cite a recalled memory that informed the turn (feeds the citation loop). | Mutating |
+| `build_project` | Build the workspace with its own toolchain (cargo/npm/go/make), or a custom command. | Mutating |
+| `run_tests` | Run the project's tests with its own runner — `kind` picks unit/e2e/all, `filter` is runner-native. | Mutating |
+| `verify_done` | Prove a change is done: the test command must pass on the new code and fail on `git HEAD`. Runs in a shadow worktree and never edits your working tree. | Mutating |
 | `screenshot` | Capture a screenshot (writes a PNG into `.stella/screenshots/`). | Mutating |
-| `generate_svg` | Generate an SVG asset. | Mutating |
+| `generate_svg` | Validate, sanitize, and save an SVG the agent authored into `.stella/artifacts/` — scripts, event handlers, and external references are stripped. | Mutating |
 
 <Callout type="info">
-`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `gather_context`, `explorations`, `ci_status`, and (when present) `graph_query`, `search_issues`, `get_issue`, `list_labels`, `list_members`.
+`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `gather_context`, `explorations`, `ci_status`, and (when present) `graph_query`, `search_issues`, `get_issue`, `list_labels`, `list_members` — plus `search_skills` at the session layer.
 </Callout>
 
 ### Conditionally registered
@@ -53,22 +58,34 @@ These appear only when their prerequisite is met:
 
 | Tool | Description | Access | Appears when |
 | --- | --- | --- | --- |
-| `graph_query` | Query the code graph. | Read-only | `stella init` has built `.stella/codegraph.db`. |
-| `generate_image` | Generate an image. | Mutating | A media-capable provider key is configured. |
-| `generate_video` | Generate a video. | Mutating | A media-capable provider key is configured. |
-| `poll_video` | Poll a video-generation job. | Mutating | A media-capable provider key is configured. |
-| `create_issue` | Create an issue (title, body, labels, assignee, Linear team). | Mutating | An issue backend is configured (see below). |
-| `update_issue` | Update title/body, comment, change status, add labels, set the assignee. | Mutating | An issue backend is configured. |
+| `graph_query` | Query the indexed code graph instead of grepping: definitions, references, imports, importers, or a file's full graph neighborhood. | Read-only | `stella init` has built `.stella/codegraph.db` (also picked up mid-session once the graph exists). |
+| `generate_image` | Generate an image from a text prompt into `.stella/artifacts/`. | Mutating | An image-capable BYOK provider key is configured. |
+| `generate_video` | Submit an asynchronous text-to-video job. Video costs real money: any job with a positive estimated cost is denied unless `confirm_spend` is true. | Mutating | The configured media provider has a **video** adapter — an image-only key registers `generate_image` without the video pair. |
+| `poll_video` | Poll a video job, reconciling its state live against the provider. | Mutating | Same video-adapter condition as `generate_video`. |
+| `create_issue` | Create an issue (title, body, labels, assignee, Linear team). Labels and assignees must exist — search them first. | Mutating | An issue backend is configured (see below). |
+| `update_issue` | Update title/body, comment, change status, add labels, set the assignee — any combination. | Mutating | An issue backend is configured. |
 | `close_issue` | Close an issue, optionally with a closing comment. | Mutating | An issue backend is configured. |
 | `search_issues` | Search or list issues, with state/assignee/label filters. | Read-only | An issue backend is configured. |
 | `get_issue` | Read one issue in full, including its comment thread. | Read-only | An issue backend is configured. |
 | `list_labels` | Search labels by substring — no guessing exact names. | Read-only | An issue backend is configured. |
 | `list_members` | Search assignable people by login, name, or email substring. | Read-only | An issue backend is configured. |
-| `start_work_on_issue` | Move an issue to in-progress and check out its branch. | Mutating | An issue backend is configured. |
+| `start_work_on_issue` | Move an issue to in-progress and create or check out its branch. | Mutating | An issue backend is configured. |
 
 <Callout type="info">
 The issue backend resolves in precedence order: `LINEAR_API_KEY` env → a stored **Linear** connection (`stella connect linear`) → a stored **GitHub** connection (`stella connect github`, runs over REST with no `gh` CLI needed) → ambient `gh` CLI auth. If none is available, no issue tools are registered at all. See [stella connect](/docs/commands/connect).
 </Callout>
+
+### Interactive session tools
+
+Interactive CLI sessions layer three more tools on top of the native registry:
+
+| Tool | Description | Access |
+| --- | --- | --- |
+| `ask_user` | Ask the user a multiple-choice question when a decision is genuinely theirs to make — 2–6 short options, and the UI always adds a free-text option. In a headless run it returns a named error instead of hanging on stdin. | Mutating |
+| `search_skills` | Search the public skills registry for reusable agent [skills](/docs/agent-tools/skills) matching a topic. | Read-only |
+| `install_skill` | Install a skill from the registry into the project's `.stella/skills/` — always asks for confirmation first. | Mutating |
+
+All told: 18 always-on tools, up to 30 native tools with the code graph, media keys, and an issue backend, plus the three session tools — before any custom script tools or MCP servers merge in.
 
 ## Where to go next
 

@@ -179,6 +179,23 @@ so a project can point at a different registry than the user default.
 }
 ```
 
+## The project trust boundary
+
+A repository you just cloned can carry a `<workspace>/.stella/settings.json` — and an
+untrusted repo must not be able to run commands on your machine or route your API keys to
+a server it controls. Stella therefore holds back the dangerous parts of a project-scope
+file until you opt in with **`STELLA_TRUST_PROJECT=1`**:
+
+- **Hooks.** Project-scope `hooks` load only when the project is trusted. (The legacy
+  `STELLA_PROJECT_HOOKS=1` flag still unlocks hooks — and only hooks.)
+- **Credential routing.** Project-scope values for `providers.<id>.base_url`,
+  `providers.<id>.api_key`, `providers.<id>.api_key_env`, and `mcp.registry_url` are
+  **silently dropped** (the trusted-scope values win) — otherwise a malicious repo could
+  point a provider at its own base URL and exfiltrate the key you attach.
+
+A stderr notice names anything skipped, so a trusted-but-forgotten flag is diagnosable.
+Cosmetic project fields (`name`, `default_model`, `dialect`) apply regardless of trust.
+
 ## Lifecycle hooks
 
 `settings.json` also carries `hooks` — shell commands that fire on agent lifecycle events.
@@ -186,9 +203,10 @@ That schema is documented on the [Hooks](/docs/agent-tools/hooks) page.
 
 Unlike `providers`, hooks **concatenate** across scopes — every scope can add matchers and
 none replaces another's. Hooks from the user and org-managed scopes always load, but hooks
-declared in a repository's project-scope file (`<workspace>/.stella/settings.json`) load
-**only** when `STELLA_PROJECT_HOOKS=1` is set (a trust boundary, so a cloned repo can't run
-commands on your machine unbidden); a stderr notice names any skipped project hooks.
+declared in a repository's project-scope file load **only** behind the
+[project trust boundary](#the-project-trust-boundary) (`STELLA_TRUST_PROJECT=1`, or the
+legacy hooks-only `STELLA_PROJECT_HOOKS=1`); a stderr notice names any skipped project
+hooks.
 
 ## Security
 

@@ -1,23 +1,47 @@
 ---
 title: stella models
-description: List configured providers and available models with key status and defaults.
+description: List configured providers and available models, and manage the live model catalog.
 ---
 
-List the configured providers and their available models. For each provider, Stella shows its key status, default model, and base URL.
+List the configured providers and their available models, and manage the **live model catalog**. For each provider, Stella shows its key status, default model, and base URL.
 
 ## Synopsis
 
 ```bash
 stella models [global flags]
+stella models refresh [--force]
+stella models list [--provider <id>]
 ```
 
 ## What it does
 
-`stella models` enumerates the built-in providers and reports, for each one, its display name, key status, default model, and base URL. Any custom providers you define in `settings.json` are listed too, under a separate **Config-defined providers** heading with their wire dialect. It is the quickest way to confirm which providers are ready to use before you pin one with `--model`.
+`stella models` enumerates the built-in providers and reports, for each one, its display name, key status, default model, and base URL, followed by a status line for the local model catalog. Any custom providers you define in `settings.json` are listed too, under a separate **Config-defined providers** heading with their wire dialect. It is the quickest way to confirm which providers are ready to use before you pin one with `--model`.
 
 The **key status** reflects only whether the provider's environment variable (primary or an alias) is set, or a non-empty `api_key` is present in `settings.json`. A key stored only in `~/.config/stella/credentials.toml` (or supplied at the interactive prompt) resolves fine at run time but does not light up this column.
 
 The same listing is available from inside an interactive session via the [`/models`](/docs/commands/chat) slash command.
+
+## Subcommands — the live model catalog
+
+The catalog behind model validation and pricing syncs from [models.dev](https://models.dev) into local SQLite, with versioned pricing model cards and strict slug validation (a mistyped model gets a did-you-mean, not a silent request). See [Models &amp; the live catalog](/docs/api-providers/models) for the full design.
+
+### `stella models refresh [--force]`
+
+Sync the catalog now. Incremental by default (ETag-aware); `--force` re-downloads everything. Without an explicit refresh, the catalog auto-resyncs when it is older than 24 hours (disable with `STELLA_CATALOG_AUTO_REFRESH=0`).
+
+```bash
+stella models refresh
+stella models refresh --force
+```
+
+### `stella models list [--provider <id>]`
+
+List the models in the local catalog — slug, display name, context window, and current pricing — optionally filtered to one provider.
+
+```bash
+stella models list
+stella models list --provider anthropic
+```
 
 <Callout type="info">
 Provider credentials are resolved through the credential chain: `--api-key` flag, then the provider env var (and aliases), then `settings.json`, then `~/.config/stella/credentials.toml`, and finally an interactive prompt on a TTY.
@@ -43,7 +67,7 @@ openai       missing    gpt-5.5                             https://api.openai.c
 gemini       missing    gemini-3-pro                        https://generativelanguage.googleapis.com/v1beta
 xai          missing    grok-4                              https://api.x.ai/v1
 deepseek     missing    deepseek-chat                       https://api.deepseek.com/v1
-openrouter   missing    auto                                https://openrouter.ai/api/v1
+openrouter   missing    openrouter/auto                     https://openrouter.ai/api/v1
 vertex       missing    gemini-3-pro                        (project/region-scoped)
 bedrock      missing    us.anthropic.claude-sonnet-4-5-...  (region-scoped)
 ```

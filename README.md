@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/stella-logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="assets/stella-logo-light.svg">
-    <img src="assets/stella-logo-light.svg" alt="Stella" width="420">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockups/stella-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/brand/lockups/stella-logo-light.svg">
+    <img src="docs/brand/lockups/stella-logo-light.svg" alt="Stella" width="420">
   </picture>
 </p>
 
@@ -18,7 +18,7 @@
 <p align="center">
   <a href="https://stella.oxagen.sh"><b>Website</b></a> ·
   <a href="https://stella.oxagen.sh/docs"><b>Docs</b></a> ·
-  <a href="https://stella.oxagen.sh/docs/quickstart"><b>Quickstart</b></a>
+  <a href="https://stella.oxagen.sh/docs/getting-started/installation"><b>Quickstart</b></a>
 </p>
 
 Stella is an open-source, bring-your-own-key (BYOK) coding agent that runs in
@@ -276,7 +276,7 @@ queue. `--plain` (or `STELLA_PLAIN=1`, or piped stdio) falls back to the line RE
 | `/files` | Show the Files-Touched panel — `[C·R·U·D] path` per file |
 | `/models` `/config` | List providers/models · show resolved configuration |
 | `/rename <name>` `/color <name>` | Rename the tab · switch accent color |
-| `/pipeline` | Toggle witness-verified staged turns (Command Deck; see `docs/design/pipeline.md`) |
+| `/pipeline` | Toggle witness-verified staged turns (Command Deck; see `stella-docs/content/docs/inference-pipeline.mdx`) |
 | `/clear` `/help` | Clear history · show help |
 | `/exit` or `Ctrl-D` | Exit |
 
@@ -334,17 +334,21 @@ stella stats     # cost, tokens, and $/resolved task per provider/model
 uses the staged pipeline by default; `--no-pipeline` falls back to the raw
 step-loop. In pipeline mode, `--test-command <cmd>` arms deterministic
 verification with your own test; without it an independent witness author
-writes a failing test whose fail→pass flip proves the work (`docs/design/pipeline.md`).
+writes a failing test whose fail→pass flip proves the work (`stella-docs/content/docs/inference-pipeline.mdx`).
 
 ## Built-in tools
 
 | Tool | Description |
 |---|---|
 | `read_file` · `write_file` · `edit_file` · `delete_file` | File CRUD with surgical exact-substring edits |
-| `bash` | Run a shell command (timeout kill; `trace: true` echoes each line) |
+| `bash` | Run a shell command (timeout kill; `trace: true` echoes each line) — **off by default**, registered only with `"tools": {"bash": "on"}` in settings (any scope) |
 | `grep` · `glob` | Regex content search (ripgrep) · glob file discovery (fd) |
 | `graph_query` | Query the indexed code graph: symbol definitions/references, file imports/importers/neighborhood — auto-built at session start, refreshed live |
 | `build_project` · `run_tests` | Build/test with the workspace's toolchain (cargo/npm/go/make) |
+| `run_lint` · `format_code` | The project's own linter/formatter (cargo clippy/fmt, or package.json `lint`/`format` scripts), spawned argv-style — no shell |
+| `run_script` | Run a verb the project itself declares (Makefile target, package.json script, cargo alias); unknown names list the discovered vocabulary |
+| `start_process` · `read_output` · `send_stdin` · `stop_process` | Long-running processes (dev servers, REPLs, watchers) from an argv vector — capped output ring, SIGTERM-then-kill stop, reaped at session end |
+| `repo_status` · `repo_commit` · `repo_push` · `repo_pull` · `repo_rollback` | Vendor-neutral repository tools: structured status, pathspec-explicit commits, pushes that structurally refuse the default branch (never forced), fast-forward-only pulls, restore-named-paths rollback |
 | `verify_done` | Replay new test files against `git HEAD` to prove the change works |
 | `explorations` · `save_exploration` | Shared codebase maps — explore once, reuse everywhere |
 | `save_memory` | Persist a lesson into every future session's system prompt |
@@ -356,6 +360,12 @@ writes a failing test whose fail→pass flip proves the work (`docs/design/pipel
 All file tools are workspace-root-pinned, and every read/write/edit/delete is
 recorded in the Files-Touched ledger (shown per turn as `[C·R·U·D] path`, also
 via `/files`).
+
+**Bash is opt-in.** The default tool surface has no shell: the model works
+through enumerable-argv tools (build/test/lint/format, `run_script`'s
+project-declared verbs, the process group, the `repo_*` tools). Enable `bash`
+per user, org, or project by adding `"tools": {"bash": "on"}` to the
+corresponding `settings.json` scope (normal per-field merge — project wins).
 
 **Opt-in bash sandbox:** `STELLA_BASH_SANDBOX=workspace-write` confines `bash`
 file writes to the workspace root plus the standard tmp dirs (network still
@@ -438,7 +448,7 @@ flowchart TD
       ENG["step driver · goal loop · budget<br/>retry · compaction · loop-detection · router"]
     end
     CORE -->|Provider port| MODEL["stella-model — adapters<br/>anthropic · openai · gemini · vertex · bedrock · zai<br/>(+ any OpenAI-compatible: xai · deepseek · openrouter · local)"]
-    CORE -->|ToolExecutor port| TOOLS["stella-tools<br/>CRUD · bash · grep · glob · build · test · verify_done · issues · CI"]
+    CORE -->|ToolExecutor port| TOOLS["stella-tools<br/>CRUD · grep · glob · build · test · lint · scripts · processes · repo · verify_done · issues · CI · opt-in bash"]
     MCP["stella-mcp<br/>external MCP servers"] -.->|merges tools into registry| TOOLS
     CORE -->|emits AgentEvent stream| STORE["stella-store<br/>SQLite: executions · events · telemetry"]
     U -->|"recall · episodes · bi-temporal facts"| CTX["stella-context — context plane<br/>recall · embeddings · memory"]
@@ -473,17 +483,18 @@ repository and is pulled in as a pinned git dependency, not as workspace members
 |---|---|
 | `stella-cli` | CLI binary — clap surface + agent loop wiring |
 | `stella-core` | The step-driver engine (no I/O): parallel tools, goal loop, budget, retry, compaction, loop detection, router |
-| `stella-tools` | The built-in tools (CRUD, `bash`, `grep`/`glob`, build/test, `verify_done`, issues, CI) |
+| `stella-tools` | The built-in tools (CRUD, `grep`/`glob`, build/test/lint/format, `run_script`, the process group, the `repo_*` tools, `verify_done`, issues, CI — plus the opt-in `bash`) |
 | `stella-model` | The `Provider` port's adapters: anthropic, openai, gemini, vertex, bedrock, zai (SSE, tool-call dialects, SigV4, pricing) |
 | `stella-store` | SQLite persistence — executions, events, telemetry, files-touched |
 | `stella-mcp` | MCP client (stdio + HTTP, protocol `2025-06-18`) merging external tools into the registry |
 | `stella-protocol` | Zero-logic, zero-I/O stability contract: shared serde types + the `Provider`/tool ports |
 | `stella-context` | The context plane: reflection-memory recall + embedding index, episodes, bi-temporal facts |
 | `stella-graph` | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL) |
-| `stella-pipeline` | The orchestration plane above the engine — the default `stella run` path: triage → plan → scope review → witness → execute → verify → judge (`docs/design/pipeline.md`) |
+| `stella-pipeline` | The orchestration plane above the engine — the default `stella run` path: triage → plan → scope review → witness → execute → verify → judge (`stella-docs/content/docs/inference-pipeline.mdx`) |
 | `stella-fleet` | The multi-agent fleet behind `stella fleet`: DAG planner + wave scheduling, git-worktree isolation per task |
 | `stella-media` | Multimodal generation behind one `MediaProvider` port — image generation wired as the `generate_image` tool (registered when a media-capable key is set); SVG/video library-complete but not yet exposed as tools |
 | `stella-tui` | The Command Deck — a pure event-fold core + thin crossterm shell |
+| `stella-observatory` | The Observatory — `stella observe`'s loopback-only telemetry dashboard over the local SQLite stores |
 | Open Context Protocol | Its own project now: [macanderson/opencontextprotocol](https://github.com/macanderson/opencontextprotocol) — wire types, host runtime, and the public conformance suite. Stella is its reference host and depends on it via git. |
 
 The repo is a **monorepo**: alongside the Rust workspace, the documentation

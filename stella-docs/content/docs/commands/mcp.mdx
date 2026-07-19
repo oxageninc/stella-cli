@@ -10,7 +10,7 @@ For how MCP tools reach the agent, see [MCP servers](/docs/agent-tools/mcp). Thi
 ## Synopsis
 
 ```bash
-stella mcp <list|search|install|remove|usage> [args]
+stella mcp <list|search|install|remove|login|logout|usage> [args]
 ```
 
 ## What it does
@@ -51,6 +51,15 @@ Remove a configured server from `.stella/mcp.toml` by its local name.
 
 ```bash
 stella mcp remove filesystem
+```
+
+### `stella mcp login <name>` / `stella mcp logout <name>`
+
+OAuth login to a configured HTTP server that requires it (and log back out). Tokens land in `.stella/mcp_oauth.json` and refresh automatically at session start.
+
+```bash
+stella mcp login github
+stella mcp logout github
 ```
 
 ### `stella mcp usage`

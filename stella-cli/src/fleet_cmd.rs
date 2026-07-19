@@ -16,6 +16,15 @@
 //! waves once the metered total crosses the cap (in-flight siblings settle
 //! first, never a mid-tool kill).
 //!
+//! Every worker also honors its `stella_fleet::WorkerControls`: the stop
+//! line races the turn (the clean drop-at-await cancel the deck's
+//! sub-sessions use) and the pause line gates the raw step-loop at the
+//! engine's step boundary via a `TurnGate`. `stella fleet` itself drives
+//! workers to completion — the control verbs (`Fleet::pause_task` /
+//! `resume_task` / `stop_task`) exist for a supervisor; surfacing fleet
+//! tasks as controllable deck lanes is the named follow-up in
+//! `COMMAND_DECK_DESIGN.md`.
+//!
 //! Worktrees are deliberately left in place after the run — the branches
 //! (`fleet/<task>`) carry the work product for the user to review and merge.
 //! `git worktree list` shows them; the report names each one.
@@ -33,12 +42,12 @@ use stella_core::{Engine, TurnOutcome};
 use stella_fleet::{
     CiWatchOutcome, CommitRecord, Fleet, FleetConfig, FleetRunReport, FleetWorker, GhCli, Ledger,
     Monitor, MonitorError, Plan, SystemGhCli, SystemGitCli, Task, TaskId, TimeoutReason,
-    WatchConfig, WorkerOutcome, WorktreeManager,
+    WatchConfig, WorkerControls, WorkerOutcome, WorktreeManager,
 };
 use stella_protocol::{AgentEvent, CompletionMessage, PrStatus};
 use stella_tools::ToolRegistry;
 use stella_tools::hook_runner::ShellHookRunner;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::agent;
 use crate::config::Config;
@@ -357,7 +366,12 @@ struct EngineWorker {
 
 #[async_trait::async_trait]
 impl FleetWorker for EngineWorker {
-    async fn run(&self, task: &Task, workspace_root: &Path) -> WorkerOutcome {
+    async fn run(
+        &self,
+        task: &Task,
+        workspace_root: &Path,
+        controls: WorkerControls,
+    ) -> WorkerOutcome {
         // The engine's turn future is deliberately not `Send` (it holds
         // provider futures and the retry jitter RNG across awaits), but the
         // fleet's worker port requires a `Send` future. Bridge the two by
@@ -384,6 +398,7 @@ impl FleetWorker for EngineWorker {
                         &task,
                         &root,
                         &claim_holder,
+                        controls,
                     ))
                 });
             let _ = tx.send(result);
@@ -404,6 +419,31 @@ impl FleetWorker for EngineWorker {
     }
 }
 
+/// `stella_core::ports::TurnGate` over the task's pause line: the worker's
+/// turn parks at its next step boundary while a supervisor holds the watch
+/// at `true` (`Fleet::pause_task`) and continues on `false`
+/// (`Fleet::resume_task`). A dropped sender (the fleet settled this task's
+/// controls) reads as resumed — a worker must never park forever on
+/// teardown.
+///
+/// A deliberate small twin of `subsession.rs`'s private `WatchGate` (the
+/// deck's sub-session gate): the two adapters sit on opposite sides of the
+/// deck/fleet boundary and share only this trivial shape, so a co-located
+/// duplicate reads better than a shared item would.
+struct WatchGate(watch::Receiver<bool>);
+
+#[async_trait::async_trait]
+impl stella_core::ports::TurnGate for WatchGate {
+    async fn wait_if_paused(&self) {
+        let mut rx = self.0.clone();
+        while *rx.borrow() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 /// One worker turn in `root`, on the calling thread's runtime. When
 /// `use_pipeline` is true (the default), the turn runs through the staged
 /// pipeline (triage → recall → plan → witness → execute → verify → judge);
@@ -415,6 +455,7 @@ async fn run_task(
     task: &Task,
     root: &Path,
     claim_holder: &str,
+    controls: WorkerControls,
 ) -> Result<WorkerOutcome, String> {
     // Snapshot where this workspace starts so the commit report is
     // exactly this worker's commits — correct for isolated worktrees
@@ -430,7 +471,8 @@ async fn run_task(
     let mut cfg = cfg.clone();
     cfg.workspace_root = root.to_path_buf();
     let provider = agent::build_provider(&cfg)?;
-    let registry = ToolRegistry::new_detected(root.to_path_buf()).await;
+    let registry =
+        ToolRegistry::new_detected(root.to_path_buf(), agent::registry_options(&cfg)).await;
     crate::rules::enforce_workspace_rules(&registry, root);
     // Claim-on-first-write (crate::claims): tool-level write claims + the
     // transient build lane, coordinated across every writer in the
@@ -455,6 +497,27 @@ async fn run_task(
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    // The task's control lines (stella-fleet's `WorkerControls`). The stop
+    // wait mirrors `subsession.rs::run_worker` exactly: a dropped sender
+    // (the fleet settled this task's handle — no supervisor will ever
+    // signal) must not read as a stop, so the wait parks forever on a
+    // closed channel and the work always wins the race.
+    let WorkerControls { pause, stop } = controls;
+    let stop_wait = async move {
+        if stop.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    /// How a raced future resolved — `subsession.rs`'s `RacedTurn` shape,
+    /// generic because the two paths race different outcome types.
+    enum Raced<T> {
+        Outcome(T),
+        Stopped,
+    }
+    /// The stopped attempt's summary. It reports with `success: false` so a
+    /// stopped prerequisite never unblocks its dependents.
+    const STOPPED: &str = "stopped by fleet control (Fleet::stop_task)";
 
     // `success`/`summary` are set by whichever path runs, then folded into
     // the WorkerOutcome after the channel drains.
@@ -516,31 +579,52 @@ async fn run_task(
         // pipeline appends its own volatile recall+goal message, so pass the
         // raw task prompt as the goal (the pipeline never re-reads `messages`
         // for its goal — it takes `task.prompt` directly).
-        let result = pipeline.run(&task.prompt, &mut messages, &mut budget).await;
-        match result {
-            Ok(outcome) => match outcome.status {
+        // The stop line races the whole staged run — the future drops at
+        // its next await point, the same clean cancel the raw path gets.
+        // Pause is NOT honored here yet: boundary-gating individual stages
+        // needs a gate port on `PipelinePorts` (the existing named
+        // follow-up) — only the raw step-loop path below holds a TurnGate.
+        let raced = tokio::select! {
+            result = pipeline.run(&task.prompt, &mut messages, &mut budget) => {
+                Raced::Outcome(result)
+            }
+            _ = stop_wait => Raced::Stopped,
+        };
+        match raced {
+            Raced::Outcome(Ok(outcome)) => match outcome.status {
                 PipelineStatus::Completed => (truncate(&outcome.final_text), true),
                 PipelineStatus::Aborted { reason } => (truncate(&reason), false),
             },
-            Err(e) => (truncate(&e.to_string()), false),
+            Raced::Outcome(Err(e)) => (truncate(&e.to_string()), false),
+            Raced::Stopped => (STOPPED.to_string(), false),
         }
     } else {
-        let outcome = {
+        // The pause line gates the raw step-loop at the engine's step
+        // boundary (never mid-tool), and the stop line races the turn.
+        let raced = {
+            let gate = WatchGate(pause);
             let hook_runner = ShellHookRunner;
             let mut engine = Engine::with_sleeper(
                 &*provider,
                 &claims,
                 agent::engine_config_for(&cfg),
                 &TokioSleeper,
-            );
+            )
+            .with_gate(&gate);
             if let Some(hooks) = &cfg.hooks {
                 engine = engine.with_hooks(hooks, &hook_runner);
             }
-            engine.run_turn(&mut messages, &mut budget, &tx).await
+            tokio::select! {
+                outcome = engine.run_turn(&mut messages, &mut budget, &tx) => {
+                    Raced::Outcome(outcome)
+                }
+                _ = stop_wait => Raced::Stopped,
+            }
         };
-        match outcome {
-            TurnOutcome::Completed { text, .. } => (truncate(&text), true),
-            TurnOutcome::Aborted { reason } => (truncate(&reason), false),
+        match raced {
+            Raced::Outcome(TurnOutcome::Completed { text, .. }) => (truncate(&text), true),
+            Raced::Outcome(TurnOutcome::Aborted { reason }) => (truncate(&reason), false),
+            Raced::Stopped => (STOPPED.to_string(), false),
         }
     };
     drop(tx);
@@ -737,6 +821,39 @@ mod tests {
         assert!(!out.contains('\n'));
         assert!(out.chars().count() <= SUMMARY_CHARS + 1);
         assert!(out.ends_with('…'));
+    }
+
+    // ---- the worker's control lines (stella-fleet WorkerControls) -------
+
+    #[tokio::test]
+    async fn watch_gate_parks_while_paused_and_releases_on_resume_or_teardown() {
+        use stella_core::ports::TurnGate;
+        let (tx, rx) = watch::channel(true);
+        let gate = WatchGate(rx);
+        let wait = gate.wait_if_paused();
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut wait)
+                .await
+                .is_err(),
+            "a paused gate must park"
+        );
+        tx.send(false).unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(500), wait)
+            .await
+            .expect("resume releases the gate");
+
+        // A dropped sender (the fleet settled the task's controls) must
+        // release, never park forever.
+        let (tx2, rx2) = watch::channel(true);
+        let gate2 = WatchGate(rx2);
+        drop(tx2);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            gate2.wait_if_paused(),
+        )
+        .await
+        .expect("teardown releases the gate");
     }
 
     // ---- the post-fanout PR/CI watch (--watch) --------------------------

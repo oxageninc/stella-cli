@@ -71,15 +71,15 @@ export default function HomePage() {
             src="/brand/mark.svg"
             alt=""
             aria-hidden
-            className="mb-8 h-14 w-auto drop-shadow-[0_0_28px_rgba(245,179,60,0.35)]"
+            className="mb-8 h-14 w-auto drop-shadow-[0_0_28px_rgba(63,224,255,0.35)]"
           />
           <span className="mb-6 inline-flex items-center gap-2 rounded-full border border-fd-border bg-fd-card px-3 py-1 text-xs font-medium text-fd-muted-foreground">
-            <Terminal className="size-3.5 text-[var(--stella-gold)]" aria-hidden />
+            <Terminal className="size-3.5 text-[var(--stella-azure)]" aria-hidden />
             A terminal coding agent
           </span>
           <h1 className="max-w-3xl text-balance text-4xl font-semibold tracking-tight sm:text-6xl">
             Ship code from your terminal with{" "}
-            <span className="lp-gold-text font-mono">stella</span>
+            <span className="lp-brand-text font-mono">stella</span>
           </h1>
           <p className="mt-6 max-w-2xl text-balance text-lg text-fd-muted-foreground">
             A fast, bring-your-own-key, model-agnostic coding agent. Point it at any
@@ -100,7 +100,7 @@ export default function HomePage() {
               <ArrowRight className="size-4" aria-hidden />
             </Link>
             <Link
-              href="/docs/installation"
+              href="/docs/getting-started/installation"
               className="inline-flex items-center gap-2 rounded-lg border border-fd-border bg-fd-card px-5 py-2.5 text-sm font-semibold text-fd-foreground transition-colors hover:bg-fd-accent"
             >
               Install
@@ -115,7 +115,7 @@ export default function HomePage() {
           {FEATURES.map(({ icon: Icon, title, body }) => (
             <div key={title} className="bg-fd-background p-6">
               <div className="mb-4 inline-flex size-10 items-center justify-center rounded-lg border border-fd-border bg-fd-card">
-                <Icon className="size-5 text-[var(--stella-gold)]" aria-hidden />
+                <Icon className="size-5 text-[var(--stella-azure)]" aria-hidden />
               </div>
               <h3 className="text-base font-semibold">{title}</h3>
               <p className="mt-2 text-sm leading-relaxed text-fd-muted-foreground">
@@ -160,7 +160,7 @@ export default function HomePage() {
           icon={GitBranch}
           title="Goal mode"
           body="Give Stella an objective and it drives to green — editing, running, and re-checking until a judge confirms the goal from evidence."
-          href="/docs/goal-mode"
+          href="/docs/agent-modes/goal-mode"
           cta="How goal mode works"
         />
         <SplitCard
@@ -174,7 +174,7 @@ export default function HomePage() {
           icon={Wrench}
           title="Extend it"
           body="Add MCP servers, custom script tools, skills, and lifecycle hooks. Stella meets your workflow instead of replacing it."
-          href="/docs/tools/custom-tools"
+          href="/docs/agent-tools/custom-tools"
           cta="Add your own tools"
         />
       </section>
@@ -245,7 +245,7 @@ function SplitCard({
   return (
     <div className="flex flex-col rounded-xl border border-fd-border bg-fd-card p-6">
       <div className="mb-4 inline-flex size-10 items-center justify-center rounded-lg border border-fd-border bg-fd-background">
-        <Icon className="size-5 text-[var(--stella-gold)]" aria-hidden />
+        <Icon className="size-5 text-[var(--stella-azure)]" aria-hidden />
       </div>
       <h3 className="text-lg font-semibold">{title}</h3>
       <p className="mt-2 flex-1 text-sm leading-relaxed text-fd-muted-foreground">

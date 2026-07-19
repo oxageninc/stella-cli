@@ -22,15 +22,25 @@
 //!    process cannot release its own).
 //!
 //! The build lane is the one **transient** claim: `run_tests` /
-//! `build_project` serialize under the well-known pseudo-path
-//! [`BUILD_CLAIM`] for the duration of the call only (with a bounded wait,
-//! not a hard refusal — build contention is routine, edit contention is
-//! signal). This kills the phantom-failure class where one worker's test
-//! run observes a sibling's half-written edit.
+//! `build_project` — and the manifest-verb executors that can rewrite the
+//! tree (`run_lint`, `format_code`, `run_script`) — serialize under the
+//! well-known pseudo-path [`BUILD_CLAIM`] for the duration of the call
+//! only (with a bounded wait, not a hard refusal — build contention is
+//! routine, edit contention is signal). This kills the phantom-failure
+//! class where one worker's test run observes a sibling's half-written
+//! edit (or a sibling formatter's half-rewritten tree).
 //!
 //! A missing/failed store degrades to no coordination rather than no work —
 //! the same observability-loss-not-work-stoppage contract as every other
 //! store write.
+//!
+//! Coverage note: with `bash` OFF by default (settings `tools.bash`), the
+//! historically documented "bash hole" — arbitrary shell writes invisible
+//! to claim tracking — is closed in the default configuration; it exists
+//! only in sessions that explicitly opted the shell back in. (The
+//! manifest-verb executors still write outside per-path claims, but they
+//! run the project's own declared verbs, not arbitrary shell, and they
+//! serialize under the build lane below.)
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -55,8 +65,12 @@ const BUILD_POLL_MS: u64 = 500;
 pub(crate) const STALE_CLAIM_MAX_AGE_SECS: u64 = 6 * 3600;
 
 /// The tools whose successful call mutates the path in their `path` input.
-/// `bash` is the documented hole — a shell can write anything; claims cover
-/// the structured file tools, and the witness/verify ladder covers the rest.
+/// In the DEFAULT configuration this coverage is complete for file writes:
+/// `bash` — historically the documented hole, since a shell can write
+/// anything unattributably — is no longer registered unless the workspace
+/// opts in via settings (`tools.bash: "on"`). Only in an opted-in session
+/// does the hole reopen; claims cover the structured file tools, and the
+/// witness/verify ladder covers the rest.
 fn mutating_path<'i>(name: &str, input: &'i Value) -> Option<&'i str> {
     if matches!(name, "write_file" | "edit_file" | "delete_file") {
         input.get("path").and_then(Value::as_str)
@@ -157,8 +171,12 @@ impl ToolExecutor for ClaimTap<'_> {
         }
 
         // The build lane: transient, bounded-wait serialization so a test
-        // run never observes a sibling's half-written tree.
-        if matches!(name, "run_tests" | "build_project") {
+        // run never observes a sibling's half-written tree — and a sibling
+        // never observes a formatter/linter/script mid-rewrite.
+        if matches!(
+            name,
+            "run_tests" | "build_project" | "run_lint" | "format_code" | "run_script"
+        ) {
             let mut waited = 0u64;
             let acquired = loop {
                 match store.acquire_file_lock(BUILD_CLAIM, &self.holder) {
@@ -269,12 +287,22 @@ mod tests {
         let inner = Passthrough(std::sync::Mutex::new(Vec::new()));
         let tap = ClaimTap::new(&inner, Some(store.clone()), "ses-1/lead");
         let input = serde_json::json!({});
-        assert!(!tap.execute("run_tests", &input).await.is_error());
-        // Released immediately — a rival can take the lane without waiting.
-        assert!(
-            store.acquire_file_lock(BUILD_CLAIM, "ses-1/req:2").unwrap(),
-            "build lane must be free after the call"
-        );
+        // Every tree-rewriting executor rides the lane, not just tests.
+        for tool in [
+            "run_tests",
+            "build_project",
+            "run_lint",
+            "format_code",
+            "run_script",
+        ] {
+            assert!(!tap.execute(tool, &input).await.is_error());
+            // Released immediately — a rival takes the lane without waiting.
+            assert!(
+                store.acquire_file_lock(BUILD_CLAIM, "ses-1/req:2").unwrap(),
+                "build lane must be free after `{tool}`"
+            );
+            store.release_file_lock(BUILD_CLAIM, "ses-1/req:2").unwrap();
+        }
     }
 
     #[tokio::test]

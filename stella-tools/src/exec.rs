@@ -1,6 +1,9 @@
-//! Shared subprocess runner for tools that shell out (`bash`, `verify_done`,
-//! `build_project`, `run_tests`): process-group spawn, hard timeout with a
-//! group kill, combined output, middle-out truncation.
+//! Shared subprocess runner for tools that spawn commands: process-group
+//! spawn, hard timeout with a group kill, combined output, middle-out
+//! truncation. Two entry points: [`run`] shells out via `bash -c`
+//! (`verify_done`, `build_project`, `run_tests`, the opt-in `bash` tool);
+//! [`run_argv`] execs an argv vector directly with NO shell anywhere
+//! (`run_script`, `run_lint`, `format_code`).
 
 use std::time::Duration;
 
@@ -36,6 +39,37 @@ pub(crate) async fn run(
 ) -> Result<(i32, String), String> {
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(command);
+    drive(cmd, command, dir, timeout_secs).await
+}
+
+/// Run `program` with `args` DIRECTLY — argv exec, no shell anywhere — in
+/// `dir`. The runner for the manifest-verb tools (`run_script`, `run_lint`,
+/// `format_code`): arguments reach the child exactly as given, so no
+/// model-supplied string is ever shell-interpreted. Same process-group
+/// spawn, timeout kill, and truncation as [`run`].
+pub(crate) async fn run_argv(
+    program: &str,
+    args: &[String],
+    dir: &std::path::Path,
+    timeout_secs: u64,
+) -> Result<(i32, String), String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    let display = std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    drive(cmd, &display, dir, timeout_secs).await
+}
+
+/// Shared spawn/wait/kill/truncate body of [`run`] and [`run_argv`] —
+/// `command` is the human-readable command line for error messages.
+async fn drive(
+    mut cmd: Command,
+    command: &str,
+    dir: &std::path::Path,
+    timeout_secs: u64,
+) -> Result<(i32, String), String> {
     cmd.current_dir(dir);
     for var in GIT_REPO_ENV_VARS {
         cmd.env_remove(var);
@@ -122,6 +156,22 @@ mod tests {
             .unwrap();
         assert_eq!(code, 3);
         assert!(out.contains("hi"));
+    }
+
+    #[tokio::test]
+    async fn run_argv_execs_without_a_shell() {
+        // `echo` is a real binary; the argument is NOT shell-interpreted, so
+        // a metacharacter-laden string arrives verbatim.
+        let (code, out) = run_argv(
+            "echo",
+            &["$(id); `id`; && ||".to_string()],
+            std::path::Path::new("/tmp"),
+            30,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(out.contains("$(id); `id`; && ||"), "{out}");
     }
 
     #[tokio::test]

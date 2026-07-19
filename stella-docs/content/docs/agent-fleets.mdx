@@ -19,22 +19,35 @@ stella fleet \
 ## How a fleet run works
 
 1. **Plan.** Task prompts (inline, or from a `--plan` file) form a DAG:
-   tasks with `depends_on` wait for their dependencies.
-2. **Isolate.** Every isolated task gets a fresh git worktree branched from a
-   pinned base commit (the current `HEAD`, or `--base-ref`) onto a
-   `fleet/<task>` branch. Workers can't see each other's uncommitted work and
-   can't touch your checkout.
+   tasks with `depends_on` wait for their dependencies. Plans are validated
+   up front — a duplicate id, a self-dependency, an unknown dependency, or a
+   dependency cycle is rejected before anything runs, with the offending
+   task (or cycle path) named.
+2. **Isolate.** Every isolated task gets a fresh git worktree under
+   `.stella/worktrees/<slug>`, branched from a pinned base commit (the
+   current `HEAD`, or `--base-ref`, resolved to a SHA at start so mid-run
+   commits can't drift the base) onto a `fleet/<slug>-<hash>` branch. The
+   16-hex-digit hash suffix keeps re-runs — which reuse task ids like `t1` —
+   from colliding with branches and worktrees you kept from an earlier
+   fleet. Workers can't see each other's uncommitted work and can't touch
+   your checkout.
 3. **Dispatch in waves.** Dependency-ordered waves run up to
-   `--max-concurrency` tasks at once (default 4).
+   `--max-concurrency` tasks at once (default 4). A failed task does **not**
+   unblock its dependents — they end the run as `skipped` — and nothing is
+   retried automatically: the ledger records every attempt, but re-running
+   is your call.
 4. **Work.** Each worker is a full engine run — the
    [staged pipeline](/docs/inference-pipeline) with the standard toolbelt,
    honoring your [agent-engine config](/docs/configuration/agent-engine-config).
    Workers are headless by design: no MCP, no interactive prompts, nothing
-   that can block on stdin.
-5. **Record.** Every attempt, commit, timeout, and dollar lands in the fleet
-   ledger at `.stella/fleet.db` — local SQLite, like all
-   [Stella telemetry](/docs/telemetry).
-6. **Review.** Worktrees and `fleet/<task>` branches are deliberately **left
+   that can block on stdin. Pass `--no-pipeline` to run the raw step loop
+   instead of the staged pipeline.
+5. **Record.** Every attempt, commit, and dollar lands in the fleet ledger
+   at `.stella/fleet.db` — local SQLite, like all
+   [Stella telemetry](/docs/telemetry). Past runs (tasks, attempts,
+   successes, commits) also surface on the **Fleet runs** card of the
+   [Observatory dashboard](/docs/telemetry/dashboard).
+6. **Review.** Worktrees and `fleet/*` branches are deliberately **left
    in place** — the branches *are* the work product. Inspect, test, and merge
    them on your terms; `git worktree list` shows them all.
 
@@ -52,13 +65,19 @@ claims = ["Cargo.toml", "CHANGELOG.md"]
 
 [[tasks]]
 id = "t2"
-title = "Regenerate the CLI reference"
-prompt = "Regenerate docs/cli-reference.md from the current --help output"
+title = "Update the release notes page"
+prompt = "Update the release notes for 1.4.0 from the merged PRs"
 depends_on = ["t1"]
 ```
 
-Each task carries an `id`, `title`, `prompt`, and optionally `depends_on`
-(orders the waves), `isolation`, and `claims`.
+Each task carries an `id`, `title`, and `prompt`, plus optionally:
+
+- `depends_on` — ids that must succeed before this task dispatches (orders
+  the waves).
+- `isolation` — `isolated` (the default: own worktree, own branch) or
+  `shared_tree` (run directly in the repo root with **no** worktree — for
+  strictly sequential or read-only tasks that must see your live checkout).
+- `claims` — workspace-relative paths held as cooperative file locks.
 
 ### File claims — cooperative locks
 
@@ -66,22 +85,34 @@ A task that declares `claims` (workspace-relative paths it intends to touch)
 holds them as **cooperative file locks** for the attempt's duration. A second
 task — or a second fleet run — that claims an already-held path fails that
 dispatch *by name* instead of silently racing another agent into the same
-file.
+file. The locks live in the `file_locks` table of `.stella/store.db`,
+separate from the fleet ledger, so they coordinate across concurrent fleet
+runs too.
 
 ## Budget across a fleet
 
-`--budget` is enforced twice: each child runs under its own guard (the
-aggregate cap divided across the concurrency width, so one wave's in-flight
-children can't collectively overshoot), and the fleet stops launching new
-waves once total metered spend crosses the cap. In-flight siblings settle
-cleanly — never a mid-tool kill.
+Budget comes from the **global** `--budget` flag (or `STELLA_BUDGET`), which
+goes *before* the subcommand:
+
+```bash
+stella --budget 5 fleet --plan release-prep.toml
+# equivalently: STELLA_BUDGET=5 stella fleet --plan release-prep.toml
+```
+
+It is enforced twice: each child runs under its own guard — the aggregate cap
+divided across the concurrency width (`budget ÷ max-concurrency`), so one
+wave's in-flight children can't collectively overshoot — and the fleet stops
+launching new waves once total metered spend crosses the cap. In-flight
+siblings settle cleanly — never a mid-tool kill.
 
 ## Watching CI: `--watch`
 
 After the fan-out, `--watch` holds a **fleet monitor** on every branch that
 carries successful work: it watches each branch's CI to completion via the
 `gh` CLI, reconciles PR status live, and exits non-zero if any watched branch
-ends red.
+ends red. It polls every 30 seconds, allows CI 10 minutes of startup grace to
+appear, gives up on a branch after 20 minutes without progress, and caps the
+whole watch at 2 hours of wall time.
 
 ```bash
 stella fleet --plan release-prep.toml --max-concurrency 2 --watch
@@ -106,10 +137,12 @@ stella fleet --plan release-prep.toml --max-concurrency 2 --watch
 
 ## Cleaning up
 
-When you've merged (or rejected) the branches:
+When you've merged (or rejected) the branches — the branch names carry a hash
+suffix, so list them rather than guessing:
 
 ```bash
-git worktree list                 # see what the fleet left behind
+git worktree list                 # what the fleet left in .stella/worktrees/
 git worktree remove <path>        # per worktree
-git branch -D fleet/<task>        # per branch
+git branch --list 'fleet/*'      # the fleet branches
+git branch -D fleet/<slug>-<hash> # per branch, exactly as listed
 ```

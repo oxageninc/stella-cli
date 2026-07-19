@@ -1,6 +1,6 @@
 [package]
 name = "stella-tools"
-description = "Built-in agent tools: read_file, write_file, edit_file, bash, grep, glob. Workspace-root-pinned, timeout-backed, size-capped."
+description = "Built-in agent tools: file CRUD, grep/glob, build/test/lint/format, project-declared scripts, a long-running process group, vendor-neutral repo tools, and the opt-in bash. Workspace-root-pinned, timeout-backed, size-capped."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

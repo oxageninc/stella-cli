@@ -22,18 +22,18 @@ stella --version
 The `version` subcommand prints a `v`-prefixed line:
 
 ```text
-stella v0.3.9
+stella v0.5.0
 ```
 
 `stella --version` prints clap's default form instead — the binary name, a space, then the
 bare version:
 
 ```text
-stella 0.3.9
+stella 0.5.0
 ```
 
 The exact number tracks the release you installed. Binaries built in dev mode
-(`scripts/dev.sh`) append a git-sha stamp, e.g. `stella v0.3.9-dev.abc1234`; released
+(`scripts/dev.sh`) append a git-sha stamp, e.g. `stella v0.5.0-dev.abc1234`; released
 binaries print the bare semver.
 
 Use it to confirm an install or upgrade, or to capture the version in a CI log. This

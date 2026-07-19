@@ -100,6 +100,11 @@ pub struct Settings {
     /// already the status quo via `.stella/memories` and workspace rules.
     #[serde(default)]
     pub agent_engine_config: Option<AgentEngineConfig>,
+    /// Built-in tool switches ([`ToolsSettings`]). Scopes overlay per
+    /// field, project winning — so a repo may opt its sessions into (or
+    /// back out of) the `bash` tool.
+    #[serde(default)]
+    pub tools: Option<ToolsSettings>,
 }
 
 /// An `on`/`off` switch. A dedicated enum rather than `bool` because the
@@ -472,6 +477,19 @@ pub fn project_settings_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".stella").join("settings.json")
 }
 
+/// The `tools` section of settings.json — switches for the built-in tool
+/// surface. Every field is optional, and every default is the SECURE
+/// posture: an absent key never enables anything.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+pub struct ToolsSettings {
+    /// The `bash` shell tool. **Absent or `"off"` = not registered** — the
+    /// model never sees a shell; enabling it requires a literal
+    /// `"tools": {"bash": "on"}` in some scope. [`Toggle`] rather than a
+    /// bool so a typo'd value is a loud parse error, not a silent state.
+    #[serde(default)]
+    pub bash: Option<Toggle>,
+}
+
 /// The `mcp` section of settings.json. All fields optional so an absent
 /// section behaves exactly as the defaults.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -484,6 +502,17 @@ pub struct McpSettings {
 }
 
 impl Settings {
+    /// Whether the `bash` tool is enabled for this workspace. Default OFF
+    /// in every scope and configuration — only an explicit
+    /// `"tools": {"bash": "on"}` somewhere in the chain turns it on (and a
+    /// later scope's `"off"` turns it back off; project wins per field).
+    pub fn bash_tool_enabled(&self) -> bool {
+        self.tools
+            .as_ref()
+            .and_then(|t| t.bash)
+            .is_some_and(Toggle::is_on)
+    }
+
     /// The configured MCP registry URL, or the official default. Applied at the
     /// read site (the house convention) rather than baked into serde.
     pub fn mcp_registry_url(&self) -> String {
@@ -653,6 +682,15 @@ impl Settings {
                 let target = merged.mcp.get_or_insert_with(McpSettings::default);
                 if let Some(url) = &mcp.registry_url {
                     target.registry_url = Some(url.clone());
+                }
+            }
+            // Tool switches are last-scope-wins per field, like `mcp` — a
+            // project can opt into bash while the user scope stays silent,
+            // or opt back out of a user-scope enable.
+            if let Some(tools) = &scope.tools {
+                let target = merged.tools.get_or_insert_with(ToolsSettings::default);
+                if let Some(bash) = tools.bash {
+                    target.bash = Some(bash);
                 }
             }
             // Agent-engine config overlays per field / per agent, like
@@ -978,6 +1016,58 @@ mod tests {
         engine.save_to(&fresh).unwrap();
         let merged = Settings::load_from(&[fresh]).unwrap();
         assert_eq!(merged.agent_engine_config, Some(engine));
+    }
+
+    /// Witness for the bash-off-by-default posture: an absent `tools` key
+    /// (or an absent `bash` field) parses to DISABLED, and the scope merge
+    /// is per-field with the later (project) scope winning in both
+    /// directions.
+    #[test]
+    fn bash_tool_defaults_off_and_the_project_scope_wins_per_field() {
+        // Absent everywhere → off.
+        assert!(!Settings::default().bash_tool_enabled());
+        let dir = tempfile::tempdir().unwrap();
+        let silent = write(dir.path(), "silent.json", r#"{"providers": {}}"#);
+        let merged = Settings::load_from(std::slice::from_ref(&silent)).unwrap();
+        assert!(!merged.bash_tool_enabled(), "absent key must mean off");
+        let empty_tools = write(dir.path(), "empty.json", r#"{"tools": {}}"#);
+        let merged = Settings::load_from(&[empty_tools]).unwrap();
+        assert!(!merged.bash_tool_enabled(), "empty tools section is off");
+
+        // user off + project on → on (the opt-in can live in any scope).
+        let user_off = write(dir.path(), "user.json", r#"{"tools": {"bash": "off"}}"#);
+        let project_on = write(dir.path(), "project.json", r#"{"tools": {"bash": "on"}}"#);
+        let merged = Settings::load_from(&[user_off.clone(), project_on.clone()]).unwrap();
+        assert!(merged.bash_tool_enabled(), "project-scope on wins");
+
+        // user on + project off → off (project wins per field both ways).
+        let user_on = write(dir.path(), "user_on.json", r#"{"tools": {"bash": "on"}}"#);
+        let project_off = write(
+            dir.path(),
+            "project_off.json",
+            r#"{"tools": {"bash": "off"}}"#,
+        );
+        let merged = Settings::load_from(&[user_on.clone(), project_off]).unwrap();
+        assert!(!merged.bash_tool_enabled(), "project-scope off wins");
+
+        // A scope that doesn't speak `tools` leaves the earlier value.
+        let merged = Settings::load_from(&[user_on, silent]).unwrap();
+        assert!(merged.bash_tool_enabled(), "silent scope must not reset");
+    }
+
+    /// `tools.bash` takes the Toggle vocabulary only — a bool (or any
+    /// typo) is a loud parse error, never a silently-guessed state.
+    #[test]
+    fn a_non_toggle_bash_value_is_a_loud_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, json) in [
+            ("bool.json", r#"{"tools": {"bash": true}}"#),
+            ("typo.json", r#"{"tools": {"bash": "enabled"}}"#),
+        ] {
+            let bad = write(dir.path(), name, json);
+            let err = Settings::load_from(std::slice::from_ref(&bad)).unwrap_err();
+            assert!(err.contains("invalid settings file"), "{err}");
+        }
     }
 
     #[test]
