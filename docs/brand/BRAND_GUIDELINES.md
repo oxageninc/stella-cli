@@ -1,9 +1,8 @@
-# Stella Brand Guidelines — the Laika system
+# Stella Brand Guidelines — the Charlie system
 
-Stella's identity is **Laika, the astronaut pup**: a floppy-eared dog in a
-space helmet, drawn in warm cosmic sunset color on deep space plum. The name
-nods to the first dog in orbit; the star (stella) she's chasing sits in the
-wordmark and on her helmet glass.
+Stella's identity is **Charlie, the astronaut pup**: a golden retriever in a
+space helmet, drawn in warm cosmic sunset color on deep space plum. The star
+(stella) he's chasing sits in the wordmark and on his helmet glass.
 
 Every asset in this directory is **generated** — edit
 [`build.mjs`](build.mjs) and re-run it; never hand-edit the SVGs or PNGs:
@@ -13,13 +12,18 @@ node docs/brand/build.mjs            # full build (SVG + PNG, needs rsvg-convert
 node docs/brand/build.mjs --svg-only # fast iteration
 ```
 
-## The mark
+## The marks
 
-Laika's head inside her helmet: a gradient ring (the helmet), cream face with
-a caramel eye patch and floppy ears, a gold antenna bead, and a four-point
-gold star drifting across the glass. On light grounds the helmet interior
-stays deep-space plum — a porthole into space. In the mono variants the star
-is punched *through* the helmet ring as a knockout at 1:30.
+**Charlie** — his head inside the helmet: a nebula-gradient ring with a
+collar base and visor shine, golden coat, cream muzzle, caramel floppy ears,
+a gold antenna bead, and a four-point gold star drifting across the glass.
+On light grounds the helmet interior stays deep-space plum — a porthole into
+space. In the mono variants the star is punched *through* the helmet ring as
+a knockout at 1:30.
+
+**Star mark** — the dogless compact logo: the wordmark's four-point star
+enlarged in the nebula gradient with a small gold companion. Use it (or the
+wordmark alone) wherever the illustrated pup is too playful.
 
 ## Variants — every family ships six
 
@@ -42,11 +46,12 @@ grounds and ship light/dark only).
 
 | Path | Contents |
 | --- | --- |
-| `marks/` | The Laika mark, 6 variants + PNGs at 1024/512/256. |
+| `marks/` | The Charlie mark and the dogless `starmark`, 6 variants each + PNGs at 1024/512/256. |
 | `wordmarks/` | Monoline rounded `stella` + gold star, 6 variants. |
 | `lockups/` | Horizontal (mark + wordmark) and stacked lockups, 6 variants. |
 | `icons/` | `favicon-*` (simplified mark), `appicon-*` (rounded tile), `maskable-*` (full-bleed PWA icon, safe-zone compliant), `glyphs/` (24×24 UI icon set: star, sparkle, orbit, rocket, planet, paw, bone, helmet). |
-| `loader/` | Animated SVG loader — Laika assembles herself: helmet ring draws on, ears/head/patch/eyes/nose/mouth pop in, star sweeps in; loops. |
+| `loader/` | Animated SVG loader — Charlie assembles himself: helmet ring draws on, collar/ears/head/muzzle/eyes/nose/mouth pop in, star sweeps in; loops. |
+| `poses/` | Full-body Charlie illustrations — `float`, `chase`, `sit` — 6 variants each (mono cuts are solid silhouettes). |
 | `splash/` | PWA loading screens, portrait 1320×2868 and landscape 2880×1800. |
 | `wallpapers/` | Desktop (16:9, PNG at 5120×2880) and phone (2880×6240), light + dark. |
 | `textures/` | 512-box overlay patterns: `starfield`, `constellation`, `paws`, `grain` (transparent, 6 variants) and the opaque `nebula` wash. |
@@ -64,8 +69,9 @@ No ice blue anywhere. The signature **nebula gradient** runs
 | `flare` | `#F5487F` | Warm pink — gradient middle. |
 | `orchid` | `#A24BEA` | Violet — gradient end, interactive accents. |
 | `starlight` | `#FFC24D` | Gold — stars, the antenna bead, highlights. |
-| `caramel` | `#DE8F55` | Laika's ears and eye patch. |
-| `cream` | `#F9EDDC` | Laika's face. |
+| `caramel` | `#DE8F55` | Charlie's ears. |
+| `fur` | `#F2BD79` | Charlie's golden coat. |
+| `muzzle` | `#F9EDDC` | Charlie's muzzle and chest. |
 | `ink` | `#2A1A35` | Warm plum-black — text/line art on light grounds. |
 | `milk` | `#FFF6E9` | Warm white — text/line art on dark grounds. |
 
@@ -92,8 +98,10 @@ the wordmark itself is drawn geometry — monoline rounded strokes, not a font.
 
 - Clear space around the mark: at least the helmet-ring stroke width (7/120
   of mark height) on all sides.
-- Don't recolor Laika, tilt her more than the wallpapers' −6°, or separate
+- Don't recolor Charlie, tilt him more than the wallpapers' −6°, or separate
   the gold star from the wordmark.
+- Poses are illustrations for empty states, onboarding, and marketing — the
+  head mark stays the identity mark.
 - Mono variants are for single-color contexts only — never use them where
   color is available.
 - The nebula gradient is for the helmet ring, progress fills, and hero

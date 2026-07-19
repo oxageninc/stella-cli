@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 120" width="640" height="240">
-<style>@media (prefers-color-scheme: dark){.lk-cs{stroke:#FFF6E9}.lk-cf{fill:#FFF6E9}}</style><g class="lk-cs" fill="none" stroke="#2A1A35" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+<style>@media (prefers-color-scheme: dark){.ch-cs{stroke:#FFF6E9}.ch-cf{fill:#FFF6E9}}</style><g class="ch-cs" fill="none" stroke="#2A1A35" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
     <path d="M50 54 C46.5 49 37 47.5 31 51.5 C25.5 55.5 26.5 63 33.5 66 L43.5 70 C50.5 73 51.5 81 46 85 C40 89.5 29.5 88 25 82.5"/>
     <path d="M76 26 L76 79 A 15 15 0 0 0 91 94"/>
     <path d="M64 44 L89 44"/>
@@ -8,5 +8,5 @@
     <path d="M193 26 L193 79 A 15 15 0 0 0 208 94"/>
     <circle cx="243" cy="68" r="19"/>
     <path d="M262 52 L262 94"/>
-  </g><path class="lk-cf" d="M 285 26.5 L 289.3 35.2 L 298 39.5 L 289.3 43.8 L 285 52.5 L 280.7 43.8 L 272 39.5 L 280.7 35.2 Z" fill="#2A1A35"/>
+  </g><path class="ch-cf" d="M 285 26.5 L 289.3 35.2 L 298 39.5 L 289.3 43.8 L 285 52.5 L 280.7 43.8 L 272 39.5 L 280.7 35.2 Z" fill="#2A1A35"/>
 </svg>

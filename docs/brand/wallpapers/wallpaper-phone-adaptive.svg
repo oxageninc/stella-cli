@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 3120" width="1440" height="3120">
-<style>@media (prefers-color-scheme: dark){.lk-glass{fill:#FFF6E9;fill-opacity:.07}.lk-text{stroke:#FFF6E9}.lk-bg{fill:url(#bgDark)}.lk-dot{fill:#FFF6E9;opacity:.9}.lk-wash{opacity:.5}}</style><defs>
+<style>@media (prefers-color-scheme: dark){.ch-glass{fill:#FFF6E9;fill-opacity:.07}.ch-text{stroke:#FFF6E9}.ch-bg{fill:url(#bgDark)}.ch-dot{fill:#FFF6E9;opacity:.9}.ch-wash{opacity:.5}}</style><defs>
     <linearGradient id="nebula" x1="20" y1="23" x2="100" y2="103" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FF6D4D"/><stop offset=".55" stop-color="#F5487F"/><stop offset="1" stop-color="#A24BEA"/></linearGradient>
     <linearGradient id="bgLight" x1="0" y1="0" x2="0" y2="3120" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FFFAF0"/><stop offset=".6" stop-color="#F9F0E1"/><stop offset="1" stop-color="#EFE2CC"/></linearGradient>
     <linearGradient id="bgDark" x1="0" y1="0" x2="0" y2="3120" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#0E0916"/><stop offset=".55" stop-color="#171021"/><stop offset="1" stop-color="#221232"/></linearGradient>
     <radialGradient id="wpWash1" cx="0.18" cy="0.14" r="0.7"><stop offset="0" stop-color="#FF6D4D" stop-opacity=".3"/><stop offset="1" stop-color="#FF6D4D" stop-opacity="0"/></radialGradient>
     <radialGradient id="wpWash2" cx="0.85" cy="0.8" r="0.85"><stop offset="0" stop-color="#A24BEA" stop-opacity=".34"/><stop offset="1" stop-color="#A24BEA" stop-opacity="0"/></radialGradient>
     <radialGradient id="wpWash3" cx="0.6" cy="0.45" r="0.55"><stop offset="0" stop-color="#F5487F" stop-opacity=".2"/><stop offset="1" stop-color="#F5487F" stop-opacity="0"/></radialGradient>
-  </defs><rect class="lk-bg" width="1440" height="3120" fill="url(#bgLight)"/><g class="lk-wash" opacity="0.35">
+  </defs><rect class="ch-bg" width="1440" height="3120" fill="url(#bgLight)"/><g class="ch-wash" opacity="0.35">
     <rect width="1440" height="3120" fill="url(#wpWash1)"/>
     <rect width="1440" height="3120" fill="url(#wpWash2)"/>
     <rect width="1440" height="3120" fill="url(#wpWash3)"/>
@@ -22,17 +22,19 @@
   </g><g transform="translate(360 1747.2) scale(6) rotate(-6 60 63)">
   <line x1="60" y1="20" x2="60" y2="12" stroke="url(#nebula)" stroke-width="4" stroke-linecap="round"/>
   <circle cx="60" cy="9.5" r="3.4" fill="#FFC24D"/>
-  <circle class="lk-glass" cx="60" cy="63" r="40" fill="#241833" fill-opacity="1"/>
+  <rect x="40" y="94" width="40" height="16" rx="7" fill="url(#nebula)"/>
+  <circle class="ch-glass" cx="60" cy="63" r="40" fill="#241833" fill-opacity="1"/>
   <g fill="#DE8F55">
-    <rect x="36.5" y="42" width="13" height="33" rx="6.5" transform="rotate(14 43 58)"/>
-    <rect x="70.5" y="42" width="13" height="33" rx="6.5" transform="rotate(-14 77 58)"/>
+    <rect x="34.5" y="40" width="14" height="37" rx="7" transform="rotate(16 41.5 58)"/>
+    <rect x="71.5" y="40" width="14" height="37" rx="7" transform="rotate(-16 78.5 58)"/>
   </g>
-  <circle cx="60" cy="64" r="24" fill="#F9EDDC"/>
-  <circle cx="51" cy="60" r="8.5" fill="#DE8F55"/>
-  <circle cx="51" cy="61" r="3.3" fill="#2A1A35"/>
-  <circle cx="69" cy="61" r="3.3" fill="#2A1A35"/>
-  <ellipse cx="60" cy="71" rx="4.4" ry="3.5" fill="#2A1A35"/>
-  <path d="M60 74 L60 77.5 M60 77.5 C57.2 80.4 54.4 79.4 53.4 77.4 M60 77.5 C62.8 80.4 65.6 79.4 66.6 77.4" fill="none" stroke="#2A1A35" stroke-width="1.8" stroke-linecap="round"/>
+  <circle cx="60" cy="64" r="24" fill="#F2BD79"/>
+  <ellipse cx="60" cy="71.5" rx="11.5" ry="9" fill="#F9EDDC"/>
+  <circle cx="51" cy="60" r="3.3" fill="#2A1A35"/>
+  <circle cx="69" cy="60" r="3.3" fill="#2A1A35"/>
+  <ellipse cx="60" cy="69.5" rx="4.6" ry="3.6" fill="#2A1A35"/>
+  <path class="" d="M60 72.5 L60 76.5 M60 76.5 C57 79.6 54 78.6 53 76.4 M60 76.5 C63 79.6 66 78.6 67 76.4" fill="none" stroke="#2A1A35" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M31 43 A 34 34 0 0 1 46 29" fill="none" stroke="#FFF6E9" stroke-opacity="0.4" stroke-width="4" stroke-linecap="round"/>
   <circle cx="60" cy="63" r="40" fill="none" stroke="url(#nebula)" stroke-width="7"/>
   <path d="M 75.5 28.5 L 78.2 33.3 L 83 36 L 78.2 38.7 L 75.5 43.5 L 72.8 38.7 L 68 36 L 72.8 33.3 Z" fill="#FFC24D"/>
   <circle cx="38" cy="86" r="1.8" fill="#FFC24D"/></g>

@@ -1,3 +1,3 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
-<style>@media (prefers-color-scheme: dark){.lk-cs{stroke:#FFF6E9}.lk-cf{fill:#FFF6E9}}</style><circle class="lk-cs" cx="12" cy="12" r="5.6" fill="none" stroke="#2A1A35" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><ellipse class="lk-cs" cx="12" cy="12" rx="10.2" ry="3.1" transform="rotate(-16 12 12)" fill="none" stroke="#A24BEA" stroke-width="1.8"/>
+<style>@media (prefers-color-scheme: dark){.ch-cs{stroke:#FFF6E9}.ch-cf{fill:#FFF6E9}}</style><circle class="ch-cs" cx="12" cy="12" r="5.6" fill="none" stroke="#2A1A35" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><ellipse class="ch-cs" cx="12" cy="12" rx="10.2" ry="3.1" transform="rotate(-16 12 12)" fill="none" stroke="#A24BEA" stroke-width="1.8"/>
 </svg>

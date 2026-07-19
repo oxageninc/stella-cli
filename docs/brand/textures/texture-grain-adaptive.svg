@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-<style>@media (prefers-color-scheme: dark){.lk-glass{fill:#FFF6E9;fill-opacity:.07}.lk-text{stroke:#FFF6E9}.lk-bg{fill:url(#bgDark)}.lk-dot{fill:#FFF6E9;opacity:.9}.lk-wash{opacity:.5}}</style><filter id="gr" x="0" y="0" width="100%" height="100%">
+<style>@media (prefers-color-scheme: dark){.ch-glass{fill:#FFF6E9;fill-opacity:.07}.ch-text{stroke:#FFF6E9}.ch-bg{fill:url(#bgDark)}.ch-dot{fill:#FFF6E9;opacity:.9}.ch-wash{opacity:.5}}</style><filter id="gr" x="0" y="0" width="100%" height="100%">
         <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="7" stitchTiles="stitch"/>
         <feColorMatrix type="matrix" values="0 0 0 0 0.16  0 0 0 0 0.1  0 0 0 0 0.21  0 0 0 0.28 0"/>
-      </filter><rect class="lk-cf" width="512" height="512" filter="url(#gr)"/>
+      </filter><rect class="ch-cf" width="512" height="512" filter="url(#gr)"/>
 </svg>

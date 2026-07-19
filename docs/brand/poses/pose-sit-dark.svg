@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="20 -8 100 146" width="400" height="584">
+<defs><linearGradient id="nebula" x1="0" y1="0" x2="150" y2="140" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FF6D4D"/><stop offset=".55" stop-color="#F5487F"/><stop offset="1" stop-color="#A24BEA"/></linearGradient></defs>
+  <path d="M76 128 C90 130 100 124 102 114" fill="none" class="ch-cs" stroke="#F2BD79" stroke-width="7" stroke-linecap="round"/>
+  <ellipse cx="62" cy="112" rx="26" ry="22" fill="#F2BD79" class="ch-cf"/>
+  <rect x="44" y="58" width="36" height="64" rx="18" fill="#F2BD79" class="ch-cf" transform="rotate(6 62 90)"/>
+  <ellipse cx="57" cy="100" rx="13" ry="26" fill="#F9EDDC" class="ch-cf" transform="rotate(6 57 100)"/>
+  <rect x="47" y="102" width="8" height="28" rx="4" fill="#F2BD79" class="ch-cf"/>
+  <rect x="61" y="104" width="8" height="28" rx="4" fill="#F2BD79" class="ch-cf"/>
+  <circle class="ch-glass" cx="58" cy="29" r="24" fill="#FFF6E9" fill-opacity="0.07"/>
+  <rect x="44" y="46" width="24" height="11" rx="5" fill="url(#nebula)" class="ch-cf" transform="rotate(10 56 51)"/>
+  <g transform="translate(58 30) rotate(10)"><g fill="#DE8F55">
+      <rect x="-15.5" y="-12" width="9" height="23" rx="4.5" transform="rotate(18 -11 -3)"/>
+      <rect x="6.5" y="-12" width="9" height="23" rx="4.5" transform="rotate(-18 11 -3)"/>
+    </g>
+    <circle cx="0" cy="0" r="15" fill="#F2BD79"/>
+    <ellipse cx="0" cy="4.5" rx="7.2" ry="5.6" fill="#F9EDDC"/>
+    <circle cx="-5.6" cy="-2.5" r="2.1" fill="#2A1A35"/>
+    <circle cx="5.6" cy="-2.5" r="2.1" fill="#2A1A35"/>
+    <ellipse cx="0" cy="3.4" rx="2.9" ry="2.3" fill="#2A1A35"/>
+    <path d="M0 5.3 L0 7.8 M0 7.8 C-1.9 9.7 -3.7 9.1 -4.3 7.7 M0 7.8 C1.9 9.7 3.7 9.1 4.3 7.7" fill="none" stroke="#2A1A35" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M-18 -13 A 19 19 0 0 1 -8 -21" fill="none" stroke="#FFF6E9" stroke-opacity="0.4" stroke-width="2.6" stroke-linecap="round"/>
+    <circle cx="0" cy="-1" r="24" fill="none" stroke="url(#nebula)" stroke-width="4.6"/>
+    <line x1="0" y1="-25" x2="0" y2="-30" stroke="url(#nebula)" stroke-width="2.6" stroke-linecap="round"/>
+    <circle cx="0" cy="-31.8" r="2.2" fill="#FFC24D"/></g>
+  <path d="M 100 8 L 103.6 14.4 L 110 18 L 103.6 21.6 L 100 28 L 96.4 21.6 L 90 18 L 96.4 14.4 Z" fill="#FFC24D" class="ch-cf"/>
+</svg>

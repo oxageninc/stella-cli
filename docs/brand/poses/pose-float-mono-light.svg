@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 168 126" width="672" height="504">
+
+  <path d="M128 96 C140 90 144 78 138 68" fill="none" class="ch-cs" stroke="#2A1A35" stroke-width="7" stroke-linecap="round"/>
+  <rect x="108" y="98" width="8" height="19" rx="4" fill="#2A1A35" class="ch-cf" transform="rotate(40 112 100)"/>
+  <rect x="118" y="84" width="8" height="19" rx="4" fill="#2A1A35" class="ch-cf" transform="rotate(75 122 86)"/>
+  <rect x="62" y="62" width="66" height="34" rx="17" fill="#2A1A35" class="ch-cf" transform="rotate(18 95 79)"/>
+  <ellipse cx="78" cy="76" rx="14" ry="11" fill="#2A1A35" class="ch-cf" transform="rotate(18 78 76)"/>
+  <rect x="64" y="82" width="8" height="20" rx="4" fill="#2A1A35" class="ch-cf" transform="rotate(30 68 84)"/>
+  <rect x="79" y="89" width="8" height="20" rx="4" fill="#2A1A35" class="ch-cf" transform="rotate(14 83 91)"/>
+  
+  <rect x="48" y="58" width="22" height="11" rx="5" fill="#2A1A35" class="ch-cf" transform="rotate(38 59 63)"/>
+  <g transform="translate(40 38) rotate(-14)"><g fill="#2A1A35" class="ch-cf">
+      <rect x="-15.5" y="-12" width="9" height="23" rx="4.5" transform="rotate(18 -11 -3)"/>
+      <rect x="6.5" y="-12" width="9" height="23" rx="4.5" transform="rotate(-18 11 -3)"/>
+      <circle cx="0" cy="0" r="15"/></g>
+    <circle class="ch-cs" cx="0" cy="-1" r="24" fill="none" stroke="#2A1A35" stroke-width="4.6"/>
+    <line class="ch-cs" x1="0" y1="-25" x2="0" y2="-30" stroke="#2A1A35" stroke-width="2.6" stroke-linecap="round"/>
+    <circle class="ch-cf" cx="0" cy="-31.8" r="2.2" fill="#2A1A35"/></g>
+  <path d="M 12 6 L 15.2 11.8 L 21 15 L 15.2 18.2 L 12 24 L 8.8 18.2 L 3 15 L 8.8 11.8 Z" fill="#2A1A35" class="ch-cf"/>
+</svg>

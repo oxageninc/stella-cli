@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -2 170 136" width="680" height="544">
+<style>@media (prefers-color-scheme: dark){.ch-glass{fill:#FFF6E9;fill-opacity:.07}.ch-text{stroke:#FFF6E9}.ch-bg{fill:url(#bgDark)}.ch-dot{fill:#FFF6E9;opacity:.9}.ch-wash{opacity:.5}}</style><defs><linearGradient id="nebula" x1="0" y1="0" x2="150" y2="140" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FF6D4D"/><stop offset=".55" stop-color="#F5487F"/><stop offset="1" stop-color="#A24BEA"/></linearGradient></defs>
+  <path d="M32 108 C20 112 10 108 6 98" fill="none" class="ch-cs" stroke="#F2BD79" stroke-width="7" stroke-linecap="round"/>
+  <rect x="36" y="100" width="8" height="22" rx="4" fill="#F2BD79" class="ch-cf" transform="rotate(35 40 102)"/>
+  <rect x="46" y="104" width="8" height="22" rx="4" fill="#F2BD79" class="ch-cf" transform="rotate(58 50 106)"/>
+  <rect x="34" y="64" width="70" height="34" rx="17" fill="#F2BD79" class="ch-cf" transform="rotate(-26 69 81)"/>
+  <ellipse cx="92" cy="66" rx="13" ry="11" fill="#F9EDDC" class="ch-cf" transform="rotate(-26 92 66)"/>
+  <rect x="86" y="80" width="8" height="21" rx="4" fill="#F2BD79" class="ch-cf" transform="rotate(26 90 82)"/>
+  <rect x="93" y="83" width="8" height="21" rx="4" fill="#F2BD79" class="ch-cf" transform="rotate(18 97 85)"/>
+  <circle class="ch-glass" cx="116" cy="33" r="24" fill="#241833" fill-opacity="1"/>
+  <rect x="94" y="50" width="22" height="11" rx="5" fill="url(#nebula)" class="ch-cf" transform="rotate(-24 105 55)"/>
+  <g transform="translate(116 34) rotate(18)"><g fill="#DE8F55">
+      <rect x="-15.5" y="-12" width="9" height="23" rx="4.5" transform="rotate(18 -11 -3)"/>
+      <rect x="6.5" y="-12" width="9" height="23" rx="4.5" transform="rotate(-18 11 -3)"/>
+    </g>
+    <circle cx="0" cy="0" r="15" fill="#F2BD79"/>
+    <ellipse cx="0" cy="4.5" rx="7.2" ry="5.6" fill="#F9EDDC"/>
+    <circle cx="-5.6" cy="-2.5" r="2.1" fill="#2A1A35"/>
+    <circle cx="5.6" cy="-2.5" r="2.1" fill="#2A1A35"/>
+    <ellipse cx="0" cy="3.4" rx="2.9" ry="2.3" fill="#2A1A35"/>
+    <path d="M0 5.3 L0 7.8 M0 7.8 C-1.9 9.7 -3.7 9.1 -4.3 7.7 M0 7.8 C1.9 9.7 3.7 9.1 4.3 7.7" fill="none" stroke="#2A1A35" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M-18 -13 A 19 19 0 0 1 -8 -21" fill="none" stroke="#FFF6E9" stroke-opacity="0.4" stroke-width="2.6" stroke-linecap="round"/>
+    <circle cx="0" cy="-1" r="24" fill="none" stroke="url(#nebula)" stroke-width="4.6"/>
+    <line x1="0" y1="-25" x2="0" y2="-30" stroke="url(#nebula)" stroke-width="2.6" stroke-linecap="round"/>
+    <circle cx="0" cy="-31.8" r="2.2" fill="#FFC24D"/></g>
+  <path d="M 152 8 L 156 15.2 L 163.2 19.2 L 156 23.2 L 152 30.4 L 148 23.2 L 140.8 19.2 L 148 15.2 Z" fill="#FFC24D" class="ch-cf"/>
+</svg>
