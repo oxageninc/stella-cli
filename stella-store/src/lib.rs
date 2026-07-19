@@ -39,8 +39,9 @@
 //!   Written by extension providers via [`Store::upsert_rule`]; read at
 //!   session start by `stella-cli`, which merges these (lowest precedence)
 //!   with the on-disk rule files.
-//! - **file_locks** — schema + API for cooperative file claims in multi-agent
-//!   work. Reserved: no shipping command acquires locks yet.
+//! - **file_locks** — schema + API for cooperative file claims in
+//!   multi-agent work, acquired by the fleet dispatcher and the deck's
+//!   sub-session claim-on-first-write path (see # Concurrency below).
 //! - **graph_nodes / graph_edges** — schema reserved as a future seam for a
 //!   context plane; not written by any shipping command today (`stella-context`
 //!   and `stella-graph` currently use their own stores).
@@ -521,18 +522,13 @@ const MIGRATIONS: [Migration; 8] = [
     // v1 → v2: files_touched grows line-delta totals + the JSON audit log,
     // and the UNIQUE (execution_id, path) key.
     migrate_v1_to_v2,
-    // v2 → v3: the memory_citations table (purely additive — no existing
-    // table changes shape).
-    // v2 → v3: the additive `rules` table (extension-authored workspace
-    // rules for the stella-core rules engine).
+    // v2 → v3: the memory_citations table and the `rules` table
+    // (extension-authored workspace rules for the stella-core rules
+    // engine) — both purely additive; no existing table changes shape.
     migrate_v2_to_v3,
     // v3 → v4: the agent_uses invocation log (purely additive).
-    // NOTE: several in-flight branches each add a store.db migration — the
-    // slot number is taken naively here and reconciled at merge time.
     migrate_v3_to_v4,
     // v4 → v5: the skill_usage invocation log (purely additive — SKILLS tab).
-    // NOTE: same naive-slot caveat — may need a one-line renumber at
-    // cascade-merge since sibling branches also append migrations.
     migrate_v4_to_v5,
     // v5 → v6: the additive `mcp_usage` table (per-call MCP tool telemetry).
     // Renumbered from v4 at cascade-merge behind the agent_uses (v4) and

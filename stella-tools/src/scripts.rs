@@ -1247,10 +1247,7 @@ impl Tool for RunScript {
         };
         let dir = input.get("dir").and_then(|v| v.as_str());
         let args = string_args(input);
-        let timeout_secs = input
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = crate::exec::timeout_from(input, DEFAULT_TIMEOUT_SECS);
         run_by_name(root, script, dir, &args, timeout_secs).await
     }
 }

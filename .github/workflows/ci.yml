@@ -26,8 +26,8 @@ jobs:
   check:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
-    # DuckDB (stella-store, bundled) is a heavy C++ compile on a cold
-    # cache; rust-cache keeps warm runs fast.
+    # Bundled SQLite (stella-store, rusqlite) and tree-sitter grammars are
+    # heavy C compiles on a cold cache; rust-cache keeps warm runs fast.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7

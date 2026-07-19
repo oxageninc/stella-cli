@@ -9,8 +9,9 @@
 //!
 //! # What it does
 //!
-//! - **Indexes** Rust, TypeScript, TSX, JavaScript, and Python: symbols
-//!   (functions, methods, structs/classes/enums/traits/interfaces) and import
+//! - **Indexes** Rust, TypeScript, TSX, JavaScript, Python, and SQL: symbols
+//!   (functions, methods, structs/classes/enums/traits/interfaces; for SQL,
+//!   tables/views/schema enums — the rows the schema gate reads) and import
 //!   edges (`file → module/file`), via compile-time tree-sitter queries
 //!   (L-L2).
 //! - **Resolves** Python relative imports (`from . import x`,

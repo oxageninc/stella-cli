@@ -638,7 +638,7 @@ impl ToolRegistry {
                 let mut hits: Vec<String> = coverage
                     .by_path
                     .iter()
-                    .filter(|(path, _)| haystack.contains(path.as_str()))
+                    .filter(|(path, _)| mentions_path(&haystack, path))
                     .flat_map(|(_, slices)| slices.iter().cloned())
                     .filter(|slice| !coverage.hinted.contains(slice))
                     .collect();
@@ -1086,6 +1086,35 @@ impl ToolRegistry {
     }
 }
 
+/// True when `haystack` mentions `path` as a whole path token: the hit may
+/// not extend into path characters on either side, so a map covering
+/// `lib.rs` never fires on `mylib.rs` or `graphlib.rs` — a false positive
+/// would permanently consume that map's once-per-session coverage hint.
+fn mentions_path(haystack: &str, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let is_path_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(path) {
+        let start = from + pos;
+        let end = start + path.len();
+        // A preceding `/` is a component boundary, not an embedding: search
+        // results routinely print the workspace-relative map path with an
+        // absolute prefix (`/tmp/ws/covered.rs` covers `covered.rs`).
+        let clear_before = !haystack[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| is_path_char(c) && c != '/');
+        let clear_after = !haystack[end..].chars().next().is_some_and(is_path_char);
+        if clear_before && clear_after {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
 /// Fallback audit-log reason when the model omitted the tool's optional
 /// `reason` field — the schema requires a non-empty human-readable string.
 fn default_reason(op: FileOp) -> &'static str {
@@ -1126,6 +1155,27 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let reg = ToolRegistry::with_issue_backend(root.path().to_path_buf(), issue_backend);
         (root, reg)
+    }
+
+    /// A coverage hint must fire only on whole path tokens — a substring hit
+    /// (`lib.rs` inside `mylib.rs`) would permanently burn the map's
+    /// once-per-session hint on a file it doesn't cover.
+    #[test]
+    fn mentions_path_requires_token_boundaries() {
+        assert!(mentions_path("src/lib.rs:12: pub fn x()", "src/lib.rs"));
+        assert!(mentions_path("lib.rs", "lib.rs"));
+        // An absolute spelling of a covered relative path still matches.
+        assert!(mentions_path("/tmp/ws/src/lib.rs:3: fn y()", "src/lib.rs"));
+        assert!(mentions_path(
+            "see `core/driver.rs` for the loop",
+            "core/driver.rs"
+        ));
+        assert!(!mentions_path("mylib.rs:3: struct Y", "lib.rs"));
+        assert!(!mentions_path("graphlib.rs/index.js", "lib.rs"));
+        assert!(!mentions_path("src/lib.rs.bak", "src/lib.rs"));
+        // A miss on one occurrence must not mask a clean later occurrence.
+        assert!(mentions_path("mylib.rs and also lib.rs here", "lib.rs"));
+        assert!(!mentions_path("anything", ""));
     }
 
     #[tokio::test]

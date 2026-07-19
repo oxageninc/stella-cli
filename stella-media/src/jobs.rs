@@ -105,7 +105,13 @@ impl JobStore {
         }
         let body = serde_json::to_string_pretty(file)
             .map_err(|e| MediaError::Artifact(format!("cannot serialize job store: {e}")))?;
-        let tmp = self.path.with_extension("json.tmp");
+        // Pid-unique temp name (same convention as the session registry's
+        // sidecars): a fixed `.tmp` path lets two concurrent processes
+        // clobber each other's staged write — losing a paid job record, the
+        // exact orphan this module exists to prevent.
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}", std::process::id()));
         std::fs::write(&tmp, body).map_err(|e| {
             MediaError::Artifact(format!(
                 "cannot write temp job store {}: {e}",

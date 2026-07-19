@@ -98,12 +98,12 @@ impl ProviderProfile {
 // ---------------------------------------------------------------------
 
 /// Explicit per-role pins (L-M6: per-function model overrides are the core
-/// abstraction, not an afterthought). No CLI surface populates pins yet —
-/// production only ever builds `RoleTable::new()`; flags/slash commands for
-/// pinning are planned but not implemented. Absence of a pin for a role is
-/// `None`, never a magic sentinel (L-M3) — the router falls through to
-/// scenario defaults when a role isn't in this
-/// table.
+/// abstraction, not an afterthought). The CLI populates pins from the
+/// settings' `agent_engine_config` (per-agent provider/model sections and
+/// the `/model-worker`-family deck commands) on the production wiring
+/// path. Absence of a pin for a role is `None`, never a magic sentinel
+/// (L-M3) — the router falls through to scenario defaults when a role
+/// isn't in this table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleTable {
     pins: HashMap<Role, ModelRef>,

@@ -492,7 +492,7 @@ repository and is pulled in as a pinned git dependency, not as workspace members
 | `stella-graph` | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL) |
 | `stella-pipeline` | The orchestration plane above the engine — the default `stella run` path: triage → plan → scope review → witness → execute → verify → judge (`stella-docs/content/docs/inference-pipeline.mdx`) |
 | `stella-fleet` | The multi-agent fleet behind `stella fleet`: DAG planner + wave scheduling, git-worktree isolation per task |
-| `stella-media` | Multimodal generation behind one `MediaProvider` port — image generation wired as the `generate_image` tool (registered when a media-capable key is set); SVG/video library-complete but not yet exposed as tools |
+| `stella-media` | Multimodal generation behind one `MediaProvider` port — `generate_svg` always on; `generate_image` and `generate_video`/`poll_video` registered when a media-capable key is set (video behind a headless cost gate) |
 | `stella-tui` | The Command Deck — a pure event-fold core + thin crossterm shell |
 | `stella-observatory` | The Observatory — `stella observe`'s loopback-only telemetry dashboard over the local SQLite stores |
 | Open Context Protocol | Its own project now: [macanderson/opencontextprotocol](https://github.com/macanderson/opencontextprotocol) — wire types, host runtime, and the public conformance suite. Stella is its reference host and depends on it via git. |

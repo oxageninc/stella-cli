@@ -28,8 +28,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use stella_protocol::{
-    CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, MessageRole,
-    ProviderError, ToolCall,
+    CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, FinishReason,
+    MessageRole, ProviderError, ToolCall,
 };
 
 use crate::catalog::{Catalog, Pricing};
@@ -379,6 +379,10 @@ struct ConverseResponse {
     output: Option<ConverseOutput>,
     #[serde(default)]
     usage: Option<BedrockUsage>,
+    /// Converse's stop vocabulary (`end_turn`, `tool_use`, `max_tokens`,
+    /// `stop_sequence`, `guardrail_intervened`, `content_filtered`).
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -703,6 +707,16 @@ impl Provider for BedrockProvider {
             cache_write_tokens: usage.cache_write_input_tokens,
         };
         let cost_usd = self.pricing.map(|p| p.cost_usd(&usage)).unwrap_or(0.0);
+        // Normalize Converse's stop vocabulary so the driver's truncation
+        // diagnostics fire on Bedrock turns too; unknown values stay `None`
+        // per the `CompletionResult` contract.
+        let finish_reason = match parsed.stop_reason.as_deref() {
+            Some("end_turn" | "stop_sequence") => Some(FinishReason::Stop),
+            Some("max_tokens") => Some(FinishReason::Length),
+            Some("tool_use") => Some(FinishReason::ToolCalls),
+            Some("guardrail_intervened" | "content_filtered") => Some(FinishReason::ContentFilter),
+            _ => None,
+        };
 
         Ok(CompletionResult {
             text,
@@ -710,7 +724,7 @@ impl Provider for BedrockProvider {
             usage,
             model: self.model.clone(),
             cost_usd,
-            finish_reason: None,
+            finish_reason,
         })
     }
 }

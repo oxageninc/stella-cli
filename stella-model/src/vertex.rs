@@ -119,7 +119,8 @@ impl Provider for VertexProvider {
             return Err(classify_google_error("Vertex AI", response).await);
         }
 
-        let (text, tool_calls, usage) = aggregate_gemini_stream("Vertex AI", response).await?;
+        let (text, tool_calls, usage, finish_reason) =
+            aggregate_gemini_stream("Vertex AI", response).await?;
         let cost_usd = self.pricing.map(|p| p.cost_usd(&usage)).unwrap_or(0.0);
         Ok(CompletionResult {
             text,
@@ -127,7 +128,7 @@ impl Provider for VertexProvider {
             usage,
             model: self.model.clone(),
             cost_usd,
-            finish_reason: None,
+            finish_reason,
         })
     }
 }

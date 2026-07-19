@@ -10,10 +10,11 @@
 //! drained. [`Plan::topological_order`] is the linear-schedule view of the
 //! same graph (used for display and single-threaded execution).
 //!
-//! Tasks isolate by default ([`Isolation::Isolated`] — a dedicated git
-//! worktree per task): a fleet worker must never be able to see or clobber a
-//! sibling's uncommitted files unless the plan author *explicitly* opts a
-//! task into [`Isolation::SharedTree`] (
+//! Tasks share the tree by default ([`Isolation::SharedTree`] — one
+//! repository root under the cooperative claim discipline, so siblings
+//! fail fast by name on a conflicting path instead of clobbering each
+//! other); a plan author *explicitly* opts genuinely divergent work into
+//! [`Isolation::Isolated`] (a dedicated git worktree per task) (
 //! "git-worktree isolation").
 
 use std::cmp::Reverse;
@@ -63,8 +64,8 @@ pub struct Task {
     /// [`Plan::validate`]).
     #[serde(default)]
     pub depends_on: Vec<TaskId>,
-    /// Isolation strategy — defaults to [`Isolation::Isolated`] when absent
-    /// from serialized input.
+    /// Isolation strategy — defaults to [`Isolation::SharedTree`] when
+    /// absent from serialized input.
     #[serde(default)]
     pub isolation: Isolation,
     /// Workspace-relative paths this task declares it will touch. The fleet
@@ -79,7 +80,7 @@ pub struct Task {
 }
 
 impl Task {
-    /// A dependency-free, isolate-by-default task claiming no paths.
+    /// A dependency-free, shared-tree task claiming no paths.
     pub fn new(id: impl Into<TaskId>, title: impl Into<String>, prompt: impl Into<String>) -> Self {
         Self {
             id: id.into(),

@@ -101,7 +101,7 @@ impl Tool for VerifyDone {
                 "properties": {
                     "test_cmd": { "type": "string", "description": "Command that runs the witness test(s), e.g. `cargo test -p my-crate my_test` or `pnpm vitest run path/to/file.test.ts`" },
                     "test_files": { "type": "array", "items": { "type": "string" }, "description": "Workspace-relative paths of the NEW or CHANGED test files that witness this change" },
-                    "timeout_secs": { "type": "integer", "description": "Per-run timeout in seconds (default 300)" }
+                    "timeout_secs": { "type": "integer", "description": "Per-run timeout in seconds (default 300, max 600)" }
                 },
                 "required": ["test_cmd", "test_files"]
             }),
@@ -131,10 +131,7 @@ impl Tool for VerifyDone {
                     .into(),
             };
         }
-        let timeout_secs = input
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = crate::exec::timeout_from(input, DEFAULT_TIMEOUT_SECS);
 
         // The shadow-worktree copy destination must be derived from the
         // canonical path *relative to the root*, never the raw model-supplied

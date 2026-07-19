@@ -53,10 +53,7 @@ impl Tool for BuildProject {
     }
 
     async fn execute(&self, input: &Value, root: &std::path::Path) -> ToolOutput {
-        let timeout_secs = input
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = crate::exec::timeout_from(input, DEFAULT_TIMEOUT_SECS);
         if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
             return run_and_report(command, root, timeout_secs).await;
         }
@@ -99,10 +96,7 @@ impl Tool for RunTests {
     }
 
     async fn execute(&self, input: &Value, root: &std::path::Path) -> ToolOutput {
-        let timeout_secs = input
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = crate::exec::timeout_from(input, DEFAULT_TIMEOUT_SECS);
         if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
             return run_and_report(command, root, timeout_secs).await;
         }
@@ -332,10 +326,7 @@ impl Tool for RunLint {
     }
 
     async fn execute(&self, input: &Value, root: &std::path::Path) -> ToolOutput {
-        let timeout_secs = input
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = crate::exec::timeout_from(input, DEFAULT_TIMEOUT_SECS);
         let fix = input.get("fix").and_then(|v| v.as_bool()).unwrap_or(false);
         match lint_argv(&ScriptIndex::detect(root).await, fix) {
             Ok(argv) => run_argv_and_report(&argv, root, timeout_secs).await,
@@ -370,10 +361,7 @@ impl Tool for FormatCode {
     }
 
     async fn execute(&self, input: &Value, root: &std::path::Path) -> ToolOutput {
-        let timeout_secs = input
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = crate::exec::timeout_from(input, DEFAULT_TIMEOUT_SECS);
         let check = input
             .get("check")
             .and_then(|v| v.as_bool())

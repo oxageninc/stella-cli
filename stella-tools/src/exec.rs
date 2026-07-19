@@ -11,6 +11,24 @@ use tokio::process::Command;
 
 pub(crate) const MAX_OUTPUT_BYTES: usize = 30_000;
 
+/// Ceiling on any model-supplied `timeout_secs`. The timeout is the hang
+/// backstop for commands the model itself launches — accepting an arbitrary
+/// u64 lets one tool call disable the backstop entirely (u64::MAX ≈ never).
+pub(crate) const MAX_TIMEOUT_SECS: u64 = 600;
+
+/// Parse the optional `timeout_secs` field of a tool input: absent or 0
+/// means `default` (a literal 0 would otherwise time out every invocation
+/// instantly — custom.rs's convention), clamped to [`MAX_TIMEOUT_SECS`] so
+/// no exec-style tool can disable its own hang backstop.
+pub(crate) fn timeout_from(input: &serde_json::Value, default: u64) -> u64 {
+    input
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .filter(|&t| t > 0)
+        .unwrap_or(default)
+        .min(MAX_TIMEOUT_SECS)
+}
+
 /// Environment variables that re-target git at a specific repository. Tool
 /// subprocesses always run against their explicit working dir; when Stella
 /// itself was spawned from inside a git hook (which exports `GIT_DIR` et
@@ -62,6 +80,30 @@ pub(crate) async fn run_argv(
     drive(cmd, &display, dir, timeout_secs).await
 }
 
+/// SIGKILLs `pid`'s process group on drop unless disarmed — the
+/// cancellation backstop for [`drive`]: when the future driving a tool call
+/// is dropped mid-wait (Esc cancels the turn), the detached process group
+/// must not keep running — and mutating the tree — after the user believes
+/// the turn stopped. Normal exit and the timeout path disarm it.
+#[cfg(unix)]
+struct GroupKillGuard {
+    pid: i32,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl Drop for GroupKillGuard {
+    fn drop(&mut self) {
+        // Guard on a real pid: kill(-0, …) would SIGKILL Stella's OWN
+        // process group.
+        if self.armed && self.pid > 0 {
+            unsafe {
+                libc::kill(-self.pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// Shared spawn/wait/kill/truncate body of [`run`] and [`run_argv`] —
 /// `command` is the human-readable command line for error messages.
 async fn drive(
@@ -88,20 +130,32 @@ async fn drive(
         .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
     #[cfg(unix)]
     let pid = child.id().unwrap_or(0) as i32;
+    #[cfg(unix)]
+    let mut guard = GroupKillGuard { pid, armed: true };
 
     let output =
         match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
             .await
         {
-            Ok(Ok(output)) => output,
+            Ok(Ok(output)) => {
+                #[cfg(unix)]
+                {
+                    guard.armed = false;
+                }
+                output
+            }
+            // Wait failure leaves the child's state unknown — the still-armed
+            // guard kills the group on return rather than leak it.
             Ok(Err(e)) => return Err(format!("command failed: {e}")),
             Err(_) => {
                 #[cfg(unix)]
-                unsafe {
-                    // Guard on a real pid: kill(-0, …) would SIGKILL Stella's
-                    // OWN process group.
-                    if pid > 0 {
-                        libc::kill(-pid, libc::SIGKILL);
+                {
+                    guard.armed = false;
+                    unsafe {
+                        // Same real-pid guard as `GroupKillGuard`.
+                        if pid > 0 {
+                            libc::kill(-pid, libc::SIGKILL);
+                        }
                     }
                 }
                 return Err(format!("`{command}` timed out after {timeout_secs}s"));
@@ -192,6 +246,44 @@ mod tests {
         .unwrap();
         assert_eq!(code, 0);
         assert!(out.contains("$(id); `id`; && ||"), "{out}");
+    }
+
+    /// Dropping the future mid-wait (a cancelled turn) must kill the whole
+    /// process group — the [`GroupKillGuard`] backstop. Without it, Esc
+    /// during a long build left the build running and mutating the tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_run_kills_the_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        // Record the *grandchild*'s pid: when the group dies, the orphaned
+        // sleep is reaped by init, so a surviving pid means a real leak.
+        let cmd = format!("sleep 30 & echo $! > {} && wait", pidfile.display());
+        let dir_path = dir.path().to_path_buf();
+        let handle = tokio::spawn(async move { run(&cmd, &dir_path, 60).await });
+        let mut pid = None;
+        for _ in 0..250 {
+            if let Some(p) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                pid = Some(p);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = pid.expect("the child never started");
+        handle.abort();
+        let _ = handle.await;
+        let mut dead = false;
+        for _ in 0..250 {
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(dead, "cancelled run left subprocess {pid} running");
     }
 
     #[tokio::test]

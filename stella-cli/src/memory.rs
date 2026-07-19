@@ -41,10 +41,11 @@ use stella_protocol::{CompletionMessage, CompletionRequest, MessageRole, Provide
 
 use crate::domains::Domains;
 
-/// Marker prefixing the volatile recalled-context message so it can be
-/// found and refreshed in place each turn (index 1, right after the
-/// byte-stable system prompt — L-E8: recalled frames ride as a volatile
-/// message after the stable prefix, preserving prompt-cache hits).
+/// Marker prefixing a recalled-context message so [`inject_recall_block`]
+/// can find the newest one for dedup. Blocks land at the conversation
+/// tail and stay in place as durable history (L-E8: the byte-stable
+/// prefix — system prompt AND replayed turns — is never rewritten, which
+/// is what preserves prompt-cache hits).
 pub const RECALL_MARKER: &str = "[auto-recalled context]";
 
 /// One reflection lesson as the model returns it and as persisted to the
@@ -723,34 +724,51 @@ fn render_context_section(frames: &[ocp_types::ContextFrame]) -> Option<String> 
     Some(section)
 }
 
-/// Refresh (or insert) the volatile recalled-context message at index 1 —
-/// immediately after the byte-stable system prompt, before all history
-/// (L-E8). Replacing in place keeps exactly one recall block per
-/// conversation no matter how many turns run.
+/// Land the recalled-context message for this turn at the conversation
+/// TAIL — just before the turn's prompt when the prompt is already present
+/// (one-shot paths), appended otherwise (interactive paths push the prompt
+/// right after) — leaving previous turns' blocks in place as durable
+/// history. Rewriting or removing an early message every turn (the old
+/// index-1 refresh) byte-changed the front of the replayed history, which
+/// reduced the provider cache's reusable prefix to the system message
+/// alone for the whole session — the exact full-rate re-bill L-E8 exists
+/// to prevent. Durability's cost is bounded: an unchanged block is not
+/// re-appended (the model already sees it), so only genuinely new recall
+/// content adds tokens, and it rides the cached prefix from the next turn
+/// on. `None` (nothing relevant, or an A/B-suppressed turn) adds nothing
+/// and touches nothing.
 pub fn inject_recall_block(messages: &mut Vec<CompletionMessage>, block: Option<String>) {
     let is_marker =
         |m: &CompletionMessage| m.role == MessageRole::User && m.content.starts_with(RECALL_MARKER);
-    match block {
-        Some(content) => {
-            let message = CompletionMessage {
-                role: MessageRole::User,
-                content,
-                tool_calls: vec![],
-                tool_results: vec![],
-                attachments: Vec::new(),
-            };
-            if messages.len() > 1 && is_marker(&messages[1]) {
-                messages[1] = message;
-            } else {
-                messages.insert(1.min(messages.len()), message);
-            }
-        }
-        None => {
-            if messages.len() > 1 && is_marker(&messages[1]) {
-                messages.remove(1);
-            }
-        }
+    let Some(content) = block else { return };
+    if messages
+        .iter()
+        .rev()
+        .find(|m| is_marker(m))
+        .is_some_and(|m| m.content == content)
+    {
+        return;
     }
+    let message = CompletionMessage {
+        role: MessageRole::User,
+        content,
+        tool_calls: vec![],
+        tool_results: vec![],
+        attachments: Vec::new(),
+    };
+    // Context precedes the question: when the turn's prompt is already the
+    // final message, slot the block just before it.
+    let at = match messages.last() {
+        Some(last)
+            if last.role == MessageRole::User
+                && !is_marker(last)
+                && last.tool_results.is_empty() =>
+        {
+            messages.len() - 1
+        }
+        _ => messages.len(),
+    };
+    messages.insert(at, message);
 }
 
 /// Seconds since the Unix epoch — the episode timestamps' primitive.
@@ -968,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn inject_inserts_the_block_at_index_one_after_the_system_prefix() {
+    fn inject_slots_the_block_before_an_already_present_prompt() {
         let mut messages = vec![
             msg(MessageRole::System, "sys"),
             msg(MessageRole::User, "do the thing"),
@@ -977,29 +995,55 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert!(messages[1].content.starts_with(RECALL_MARKER));
         assert_eq!(messages[0].content, "sys", "stable prefix untouched (L-E8)");
-        assert_eq!(messages[2].content, "do the thing");
+        assert_eq!(
+            messages[2].content, "do the thing",
+            "context precedes the question"
+        );
     }
 
+    /// The cache contract: a later turn's refresh may not rewrite, remove,
+    /// or reorder anything already in history — the old index-1 refresh
+    /// byte-changed the front of the replayed history every turn and cut
+    /// the provider cache's reusable prefix to the system message alone.
     #[test]
-    fn inject_replaces_in_place_on_later_turns_never_accumulates() {
+    fn inject_appends_fresh_blocks_without_touching_history() {
         let mut messages = vec![msg(MessageRole::System, "sys")];
         inject_recall_block(&mut messages, Some(format!("{RECALL_MARKER}\nfirst")));
         messages.push(msg(MessageRole::User, "turn 1"));
+        messages.push(msg(MessageRole::Assistant, "did it"));
+        let history: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
         inject_recall_block(&mut messages, Some(format!("{RECALL_MARKER}\nsecond")));
+        // Fresh block at the tail; every prior message byte-identical.
+        assert_eq!(messages.len(), history.len() + 1);
+        assert!(messages.last().unwrap().content.contains("second"));
+        for (i, prior) in history.iter().enumerate() {
+            assert_eq!(&messages[i].content, prior, "history rewritten at {i}");
+        }
+    }
+
+    #[test]
+    fn inject_dedupes_an_unchanged_block() {
+        let mut messages = vec![msg(MessageRole::System, "sys")];
+        let block = format!("{RECALL_MARKER}\nstuff");
+        inject_recall_block(&mut messages, Some(block.clone()));
+        messages.push(msg(MessageRole::User, "turn 1"));
+        messages.push(msg(MessageRole::Assistant, "did it"));
+        inject_recall_block(&mut messages, Some(block));
         let markers = messages
             .iter()
             .filter(|m| m.content.starts_with(RECALL_MARKER))
             .count();
-        assert_eq!(markers, 1, "exactly one recall block, refreshed in place");
-        assert!(messages[1].content.contains("second"));
+        assert_eq!(markers, 1, "an unchanged block is not re-appended");
     }
 
     #[test]
-    fn inject_none_removes_a_stale_block() {
+    fn inject_none_adds_nothing_and_touches_nothing() {
         let mut messages = vec![msg(MessageRole::System, "sys")];
         inject_recall_block(&mut messages, Some(format!("{RECALL_MARKER}\nstuff")));
+        let before: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
         inject_recall_block(&mut messages, None);
-        assert_eq!(messages.len(), 1, "nothing relevant -> no block at all");
+        let after: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(before, after, "suppressed recall leaves history untouched");
     }
 
     fn frame(

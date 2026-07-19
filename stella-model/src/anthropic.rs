@@ -1,14 +1,13 @@
-//! Anthropic adapter — Messages API, SSE streaming, native tool-use. One of
-//! the two Phase 0 spikes ( step 3): retires raw-SSE-parsing
-//! risk against a second, structurally different dialect from Z.ai's
-//! OpenAI-compatible one (`anthropic-tools` vs. `openai-json`,
-//!).
+//! Anthropic adapter — Messages API, SSE streaming, native tool-use.
+//! Retires raw-SSE-parsing risk against a second, structurally different
+//! dialect from Z.ai's OpenAI-compatible one (`anthropic-tools` vs.
+//! `openai-json`).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use stella_protocol::{
-    CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, MessageRole,
-    ProviderError, ToolCall,
+    CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, FinishReason,
+    MessageRole, ProviderError, ToolCall,
 };
 
 use crate::catalog::{Catalog, Pricing};
@@ -66,12 +65,6 @@ struct AnthropicRequest<'a> {
     system: Option<Vec<AnthropicSystemBlock<'a>>>,
     messages: Vec<AnthropicMessage>,
     stream: bool,
-    /// Top-level auto-cache marker: the API places a breakpoint on the last
-    /// cacheable block of the request, so each agent-loop turn reads the
-    /// prefix written by the previous turn instead of re-paying the whole
-    /// replayed history at the full input rate. Pairs with the system-block
-    /// marker above (two of the four allowed breakpoints).
-    cache_control: AnthropicCacheControl,
     /// Sampling temperature, forwarded from `CompletionRequest.temperature`.
     /// Omitted when `None` so Anthropic applies its own default — dropping it
     /// unconditionally (the prior bug) meant a caller-set temperature was
@@ -141,6 +134,32 @@ struct AnthropicCacheControl {
 
 const EPHEMERAL_CACHE: AnthropicCacheControl = AnthropicCacheControl { kind: "ephemeral" };
 
+/// Stamp the conversation-tail cache breakpoint: `cache_control` on the
+/// LAST content block of the final message, so each agent-loop turn reads
+/// the prefix written by the previous turn instead of re-paying the whole
+/// replayed history at the full input rate. Pairs with the system-block
+/// marker (two of the four allowed breakpoints). Block-level is the only
+/// placement the Messages API accepts — a top-level `cache_control`
+/// request field is an unknown parameter the API rejects with a 400.
+fn stamp_tail_cache_breakpoint(messages: &mut [AnthropicMessage]) {
+    let Some(block) = messages.last_mut().and_then(|m| m.content.last_mut()) else {
+        return;
+    };
+    match block {
+        AnthropicContentBlock::Text { cache_control, .. }
+        | AnthropicContentBlock::ToolResult { cache_control, .. } => {
+            *cache_control = Some(EPHEMERAL_CACHE);
+        }
+        // A media or tool_use tail is not a request shape the loop produces
+        // (a user message's text follows its attachments; requests end on a
+        // user or tool_result turn) — the system-block breakpoint still
+        // caches the tools+system tier.
+        AnthropicContentBlock::Image { .. }
+        | AnthropicContentBlock::Document { .. }
+        | AnthropicContentBlock::ToolUse { .. } => {}
+    }
+}
+
 #[derive(Serialize)]
 struct AnthropicSystemBlock<'a> {
     #[serde(rename = "type")]
@@ -167,15 +186,15 @@ struct AnthropicMessage {
 enum AnthropicContentBlock {
     Text {
         text: String,
+        /// Set only on the final block of the last message — the
+        /// conversation-tail cache breakpoint ([`stamp_tail_cache_breakpoint`]).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     /// A user-attached image (`{"type":"image","source":{...}}`).
-    Image {
-        source: AnthropicMediaSource,
-    },
+    Image { source: AnthropicMediaSource },
     /// A user-attached PDF (`{"type":"document","source":{...}}`).
-    Document {
-        source: AnthropicMediaSource,
-    },
+    Document { source: AnthropicMediaSource },
     ToolUse {
         id: String,
         name: String,
@@ -186,6 +205,9 @@ enum AnthropicContentBlock {
         content: String,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        /// Same conversation-tail breakpoint slot as `Text::cache_control`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
 }
 
@@ -231,7 +253,10 @@ fn attachment_blocks(message: &CompletionMessage) -> Vec<AnthropicContentBlock> 
             crate::attachment::WirePart::Pdf { base64, .. } => AnthropicContentBlock::Document {
                 source: AnthropicMediaSource::base64("application/pdf", base64),
             },
-            crate::attachment::WirePart::Text { text } => AnthropicContentBlock::Text { text },
+            crate::attachment::WirePart::Text { text } => AnthropicContentBlock::Text {
+                text,
+                cache_control: None,
+            },
             // Audio/video are switched off in ANTHROPIC_CAPS, so wire_parts
             // has already degraded them to Text notes.
             crate::attachment::WirePart::Audio { .. }
@@ -409,6 +434,7 @@ fn to_anthropic_messages(
                 if !message.content.trim().is_empty() {
                     content.push(AnthropicContentBlock::Text {
                         text: message.content.clone(),
+                        cache_control: None,
                     });
                 }
                 if !content.is_empty() {
@@ -423,6 +449,7 @@ fn to_anthropic_messages(
                 if !message.content.trim().is_empty() {
                     content.push(AnthropicContentBlock::Text {
                         text: message.content.clone(),
+                        cache_control: None,
                     });
                 }
                 for call in &message.tool_calls {
@@ -459,6 +486,7 @@ fn to_anthropic_messages(
                             tool_use_id: result.call_id.clone(),
                             content: text,
                             is_error,
+                            cache_control: None,
                         }
                     })
                     .collect();
@@ -503,7 +531,8 @@ impl AnthropicProvider {
         req: CompletionRequest,
         observer: Option<&dyn ToolCallObserver>,
     ) -> Result<CompletionResult, ProviderError> {
-        let (system, messages) = to_anthropic_messages(&req.messages);
+        let (system, mut messages) = to_anthropic_messages(&req.messages);
+        stamp_tail_cache_breakpoint(&mut messages);
         // Thinking budget, resolved before max_tokens because the two are
         // coupled: the API requires budget < max_tokens, and this adapter's
         // 4096-token max_tokens default would leave no room for any budget
@@ -512,7 +541,10 @@ impl AnthropicProvider {
         // spends from the same output allowance as the answer — a budget
         // that consumes the whole cap yields a truncated or empty turn).
         // A caller-set cap is honored as-is and the budget clamps to it:
-        // at most max_tokens - 1024, never below the API's 1024 floor.
+        // at most max_tokens - 1024, never below the API's 1024 floor — and
+        // a cap at or below the floor leaves NO legal budget (the API
+        // requires 1024 <= budget < max_tokens), so thinking is omitted
+        // entirely rather than sent as a request the API rejects with 400.
         let thinking_budget =
             (req.reasoning == Some(true)).then(|| thinking_budget_tokens(req.effort));
         let max_tokens = match (req.max_output_tokens, thinking_budget) {
@@ -520,9 +552,11 @@ impl AnthropicProvider {
             (None, Some(budget)) => budget + 8_192,
             (None, None) => 4096,
         };
-        let thinking = thinking_budget.map(|budget| AnthropicThinking {
-            kind: "enabled",
-            budget_tokens: budget.min(max_tokens.saturating_sub(1024)).max(1024),
+        let thinking = thinking_budget.and_then(|budget| {
+            (max_tokens > 1024).then(|| AnthropicThinking {
+                kind: "enabled",
+                budget_tokens: budget.min(max_tokens - 1024).max(1024),
+            })
         });
         let params = req.params.unwrap_or_default();
         let body = AnthropicRequest {
@@ -537,7 +571,6 @@ impl AnthropicProvider {
             }),
             messages,
             stream: true,
-            cache_control: EPHEMERAL_CACHE,
             // The API rejects temperature != 1 with thinking enabled; rather
             // than special-casing 1.0, omit the field entirely and let the
             // API apply its own thinking-compatible default.
@@ -583,15 +616,17 @@ impl AnthropicProvider {
             ));
         }
 
-        let (text, tool_calls, usage) = aggregate_anthropic_stream(response, observer).await?;
+        let (text, tool_calls, usage, stop_reason) =
+            aggregate_anthropic_stream(response, observer).await?;
         let cost_usd = self.pricing.map(|p| p.cost_usd(&usage)).unwrap_or(0.0);
+        let finish_reason = map_stop_reason(stop_reason.as_deref());
         Ok(CompletionResult {
             text,
             tool_calls,
             usage,
             model: self.model.clone(),
             cost_usd,
-            finish_reason: None,
+            finish_reason,
         })
     }
 }
@@ -605,10 +640,24 @@ struct ToolUseAccumulator {
     input_json: String,
 }
 
+/// Normalize the Messages API's `stop_reason` vocabulary onto the
+/// provider-neutral [`FinishReason`] — the driver's truncation diagnostics
+/// (`driver.rs`) only fire when `Length` actually reaches it. Unknown or
+/// unreported reasons stay `None` per the `CompletionResult` contract.
+fn map_stop_reason(stop_reason: Option<&str>) -> Option<FinishReason> {
+    match stop_reason? {
+        "end_turn" | "stop_sequence" | "pause_turn" => Some(FinishReason::Stop),
+        "max_tokens" => Some(FinishReason::Length),
+        "tool_use" => Some(FinishReason::ToolCalls),
+        "refusal" => Some(FinishReason::ContentFilter),
+        _ => None,
+    }
+}
+
 async fn aggregate_anthropic_stream(
     response: reqwest::Response,
     observer: Option<&dyn ToolCallObserver>,
-) -> Result<(String, Vec<ToolCall>, CompletionUsage), ProviderError> {
+) -> Result<(String, Vec<ToolCall>, CompletionUsage, Option<String>), ProviderError> {
     use std::collections::BTreeMap;
 
     let mut decoder = SseDecoder::new();
@@ -791,7 +840,7 @@ async fn aggregate_anthropic_stream(
         });
     }
 
-    Ok((text, tool_calls, usage))
+    Ok((text, tool_calls, usage, stop_reason))
 }
 
 #[cfg(test)]
@@ -1196,7 +1245,7 @@ mod tests {
         // Not one emitted text block is empty or whitespace-only.
         for m in &mapped {
             for block in &m.content {
-                if let AnthropicContentBlock::Text { text } = block {
+                if let AnthropicContentBlock::Text { text, .. } = block {
                     assert!(
                         !text.trim().is_empty(),
                         "emitted an empty/whitespace text block: {text:?}"
@@ -1227,11 +1276,31 @@ mod tests {
     }
 
     /// Prompt caching is opt-in per request: the serialized body must carry
-    /// both breakpoints — one on the system block (tools+system tier) and
-    /// the top-level auto marker (conversation tail) — or the API silently
-    /// caches nothing and every turn re-pays the full replayed prefix.
+    /// both breakpoints — one on the system block (tools+system tier), one
+    /// on the final content block of the last message (conversation tail) —
+    /// or the API silently caches nothing and every turn re-pays the full
+    /// replayed prefix. And it must carry them at BLOCK level only: a
+    /// top-level `cache_control` request field is an unknown parameter the
+    /// live API rejects with a 400, killing every Anthropic call.
     #[test]
     fn request_serializes_both_cache_breakpoints() {
+        let mut messages = vec![
+            AnthropicMessage {
+                role: "user",
+                content: vec![AnthropicContentBlock::Text {
+                    text: "earlier turn".into(),
+                    cache_control: None,
+                }],
+            },
+            AnthropicMessage {
+                role: "user",
+                content: vec![AnthropicContentBlock::Text {
+                    text: "hi".into(),
+                    cache_control: None,
+                }],
+            },
+        ];
+        stamp_tail_cache_breakpoint(&mut messages);
         let body = AnthropicRequest {
             model: "claude-fable-5",
             max_tokens: 64,
@@ -1240,12 +1309,8 @@ mod tests {
                 text: "You are a coding agent.",
                 cache_control: EPHEMERAL_CACHE,
             }]),
-            messages: vec![AnthropicMessage {
-                role: "user",
-                content: vec![AnthropicContentBlock::Text { text: "hi".into() }],
-            }],
+            messages,
             stream: true,
-            cache_control: EPHEMERAL_CACHE,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -1255,7 +1320,21 @@ mod tests {
         let v = serde_json::to_value(&body).expect("request serializes");
         assert_eq!(v["system"][0]["type"], "text");
         assert_eq!(v["system"][0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(v["cache_control"]["type"], "ephemeral");
+        // Tail breakpoint on the LAST block of the LAST message only.
+        assert_eq!(
+            v["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(
+            v["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none(),
+            "only the tail block carries a breakpoint"
+        );
+        assert!(
+            v.get("cache_control").is_none(),
+            "top-level cache_control is not a Messages API parameter"
+        );
         // The optional params/thinking fields must vanish when unset — the
         // byte-stability contract for requests without overrides.
         let body_json = serde_json::to_string(&v).unwrap();

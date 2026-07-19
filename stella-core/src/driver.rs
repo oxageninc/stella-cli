@@ -5,8 +5,8 @@
 //! wiring together every other module in this crate.
 //!
 //! `Engine` drives through `&dyn Provider` (`stella_protocol`) and
-//! `&dyn ToolExecutor` (`crate::ports`) — no adapter-specific code, no
-//! filesystem call, lives here. Everything
+//! `&dyn ToolExecutor` (`crate::ports`) — no adapter-specific code and no
+//! direct filesystem access live here. Everything
 //! *inside* one step (compaction, loop detection, budget evaluation) is the
 //! plain synchronous logic from the other modules in this crate; `run_turn`
 //! is the one place that sequences them against real I/O.
