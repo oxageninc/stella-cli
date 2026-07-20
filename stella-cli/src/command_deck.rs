@@ -46,8 +46,12 @@
 //!   drains what was already emitted. The deck's single Esc is the SOFT stop
 //!   for step-loop lead turns (the engine ends at the next step boundary,
 //!   keeping completed work — `stella_core::SOFT_STOP_REASON`); pipeline
-//!   turns and worker lanes cancel immediately. After a cancel the loop pops
-//!   the next queued prompt as usual ("interrupt current, run next").
+//!   turns and worker lanes cancel immediately (a pipeline is a multi-stage
+//!   flow with no single soft-stop continuation). Mid-turn `>` steering,
+//!   though, reaches BOTH lead turn shapes — the step-loop engine and the
+//!   pipeline's execute engine both drain the steering tap at their step
+//!   boundaries. After a cancel the loop pops the next queued prompt as
+//!   usual ("interrupt current, run next").
 //!   A double-Esc `StopAndHold` is the immediate clean cancel plus
 //!   queue discipline: the interrupted prompt returns to the FRONT of the
 //!   backlog and dispatch parks until the user's next submission, which
@@ -1186,6 +1190,7 @@ pub async fn run_deck_session(
                         &sup_tx,
                         &lead_holder,
                         &discovery_activation,
+                        &steering,
                     )
                     .await
                 } else {
@@ -1251,11 +1256,9 @@ pub async fn run_deck_session(
                         }) => {
                             // `>`-prefix = steer THIS turn (step-boundary
                             // injection; the `Steered` event is the ack).
-                            // Pipeline mode has no steering seam — there
-                            // the prefix stays an ordinary prompt.
-                            if !pipeline_on
-                                && let Some(steer) = text.trim_start().strip_prefix('>')
-                            {
+                            // Works for both the step-loop lead turn and the
+                            // pipeline execute engine — both drain the tap.
+                            if let Some(steer) = text.trim_start().strip_prefix('>') {
                                 steering.push(steer.trim_start().to_string());
                                 continue;
                             }
@@ -1298,9 +1301,12 @@ pub async fn run_deck_session(
                             control: stella_tui::AgentControl::Stop, agent,
                         }) => {
                             if agent == LEAD {
-                                // Pipeline turns have no steering seam (the
-                                // pipeline drives its own engines) — there
-                                // the plain stop stays the hard cancel.
+                                // Pipeline turns accept mid-turn `>` steering
+                                // (the execute engine drains the tap) but the
+                                // STOP stays a hard cancel: a pipeline is
+                                // triage→…→judge, so a mid-execute soft stop
+                                // has no single obvious continuation. Only the
+                                // step-loop turn soft-stops.
                                 if pipeline_on {
                                     break TurnEnd::Cancelled { hold: false };
                                 }
@@ -4165,6 +4171,7 @@ async fn run_lead_pipeline_turn(
     sup_tx: &UnboundedSender<SupervisorMsg>,
     claim_holder: &str,
     activated: &crate::discovery::ActivatedTools,
+    steering: &subsession::SteeringTap,
 ) -> Result<(), String> {
     budget.begin_turn();
 
@@ -4243,6 +4250,9 @@ async fn run_lead_pipeline_turn(
                 .as_ref()
                 .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
             candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+            // The deck's per-turn tap: `>` steers the execute engine mid-turn
+            // (the same tap the step-loop lead turn uses).
+            steering: Some(steering),
         };
         let config = PipelineConfig {
             engine: agent::pipeline_engine_config_for(cfg),

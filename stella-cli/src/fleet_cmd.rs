@@ -561,6 +561,8 @@ async fn run_task(
                 .as_ref()
                 .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
             candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+            // Headless / fleet: no concurrent input channel to steer from.
+            steering: None,
         };
         let config = PipelineConfig {
             engine: agent::pipeline_engine_config_for(&cfg),

@@ -13,8 +13,8 @@ use stella_core::router::{CircuitBreaker, ProviderProfile, RoleTable};
 use stella_core::{Clock, ToolExecutor};
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{
-    CompletionRequest, CompletionUsage, FileChangeKind, ProviderError, ScopeProposal, ToolOutput,
-    ToolSchema,
+    CompletionRequest, CompletionUsage, FileChangeKind, MessageRole, ProviderError, ScopeProposal,
+    ToolOutput, ToolSchema,
 };
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
@@ -108,6 +108,24 @@ impl Provider for ScriptedProvider {
         let mut q = self.script.lock().await;
         q.pop_front()
             .ok_or_else(|| ProviderError::Terminal("scripted provider exhausted".into()))
+    }
+}
+
+/// A [`TurnSteering`] that hands out its queue on the first drain and never
+/// soft-stops — the witness that a queued steer reaches the execute engine.
+#[derive(Default)]
+struct SteeringOnce {
+    queued: std::sync::Mutex<Vec<String>>,
+    drains: std::sync::atomic::AtomicU32,
+}
+impl stella_core::ports::TurnSteering for SteeringOnce {
+    fn drain_steering(&self) -> Vec<String> {
+        self.drains
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::mem::take(&mut *self.queued.lock().unwrap())
+    }
+    fn soft_stop_requested(&self) -> bool {
+        false
     }
 }
 
@@ -432,6 +450,7 @@ async fn single_task_with_a_flip_submits_fast_and_skips_the_judge() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            steering: None,
         },
         tx,
         config,
@@ -464,6 +483,74 @@ async fn single_task_with_a_flip_submits_fast_and_skips_the_judge() {
             evidence
         } if evidence.deterministic
     )));
+}
+
+/// A mid-turn steer reaches the EXECUTE engine: a message queued on the
+/// steering tap is injected as the execute turn's next observation and so
+/// rides into the returned trajectory. Triage runs as a raw completion (no
+/// engine), so the tap is drained only by the execute engine's step loop.
+#[tokio::test]
+async fn a_queued_steer_is_injected_into_the_execute_turn() {
+    // triage → "single"; worker turn → final text (no tool calls).
+    let provider = ScriptedProvider::new(vec![text_result("single"), text_result("done")]);
+    let resolver = OneProvider(&provider);
+    let runner = ScriptedRunner::new(vec![false, true], "@@ -1 +1 @@\n-old\n+new");
+    let tools = EmptyTools;
+    let recall = NoContextRecall;
+    let repo = NoRepoStructure;
+    let repo_status = NoRepoStatus;
+    let approvals = AutoApproveGate;
+    let sleeper = NoopSleeper;
+    let router = router();
+    let steering = SteeringOnce {
+        queued: std::sync::Mutex::new(vec!["also update the changelog".into()]),
+        drains: std::sync::atomic::AtomicU32::new(0),
+    };
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let config = PipelineConfig {
+        test_command: Some("cargo test -p x".into()),
+        diff_command: Some("git diff".into()),
+        ..PipelineConfig::default()
+    };
+    let pipeline = Pipeline::new(
+        PipelinePorts {
+            router: &router,
+            providers: &resolver,
+            tools: &tools,
+            recall: &recall,
+            repo: &repo,
+            repo_status: &repo_status,
+            commands: &runner,
+            approvals: &approvals,
+            sleeper: &sleeper,
+            hooks: None,
+            candidate_workspaces: None,
+            steering: Some(&steering),
+        },
+        tx,
+        config,
+    );
+
+    let mut messages = vec![CompletionMessage::system("sys")];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    pipeline
+        .run("Fix the failing test", &mut messages, &mut budget)
+        .await
+        .expect("run succeeds");
+
+    let injected = messages
+        .iter()
+        .filter(|m| m.role == MessageRole::User && m.content == "also update the changelog")
+        .count();
+    assert_eq!(
+        injected, 1,
+        "the steer must be injected exactly once, into the execute turn"
+    );
+    assert!(
+        steering.drains.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the execute engine must have drained the steering tap"
+    );
 }
 
 /// The zero-diff guard: triage misclassifies a file-touching task as a
@@ -507,6 +594,7 @@ async fn misclassified_lookup_that_touches_files_still_gets_verified() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            steering: None,
         },
         tx,
         config,
@@ -564,6 +652,7 @@ async fn clean_lookup_skips_plan_verify_and_judge() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            steering: None,
         },
         tx,
         PipelineConfig::default(),
@@ -628,6 +717,7 @@ async fn headless_scope_review_without_bypass_is_a_named_error() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            steering: None,
         },
         tx,
         config,
@@ -678,6 +768,7 @@ async fn user_abort_at_scope_review_is_a_clean_abort() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            steering: None,
         },
         tx,
         PipelineConfig::default(),
@@ -746,6 +837,7 @@ async fn gather_diff_counts_real_new_file_lines_and_excludes_pre_existing() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            steering: None,
         },
         tx,
         PipelineConfig::default(),
@@ -839,6 +931,7 @@ async fn witness_authored_command_arms_the_flip_oracle_and_submits_fast() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            steering: None,
         },
         tx,
         PipelineConfig::default(),
@@ -909,6 +1002,7 @@ async fn a_witness_that_never_fails_is_discarded_and_the_judge_verifies() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            steering: None,
         },
         tx,
         PipelineConfig::default(),
@@ -990,6 +1084,7 @@ async fn a_tampered_witness_file_excludes_the_flip_from_evidence() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            steering: None,
         },
         tx,
         config,
@@ -1058,6 +1153,7 @@ async fn second_consecutive_red_verification_gets_judge_guidance() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            steering: None,
         },
         tx,
         config,
@@ -1125,6 +1221,7 @@ async fn run_isolated(
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: Some(port),
+            steering: None,
         },
         tx,
         config,
@@ -1249,6 +1346,7 @@ async fn single_shot_never_touches_the_candidate_workspace_port() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: Some(&port),
+            steering: None,
         },
         tx,
         PipelineConfig {
@@ -1401,6 +1499,7 @@ async fn best_of_n_without_a_port_degrades_to_the_shared_tree_with_a_warning() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            steering: None,
         },
         tx,
         isolated_config(2),
