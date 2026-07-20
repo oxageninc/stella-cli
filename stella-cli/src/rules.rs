@@ -442,7 +442,10 @@ mod tests {
             root.path().to_path_buf(),
             None,
             None,
-            stella_tools::RegistryOptions { bash: true },
+            stella_tools::RegistryOptions {
+                bash: true,
+                web: false,
+            },
         );
         enforce_workspace_rules(&registry, root.path());
 

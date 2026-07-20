@@ -488,6 +488,11 @@ pub struct ToolsSettings {
     /// bool so a typo'd value is a loud parse error, not a silent state.
     #[serde(default)]
     pub bash: Option<Toggle>,
+    /// The web family (`web_search`, `web_fetch`, `web_extract_assets`,
+    /// `web_download`). **Absent or `"off"` = not registered** — network
+    /// egress is opt-in exactly like the shell: `"tools": {"web": "on"}`.
+    #[serde(default)]
+    pub web: Option<Toggle>,
 }
 
 /// The `mcp` section of settings.json. All fields optional so an absent
@@ -510,6 +515,16 @@ impl Settings {
         self.tools
             .as_ref()
             .and_then(|t| t.bash)
+            .is_some_and(Toggle::is_on)
+    }
+
+    /// Whether the web tool family is enabled for this workspace. Same
+    /// posture as [`Settings::bash_tool_enabled`]: default OFF everywhere,
+    /// only an explicit `"tools": {"web": "on"}` in the chain turns it on.
+    pub fn web_tools_enabled(&self) -> bool {
+        self.tools
+            .as_ref()
+            .and_then(|t| t.web)
             .is_some_and(Toggle::is_on)
     }
 
@@ -691,6 +706,9 @@ impl Settings {
                 let target = merged.tools.get_or_insert_with(ToolsSettings::default);
                 if let Some(bash) = tools.bash {
                     target.bash = Some(bash);
+                }
+                if let Some(web) = tools.web {
+                    target.web = Some(web);
                 }
             }
             // Agent-engine config overlays per field / per agent, like
@@ -1053,6 +1071,31 @@ mod tests {
         // A scope that doesn't speak `tools` leaves the earlier value.
         let merged = Settings::load_from(&[user_on, silent]).unwrap();
         assert!(merged.bash_tool_enabled(), "silent scope must not reset");
+    }
+
+    /// The web family shares the bash posture — absent = off, per-field
+    /// scope merge with the project winning — and the two switches are
+    /// independent fields of the one `tools` section.
+    #[test]
+    fn web_tools_default_off_and_merge_per_field() {
+        assert!(!Settings::default().web_tools_enabled());
+        let dir = tempfile::tempdir().unwrap();
+        let user_on = write(dir.path(), "user.json", r#"{"tools": {"web": "on"}}"#);
+        let merged = Settings::load_from(std::slice::from_ref(&user_on)).unwrap();
+        assert!(merged.web_tools_enabled());
+        assert!(!merged.bash_tool_enabled(), "web on must not enable bash");
+
+        let project = write(
+            dir.path(),
+            "project.json",
+            r#"{"tools": {"web": "off", "bash": "on"}}"#,
+        );
+        let merged = Settings::load_from(&[user_on, project]).unwrap();
+        assert!(!merged.web_tools_enabled(), "project-scope off wins");
+        assert!(
+            merged.bash_tool_enabled(),
+            "sibling field merges independently"
+        );
     }
 
     /// `tools.bash` takes the Toggle vocabulary only — a bool (or any

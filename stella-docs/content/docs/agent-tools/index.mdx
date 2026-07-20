@@ -103,7 +103,7 @@ These 35 tools register in every session — no configuration, no prerequisites.
 | `task_assign` | Delegate a board task to a parallel sub-agent — the briefing is passed verbatim, so write it self-contained. | Mutating |
 
 <Callout type="info">
-`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `gather_context`, `explorations`, `ci_status`, `repo_status`, `task_list`, and (when present) `graph_query`, `search_issues`, `get_issue`, `list_labels`, `list_members` — plus `search_skills`, `tool_search`, `skill_search`, and `mcp_search` at the session layer.
+`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `gather_context`, `explorations`, `ci_status`, `repo_status`, `task_list`, and (when present) `graph_query`, `search_issues`, `get_issue`, `list_labels`, `list_members`, `web_search`, `web_fetch`, `web_extract_assets` — plus `search_skills`, `tool_search`, `skill_search`, and `mcp_search` at the session layer. (`web_download` writes a file, so it is mutating.)
 </Callout>
 
 ### Conditionally registered
@@ -113,6 +113,10 @@ These appear only when their prerequisite is met:
 | Tool | Description | Access | Appears when |
 | --- | --- | --- | --- |
 | `bash` | Run a shell command in the workspace root, with a timeout backstop. | Mutating | Your [settings](/docs/configuration/settings) opt in with `"tools": {"bash": "on"}` (any scope). **Off by default everywhere**, including interactive sessions — see below. |
+| `web_fetch` | Fetch a URL and read it as markdown, plain text, or raw HTML — links absolutized so the agent can follow them. | Read-only | Your settings opt in with `"tools": {"web": "on"}` (any scope). **Off by default** — see [Web tools](#web-opt-in). |
+| `web_extract_assets` | Fetch a page and mine its design assets — stylesheets, scripts, images, fonts, plus design tokens (colors, font families, custom properties, `@font-face`) distilled from the CSS. | Read-only | The `web` opt-in (as above). |
+| `web_download` | Download a URL to a file inside the workspace (images, fonts, stylesheets, archives). | Mutating | The `web` opt-in (as above). |
+| `web_search` | Search the web and get ranked results (title, URL, snippet). | Read-only | The `web` opt-in **and** a BYOK search key (`BRAVE_API_KEY` or `TAVILY_API_KEY`) — the other three web tools need no key. |
 | `graph_query` | Query the indexed code graph instead of grepping: definitions, references, imports, importers, or a file's full graph neighborhood. | Read-only | `stella init` has built `.stella/codegraph.db` (also picked up mid-session once the graph exists). |
 | `generate_image` | Generate an image from a text prompt into `.stella/artifacts/`. | Mutating | An image-capable BYOK provider key is configured. |
 | `generate_video` | Submit an asynchronous text-to-video job. Video costs real money: any job with a positive estimated cost is denied unless `confirm_spend` is true. | Mutating | The configured media provider has a **video** adapter — an image-only key registers `generate_image` without the video pair. |
@@ -132,6 +136,52 @@ These appear only when their prerequisite is met:
 
 <Callout type="info">
 The issue backend resolves in precedence order: `LINEAR_API_KEY` env → a stored **Linear** connection (`stella connect linear`) → a stored **GitHub** connection (`stella connect github`, runs over REST with no `gh` CLI needed) → ambient `gh` CLI auth. If none is available, no issue tools are registered at all. See [stella connect](/docs/commands/connect).
+</Callout>
+
+### Web (opt-in)
+
+The web family gives the agent the open internet: search, fetch-and-read, asset extraction, and download. It powers things like *"build me a design system based on this site"* or *"read this article and summarize it."* Like `bash`, it is **off by default in every scope** — a fetched page is both untrusted input and an uncontrolled egress channel, so you turn it on deliberately:
+
+```json title="settings.json"
+{
+  "tools": {
+    "web": "on"
+  }
+}
+```
+
+With the opt-in, three tools register with **no key required**:
+
+| Tool | What it does | Access |
+| --- | --- | --- |
+| `web_fetch` | Fetch a URL and read it. HTML renders as markdown (default), plain `text`, or raw `html`; links and images come back absolute so the agent can follow them. Binary responses are reported, not dumped — use `web_download` for those. | Read-only |
+| `web_extract_assets` | Fetch a page and mine its design assets: external + inline stylesheets, scripts, images, preloaded fonts, and **design tokens distilled from the CSS** — colors and font families ranked by frequency, CSS custom properties, and `@font-face` families with their source files. The starting point for reconstructing a site's design system. | Read-only |
+| `web_download` | Download a URL to a workspace-relative path (confined to the workspace root, audited in the file-touch ledger like `write_file`). Assets belong under `.stella/artifacts/web/`. | Mutating |
+
+`web_search` registers additionally when a **BYOK search key** is present — `BRAVE_API_KEY` (a dedicated web-search API) or `TAVILY_API_KEY`. Without a key the other three still work; you just fetch URLs you already know.
+
+#### Logging in to sites (`web_auth.toml`)
+
+To fetch pages behind a login — your subscriptions, a paywalled news site, an internal tool — give Stella your own session in `~/.config/stella/web_auth.toml` (override the path with `STELLA_WEB_AUTH_FILE`). Cookies and headers are injected per domain at request time and **never appear in tool output**, so the secrets stay out of the model's context.
+
+```toml title="~/.config/stella/web_auth.toml"
+# Optional: override the default `stella/<version>` User-Agent for all requests.
+[defaults]
+user_agent = "Mozilla/5.0 (compatible; my-research-bot)"
+
+# One block per domain. A domain also matches its subdomains; the longest
+# configured suffix wins (api.example.com beats example.com).
+[domains."news.example.com"]
+cookie = "session=…; csrftoken=…"   # paste from your logged-in browser session
+
+[domains."internal.corp"]
+authorization = "Bearer …"
+[domains."internal.corp".headers]
+X-Tenant = "acme"
+```
+
+<Callout type="warn">
+`web_auth.toml` holds live session secrets — treat it like `credentials.toml`. Stella redacts the values from its own logs and never echoes them into a tool result, but the file itself is plaintext: restrict it to owner-only (`chmod 600`). Unknown keys are a hard parse error, and a broken file makes every web tool fail loudly rather than silently fetching unauthenticated. Cookies and `Authorization` are dropped on cross-host redirects.
 </Callout>
 
 ### Session tools
@@ -158,7 +208,7 @@ The other three session tools are read-only **discovery** tools layered over the
 
 Set `STELLA_LEAN_TOOLS=1` to advertise only a lean core toolset (file CRUD, search, build/test/verify, `ask_user`, and `bash` when the opt-in has enabled it) plus the discovery tools; everything else stays out of the prompt until a `tool_search` surfaces it. Matched tools are *activated* — advertised for the rest of the session. Set the variable to a comma-separated list of tool names to choose your own core. A hidden tool called by name still executes, so lean mode trims prompt weight without ever gating a capability.
 
-All told: 35 always-on tools, up to 48 native tools with the `bash` opt-in, the code graph, media keys, and an issue backend, plus the six session tools — before any custom script tools or MCP servers merge in.
+All told: 35 always-on tools, up to 52 native tools with the `bash` and `web` opt-ins, the code graph, media keys, a search key, and an issue backend, plus the six session tools — before any custom script tools or MCP servers merge in.
 
 ## Where to go next
 

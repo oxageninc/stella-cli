@@ -49,6 +49,7 @@ notify = "8"
 ratatui = "0.30"
 unicode-width = "0.2"
 roxmltree = "0.21"
+scraper = "0.23"
 rusqlite = { version = "0.40", features = ["bundled"] }
 hmac = "0.13"
 sha2 = "0.11"

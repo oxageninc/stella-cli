@@ -148,6 +148,11 @@ pub struct RegistryOptions {
     /// the model never sees the schema, and calling `bash` anyway returns
     /// the standard unknown-tool error.
     pub bash: bool,
+    /// Register the web family (`web_fetch`, `web_extract_assets`,
+    /// `web_download`, and `web_search` when a BYOK search key is present).
+    /// Off by default everywhere — network egress is opt-in exactly like
+    /// the shell (settings `tools.web: "on"`).
+    pub web: bool,
 }
 
 impl ToolRegistry {
@@ -272,6 +277,21 @@ impl ToolRegistry {
         // policy enforced at the tool boundary, not by prompt discipline.
         if options.bash {
             entries.push(Arc::new(crate::bash::Bash));
+        }
+        // The web family is OPT-IN like bash (`tools.web: "on"`): a fetched
+        // page is untrusted input AND an uncontrolled egress channel, so
+        // network access is never ambient. `web_search` additionally needs a
+        // BYOK search key — no key, no dead schema, mirroring the media
+        // tools' conditional registration.
+        if options.web {
+            let auth: Arc<crate::web::WebAuthState> =
+                Arc::new(crate::web::WebAuthConfig::load_default());
+            entries.push(Arc::new(crate::web::WebFetch(auth.clone())));
+            entries.push(Arc::new(crate::web::WebExtractAssets(auth.clone())));
+            entries.push(Arc::new(crate::web::WebDownload(auth)));
+            if let Some(search) = crate::web::detect_search_backend() {
+                entries.push(Arc::new(crate::web::WebSearch(search)));
+            }
         }
         // The code-graph query tool exists only when `stella init` has built
         // an index — same conditional-registration discipline as the issue
@@ -885,7 +905,9 @@ impl ToolRegistry {
             "read_file" => FileOp::Read,
             "edit_file" => FileOp::Update,
             "delete_file" => FileOp::Delete,
-            "write_file" => {
+            // `web_download` lands a file exactly like `write_file`, so it
+            // takes the same ledger classification and hook gating.
+            "write_file" | "web_download" => {
                 if full.exists() {
                     FileOp::Update
                 } else {
@@ -1426,6 +1448,7 @@ mod tests {
         }
         // And the default options value IS the off posture.
         assert!(!RegistryOptions::default().bash);
+        assert!(!RegistryOptions::default().web);
     }
 
     /// Witness: the explicit opt-in registers `bash` — schema advertised
@@ -1437,7 +1460,10 @@ mod tests {
             root.path().to_path_buf(),
             None,
             None,
-            RegistryOptions { bash: true },
+            RegistryOptions {
+                bash: true,
+                web: false,
+            },
         );
         assert!(reg.schemas().iter().any(|s| s.name == "bash"));
         let out = reg
@@ -1449,6 +1475,52 @@ mod tests {
         match out {
             ToolOutput::Ok { content } => assert!(content.contains("bash_enabled_ok")),
             ToolOutput::Error { message } => panic!("enabled bash must run: {message}"),
+        }
+    }
+
+    // ---- web opt-in (default OFF everywhere) --------------------------
+
+    /// Witness: the web family is settings opt-in exactly like bash —
+    /// absent by default, registered (fetch/extract/download, all
+    /// key-free) with the flag. `web_search` additionally needs a search
+    /// key, so its presence is environment-dependent and not pinned here.
+    #[test]
+    fn web_family_registers_only_with_the_opt_in_flag() {
+        let (_root, reg) = bare_registry(None);
+        let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
+        for absent in [
+            "web_fetch",
+            "web_extract_assets",
+            "web_download",
+            "web_search",
+        ] {
+            assert!(
+                !names.contains(&absent.to_string()),
+                "{absent} must be absent by default"
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::with_backends_and_options(
+            root.path().to_path_buf(),
+            None,
+            None,
+            RegistryOptions {
+                bash: false,
+                web: true,
+            },
+        );
+        let schemas = reg.schemas();
+        for (expected, read_only) in [
+            ("web_fetch", true),
+            ("web_extract_assets", true),
+            ("web_download", false),
+        ] {
+            let schema = schemas
+                .iter()
+                .find(|s| s.name == expected)
+                .unwrap_or_else(|| panic!("{expected} must register with the web opt-in"));
+            assert_eq!(schema.read_only, read_only, "{expected}");
         }
     }
 
@@ -2398,7 +2470,10 @@ mod tests {
             dir.path().to_path_buf(),
             None,
             None,
-            RegistryOptions { bash: true },
+            RegistryOptions {
+                bash: true,
+                web: false,
+            },
         );
         let bus = HookBus::new("sess");
         bus.on_blocking(hook_names::COMMAND_STARTED, |_| HookDecision::Deny {

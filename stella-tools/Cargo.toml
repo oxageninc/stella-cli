@@ -1,6 +1,6 @@
 [package]
 name = "stella-tools"
-description = "Built-in agent tools: file CRUD, grep/glob, build/test/lint/format, project-declared scripts, a long-running process group, vendor-neutral repo tools, and the opt-in bash. Workspace-root-pinned, timeout-backed, size-capped."
+description = "Built-in agent tools: file CRUD, grep/glob, build/test/lint/format, project-declared scripts, a long-running process group, vendor-neutral repo tools, and the opt-in bash and web families. Workspace-root-pinned, timeout-backed, size-capped."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,6 +21,10 @@ async-trait.workspace = true
 futures-util.workspace = true
 libc.workspace = true
 reqwest = { workspace = true }
+# HTML parsing for the opt-in web family (`web_fetch` readable extraction,
+# `web_extract_assets` design-token mining) — the Servo html5ever parser, so
+# real-world tag soup parses the way a browser reads it.
+scraper = { workspace = true }
 # Tracker OAuth (PKCE S256, state) — same vetted crates as stella-mcp.
 base64.workspace = true
 rand.workspace = true
