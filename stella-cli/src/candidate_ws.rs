@@ -26,28 +26,37 @@
 //!
 //! # What a candidate's engine can reach
 //!
-//! Candidates drive a fresh built-in [`ToolRegistry`] rooted at the
-//! snapshot (with the session's workspace rules and schema gate applied).
-//! MCP servers, custom script tools, and the interactive/discovery layers
-//! are deliberately NOT re-wired into candidates: they were spawned against
-//! the real workspace, so routing them into a candidate would leak its edits
-//! straight into the tree isolation exists to protect.
-//! TODO(best-of-n-tool-surface): grow the candidate tool surface — custom
-//! script tools re-rooted at the snapshot are straightforward; MCP needs
-//! per-candidate server sessions (or a cwd-forwarding protocol extension)
-//! before it can be offered safely.
+//! Candidates drive the built-in [`ToolRegistry`] PLUS the session's custom
+//! script tools, both rooted at the snapshot (with the session's workspace
+//! rules and schema gate applied) — a [`CustomToolSet`] owning the registry
+//! by `Arc`. Custom tools spawn subprocesses with the snapshot as cwd
+//! ([`CustomToolSet::new_owned`]), so their writes land in the isolated
+//! shadow, never the real tree.
+//!
+//! MCP servers and the interactive/discovery layers are still NOT re-wired
+//! into candidates, and this is a CORRECTNESS boundary, not just a leak one:
+//! an MCP server was spawned against the REAL workspace, so even a read-only
+//! MCP tool would return the real tree's content — a candidate that edited a
+//! file then read it back via MCP would see the UNEDITED bytes, mixing a
+//! stale view into its snapshot-rooted work. Offering MCP to candidates
+//! needs per-candidate server sessions (cwd = snapshot); until then it is
+//! correctly withheld. The interactive layer (`ask_user`) is withheld
+//! because a fan-out of N candidates has no single owner for a prompt.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use std::sync::Arc;
 use stella_fleet::git::{GitCli, SystemGitCli};
 use stella_pipeline::ports::{
     AdoptedChange, CandidateWorkspace, CandidateWorkspacePort, CommandRunner, RepoStatusPort,
     WorkspaceError,
 };
 use stella_protocol::FileChangeKind;
+
+use stella_tools::custom::{CustomTool, CustomToolSet};
 use stella_tools::{RegistryOptions, ToolRegistry};
 
 use crate::agent::{GitRepoStatus, ShellCommandRunner, fs_fingerprint};
@@ -195,11 +204,24 @@ pub(crate) struct GitCandidateWorkspaces {
     /// Registry switches for the per-candidate tool registry (same secure
     /// posture as the session's: `bash` only when settings opt in).
     options: RegistryOptions,
+    /// The session's custom script tools, re-rooted at each candidate's
+    /// snapshot (their subprocesses spawn with the snapshot as cwd, so they
+    /// stay isolated). Cloned per candidate; the manifests are identical to
+    /// the session's because the snapshot is a copy of the real tree.
+    custom_tools: Vec<CustomTool>,
 }
 
 impl GitCandidateWorkspaces {
-    pub(crate) fn new(root: PathBuf, options: RegistryOptions) -> Self {
-        Self { root, options }
+    pub(crate) fn new(
+        root: PathBuf,
+        options: RegistryOptions,
+        custom_tools: Vec<CustomTool>,
+    ) -> Self {
+        Self {
+            root,
+            options,
+            custom_tools,
+        }
     }
 
     /// The concrete create (the trait impl boxes its result): snapshot the
@@ -242,12 +264,20 @@ impl GitCandidateWorkspaces {
         match populate_snapshot(&toplevel, &dir, &root_rel).await {
             Ok(overlay_untracked) => {
                 let ws_root = dir.join(&root_rel);
-                let tools = ToolRegistry::new_detected(ws_root.clone(), self.options).await;
+                let registry = ToolRegistry::new_detected(ws_root.clone(), self.options).await;
                 // Same governance as the session registry: workspace rules
                 // and the schema gate travel with the tree — best-of-N must
-                // not be a way around them.
-                crate::agent::populate_schema_index(&tools, &ws_root);
-                crate::rules::enforce_workspace_rules(&tools, &ws_root);
+                // not be a way around them. Applied while `registry` is still
+                // a plain `ToolRegistry`, before it moves into the `Arc`.
+                crate::agent::populate_schema_index(&registry, &ws_root);
+                crate::rules::enforce_workspace_rules(&registry, &ws_root);
+                // The candidate's tool surface: the snapshot-rooted registry
+                // plus the session's custom script tools, owned as one value
+                // (the workspace outlives every borrow). Custom tools re-root
+                // to `ws_root`, so their subprocesses run in the shadow.
+                let registry: Arc<dyn stella_core::ToolExecutor> = Arc::new(registry);
+                let tools =
+                    CustomToolSet::new_owned(registry, self.custom_tools.clone(), ws_root.clone());
                 Ok(GitCandidateWorkspace {
                     toplevel,
                     dir: dir.clone(),
@@ -405,7 +435,9 @@ pub(crate) struct GitCandidateWorkspace {
     toplevel: PathBuf,
     /// The shadow worktree directory.
     dir: PathBuf,
-    tools: ToolRegistry,
+    /// The candidate's tool surface: snapshot-rooted registry + custom tools,
+    /// owned so the boxed workspace can hand out `&dyn ToolExecutor`.
+    tools: CustomToolSet<'static>,
     commands: ShellCommandRunner,
     repo_status: SnapshotRepoStatus,
 }
@@ -665,7 +697,8 @@ mod tests {
     async fn snapshot_mirrors_dirty_staged_and_untracked_state_without_touching_the_real_tree() {
         let root = scaffold("snap");
         let before = tree_state(&root);
-        let port = GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default());
+        let port =
+            GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default(), Vec::new());
 
         let ws = port.create_workspace().await.unwrap();
         // Uncommitted tracked edit, staged-but-uncommitted new file, and the
@@ -705,10 +738,66 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A candidate's tool surface includes the session's custom script tools,
+    /// and running one executes in the SNAPSHOT (cwd = shadow), never the real
+    /// tree — the isolation guarantee for the grown tool surface.
+    #[tokio::test]
+    async fn custom_tools_reach_the_candidate_and_run_in_the_snapshot() {
+        let root = scaffold("customtools");
+        // A custom tool that writes a file into its cwd. Discovered from the
+        // real root exactly as the session discovers it.
+        std::fs::create_dir_all(root.join(".stella/tools")).unwrap();
+        std::fs::write(
+            root.join(".stella/tools/writer.toml"),
+            "name = \"writer\"\n\
+             description = \"write a marker file into the cwd\"\n\
+             command = [\"sh\", \"-c\", \"printf candidate > candidate_wrote.txt\"]\n\
+             [input_schema]\n\
+             type = \"object\"\n",
+        )
+        .unwrap();
+        let custom_tools = stella_tools::custom::discover(&root).tools;
+        assert_eq!(custom_tools.len(), 1, "the writer tool must be discovered");
+
+        let port =
+            GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default(), custom_tools);
+        let ws = port.create_workspace().await.unwrap();
+
+        // The candidate model sees the custom tool in its schema…
+        let names: Vec<String> = ws.tools().schemas().into_iter().map(|s| s.name).collect();
+        assert!(
+            names.iter().any(|n| n == "writer"),
+            "candidate schemas must include the custom tool: {names:?}"
+        );
+        // …and it also still sees a built-in (the registry is the inner set).
+        assert!(
+            names.iter().any(|n| n == "read_file"),
+            "candidate must still have the built-in registry"
+        );
+
+        // Executing it writes into the SNAPSHOT, not the real tree.
+        let out = ws.tools().execute("writer", &serde_json::json!({})).await;
+        assert!(!out.is_error(), "custom tool run failed: {out:?}");
+        assert_eq!(
+            read(&ws.dir().join("candidate_wrote.txt")),
+            "candidate",
+            "the custom tool must write inside the snapshot"
+        );
+        assert!(
+            !root.join("candidate_wrote.txt").exists(),
+            "the custom tool must NOT touch the real tree"
+        );
+
+        ws.remove().await;
+        assert_no_candidate_worktrees(&root);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[tokio::test]
     async fn winner_adoption_lands_only_the_winners_changes() {
         let root = scaffold("adopt");
-        let port = GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default());
+        let port =
+            GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default(), Vec::new());
         let loser = port.create_workspace().await.unwrap();
         let winner = port.create_workspace().await.unwrap();
 
@@ -758,7 +847,8 @@ mod tests {
     #[tokio::test]
     async fn a_mid_run_user_edit_fails_adoption_atomically_naming_the_path() {
         let root = scaffold("conflict");
-        let port = GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default());
+        let port =
+            GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default(), Vec::new());
         let ws = port.create_workspace().await.unwrap();
 
         std::fs::write(ws.dir().join("tracked.txt"), "base\ndirty\ncandidate\n").unwrap();
@@ -804,7 +894,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         scratch_git(&root, &["init", "-q"]);
-        let port = GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default());
+        let port =
+            GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default(), Vec::new());
         match port.create_workspace().await {
             Err(WorkspaceError::Snapshot { reason }) => {
                 assert!(reason.contains("at least one commit"), "{reason}")
