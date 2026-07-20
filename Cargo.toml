@@ -40,6 +40,10 @@ libc = "0.2"
 rand = "0.10"
 proptest = "1"
 toml = "1.1"
+# Vetted dotenv parser (quotes, escapes, multi-line values, `export` prefixes),
+# used as a non-mutating iterator so the CLI keeps control of precedence and
+# never overrides the live shell. See stella-cli/src/env_files.rs.
+dotenvy = "0.15"
 rpassword = "7"
 base64 = "0.22"
 arboard = { version = "3", default-features = false, features = ["image-data"] }

@@ -28,6 +28,7 @@ mod connect_cmd;
 mod discovery;
 mod domains;
 mod engine_config;
+mod env_files;
 mod export;
 mod extensions;
 mod fleet_cmd;
@@ -936,7 +937,18 @@ fn main() -> ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
+    // Load project-scoped `.env`/`.env.local`/`.env.<mode>.local` before
+    // parsing, so both clap's `env = …` fields and downstream credential
+    // resolution see project keys. Runs here at single-threaded startup where
+    // mutating the process environment is safe. The live shell always wins;
+    // `STELLA_NO_ENV_FILE=1` opts out entirely.
+    let loaded_env = env_files::maybe_load();
+
     let cli = Cli::parse();
+
+    // Value-free confirmation (names only), gated on STELLA_ENV_DEBUG + a TTY +
+    // a human output format so it never pollutes json/stream-json.
+    env_files::announce(&loaded_env, cli.output_format);
 
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,

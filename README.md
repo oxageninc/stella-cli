@@ -139,6 +139,16 @@ route through the dedicated coding endpoint.
 **Credential chain** (first hit wins): `--api-key` flag → provider env var →
 `settings.json` `api_key` → `~/.config/stella/credentials.toml` → interactive prompt.
 
+**Project `.env` files** — so keys can follow the project you're in, Stella
+reads `.env`, `.env.local`, and `.env.<mode>.local` (e.g. `.env.production.local`)
+from the working directory (or the nearest ancestor within the same git repo)
+into the environment at startup, most-specific file first. Template files
+(`.env.example`, `.env.sample`, `.env.dist`) and non-`.local` mode files
+(`.env.production`) are never read. **Your live shell always wins** — a value
+already exported (or `OPENROUTER_API_KEY=… stella …`) is never overwritten by a
+file, so unset a stale export if you mean to switch. Disable the whole mechanism
+with `STELLA_NO_ENV_FILE=1`; see what loaded with `STELLA_ENV_DEBUG=1`.
+
 ```bash
 stella models    # list providers, models, and key status
 stella config    # show the fully resolved configuration

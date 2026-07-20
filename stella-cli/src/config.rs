@@ -699,8 +699,9 @@ impl Config {
 
         Err(format!(
             "no API key found. Set one of: {}\n\nExample: export ZAI_API_KEY=your_key_here\n\
-             (or add it to ~/.config/stella/credentials.toml, or pass --model provider/model \
-             to be prompted interactively)",
+             (or put it in a project .env / .env.local, add it to \
+             ~/.config/stella/credentials.toml, or pass --model provider/model to be prompted \
+             interactively)",
             PROVIDERS
                 .iter()
                 .map(|p| format!("{} ({})", p.env_var, p.display_name))
