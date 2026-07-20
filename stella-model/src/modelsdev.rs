@@ -22,10 +22,14 @@ use sha2::{Digest, Sha256};
 
 use crate::http;
 
-/// The master-list endpoint. Public and unauthenticated — but never fetched
+/// The master-list endpoint. Public and unauthenticated — but a THIRD
+/// party, not the user's chosen provider, so it is never fetched
 /// implicitly: stella's no-phone-home rule means the first fetch is always
 /// an explicit `stella models refresh` (auto-refresh only re-arms after
-/// that opt-in; see `stella-cli`'s catalog bootstrap).
+/// that opt-in; see `stella-cli`'s catalog bootstrap and its
+/// `STELLA_CATALOG_AUTO_REFRESH=0` kill switch). Provider-native model
+/// discovery, which does auto-sync, talks to the user's own provider
+/// instead — see `stella_model::provider_listing`.
 pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 
 /// One provider block: `{ id, name, models: { <model-id>: {...} } }`.
@@ -60,6 +64,13 @@ pub struct ModelEntry {
     pub release_date: Option<String>,
     #[serde(default)]
     pub last_updated: Option<String>,
+    /// Whether the model supports reasoning / extended thinking. Absent in
+    /// the document means unknown — degrade to "unknown", never assume.
+    #[serde(default)]
+    pub reasoning: Option<bool>,
+    /// Whether the model accepts tool definitions.
+    #[serde(default)]
+    pub tool_call: Option<bool>,
 }
 
 /// List pricing in USD per million tokens. All optional: free/local models
@@ -211,6 +222,8 @@ mod tests {
                     "family": "claude-sonnet",
                     "release_date": "2025-09-29",
                     "last_updated": "2025-09-29",
+                    "reasoning": true,
+                    "tool_call": true,
                     "limit": { "context": 1000000, "output": 64000 },
                     "cost": { "input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75 }
                 },
@@ -244,6 +257,8 @@ mod tests {
         assert_eq!(cost.cache_write, Some(3.75));
         assert_eq!(sonnet.limit.unwrap().context, Some(1_000_000));
         assert_eq!(sonnet.release_date.as_deref(), Some("2025-09-29"));
+        assert_eq!(sonnet.reasoning, Some(true));
+        assert_eq!(sonnet.tool_call, Some(true));
         assert_eq!(anthropic.name.as_deref(), Some("Anthropic"));
     }
 
@@ -255,6 +270,8 @@ mod tests {
         assert_eq!(preview.id, "claude-free-preview");
         assert!(preview.cost.is_none());
         assert!(preview.limit.is_none());
+        assert_eq!(preview.reasoning, None, "absent capability stays unknown");
+        assert_eq!(preview.tool_call, None);
     }
 
     #[test]

@@ -304,6 +304,17 @@ fn tuned_engine_config(cfg: &Config, kind: crate::settings::EngineAgentKind) -> 
         engine.reasoning = tuning.reasoning;
         engine.params = tuning.params;
     }
+    // Capability clamp: a catalog-confirmed non-reasoning model must not
+    // carry effort/reasoning onto the wire — providers reject or silently
+    // ignore them, and both outcomes are worse than omitting the fields
+    // (the auto modes set effort for every role without knowing the
+    // model). Unknown capability passes through: the provider stays the
+    // authority.
+    if crate::engine_config::model_supports_reasoning(cfg.provider.id, &cfg.model_id) == Some(false)
+    {
+        engine.effort = None;
+        engine.reasoning = None;
+    }
     engine
 }
 
@@ -810,12 +821,37 @@ pub(crate) fn resolve_engine_wiring(cfg: &Config, worker_ref: &ModelRef) -> Engi
     } else {
         model_spec_for(&engine, EngineAgentKind::Judge, &is_provider)
     };
+    let triage_spec = model_spec_for(&engine, EngineAgentKind::Triage, &is_provider);
+
+    // Capability clamp, mirroring `tuned_engine_config`: a role whose
+    // model (pinned, provider-default, or riding the worker) is a
+    // catalog-confirmed non-reasoning model must not carry effort or
+    // reasoning onto the wire. Unknown capability passes through.
+    {
+        let clamp = |overrides: &mut stella_pipeline::RoleCallOverrides,
+                     spec: Option<&ModelSpec>| {
+            let resolved: Option<(String, String)> = match spec {
+                Some(s) if !s.model.is_empty() => Some((s.provider.clone(), s.model.clone())),
+                // Provider pin without a model → the provider's default.
+                Some(s) => crate::config::PROVIDERS
+                    .iter()
+                    .find(|p| p.id == s.provider && !p.default_model.is_empty())
+                    .map(|p| (s.provider.clone(), p.default_model.to_string())),
+                None => Some((worker_ref.provider.clone(), worker_ref.model_id.clone())),
+            };
+            if let Some((provider, model)) = resolved
+                && crate::engine_config::model_supports_reasoning(&provider, &model) == Some(false)
+            {
+                overrides.effort = None;
+                overrides.reasoning = None;
+            }
+        };
+        clamp(&mut wiring.role_overrides.triage, triage_spec.as_ref());
+        clamp(&mut wiring.role_overrides.judge, judge_spec.as_ref());
+    }
+
     let role_specs = [
-        (
-            Role::Triage,
-            "triage",
-            model_spec_for(&engine, EngineAgentKind::Triage, &is_provider),
-        ),
+        (Role::Triage, "triage", triage_spec),
         (Role::Judge, "judge", judge_spec),
     ];
 

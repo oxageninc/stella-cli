@@ -3145,8 +3145,11 @@ fn deck_reserved() -> Vec<&'static str> {
 /// Build an [`Inbound::EngineConfig`] snapshot: the freshly merged
 /// `agent_engine_config` from the settings scope chain, plus the picker
 /// vocabularies — every provider whose credential currently resolves, and
-/// the seed catalog's `provider/slug` list as the model-picker fallback
-/// when `allowed_models` is empty. Re-reading the chain (rather than
+/// the catalog's `provider/slug` list as the model-picker fallback when
+/// `allowed_models` is empty. The model list is scoped to those same
+/// credentialed providers (plus the session's active one): a model you
+/// have no key for is not an option, and offering it anyway was exactly
+/// the "selectable but unusable" bug. Re-reading the chain (rather than
 /// caching) keeps the overlay honest about hand edits and about what a
 /// save at one scope means under the others.
 fn engine_config_inbound(cfg: &Config, status: Option<String>) -> Inbound {
@@ -3158,13 +3161,51 @@ fn engine_config_inbound(cfg: &Config, status: Option<String>) -> Inbound {
         .into_iter()
         .map(|p| p.config.id.to_string())
         .collect();
-    let catalog_models: Vec<String> = stella_model::catalog::Catalog::current()
+    // The session's provider is always usable — its credential resolved at
+    // startup (possibly interactively, which discovery never does).
+    let mut usable: std::collections::HashSet<&str> =
+        providers.iter().map(String::as_str).collect();
+    usable.insert(cfg.provider.id);
+    let catalog = stella_model::catalog::Catalog::current();
+    let mut catalog_models: Vec<String> = Vec::new();
+    let mut model_efforts: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for entry in catalog
         .entries()
         .iter()
-        .map(|entry| format!("{}/{}", entry.provider, entry.id))
-        .collect();
+        .filter(|entry| usable.contains(entry.provider.as_str()))
+    {
+        let spec = format!("{}/{}", entry.provider, entry.id);
+        let levels = crate::engine_config::effort_levels(
+            &entry.provider,
+            crate::config::PROVIDERS
+                .iter()
+                .find(|p| p.id == entry.provider)
+                .map(|p| p.dialect)
+                .unwrap_or(crate::config::Dialect::OpenaiCompatible),
+            entry.supports_reasoning,
+        );
+        model_efforts.insert(spec.clone(), levels.iter().map(|s| s.to_string()).collect());
+        catalog_models.push(spec);
+    }
+    // `allowed_models` specs are picker entries too — give each its effort
+    // vocabulary so the effort row is model-aware under a restriction.
+    for raw in engine.allowed_models() {
+        if model_efforts.contains_key(raw) {
+            continue;
+        }
+        if let Some(spec) = crate::engine_config::parse_model_spec(raw, &|id| usable.contains(id)) {
+            let levels = crate::engine_config::effort_levels_for_spec(&spec.provider, &spec.model);
+            model_efforts.insert(raw.clone(), levels.iter().map(|s| s.to_string()).collect());
+        }
+    }
     Inbound::EngineConfig {
-        state: crate::engine_config::state_from_settings(&engine, providers, catalog_models),
+        state: crate::engine_config::state_from_settings(
+            &engine,
+            providers,
+            catalog_models,
+            model_efforts,
+        ),
         status,
     }
 }

@@ -267,6 +267,68 @@ fn split_params(
 }
 
 // ---------------------------------------------------------------------
+// Per-model effort vocabulary
+// ---------------------------------------------------------------------
+
+/// What the catalog knows about `provider/model`'s reasoning support.
+/// `None` when the model is unknown to the catalog OR known without
+/// capability data — both degrade to "the provider is the authority".
+pub fn model_supports_reasoning(provider: &str, model: &str) -> Option<bool> {
+    stella_model::catalog::Catalog::current()
+        .resolve_for(provider, model)
+        .ok()
+        .and_then(|entry| entry.supports_reasoning)
+}
+
+/// The effort levels that DO something for a model served by `provider_id`.
+/// Two constraints intersect here:
+/// - the model: a catalog-confirmed non-reasoning model has no levels at
+///   all (sending one would either error or silently no-op);
+/// - the provider's wire vocabulary: Anthropic/Bedrock budgets give all
+///   five tiers distinct meaning; Gemini's `thinkingLevel` is low/high;
+///   the OpenAI shapes document low/medium/high (higher tiers collapse to
+///   `high` on the wire — offering them would promise a distinction the
+///   request can't express); GLM's thinking switch is on/off — effort
+///   itself is not a knob there.
+///
+/// Unknown capability (`None`) keeps the provider's full vocabulary: an
+/// unknown must never *restrict*, only a confirmed "no" may.
+pub fn effort_levels(
+    provider_id: &str,
+    dialect: crate::config::Dialect,
+    supports_reasoning: Option<bool>,
+) -> &'static [&'static str] {
+    use crate::config::Dialect;
+    if supports_reasoning == Some(false) {
+        return &[];
+    }
+    if provider_id == "zai" {
+        return &[];
+    }
+    match dialect {
+        Dialect::Anthropic | Dialect::Bedrock => &["low", "medium", "high", "xhigh", "max"],
+        Dialect::Gemini | Dialect::Vertex => &["low", "high"],
+        Dialect::OpenaiResponses | Dialect::OpenaiCompatible => &["low", "medium", "high"],
+    }
+}
+
+/// [`effort_levels`] for a `provider/slug` picker spec, resolving the
+/// provider's dialect from the built-in table (settings-defined providers
+/// default to the OpenAI-compatible vocabulary, matching their adapter).
+pub fn effort_levels_for_spec(provider_id: &str, model: &str) -> &'static [&'static str] {
+    let dialect = crate::config::PROVIDERS
+        .iter()
+        .find(|p| p.id == provider_id)
+        .map(|p| p.dialect)
+        .unwrap_or(crate::config::Dialect::OpenaiCompatible);
+    effort_levels(
+        provider_id,
+        dialect,
+        model_supports_reasoning(provider_id, model),
+    )
+}
+
+// ---------------------------------------------------------------------
 // Enum ↔ string (the TUI edits strings; settings/serde hold enums)
 // ---------------------------------------------------------------------
 
@@ -353,12 +415,14 @@ fn flat_model(engine: &AgentEngineConfig, kind: EngineAgentKind) -> Option<&str>
     }
 }
 
-/// Build the engine panel's snapshot from the merged settings plus
-/// the picker vocabularies the driver knows (provider ids, catalog slugs).
+/// Build the engine panel's snapshot from the merged settings plus the
+/// picker vocabularies the driver knows (provider ids, catalog slugs, and
+/// each slug's per-model effort vocabulary).
 pub fn state_from_settings(
     engine: &AgentEngineConfig,
     providers: Vec<String>,
     catalog_models: Vec<String>,
+    model_efforts: std::collections::HashMap<String, Vec<String>>,
 ) -> EngineConfigState {
     let agents = EngineRole::ALL
         .iter()
@@ -400,6 +464,7 @@ pub fn state_from_settings(
         allowed_models: engine.allowed_models().to_vec(),
         providers,
         catalog_models,
+        model_efforts,
         agents,
     }
 }
@@ -667,6 +732,58 @@ mod tests {
     }
 
     #[test]
+    fn effort_levels_intersect_model_capability_with_the_provider_vocabulary() {
+        use crate::config::Dialect;
+        // A confirmed non-reasoning model has no levels anywhere.
+        assert!(effort_levels("anthropic", Dialect::Anthropic, Some(false)).is_empty());
+        assert!(effort_levels("openrouter", Dialect::OpenaiCompatible, Some(false)).is_empty());
+        // GLM's thinking switch is on/off — effort is not a knob even
+        // though the model reasons.
+        assert!(effort_levels("zai", Dialect::OpenaiCompatible, Some(true)).is_empty());
+        // Provider wire vocabularies.
+        assert_eq!(
+            effort_levels("anthropic", Dialect::Anthropic, Some(true)),
+            &["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            effort_levels("gemini", Dialect::Gemini, Some(true)),
+            &["low", "high"]
+        );
+        assert_eq!(
+            effort_levels("openai", Dialect::OpenaiResponses, Some(true)),
+            &["low", "medium", "high"]
+        );
+        // Unknown capability must not restrict — the provider's own full
+        // vocabulary stays offered.
+        assert_eq!(
+            effort_levels("openrouter", Dialect::OpenaiCompatible, None),
+            &["low", "medium", "high"]
+        );
+
+        // The spec form resolves dialect + capability from the tables: the
+        // seed marks deepseek-chat non-reasoning, claude-fable-5 reasoning.
+        assert!(effort_levels_for_spec("deepseek", "deepseek-chat").is_empty());
+        assert_eq!(
+            effort_levels_for_spec("anthropic", "claude-fable-5"),
+            &["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
+    fn model_supports_reasoning_reads_the_catalog_and_defaults_to_unknown() {
+        assert_eq!(
+            model_supports_reasoning("deepseek", "deepseek-chat"),
+            Some(false)
+        );
+        assert_eq!(model_supports_reasoning("zai", "glm-5.2"), Some(true));
+        // Unknown slug or provider → unknown, never a hard no.
+        assert_eq!(
+            model_supports_reasoning("openrouter", "no-such/model"),
+            None
+        );
+    }
+
+    #[test]
     fn snapshot_roundtrips_through_the_tui_state() {
         let engine = engine_from_json(
             r#"{"default_model": "anthropic/claude-fable-5",
@@ -679,7 +796,12 @@ mod tests {
                                                   "verbosity": "low",
                                                   "service_tier": "flex"}}}}"#,
         );
-        let state = state_from_settings(&engine, vec!["zai".into()], vec!["zai/glm-5.2".into()]);
+        let state = state_from_settings(
+            &engine,
+            vec!["zai".into()],
+            vec!["zai/glm-5.2".into()],
+            Default::default(),
+        );
         assert!(!state.auto_mode);
         assert!(state.effort_auto);
         let judge = state.agent(EngineRole::Judge).expect("judge state");
@@ -715,7 +837,12 @@ mod tests {
         assert_eq!(back.effort_auto, Some(Toggle::On));
         // The round trip is stable: state → settings → state is identity
         // for the fields the snapshot carries.
-        let state2 = state_from_settings(&back, vec!["zai".into()], vec!["zai/glm-5.2".into()]);
+        let state2 = state_from_settings(
+            &back,
+            vec!["zai".into()],
+            vec!["zai/glm-5.2".into()],
+            Default::default(),
+        );
         assert_eq!(state2.agents, state.agents);
         assert_eq!(state2.allowed_models, state.allowed_models);
     }

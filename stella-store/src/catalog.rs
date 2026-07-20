@@ -95,6 +95,34 @@ CREATE TABLE IF NOT EXISTS catalog_sync (
 );
 ";
 
+/// Columns added after the first shipped schema. `CREATE TABLE IF NOT
+/// EXISTS` never grows an existing table, so each (table, column, type)
+/// here is applied with `ALTER TABLE … ADD COLUMN` when missing — the
+/// SQLite-idiomatic in-place migration (nullable columns only, so old rows
+/// stay valid and old binaries reading a new db just ignore the extras).
+const CATALOG_MIGRATIONS: &[(&str, &str, &str)] = &[
+    // Capability flags (0/1, NULL = unknown): whether the model can think
+    // (reasoning/extended thinking) and whether it accepts tool definitions.
+    // Synced from models.dev and from provider-native /models endpoints.
+    ("model_card_versions", "supports_reasoning", "INTEGER"),
+    ("model_card_versions", "supports_tools", "INTEGER"),
+];
+
+/// Apply [`CATALOG_MIGRATIONS`] to an open connection.
+fn migrate(conn: &Connection) -> Result<()> {
+    for (table, column, ty) in CATALOG_MIGRATIONS {
+        let present: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// One pricing configuration — the payload of a model-card version. All
 /// fields optional: the master list legitimately omits pricing for free or
 /// gateway-priced models, and an unknown price must stay unknown (a `0.0`
@@ -109,6 +137,12 @@ pub struct VersionData {
     pub max_output_tokens: Option<u64>,
     pub release_date: Option<String>,
     pub last_updated: Option<String>,
+    /// Whether the model supports reasoning / extended thinking. `None` is
+    /// "unknown" and must stay `None` — an unknown capability degrades to
+    /// today's permissive behavior, never to a hard "no".
+    pub supports_reasoning: Option<bool>,
+    /// Whether the model accepts tool definitions.
+    pub supports_tools: Option<bool>,
 }
 
 impl VersionData {
@@ -117,7 +151,7 @@ impl VersionData {
     /// pricing configuration and token limits — NOT display metadata, so a
     /// renamed model doesn't fabricate a pricing-history entry.
     pub fn content_hash(&self) -> String {
-        fnv_hex(&format!(
+        let mut key = format!(
             "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
             self.input_usd_per_mtok,
             self.output_usd_per_mtok,
@@ -125,7 +159,17 @@ impl VersionData {
             self.cache_write_usd_per_mtok,
             self.context_window,
             self.max_output_tokens,
-        ))
+        );
+        // Capabilities join the hash only when known, so every version
+        // stored before the columns existed keeps its historical hash and a
+        // re-sync of unchanged capability-less data appends nothing.
+        if self.supports_reasoning.is_some() || self.supports_tools.is_some() {
+            key.push_str(&format!(
+                "|{:?}|{:?}",
+                self.supports_reasoning, self.supports_tools
+            ));
+        }
+        fnv_hex(&key)
     }
 }
 
@@ -231,6 +275,7 @@ impl CatalogStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(CATALOG_SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -324,8 +369,9 @@ impl CatalogStore {
                     "INSERT INTO model_card_versions
                          (model_card_id, version, input_usd_per_mtok, output_usd_per_mtok,
                           cached_input_usd_per_mtok, cache_write_usd_per_mtok, context_window,
-                          max_output_tokens, release_date, last_updated, source, content_hash)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                          max_output_tokens, release_date, last_updated, source, content_hash,
+                          supports_reasoning, supports_tools)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         card_id,
                         next,
@@ -338,7 +384,9 @@ impl CatalogStore {
                         model.version.release_date,
                         model.version.last_updated,
                         model.source,
-                        new_hash
+                        new_hash,
+                        model.version.supports_reasoning,
+                        model.version.supports_tools
                     ],
                 )?;
                 counts.versions_added += 1;
@@ -450,7 +498,8 @@ impl CatalogStore {
                         COALESCE(v.version, 0),
                         v.input_usd_per_mtok, v.output_usd_per_mtok,
                         v.cached_input_usd_per_mtok, v.cache_write_usd_per_mtok,
-                        v.context_window, v.max_output_tokens, v.release_date, v.last_updated
+                        v.context_window, v.max_output_tokens, v.release_date, v.last_updated,
+                        v.supports_reasoning, v.supports_tools
                  FROM model_aliases a
                  JOIN model_cards c ON c.id = a.model_card_id
                  LEFT JOIN model_card_versions v ON v.model_card_id = c.id
@@ -478,6 +527,8 @@ impl CatalogStore {
                             max_output_tokens: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
                             release_date: row.get(15)?,
                             last_updated: row.get(16)?,
+                            supports_reasoning: row.get(17)?,
+                            supports_tools: row.get(18)?,
                         },
                     })
                 },
@@ -515,7 +566,8 @@ impl CatalogStore {
                           c.source, COALESCE(v.version, 0),
                           v.input_usd_per_mtok, v.output_usd_per_mtok,
                           v.cached_input_usd_per_mtok, v.cache_write_usd_per_mtok,
-                          v.context_window, v.max_output_tokens, v.release_date, v.last_updated
+                          v.context_window, v.max_output_tokens, v.release_date, v.last_updated,
+                          v.supports_reasoning, v.supports_tools
                    FROM model_cards c
                    LEFT JOIN model_card_versions v ON v.model_card_id = c.id
                         AND v.version = (SELECT MAX(version) FROM model_card_versions
@@ -541,6 +593,8 @@ impl CatalogStore {
                     max_output_tokens: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
                     release_date: row.get(13)?,
                     last_updated: row.get(14)?,
+                    supports_reasoning: row.get(15)?,
+                    supports_tools: row.get(16)?,
                 },
             })
         })?;
@@ -631,6 +685,8 @@ mod tests {
                 max_output_tokens: Some(64_000),
                 release_date: Some("2025-09-29".to_string()),
                 last_updated: Some("2025-09-29".to_string()),
+                supports_reasoning: Some(true),
+                supports_tools: Some(true),
             },
             aliases: vec![
                 AliasForm {
@@ -824,5 +880,79 @@ mod tests {
         assert_eq!(cards, 1);
         assert_eq!(versions, 2);
         assert_eq!(aliases, 3);
+    }
+
+    #[test]
+    fn capabilities_roundtrip_and_only_hash_when_known() {
+        let (_dir, store) = store();
+        store.apply_batch(&[sonnet_upsert()]).expect("apply");
+        let resolved = store
+            .resolve("anthropic", "claude-sonnet-4-5")
+            .unwrap()
+            .expect("hit");
+        assert_eq!(resolved.pricing.supports_reasoning, Some(true));
+        assert_eq!(resolved.pricing.supports_tools, Some(true));
+        let listing = &store.models_for_provider(Some("anthropic")).unwrap()[0];
+        assert_eq!(listing.pricing.supports_reasoning, Some(true));
+
+        // Unknown capabilities hash exactly like the pre-column format —
+        // a re-sync of capability-less data must not append a version.
+        let mut without = sonnet_upsert().version;
+        without.supports_reasoning = None;
+        without.supports_tools = None;
+        let legacy_hash = fnv_hex(&format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            without.input_usd_per_mtok,
+            without.output_usd_per_mtok,
+            without.cached_input_usd_per_mtok,
+            without.cache_write_usd_per_mtok,
+            without.context_window,
+            without.max_output_tokens,
+        ));
+        assert_eq!(without.content_hash(), legacy_hash);
+        assert_ne!(sonnet_upsert().version.content_hash(), legacy_hash);
+
+        // Capability data arriving for a previously capability-less card IS
+        // a real change: one new version.
+        let mut gained = sonnet_upsert();
+        gained.version.supports_reasoning = Some(false);
+        let counts = store.apply_batch(&[gained]).expect("capability change");
+        assert_eq!(counts.versions_added, 1);
+    }
+
+    #[test]
+    fn open_migrates_a_pre_capability_database_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("catalog.db");
+        {
+            // A database created by an older binary: base schema only (the
+            // CATALOG_SCHEMA string IS the original shape; columns arrive
+            // via `migrate`), with one card + version already stored.
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute_batch(CATALOG_SCHEMA).expect("old schema");
+            conn.execute_batch(
+                "INSERT INTO model_cards
+                     (api_provider, model_provider, slug, source)
+                 VALUES ('anthropic', 'anthropic', 'claude-old', 'models.dev');
+                 INSERT INTO model_card_versions
+                     (model_card_id, version, input_usd_per_mtok, source, content_hash)
+                 VALUES (1, 1, 3.0, 'models.dev', 'h');
+                 INSERT INTO model_aliases
+                     (alias, api_provider, model_provider, model_card_id, source)
+                 VALUES ('claude-old', 'anthropic', 'anthropic', 1, 'catalog');",
+            )
+            .expect("old rows");
+        }
+        let store = CatalogStore::open(&path).expect("open migrates");
+        let resolved = store
+            .resolve("anthropic", "claude-old")
+            .expect("resolve works post-migration")
+            .expect("row survived");
+        assert_eq!(resolved.pricing.input_usd_per_mtok, Some(3.0));
+        assert_eq!(resolved.pricing.supports_reasoning, None);
+        assert_eq!(resolved.pricing.supports_tools, None);
+        // Re-open: the migration is idempotent.
+        drop(store);
+        CatalogStore::open(&path).expect("second open is clean");
     }
 }

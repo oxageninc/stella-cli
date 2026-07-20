@@ -13,6 +13,7 @@ pub(crate) mod http;
 pub mod modelsdev;
 pub mod openai;
 pub mod provider;
+pub mod provider_listing;
 pub mod sse;
 pub mod vertex;
 pub mod zai;

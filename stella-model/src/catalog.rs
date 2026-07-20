@@ -107,12 +107,19 @@ pub struct CatalogEntry {
     /// List pricing used to compute `CompletionResult::cost_usd` on the real
     /// request path — each adapter resolves its own row in its constructor.
     pub pricing: Pricing,
+    /// Whether this model supports reasoning / extended thinking. `None` is
+    /// "unknown": effort settings pass through and the provider stays the
+    /// authority. `Some(false)` is a hard "no" from catalog data — the
+    /// effort picker hides its levels and the request path drops
+    /// effort/reasoning instead of sending a parameter the API rejects.
+    pub supports_reasoning: Option<bool>,
 }
 
 impl CatalogEntry {
     /// A catalog row without the field-by-field ceremony — the seed table
     /// below, the runtime-catalog assembly in `stella-cli`, and tests all
-    /// build entries through this.
+    /// build entries through this. Capabilities default to unknown; chain
+    /// [`CatalogEntry::with_reasoning`] where the data exists.
     pub fn new(
         id: &str,
         provider: &str,
@@ -128,7 +135,15 @@ impl CatalogEntry {
             context_window,
             tool_dialect,
             pricing,
+            supports_reasoning: None,
         }
+    }
+
+    /// Set the reasoning capability (builder-style, so the many existing
+    /// `new` call sites stay untouched).
+    pub fn with_reasoning(mut self, supports_reasoning: Option<bool>) -> Self {
+        self.supports_reasoning = supports_reasoning;
+        self
     }
 }
 
@@ -171,7 +186,8 @@ impl Catalog {
                         output_usd_per_mtok: 2.20,
                         cached_input_usd_per_mtok: 0.11,
                     },
-                ),
+                )
+                .with_reasoning(Some(true)),
                 CatalogEntry::new(
                     "claude-fable-5",
                     "anthropic",
@@ -183,7 +199,8 @@ impl Catalog {
                         output_usd_per_mtok: 15.00,
                         cached_input_usd_per_mtok: 0.30,
                     },
-                ),
+                )
+                .with_reasoning(Some(true)),
                 // Real adapter now exists (stella_model::openai) — this row
                 // used to be OpenaiJson, which was wrong: OpenAI was never
                 // routed through Chat Completions, only through the generic
@@ -200,7 +217,8 @@ impl Catalog {
                         output_usd_per_mtok: 10.00,
                         cached_input_usd_per_mtok: 0.125,
                     },
-                ),
+                )
+                .with_reasoning(Some(true)),
                 CatalogEntry::new(
                     "grok-4",
                     "xai",
@@ -212,7 +230,10 @@ impl Catalog {
                         output_usd_per_mtok: 15.00,
                         cached_input_usd_per_mtok: 0.75,
                     },
-                ),
+                )
+                .with_reasoning(Some(true)),
+                // The non-thinking chat model (`deepseek-reasoner` is the
+                // reasoning one) — the seed's one honest `Some(false)`.
                 CatalogEntry::new(
                     "deepseek-chat",
                     "deepseek",
@@ -224,7 +245,8 @@ impl Catalog {
                         output_usd_per_mtok: 1.10,
                         cached_input_usd_per_mtok: 0.07,
                     },
-                ),
+                )
+                .with_reasoning(Some(false)),
                 // The native Gemini-direct adapter (stella_model::gemini) —
                 // this row used to be OpenaiJson while requests routed
                 // through Google's OpenAI-compatibility shim as a stand-in.
@@ -239,7 +261,8 @@ impl Catalog {
                         output_usd_per_mtok: 10.00,
                         cached_input_usd_per_mtok: 0.31,
                     },
-                ),
+                )
+                .with_reasoning(Some(true)),
                 // The same Google model surfaced through Vertex AI — one
                 // model genuinely existing on two providers is why
                 // uniqueness (and `resolve_for`) is keyed on
@@ -256,7 +279,8 @@ impl Catalog {
                         output_usd_per_mtok: 10.00,
                         cached_input_usd_per_mtok: 0.31,
                     },
-                ),
+                )
+                .with_reasoning(Some(true)),
                 // A cross-region inference profile, not a bare model id —
                 // Bedrock rejects on-demand invocation of newer Anthropic
                 // models without one. Priced as Claude Sonnet 4.5 (Bedrock
@@ -272,7 +296,8 @@ impl Catalog {
                         output_usd_per_mtok: 15.00,
                         cached_input_usd_per_mtok: 0.30,
                     },
-                ),
+                )
+                .with_reasoning(Some(true)),
                 // OpenRouter's fully-qualified slug for its own meta-router.
                 // The gateway's model ids are ALL `vendor/model` — a bare
                 // `auto` is not a model there, so this row must carry the
