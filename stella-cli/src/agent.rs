@@ -304,6 +304,17 @@ fn tuned_engine_config(cfg: &Config, kind: crate::settings::EngineAgentKind) -> 
         engine.reasoning = tuning.reasoning;
         engine.params = tuning.params;
     }
+    // Capability clamp: a catalog-confirmed non-reasoning model must not
+    // carry effort/reasoning onto the wire — providers reject or silently
+    // ignore them, and both outcomes are worse than omitting the fields
+    // (the auto modes set effort for every role without knowing the
+    // model). Unknown capability passes through: the provider stays the
+    // authority.
+    if crate::engine_config::model_supports_reasoning(cfg.provider.id, &cfg.model_id) == Some(false)
+    {
+        engine.effort = None;
+        engine.reasoning = None;
+    }
     engine
 }
 
@@ -810,12 +821,37 @@ pub(crate) fn resolve_engine_wiring(cfg: &Config, worker_ref: &ModelRef) -> Engi
     } else {
         model_spec_for(&engine, EngineAgentKind::Judge, &is_provider)
     };
+    let triage_spec = model_spec_for(&engine, EngineAgentKind::Triage, &is_provider);
+
+    // Capability clamp, mirroring `tuned_engine_config`: a role whose
+    // model (pinned, provider-default, or riding the worker) is a
+    // catalog-confirmed non-reasoning model must not carry effort or
+    // reasoning onto the wire. Unknown capability passes through.
+    {
+        let clamp = |overrides: &mut stella_pipeline::RoleCallOverrides,
+                     spec: Option<&ModelSpec>| {
+            let resolved: Option<(String, String)> = match spec {
+                Some(s) if !s.model.is_empty() => Some((s.provider.clone(), s.model.clone())),
+                // Provider pin without a model → the provider's default.
+                Some(s) => crate::config::PROVIDERS
+                    .iter()
+                    .find(|p| p.id == s.provider && !p.default_model.is_empty())
+                    .map(|p| (s.provider.clone(), p.default_model.to_string())),
+                None => Some((worker_ref.provider.clone(), worker_ref.model_id.clone())),
+            };
+            if let Some((provider, model)) = resolved
+                && crate::engine_config::model_supports_reasoning(&provider, &model) == Some(false)
+            {
+                overrides.effort = None;
+                overrides.reasoning = None;
+            }
+        };
+        clamp(&mut wiring.role_overrides.triage, triage_spec.as_ref());
+        clamp(&mut wiring.role_overrides.judge, judge_spec.as_ref());
+    }
+
     let role_specs = [
-        (
-            Role::Triage,
-            "triage",
-            model_spec_for(&engine, EngineAgentKind::Triage, &is_provider),
-        ),
+        (Role::Triage, "triage", triage_spec),
         (Role::Judge, "judge", judge_spec),
     ];
 
@@ -2375,12 +2411,17 @@ pub fn run_tools_listing() -> Result<(), String> {
     tui::section_header("Stella tools");
 
     // The listing mirrors a real session's surface, so the settings-driven
-    // switches (bash opt-in) apply here exactly as they do at session start.
+    // switches (bash/web opt-ins) apply here exactly as they do at session
+    // start.
     let settings = crate::settings::Settings::load(&workspace_root)?;
     let bash_enabled = settings.bash_tool_enabled();
+    let web_enabled = settings.web_tools_enabled();
     let registry = ToolRegistry::new(
         workspace_root.clone(),
-        stella_tools::RegistryOptions { bash: bash_enabled },
+        stella_tools::RegistryOptions {
+            bash: bash_enabled,
+            web: web_enabled,
+        },
     );
     println!("  {}", "built-in:".dimmed());
     let mut native: Vec<String> = stella_core::ports::ToolExecutor::schemas(&registry)
@@ -2396,6 +2437,15 @@ pub fn run_tools_listing() -> Result<(), String> {
             "    {} {}",
             "·".dimmed(),
             "bash — disabled (default); enable with \"tools\": {\"bash\": \"on\"} in settings"
+                .dimmed()
+        );
+    }
+    if !web_enabled {
+        println!(
+            "    {} {}",
+            "·".dimmed(),
+            "web_search/web_fetch/web_extract_assets/web_download — disabled (default); \
+             enable with \"tools\": {\"web\": \"on\"} in settings"
                 .dimmed()
         );
     }
@@ -3529,6 +3579,7 @@ async fn run_goal_pipeline_turn(
 pub(crate) fn registry_options(cfg: &Config) -> stella_tools::RegistryOptions {
     stella_tools::RegistryOptions {
         bash: cfg.tools_bash,
+        web: cfg.tools_web,
     }
 }
 
@@ -4117,6 +4168,7 @@ mod tests {
             hooks: None,
             engine_settings: None,
             tools_bash: false,
+            tools_web: false,
         }
     }
 

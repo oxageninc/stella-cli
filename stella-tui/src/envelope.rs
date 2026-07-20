@@ -764,9 +764,17 @@ pub struct EngineConfigState {
     pub allowed_models: Vec<String>,
     /// Every configured provider id, for the provider picker.
     pub providers: Vec<String>,
-    /// `provider/slug` strings from the seed catalog — the picker's
-    /// fallback vocabulary when `allowed_models` is empty.
+    /// `provider/slug` strings from the catalog, scoped by the driver to
+    /// providers with a usable credential — the picker's fallback
+    /// vocabulary when `allowed_models` is empty.
     pub catalog_models: Vec<String>,
+    /// Per-model effort vocabularies, keyed by the same `provider/slug`
+    /// strings (plus any `allowed_models` spec): the effort levels this
+    /// model, as served by this provider, can actually act on. An empty
+    /// list means effort is not a knob for that model (no reasoning
+    /// support, or an on/off-only thinking switch); a model absent from
+    /// the map is unknown and keeps the full vocabulary.
+    pub model_efforts: std::collections::HashMap<String, Vec<String>>,
     /// Exactly one entry per [`EngineRole::ALL`] slot, in that order.
     pub agents: Vec<EngineAgentState>,
 }

@@ -208,24 +208,32 @@ so a project can point at a different registry than the user default.
 
 ## The `tools` section
 
-The top-level `tools` section switches built-in tools that are **off by default**. Today
-that is exactly one tool — raw `bash`:
+The top-level `tools` section switches built-in tools that are **off by default**. There
+are two such switches — raw `bash` and the `web` family:
 
 ```json title="settings.json"
 {
   "tools": {
-    "bash": "on"
+    "bash": "on",
+    "web": "on"
   }
 }
 ```
 
 Absent or `"off"`, the `bash` tool is **not registered** in any session — including
 interactive ones; the agent works through the structured tools (`run_tests`,
-`build_project`, `run_script`, the process tools) instead. The values are the strings
-`"on"`/`"off"` — a bare boolean or a typo is a hard, named parse error rather than a
-silent ignore. Merges last-scope-wins, so a project can switch bash on for a repo whose
-workflow needs it while your user scope keeps it off. See
-[Built-in tools](/docs/agent-tools) for what registers when.
+`build_project`, `run_script`, the process tools) instead.
+
+`"web": "on"` registers the [web family](/docs/agent-tools#web-opt-in) — `web_fetch`,
+`web_extract_assets`, `web_download`, and (with a `BRAVE_API_KEY` or `TAVILY_API_KEY`)
+`web_search`. It is off by default for the same reason as `bash`: a fetched page is both
+untrusted input and an outbound network channel. Logged-in fetches are configured
+separately in `~/.config/stella/web_auth.toml`.
+
+The values are the strings `"on"`/`"off"` — a bare boolean or a typo is a hard, named
+parse error rather than a silent ignore. Each field merges last-scope-wins independently,
+so a project can switch `web` on for a repo whose workflow needs it while your user scope
+keeps it off. See [Built-in tools](/docs/agent-tools) for what registers when.
 
 ## The project trust boundary
 

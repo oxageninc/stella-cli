@@ -380,6 +380,10 @@ pub struct Config {
     /// construction via `agent::registry_options` — the default tool
     /// surface has no shell.
     pub tools_bash: bool,
+    /// Whether the web tool family is enabled (`tools.web`; absent = OFF).
+    /// Same threading as `tools_bash` — the default tool surface has no
+    /// network egress.
+    pub tools_web: bool,
 }
 
 impl Config {
@@ -473,6 +477,7 @@ impl Config {
         cfg.hooks = settings.hooks.clone();
         cfg.engine_settings = settings.agent_engine_config.clone();
         cfg.tools_bash = settings.bash_tool_enabled();
+        cfg.tools_web = settings.web_tools_enabled();
         Ok(cfg)
     }
 
@@ -568,6 +573,7 @@ impl Config {
                     hooks: None,
                     engine_settings: None,
                     tools_bash: false,
+                    tools_web: false,
                 });
             }
 
@@ -758,6 +764,7 @@ impl Config {
             hooks: None,
             engine_settings: None,
             tools_bash: false,
+            tools_web: false,
         })
     }
 
@@ -1216,6 +1223,7 @@ mod tests {
             hooks: None,
             engine_settings: None,
             tools_bash: false,
+            tools_web: false,
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains(secret), "Config Debug leaked the key: {dbg}");

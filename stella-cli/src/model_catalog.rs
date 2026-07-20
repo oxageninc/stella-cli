@@ -4,10 +4,16 @@
 //!
 //! What lives here:
 //! - **`bootstrap`** — open the user-tier `catalog.db`, lay the seed floor,
-//!   opportunistically refresh a stale master list (only after the user has
-//!   opted in by running `stella models refresh` at least once — the
-//!   no-phone-home rule), and install the merged runtime catalog every
-//!   pricing consumer resolves through `Catalog::current()`.
+//!   auto-sync each configured provider's own live `/models` listing
+//!   (BYOK-clean: traffic to the provider the user already keyed, which is
+//!   what keeps the selectable-model list complete and current as providers
+//!   ship releases — no manual refresh needed), opportunistically re-fetch
+//!   a stale models.dev master list ONLY after the user's explicit first
+//!   `stella models refresh` (models.dev is a third party — the no-phone-
+//!   home rule), and install the merged runtime catalog every pricing
+//!   consumer resolves through `Catalog::current()`.
+//!   `STELLA_CATALOG_AUTO_REFRESH=0` switches all implicit fetching off;
+//!   a zero-config install (no credentials) never fetches anything.
 //! - **`validate_model_slug`** — the anti-invalid-slug gate `build_provider`
 //!   calls for EVERY provider. Strictness is earned, never assumed: the
 //!   seed floor always passes; a provider whose master-list rows are synced
@@ -28,14 +34,26 @@ use std::sync::{Arc, Mutex, OnceLock};
 use colored::Colorize;
 use stella_model::catalog::{Catalog, CatalogEntry, Pricing, ToolDialect};
 use stella_model::modelsdev::{self, FetchOutcome, FetchedCatalog};
+use stella_model::provider_listing::{self, ProviderModel};
 use stella_store::catalog::{
     AliasForm, CatalogStore, ModelUpsert, RefreshCounts, VersionData, catalog_db_path,
 };
 
-use crate::config::{Dialect, LOCAL_PROVIDER, PROVIDERS, ProviderConfig};
+use crate::config::{ConfiguredProvider, Dialect, LOCAL_PROVIDER, PROVIDERS, ProviderConfig};
 
 /// The `catalog_sync.source` key for the models.dev master list.
 pub const SYNC_SOURCE: &str = "models.dev";
+
+/// The card `source` for rows discovered from a provider's own `/models`
+/// endpoint. A provider with rows from EITHER sync source has an
+/// authoritative slug set — `validate_model_slug` counts both.
+pub const NATIVE_SOURCE: &str = "provider";
+
+/// The per-provider `catalog_sync` bookkeeping key for native listings —
+/// each provider gets its own staleness clock.
+fn native_sync_source(provider_id: &str) -> String {
+    format!("{NATIVE_SOURCE}:{provider_id}")
+}
 
 /// How stale a previously-synced master list may get before `bootstrap`
 /// re-fetches it (conditional request — an unchanged list is one cheap 304).
@@ -326,6 +344,8 @@ pub(crate) fn build_upserts(fetched: &FetchedCatalog) -> Vec<ModelUpsert> {
                     max_output_tokens: limit.output,
                     release_date: model.release_date.clone(),
                     last_updated: model.last_updated.clone(),
+                    supports_reasoning: model.reasoning,
+                    supports_tools: model.tool_call,
                 },
                 aliases: alias_forms(api_provider, &model.id),
             });
@@ -355,6 +375,8 @@ fn seed_upserts() -> Vec<ModelUpsert> {
                 max_output_tokens: None,
                 release_date: None,
                 last_updated: None,
+                supports_reasoning: None,
+                supports_tools: None,
             },
             aliases: alias_forms(&entry.provider, &entry.id),
         })
@@ -375,6 +397,109 @@ fn ensure_seed_floor(store: &CatalogStore) {
 }
 
 // ---------------------------------------------------------------------
+// Provider-native discovery (each provider's own /models endpoint)
+// ---------------------------------------------------------------------
+
+/// Fetch `provider`'s own live model listing, dispatched on its wire
+/// dialect. Vertex and Bedrock have no key-shaped credential to list with
+/// (OAuth token / SigV4) — the master list covers them.
+async fn fetch_native_listing(
+    provider: &ProviderConfig,
+    api_key: &stella_model::credential::ApiKey,
+) -> Result<Vec<ProviderModel>, String> {
+    match provider.dialect {
+        Dialect::OpenaiCompatible if provider.id == "openrouter" => {
+            provider_listing::fetch_openrouter(provider.base_url).await
+        }
+        Dialect::OpenaiCompatible | Dialect::OpenaiResponses => {
+            provider_listing::fetch_openai_compatible(
+                provider.display_name,
+                provider.base_url,
+                api_key,
+            )
+            .await
+        }
+        Dialect::Anthropic => provider_listing::fetch_anthropic(provider.base_url, api_key).await,
+        Dialect::Gemini => provider_listing::fetch_gemini(provider.base_url, api_key).await,
+        Dialect::Vertex | Dialect::Bedrock => {
+            Err("no native listing endpoint (the master list covers this provider)".to_string())
+        }
+    }
+}
+
+/// Whether [`fetch_native_listing`] can list this provider at all.
+fn has_native_listing(provider: &ProviderConfig) -> bool {
+    !matches!(provider.dialect, Dialect::Vertex | Dialect::Bedrock)
+}
+
+/// Map one provider's native listing into store upserts. Each row is
+/// overlaid on what the catalog already knows for that (provider, slug):
+/// a native listing that carries no pricing (Anthropic, plain `/models`
+/// ids) must not blank out master-list pricing — and when it adds nothing
+/// new, the merged version hashes identically and the store appends no
+/// version at all.
+fn native_upserts(
+    provider: &ProviderConfig,
+    models: &[ProviderModel],
+    store: &CatalogStore,
+) -> Vec<ModelUpsert> {
+    models
+        .iter()
+        .filter(|m| !m.id.is_empty())
+        .map(|m| {
+            let prior = store
+                .resolve(provider.id, &m.id)
+                .ok()
+                .flatten()
+                .map(|existing| existing.pricing)
+                .unwrap_or_default();
+            ModelUpsert {
+                api_provider: provider.id.to_string(),
+                model_provider: derive_model_provider(provider.id, &m.id),
+                slug: m.id.clone(),
+                display_name: m.display_name.clone(),
+                // The card UPDATE coalesces NULL family to the existing
+                // value, so master-list families survive native re-syncs.
+                family: None,
+                source: NATIVE_SOURCE.to_string(),
+                version: VersionData {
+                    input_usd_per_mtok: m.input_usd_per_mtok.or(prior.input_usd_per_mtok),
+                    output_usd_per_mtok: m.output_usd_per_mtok.or(prior.output_usd_per_mtok),
+                    cached_input_usd_per_mtok: m
+                        .cached_input_usd_per_mtok
+                        .or(prior.cached_input_usd_per_mtok),
+                    cache_write_usd_per_mtok: m
+                        .cache_write_usd_per_mtok
+                        .or(prior.cache_write_usd_per_mtok),
+                    context_window: m.context_window.or(prior.context_window),
+                    max_output_tokens: m.max_output_tokens.or(prior.max_output_tokens),
+                    release_date: prior.release_date,
+                    last_updated: prior.last_updated,
+                    supports_reasoning: m.supports_reasoning.or(prior.supports_reasoning),
+                    supports_tools: m.supports_tools.or(prior.supports_tools),
+                },
+                aliases: alias_forms(provider.id, &m.id),
+            }
+        })
+        .collect()
+}
+
+/// One native refresh pass for one configured provider: fetch its live
+/// listing, overlay-merge, batch-apply, stamp its staleness clock.
+async fn refresh_native_provider(
+    store: &CatalogStore,
+    configured: &ConfiguredProvider,
+) -> Result<(usize, RefreshCounts), String> {
+    let models = fetch_native_listing(&configured.config, &configured.api_key).await?;
+    let upserts = native_upserts(&configured.config, &models, store);
+    let counts = store.apply_batch(&upserts).map_err(|e| e.to_string())?;
+    store
+        .record_sync(&native_sync_source(configured.config.id), None, None)
+        .map_err(|e| e.to_string())?;
+    Ok((models.len(), counts))
+}
+
+// ---------------------------------------------------------------------
 // Bootstrap & runtime catalog
 // ---------------------------------------------------------------------
 
@@ -391,12 +516,13 @@ fn tool_dialect_for(dialect: Dialect) -> ToolDialect {
     }
 }
 
-/// Open the catalog, lay the seed floor, refresh a stale master list (only
-/// ever after the explicit first `stella models refresh` — see
-/// [`maybe_auto_refresh`]), and install the merged runtime catalog. Called
-/// once at startup, before any provider is resolved; every failure
-/// degrades silently to today's seed-only behavior (the catalog is an
-/// upgrade, never a new way to break a turn).
+/// Open the catalog, lay the seed floor, auto-sync each configured
+/// provider's native listing plus (once armed) a stale models.dev master
+/// list — see [`maybe_auto_refresh`] for the two sources' distinct rules —
+/// and install the merged runtime catalog. Called once at startup, before
+/// any provider is resolved; every failure degrades silently to today's
+/// seed-only behavior (the catalog is an upgrade, never a new way to break
+/// a turn).
 pub fn bootstrap() {
     let store = match CatalogStore::open(&catalog_db_path()) {
         Ok(store) => Some(Arc::new(store)),
@@ -416,20 +542,80 @@ pub fn bootstrap() {
     let _ = STORE.set(store);
 }
 
-/// Re-fetch the master list when it is stale — but ONLY if a sync row
-/// already exists: the first fetch is always the user's explicit `stella
-/// models refresh` (the no-phone-home rule), and `STELLA_CATALOG_AUTO_REFRESH=0`
-/// switches the re-fetch off entirely. Best-effort: offline just means
-/// the catalog stays as of the last sync.
+/// Whether a NATIVE listing's staleness clock says it needs a fetch:
+/// never synced, or older than the TTL. A store error reads as "fresh" —
+/// auto-sync must never turn a flaky disk into a network storm. Native
+/// listings can fire on the never-synced case because they are traffic to
+/// the user's own chosen provider (see [`maybe_auto_refresh`]).
+fn native_sync_is_due(store: &CatalogStore, source: &str) -> bool {
+    match store.seconds_since_sync(source) {
+        Ok(Some(age)) => age >= AUTO_REFRESH_TTL_SECS,
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+/// Whether the models.dev master list may auto-*re*fresh. Distinct from
+/// [`native_sync_is_due`] on the never-synced case, and deliberately so:
+/// models.dev is a THIRD PARTY, not the user's chosen provider, so the
+/// no-phone-home rule (the published "the only network traffic goes to the
+/// provider you chose" guarantee) forbids contacting it implicitly. It may
+/// only auto-refresh once a sync ROW already exists — i.e. after the user's
+/// explicit first `stella models refresh`. A fresh install never touches
+/// models.dev on its own.
+fn master_list_auto_due(store: &CatalogStore) -> bool {
+    matches!(
+        store.seconds_since_sync(SYNC_SOURCE),
+        Ok(Some(age)) if age >= AUTO_REFRESH_TTL_SECS
+    )
+}
+
+/// Keep the catalog current without anyone asking. Two sources, two rules:
+///
+/// - **Native provider listings** (each configured provider's own `/models`
+///   endpoint) auto-sync whenever stale, INCLUDING the very first time —
+///   this is what surfaces new releases as they ship. It is BYOK-clean: the
+///   request goes to the provider the user already gave stella a key for,
+///   the same host the next turn calls anyway. No credential → nothing
+///   fetched.
+/// - **The models.dev master list** is a third party, so it only auto-
+///   *re*freshes after the user's explicit first `stella models refresh`
+///   ([`master_list_auto_due`]) — the no-phone-home rule, unchanged.
+///
+/// `STELLA_CATALOG_AUTO_REFRESH=0` disables all implicit fetching. Best-
+/// effort throughout: offline just means the catalog stays as of the last
+/// sync.
 fn maybe_auto_refresh(store: &Arc<CatalogStore>) {
     if std::env::var("STELLA_CATALOG_AUTO_REFRESH").as_deref() == Ok("0") {
         return;
     }
-    let Ok(Some(age)) = store.seconds_since_sync(SYNC_SOURCE) else {
+    let configured = crate::config::discover_configured_providers();
+    if configured.is_empty() {
         return;
-    };
-    if age < AUTO_REFRESH_TTL_SECS {
+    }
+    let master_due = master_list_auto_due(store);
+    let native_due: Vec<&ConfiguredProvider> = configured
+        .iter()
+        .filter(|p| has_native_listing(&p.config))
+        .filter(|p| native_sync_is_due(store, &native_sync_source(p.config.id)))
+        .collect();
+    if !master_due && native_due.is_empty() {
         return;
+    }
+    // First-ever native sync fetches each provider's live list and takes a
+    // moment — say so once, instead of looking hung.
+    let first_native = native_due.iter().any(|p| {
+        store
+            .sync_info(&native_sync_source(p.config.id))
+            .ok()
+            .flatten()
+            .is_none()
+    });
+    if first_native {
+        eprintln!(
+            "  {} discovering models from your configured providers…",
+            "models:".dimmed()
+        );
     }
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -437,7 +623,14 @@ fn maybe_auto_refresh(store: &Arc<CatalogStore>) {
     else {
         return;
     };
-    let _ = rt.block_on(refresh_with_store(store, false));
+    rt.block_on(async {
+        if master_due {
+            let _ = refresh_with_store(store, false).await;
+        }
+        for provider in native_due {
+            let _ = refresh_native_provider(store, provider).await;
+        }
+    });
 }
 
 /// Assemble and install the runtime catalog: every seed row (verbatim, so
@@ -480,25 +673,28 @@ fn install_runtime_catalog(store: &CatalogStore) {
                 .family
                 .clone()
                 .unwrap_or_else(|| listing.model_provider.clone());
-            entries.push(CatalogEntry::new(
-                &listing.slug,
-                &listing.api_provider,
-                &family,
-                listing
-                    .pricing
-                    .context_window
-                    .unwrap_or(0)
-                    .min(u32::MAX as u64) as u32,
-                dialect,
-                Pricing {
-                    input_usd_per_mtok: listing.pricing.input_usd_per_mtok.unwrap_or(0.0),
-                    output_usd_per_mtok: listing.pricing.output_usd_per_mtok.unwrap_or(0.0),
-                    cached_input_usd_per_mtok: listing
+            entries.push(
+                CatalogEntry::new(
+                    &listing.slug,
+                    &listing.api_provider,
+                    &family,
+                    listing
                         .pricing
-                        .cached_input_usd_per_mtok
-                        .unwrap_or(0.0),
-                },
-            ));
+                        .context_window
+                        .unwrap_or(0)
+                        .min(u32::MAX as u64) as u32,
+                    dialect,
+                    Pricing {
+                        input_usd_per_mtok: listing.pricing.input_usd_per_mtok.unwrap_or(0.0),
+                        output_usd_per_mtok: listing.pricing.output_usd_per_mtok.unwrap_or(0.0),
+                        cached_input_usd_per_mtok: listing
+                            .pricing
+                            .cached_input_usd_per_mtok
+                            .unwrap_or(0.0),
+                    },
+                )
+                .with_reasoning(listing.pricing.supports_reasoning),
+            );
             known.insert(key);
         }
     }
@@ -539,7 +735,10 @@ pub fn validate_model_slug(provider: &ProviderConfig, model_id: &str) -> Result<
         }
         let synced = store
             .provider_model_count(provider.id, Some(SYNC_SOURCE))
-            .unwrap_or(0);
+            .unwrap_or(0)
+            + store
+                .provider_model_count(provider.id, Some(NATIVE_SOURCE))
+                .unwrap_or(0);
         if synced > 0 {
             return Err(unknown_model_message(&store, provider.id, model_id));
         }
@@ -712,25 +911,21 @@ async fn refresh_with_store(
     }
 }
 
-/// `stella models refresh [--force]`.
+/// `stella models refresh [--force]`: the master list, then every
+/// configured provider's own live `/models` listing.
 pub async fn run_refresh(force: bool) -> Result<(), String> {
     let store = store_for_command()?;
     ensure_seed_floor(&store);
-    println!(
-        "{}\n",
-        "Stella — Model Catalog Refresh (models.dev)"
-            .yellow()
-            .bold()
-    );
+    println!("{}\n", "Stella — Model Catalog Refresh".yellow().bold());
     let (not_modified, providers, counts) = refresh_with_store(&store, force).await?;
     if not_modified {
         println!(
-            "  {} master list unchanged (ETag match) — catalog already current",
+            "  {} master list (models.dev) unchanged (ETag match) — already current",
             "✓".green()
         );
     } else {
         println!(
-            "  {} synced {} models across {} providers",
+            "  {} master list (models.dev): {} models across {} providers",
             "✓".green(),
             counts.models_seen,
             providers
@@ -740,12 +935,32 @@ pub async fn run_refresh(force: bool) -> Result<(), String> {
             counts.cards_added, counts.versions_added, counts.aliases_added
         );
     }
+
+    // Live listings, straight from each configured provider's own API —
+    // the authoritative "what can this key use right now", which also
+    // catches releases the master list hasn't indexed yet.
+    for configured in crate::config::discover_configured_providers() {
+        if !has_native_listing(&configured.config) {
+            continue;
+        }
+        let id = configured.config.id;
+        match refresh_native_provider(&store, &configured).await {
+            Ok((seen, counts)) => println!(
+                "  {} {id}: {seen} models live from the provider ({} new cards)",
+                "✓".green(),
+                counts.cards_added
+            ),
+            Err(e) => println!("  {} {id}: {e}", "–".yellow()),
+        }
+    }
+
     let (cards, versions, aliases) = store.counts().map_err(|e| e.to_string())?;
     println!(
-        "  catalog now holds {cards} model cards, {versions} pricing versions, {aliases} aliases"
+        "\n  catalog now holds {cards} model cards, {versions} pricing versions, {aliases} aliases"
     );
     println!(
-        "\n  Model slugs now validate against this master list; re-run to pick up new releases."
+        "  Model slugs validate against this catalog; it re-syncs automatically once a day \
+         while a provider credential is configured."
     );
     Ok(())
 }
@@ -760,13 +975,29 @@ fn rate(value: Option<f64>) -> String {
     }
 }
 
-/// `stella models list [--provider <id>]`.
-pub fn run_list(provider: Option<&str>) -> Result<(), String> {
+/// `stella models list [--provider <id>] [--all]`. Without `--provider`,
+/// the listing is scoped to providers whose credential currently resolves —
+/// the same set the deck's model picker offers — because "what can I
+/// actually select right now" is the question this answers; `--all` lifts
+/// the scope to the whole catalog.
+pub fn run_list(provider: Option<&str>, all: bool) -> Result<(), String> {
     let store = store_for_command()?;
     ensure_seed_floor(&store);
-    let listings = store
+    let mut listings = store
         .models_for_provider(provider)
         .map_err(|e| e.to_string())?;
+    let mut hidden = 0;
+    if provider.is_none() && !all {
+        let configured: HashSet<String> = crate::config::discover_configured_providers()
+            .into_iter()
+            .map(|p| p.config.id.to_string())
+            .collect();
+        if !configured.is_empty() {
+            let before = listings.len();
+            listings.retain(|l| configured.contains(&l.api_provider));
+            hidden = before - listings.len();
+        }
+    }
     if listings.is_empty() {
         match provider {
             Some(p) => println!(
@@ -789,8 +1020,14 @@ pub fn run_list(provider: Option<&str>) -> Result<(), String> {
             .context_window
             .map(|c| format!("{}k", c / 1000))
             .unwrap_or_else(|| "-".to_string());
+        // Capability marker: `thinks` when the model supports reasoning —
+        // the flag the effort picker keys on. Unknown shows nothing.
+        let thinks = match l.pricing.supports_reasoning {
+            Some(true) => "  thinks",
+            _ => "",
+        };
         println!(
-            "  {}/{}  {} / {} / {}  ctx {}  {}  [v{}]",
+            "  {}/{}  {} / {} / {}  ctx {}  {}{}  [v{}]",
             l.api_provider.bright_magenta(),
             l.slug.bright_white(),
             rate(l.pricing.input_usd_per_mtok),
@@ -798,6 +1035,7 @@ pub fn run_list(provider: Option<&str>) -> Result<(), String> {
             rate(l.pricing.cached_input_usd_per_mtok),
             ctx,
             l.model_provider.dimmed(),
+            thinks.cyan(),
             l.version,
         );
     }
@@ -805,6 +1043,12 @@ pub fn run_list(provider: Option<&str>) -> Result<(), String> {
         "\n  {} models. Pricing shown is each card's latest version.",
         listings.len()
     );
+    if hidden > 0 {
+        println!(
+            "  {hidden} models on providers without a configured credential are hidden — \
+             `stella models list --all` shows everything."
+        );
+    }
     match store.sync_info(SYNC_SOURCE).map_err(|e| e.to_string())? {
         Some(info) => println!(
             "  master list last refreshed {} UTC — `stella models refresh` to update",
@@ -830,8 +1074,9 @@ pub fn print_catalog_status() {
             info.refreshed_at
         ),
         _ => println!(
-            "\n  Model catalog: seed only — `stella models refresh` pulls the live master list \
-             (models.dev) and turns on strict slug validation for every provider."
+            "\n  Model catalog: seed only — each configured provider's live model list syncs \
+             automatically; `stella models refresh` also pulls the models.dev master list \
+             (pricing + capabilities) and re-syncs it daily thereafter."
         ),
     }
 }
@@ -977,6 +1222,8 @@ mod tests {
                 }),
                 release_date: Some("2025-11-18".to_string()),
                 last_updated: None,
+                reasoning: Some(true),
+                tool_call: Some(true),
             },
         );
         let mut providers = BTreeMap::new();
@@ -1008,7 +1255,127 @@ mod tests {
         assert_eq!(up.version.cached_input_usd_per_mtok, Some(0.31));
         assert_eq!(up.version.context_window, Some(1_000_000));
         assert_eq!(up.version.release_date.as_deref(), Some("2025-11-18"));
+        assert_eq!(up.version.supports_reasoning, Some(true));
+        assert_eq!(up.version.supports_tools, Some(true));
         assert!(up.aliases.iter().any(|a| a.alias == "gemini/gemini-3-pro"));
+    }
+
+    #[test]
+    fn native_upserts_overlay_missing_fields_from_the_existing_card() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(&dir.path().join("catalog.db")).expect("open");
+        let anthropic = PROVIDERS
+            .iter()
+            .find(|p| p.id == "anthropic")
+            .expect("anthropic row");
+
+        // The master list already priced this model and knows it reasons.
+        store
+            .apply_batch(&[ModelUpsert {
+                api_provider: "anthropic".to_string(),
+                model_provider: "anthropic".to_string(),
+                slug: "claude-fable-5".to_string(),
+                display_name: None,
+                family: Some("claude".to_string()),
+                source: SYNC_SOURCE.to_string(),
+                version: VersionData {
+                    input_usd_per_mtok: Some(3.0),
+                    output_usd_per_mtok: Some(15.0),
+                    cached_input_usd_per_mtok: Some(0.3),
+                    cache_write_usd_per_mtok: None,
+                    context_window: Some(200_000),
+                    max_output_tokens: Some(64_000),
+                    release_date: Some("2026-01-15".to_string()),
+                    last_updated: None,
+                    supports_reasoning: Some(true),
+                    supports_tools: Some(true),
+                },
+                aliases: alias_forms("anthropic", "claude-fable-5"),
+            }])
+            .expect("master-list row");
+
+        // Anthropic's own /v1/models reports ids + display names only. The
+        // merged upsert must keep every master-list fact…
+        let native = [ProviderModel {
+            id: "claude-fable-5".to_string(),
+            display_name: Some("Claude Fable 5".to_string()),
+            ..ProviderModel::default()
+        }];
+        let ups = native_upserts(anthropic, &native, &store);
+        assert_eq!(ups.len(), 1);
+        assert_eq!(ups[0].source, NATIVE_SOURCE);
+        assert_eq!(ups[0].version.input_usd_per_mtok, Some(3.0));
+        assert_eq!(ups[0].version.supports_reasoning, Some(true));
+        assert_eq!(ups[0].version.release_date.as_deref(), Some("2026-01-15"));
+        // …which also means the merged version hashes identically and a
+        // native re-sync appends NO new pricing version.
+        let counts = store.apply_batch(&ups).expect("native apply");
+        assert_eq!(
+            counts.versions_added, 0,
+            "no-new-information sync is version-silent"
+        );
+        assert_eq!(counts.cards_added, 0);
+
+        // A model the master list has never heard of (released today) still
+        // lands as a fresh card.
+        let brand_new = [ProviderModel {
+            id: "claude-brand-new".to_string(),
+            ..ProviderModel::default()
+        }];
+        let counts = store
+            .apply_batch(&native_upserts(anthropic, &brand_new, &store))
+            .expect("new-model apply");
+        assert_eq!(counts.cards_added, 1);
+    }
+
+    #[test]
+    fn native_sync_fires_on_first_run_but_master_list_never_does() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(&dir.path().join("catalog.db")).expect("open");
+
+        // Native listings (traffic to the user's own provider) DO fire on
+        // the never-synced case — that's how new installs discover models.
+        assert!(
+            native_sync_is_due(&store, &native_sync_source("openrouter")),
+            "never synced native → due (BYOK-clean)"
+        );
+
+        // models.dev (a third party) must NOT auto-fetch until the user has
+        // explicitly refreshed at least once — the no-phone-home rule.
+        assert!(
+            !master_list_auto_due(&store),
+            "never synced master list → NOT due (no phone home on a fresh install)"
+        );
+
+        // After an explicit refresh recorded a sync row, it may auto-refresh
+        // once stale — but a just-recorded sync is still fresh.
+        store
+            .record_sync(SYNC_SOURCE, None, None)
+            .expect("record sync");
+        assert!(
+            !master_list_auto_due(&store),
+            "just refreshed → not due until the TTL passes"
+        );
+        store
+            .record_sync(&native_sync_source("openrouter"), None, None)
+            .expect("record native sync");
+        assert!(
+            !native_sync_is_due(&store, &native_sync_source("openrouter")),
+            "just synced native → not due until the TTL passes"
+        );
+    }
+
+    #[test]
+    fn every_builtin_except_vertex_and_bedrock_has_a_native_listing() {
+        for provider in PROVIDERS {
+            let expected = !matches!(provider.dialect, Dialect::Vertex | Dialect::Bedrock);
+            assert_eq!(
+                has_native_listing(provider),
+                expected,
+                "native-listing coverage drifted for `{}`",
+                provider.id
+            );
+        }
     }
 
     #[test]

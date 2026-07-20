@@ -135,7 +135,21 @@ async fn copy_preserving_mtime(src: &Path, dst: &Path) -> std::io::Result<()> {
         let perms = meta.permissions();
         let restore = if perms.readonly() {
             let mut writable = perms.clone();
-            writable.set_readonly(false);
+            // Grant only the owner-write bit so the mtime stamp below can open
+            // `dst` for writing; `set_readonly(false)` would also add the
+            // group/other-write bits (`0o222`, world-writable on Unix). The
+            // original mode is restored right after, so the writable window is
+            // momentary and confined to this private per-candidate shadow tree.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                writable.set_mode(writable.mode() | 0o200);
+            }
+            #[cfg(not(unix))]
+            {
+                #[allow(clippy::permissions_set_readonly_false)]
+                writable.set_readonly(false);
+            }
             std::fs::set_permissions(dst, writable)?;
             Some(perms)
         } else {

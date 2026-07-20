@@ -41,8 +41,53 @@ use crate::render::scroll_window_start;
 use crate::theme;
 
 /// The legal `effort` values, in cycle order (⏎ walks them, then wraps to
-/// "provider default").
+/// "provider default"). This is the FULL vocabulary — the fallback when
+/// the selected model's own levels are unknown; [`effort_values_for`]
+/// narrows it to what the model/provider pair actually supports.
 const EFFORT_VALUES: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// The effort levels `role`'s currently-selected model can act on, from
+/// the driver-computed `model_efforts` map. Lookup tries the model string
+/// verbatim (the picker writes `provider/slug`), then provider-qualified,
+/// then any provider serving that bare slug. Unknown models keep the full
+/// vocabulary — unknown must never restrict. `Some(vec![])` means effort
+/// is genuinely not a knob for this model.
+fn effort_values_for(state: &EngineConfigState, role: EngineRole) -> Vec<String> {
+    let full = || EFFORT_VALUES.iter().map(|s| s.to_string()).collect();
+    let Some(agent) = state.agent(role) else {
+        return full();
+    };
+    let Some(model) = agent
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    else {
+        return full();
+    };
+    let qualified = agent
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("{p}/{model}"));
+    let suffix = format!("/{model}");
+    let hit = state
+        .model_efforts
+        .get(model)
+        .or_else(|| qualified.as_ref().and_then(|q| state.model_efforts.get(q)))
+        .or_else(|| {
+            state
+                .model_efforts
+                .iter()
+                .find(|(spec, _)| spec.ends_with(&suffix))
+                .map(|(_, levels)| levels)
+        });
+    match hit {
+        Some(levels) => levels.clone(),
+        None => full(),
+    }
+}
 /// The legal `verbosity` values.
 const VERBOSITY_VALUES: [&str; 3] = ["low", "medium", "high"];
 /// The legal `service_tier` values.
@@ -616,11 +661,32 @@ fn activate_row(ui: &mut DeckUi, via_space: bool) -> DeckAction {
                     if via_space {
                         return DeckAction::Handled;
                     }
-                    let values: &[&str] = match field {
-                        AgentField::Effort => &EFFORT_VALUES,
-                        AgentField::Verbosity => &VERBOSITY_VALUES,
-                        _ => &SERVICE_TIER_VALUES,
+                    let owned_values: Vec<String> = match field {
+                        // Model-aware: only the levels this agent's selected
+                        // model (as served by its provider) can act on.
+                        AgentField::Effort => {
+                            let state = ui.engine.state.as_ref().expect("guarded above");
+                            effort_values_for(state, role)
+                        }
+                        AgentField::Verbosity => {
+                            VERBOSITY_VALUES.iter().map(|s| s.to_string()).collect()
+                        }
+                        _ => SERVICE_TIER_VALUES.iter().map(|s| s.to_string()).collect(),
                     };
+                    if owned_values.is_empty() {
+                        // Effort on a model with no reasoning: explain
+                        // instead of a keypress that visibly does nothing,
+                        // and drop any stale level so a save can't carry it.
+                        let state = ui.engine.state.as_mut().expect("guarded above");
+                        if let Some(agent) = agent_mut(state, role) {
+                            agent.effort = None;
+                        }
+                        ui.engine.status = Some(
+                            "this model does not support reasoning — effort does not apply".into(),
+                        );
+                        return DeckAction::Handled;
+                    }
+                    let values: Vec<&str> = owned_values.iter().map(String::as_str).collect();
                     let state = ui.engine.state.as_mut().expect("guarded above");
                     if let Some(agent) = agent_mut(state, role) {
                         let slot = match field {
@@ -628,7 +694,7 @@ fn activate_row(ui: &mut DeckUi, via_space: bool) -> DeckAction {
                             AgentField::Verbosity => &mut agent.verbosity,
                             _ => &mut agent.service_tier,
                         };
-                        cycle_enum(slot, values);
+                        cycle_enum(slot, &values);
                     }
                 }
                 AgentField::Provider => {
@@ -1197,6 +1263,7 @@ mod tests {
             allowed_models: vec!["anthropic/claude-fable-5".into(), "openai/gpt-6".into()],
             providers: vec!["anthropic".into(), "openrouter".into()],
             catalog_models: vec!["zai/glm-5".into()],
+            model_efforts: Default::default(),
             agents: vec![EngineAgentState::default(); 4],
         }
     }
@@ -1211,6 +1278,84 @@ mod tests {
         ui.engine.state = Some(sample_state());
         ui.engine.pristine = Some(sample_state());
         (model, ui)
+    }
+
+    #[test]
+    fn effort_vocabulary_follows_the_selected_model() {
+        let mut state = sample_state();
+        state.model_efforts.insert(
+            "anthropic/claude-fable-5".into(),
+            vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "max".into(),
+            ],
+        );
+        state
+            .model_efforts
+            .insert("openrouter/mistralai/mistral-7b-instruct".into(), vec![]);
+        state.model_efforts.insert(
+            "gemini/gemini-3-pro".into(),
+            vec!["low".into(), "high".into()],
+        );
+
+        // Picker-written qualified spec → exact hit.
+        state.agents[0].model = Some("anthropic/claude-fable-5".into());
+        assert_eq!(effort_values_for(&state, EngineRole::Default).len(), 5);
+
+        // A confirmed no-reasoning model → no levels at all.
+        state.agents[0].model = Some("openrouter/mistralai/mistral-7b-instruct".into());
+        assert!(effort_values_for(&state, EngineRole::Default).is_empty());
+
+        // Provider pin + bare slug → provider-qualified lookup.
+        state.agents[0].provider = Some("gemini".into());
+        state.agents[0].model = Some("gemini-3-pro".into());
+        assert_eq!(
+            effort_values_for(&state, EngineRole::Default),
+            vec!["low".to_string(), "high".to_string()]
+        );
+
+        // Unknown model (or no model at all) keeps the full vocabulary —
+        // unknown never restricts.
+        state.agents[0].provider = None;
+        state.agents[0].model = Some("something-new".into());
+        assert_eq!(effort_values_for(&state, EngineRole::Default).len(), 5);
+        state.agents[0].model = None;
+        assert_eq!(effort_values_for(&state, EngineRole::Default).len(), 5);
+    }
+
+    #[test]
+    fn cycling_effort_on_a_non_reasoning_model_clears_and_explains() {
+        let (_model, mut ui) = open_ui();
+        let mut state = sample_state();
+        state
+            .model_efforts
+            .insert("openrouter/mistralai/mistral-7b-instruct".into(), vec![]);
+        state.agents[0].model = Some("openrouter/mistralai/mistral-7b-instruct".into());
+        state.agents[0].effort = Some("xhigh".into()); // stale — model can't
+        ui.engine.state = Some(state.clone());
+        ui.engine.pristine = Some(state);
+        ui.engine.tab = EngineTab::Agent(EngineRole::Default);
+        // Row index of the Effort field on the agent tab.
+        ui.engine.row = AgentField::ALL
+            .iter()
+            .position(|f| *f == AgentField::Effort)
+            .expect("effort row exists");
+
+        let action = handle_engine_key(key(KeyCode::Enter), &mut ui);
+        assert_eq!(action, DeckAction::Handled);
+        let agent = &ui.engine.state.as_ref().unwrap().agents[0];
+        assert_eq!(agent.effort, None, "stale effort was dropped, not cycled");
+        assert!(
+            ui.engine
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("does not support reasoning")),
+            "status explains why nothing cycled: {:?}",
+            ui.engine.status
+        );
     }
 
     #[test]
