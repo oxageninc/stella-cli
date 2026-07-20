@@ -17,7 +17,11 @@ yanked = "warn"
 # - RUSTSEC-2024-0436: `paste` is archived/unmaintained but has no known
 #   vulnerability — a compile-time macro helper pulled in transitively
 #   (ratatui et al.). Not a security issue, so it must not block CI.
-ignore = ["RUSTSEC-2024-0436"]
+# - RUSTSEC-2025-0057: `fxhash` is unmaintained (no known vulnerability) —
+#   a transitive hash-function dep of `scraper`→`selectors` (the web-tools
+#   HTML parser). Informational, not a security issue; unavoidable without
+#   dropping `scraper`.
+ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2025-0057"]
 
 [bans]
 # Multiple versions of the same crate is a warning, not a failure — the bundled
