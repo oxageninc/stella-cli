@@ -915,61 +915,43 @@ impl ToolRegistry {
         index.session.extend(pass.created.iter().cloned());
     }
 
-    /// The live storage map for the gate: the persisted index + manifest,
-    /// re-read per gated write (so a mid-session `stella init` or manifest
-    /// edit is seen immediately), merged with the host-seeded baseline and
-    /// the objects created by earlier writes this session (covers the
-    /// watcher's re-index lag).
-    fn storage_snapshot(&self) -> stella_graph::StorageSnapshot {
-        let mut snapshot = stella_graph::load_storage_snapshot(&self.root);
-        let index = self.storage_index.lock().unwrap_or_else(|p| p.into_inner());
-        for rel in index.baseline.relations.iter().chain(index.session.iter()) {
-            if let Some(existing) = snapshot
-                .relations
-                .iter_mut()
-                .find(|r| r.address == rel.address)
-            {
-                // Same relation known from disk: union in any fields the
-                // overlay knows about that the index hasn't caught up on.
-                for field in &rel.fields {
-                    let key = stella_graph::storage::normalize_name(&field.name);
-                    if !existing
-                        .fields
-                        .iter()
-                        .any(|f| stella_graph::storage::normalize_name(&f.name) == key)
-                    {
-                        existing.fields.push(field.clone());
-                    }
-                }
-            } else {
-                snapshot.relations.push(rel.clone());
-            }
+    /// The effective command line of one tool call, feeding both the
+    /// blocking `command.started` policy chain and the `command.*`
+    /// observer events: `bash`'s own input, `run_script`'s index-resolved
+    /// command (`None` when resolution failed — the tool returns the named
+    /// error itself, ungated), or `start_process`'s space-joined argv. The
+    /// argv spawn MUST ride the same fence as `bash`: it sits in the
+    /// default surface while `bash` is opt-in, and argv[0] may itself be a
+    /// shell (`["bash", "-c", …]`), so leaving it out hands ambient shell
+    /// execution to the very posture that turned `bash` off.
+    fn command_line_for(
+        name: &str,
+        input: &Value,
+        resolved_script: Option<&str>,
+    ) -> Option<String> {
+        match name {
+            "bash" => Some(
+                input
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            "run_script" => resolved_script.map(str::to_string),
+            "start_process" => Some(
+                input
+                    .get("argv")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default(),
+            ),
+            _ => None,
         }
-        snapshot
-    }
-
-    /// Record what a landed write created: grow the session overlay, and —
-    /// when the model declared a `storage_intent` — append it to
-    /// `stella.storage.toml` (origin `declared`). The gate's justification
-    /// path is what populates the map: every challenged object is born
-    /// documented (spec §8 ring 3).
-    fn record_storage_objects(&self, pass: &crate::schema_gate::GatePass, intent: Option<&str>) {
-        if let Some(intent) = intent {
-            for address in &pass.intent_addresses {
-                let _ = stella_graph::manifest::append_meaning(
-                    &self.root,
-                    "relations",
-                    address,
-                    intent,
-                    "declared",
-                );
-            }
-        }
-        if pass.created.is_empty() {
-            return;
-        }
-        let mut index = self.storage_index.lock().unwrap_or_else(|p| p.into_inner());
-        index.session.extend(pass.created.iter().cloned());
     }
 
     /// `[C|R|U|D]`-classify a call: reads → R, writes → C (new) or U
