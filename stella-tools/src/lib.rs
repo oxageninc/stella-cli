@@ -40,6 +40,8 @@ pub mod tasks;
 pub mod tracker_auth;
 pub mod validate;
 pub mod verify;
+pub mod web;
+pub mod web_extract;
 pub mod write;
 
 pub use registry::{RegistryOptions, ToolRegistry};

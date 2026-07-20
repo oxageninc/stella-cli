@@ -2411,12 +2411,17 @@ pub fn run_tools_listing() -> Result<(), String> {
     tui::section_header("Stella tools");
 
     // The listing mirrors a real session's surface, so the settings-driven
-    // switches (bash opt-in) apply here exactly as they do at session start.
+    // switches (bash/web opt-ins) apply here exactly as they do at session
+    // start.
     let settings = crate::settings::Settings::load(&workspace_root)?;
     let bash_enabled = settings.bash_tool_enabled();
+    let web_enabled = settings.web_tools_enabled();
     let registry = ToolRegistry::new(
         workspace_root.clone(),
-        stella_tools::RegistryOptions { bash: bash_enabled },
+        stella_tools::RegistryOptions {
+            bash: bash_enabled,
+            web: web_enabled,
+        },
     );
     println!("  {}", "built-in:".dimmed());
     let mut native: Vec<String> = stella_core::ports::ToolExecutor::schemas(&registry)
@@ -2432,6 +2437,15 @@ pub fn run_tools_listing() -> Result<(), String> {
             "    {} {}",
             "·".dimmed(),
             "bash — disabled (default); enable with \"tools\": {\"bash\": \"on\"} in settings"
+                .dimmed()
+        );
+    }
+    if !web_enabled {
+        println!(
+            "    {} {}",
+            "·".dimmed(),
+            "web_search/web_fetch/web_extract_assets/web_download — disabled (default); \
+             enable with \"tools\": {\"web\": \"on\"} in settings"
                 .dimmed()
         );
     }
@@ -3565,6 +3579,7 @@ async fn run_goal_pipeline_turn(
 pub(crate) fn registry_options(cfg: &Config) -> stella_tools::RegistryOptions {
     stella_tools::RegistryOptions {
         bash: cfg.tools_bash,
+        web: cfg.tools_web,
     }
 }
 
@@ -4153,6 +4168,7 @@ mod tests {
             hooks: None,
             engine_settings: None,
             tools_bash: false,
+            tools_web: false,
         }
     }
 
