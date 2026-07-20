@@ -659,7 +659,7 @@ pub struct DeckUi {
     /// finished OAuth login refreshes the MCP snapshot). The shell drains
     /// this after every key/inbound and forwards each as a submission.
     pub pending_inputs: Vec<WorkspaceInput>,
-    /// The ENGINE panel (AGENT ENGINE tab, `/model-*`): the editor for
+    /// The ENGINE panel (SETTINGS tab, `/model-*`): the editor for
     /// `settings.json` → `agent_engine_config`, over a driver-owned snapshot
     /// ([`Inbound::EngineConfig`]). Modal while open.
     pub engine: crate::views::engine::EngineOverlay,
@@ -801,11 +801,11 @@ impl DeckUi {
             return;
         }
 
-        // 2b. The ENGINE panel is modal while focused (AGENT ENGINE tab): a
+        // 2b. The ENGINE panel is modal while focused (SETTINGS tab): a
         //     paste belongs to its inline edit (a prompt, a model list) or
         //     the picker filter — and with neither active it is swallowed,
         //     never the composer's.
-        if self.tab == DeckTab::Agents && self.engine.focused {
+        if self.tab == DeckTab::Settings && self.engine.focused {
             if let Some(edit) = self.engine.edit.as_mut() {
                 push_single_line(&mut edit.buffer, text);
             } else if let Some(picker) = self.engine.picker.as_mut() {
@@ -1324,12 +1324,12 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         return handle_graph_picker_key(key, ui);
     }
 
-    // The ENGINE panel (the AGENT ENGINE tab's right column) is modal
-    // exactly like the queue editor while focused: it owns the keyboard —
-    // its inline edit buffer, its model picker, and its letter verbs
-    // (`s`/`S`/`x`/`r`) must never leak into the composer. Scoped to its
-    // own tab so a stale focus flag can never trap the keyboard elsewhere.
-    if ui.tab == DeckTab::Agents && ui.engine.focused {
+    // The ENGINE panel (the SETTINGS tab's config editor) is modal exactly
+    // like the queue editor while focused: it owns the keyboard — its inline
+    // edit buffer, its model picker, and its letter verbs (`s`/`S`/`x`/`r`)
+    // must never leak into the composer. Scoped to its own tab so a stale
+    // focus flag can never trap the keyboard elsewhere.
+    if ui.tab == DeckTab::Settings && ui.engine.focused {
         return crate::views::engine::handle_engine_key(key, ui);
     }
 
@@ -1460,6 +1460,7 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         DeckTab::Mcp => handle_mcp_key(key, ui, composer_empty),
         DeckTab::Issues => handle_issues_browse_key(key, ui, composer_empty),
         DeckTab::Session => handle_session_key(key, model, ui),
+        DeckTab::Settings => handle_settings_key(key, ui, composer_empty),
         // The SKILLS tab claims its keys earlier (before the composer), so a
         // key that reaches here fell through on purpose — leave it to the
         // deck-global handlers below.
@@ -1615,6 +1616,12 @@ fn handle_slash_key(key: KeyEvent, matches: &[String], ui: &mut DeckUi) -> Optio
                 ui.set_tab(DeckTab::Mcp);
                 DeckAction::Handled
             }
+            // `/settings` opens the SETTINGS tab — the home of all config
+            // (deck-local view state, like the tab switches above).
+            "/settings" => {
+                ui.set_tab(DeckTab::Settings);
+                DeckAction::Handled
+            }
             // The three transcript-page overlays are deck-local view state,
             // exactly like the tab switches above (their keyboard shortcuts:
             // empty-prompt `←` / `→`, and the footer's ✉ badge for the inbox).
@@ -1623,10 +1630,10 @@ fn handle_slash_key(key: KeyEvent, matches: &[String], ui: &mut DeckUi) -> Optio
             "/inbox" => open_inbox_overlay(ui),
             // The ENGINE panel: deck-local view state over a driver-owned
             // settings snapshot. The old `/engine` popup is gone — the panel
-            // lives permanently in the AGENT ENGINE tab's right column, and
-            // the four `/model-<agent>` commands jump straight there with
-            // that agent's model picker already open. Intercepted here so
-            // these never get submitted as prompts.
+            // is the full-width body of the SETTINGS tab, and the four
+            // `/model-<agent>` commands jump straight there with that agent's
+            // model picker already open. Intercepted here so these never get
+            // submitted as prompts.
             "/model-default" => crate::views::engine::open_with_picker(ui, EngineRole::Default),
             "/model-worker" => crate::views::engine::open_with_picker(ui, EngineRole::Worker),
             "/model-judge" => crate::views::engine::open_with_picker(ui, EngineRole::Judge),
@@ -3231,18 +3238,24 @@ fn handle_mcp_auth_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
     }
 }
 
+/// The SETTINGS tab's browse keys (non-modal — the composer stays live). The
+/// tab hosts the `agent_engine_config` editor; `e` hands it the keyboard (its
+/// own Esc hands it back), gated on a blank composer like every other tab's
+/// letter verb so typing a prompt still works from here. Once focused, the
+/// editor claims every key ahead of this handler (see `handle_deck_key`).
+fn handle_settings_key(key: KeyEvent, ui: &mut DeckUi, composer_empty: bool) -> Option<DeckAction> {
+    if composer_empty && key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('e')) {
+        return Some(crate::views::engine::focus_panel(ui));
+    }
+    None
+}
+
 fn handle_agents_key(
     key: KeyEvent,
     model: &WorkspaceModel,
     ui: &mut DeckUi,
     composer_empty: bool,
 ) -> Option<DeckAction> {
-    // `e` hands the keyboard to the engine panel (the right column) from
-    // either pane — the panel's own Esc hands it back.
-    if composer_empty && key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('e')) {
-        return Some(crate::views::engine::focus_panel(ui));
-    }
-
     // The secondary nav: ←/→ switch EXECUTIONS ↔ INSTALLED AGENTS. These
     // only arrive here with a blank composer (a composer holding text claims
     // ←/→ for cursor motion first), same gate as every other tab key.

@@ -1,9 +1,9 @@
-//! The ENGINE panel — the AGENT ENGINE tab's permanent right column, the
-//! editor for `settings.json` → `agent_engine_config`: the global routing
-//! toggles plus the per-agent model / prompt / sampling overrides for the
-//! four pipeline agents (default · worker · judge · triage). Formerly the
-//! `/engine` popup; the command and the popup are gone — the same content
-//! now lives beside the executions dashboard in a 60/40 split.
+//! The ENGINE panel — the config editor the SETTINGS tab hosts full-width,
+//! for `settings.json` → `agent_engine_config`: the global routing toggles
+//! plus the per-agent model / prompt / sampling overrides for the four
+//! pipeline agents (default · worker · judge · triage). Formerly the
+//! `/engine` popup, then the AGENTS tab's right column; the same content now
+//! lives on SETTINGS ([`crate::views::settings`]), the home of all config.
 //!
 //! Ownership mirrors the MCP and SKILLS surfaces: the **driver** owns the
 //! settings files on disk and pushes [`crate::envelope::Inbound::EngineConfig`]
@@ -20,9 +20,9 @@
 //! path).
 //!
 //! Interaction follows the queue-editor contract: **modal while focused**
-//! (`e` on the AGENT ENGINE tab focuses; Esc returns focus to the left
-//! column). Every key is claimed by [`handle_engine_key`] while focused, so
-//! the letter verbs (`s`/`S`/`x`/`r`), the inline edit buffer, and the
+//! (`e` on the SETTINGS tab focuses; Esc hands the keyboard back to the
+//! tab). Every key is claimed by [`handle_engine_key`] while focused, so the
+//! letter verbs (`s`/`S`/`x`/`r`), the inline edit buffer, and the
 //! model-picker filter can never leak a keystroke into the global composer.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -258,9 +258,9 @@ pub struct ModelPicker {
 /// All engine-panel view state (a field on [`DeckUi`]). The config itself
 /// is driver-owned — `state` is the working copy being edited and `pristine`
 /// the last snapshot adopted from the driver; everything else is ephemeral
-/// interaction state. The panel lives permanently in the AGENT ENGINE tab's
-/// right column (no popup, no `/engine` command): `focused` is what routes
-/// the keyboard to it.
+/// interaction state. The panel is the full-width body of the SETTINGS tab
+/// (no popup, no `/engine` command): `focused` is what routes the keyboard
+/// to it.
 #[derive(Debug, Clone, Default)]
 pub struct EngineOverlay {
     /// Whether the panel owns the keyboard (modal while set, on the AGENT
@@ -331,14 +331,14 @@ pub fn ingest_config(ui: &mut DeckUi, state: &EngineConfigState, status: &Option
     e.busy = false;
 }
 
-// ── focusers (`e` on the AGENT ENGINE tab, and `/model-*`) ─────────────────
+// ── focusers (`e` on the SETTINGS tab, and `/model-*`) ─────────────────────
 
-/// Focus the engine panel (switching to the AGENT ENGINE tab if needed) on
+/// Focus the engine panel (switching to the SETTINGS tab if needed) on
 /// the GLOBAL tab, and ask the driver to re-read the settings chain so the
 /// panel reflects disk truth (the reply is dirty-guarded by
 /// [`ingest_config`], so refocusing over unsaved edits is safe).
 pub fn focus_panel(ui: &mut DeckUi) -> DeckAction {
-    ui.set_tab(DeckTab::Agents);
+    ui.set_tab(DeckTab::Settings);
     let e = &mut ui.engine;
     e.focused = true;
     e.tab = EngineTab::Global;
@@ -349,11 +349,11 @@ pub fn focus_panel(ui: &mut DeckUi) -> DeckAction {
     DeckAction::Send(WorkspaceInput::EngineConfigRefresh)
 }
 
-/// `/model-<agent>`: jump to the AGENT ENGINE tab, focus the panel on that
+/// `/model-<agent>`: jump to the SETTINGS tab, focus the panel on that
 /// agent's tab with the model picker already up — the one-keystroke "change
 /// this agent's model" path.
 pub fn open_with_picker(ui: &mut DeckUi, role: EngineRole) -> DeckAction {
-    ui.set_tab(DeckTab::Agents);
+    ui.set_tab(DeckTab::Settings);
     let e = &mut ui.engine;
     e.focused = true;
     e.tab = EngineTab::Agent(role);
@@ -936,12 +936,12 @@ fn cycle_enum(current: &mut Option<String>, values: &[&str]) {
 /// Label column width — fits the longest key (`repetition_penalty`, 18).
 const LABEL_W: usize = 19;
 
-/// Render the ENGINE panel into the AGENT ENGINE tab's right column: an
-/// area-filling bordered panel (accent border while it owns the keyboard,
-/// hairline otherwise), windowed rows with the selection reversed, and the
-/// model-picker sub-overlay centered over the panel when open. This is the
-/// exact content the old `/engine` popup carried — permanent now, so the
-/// engine config is always in view beside the executions it drives.
+/// Render the ENGINE panel into the SETTINGS tab: an area-filling bordered
+/// panel (accent border while it owns the keyboard, hairline otherwise),
+/// windowed rows with the selection reversed, and the model-picker
+/// sub-overlay centered over the panel when open. This is the exact content
+/// the old `/engine` popup carried — a permanent config surface now, the
+/// full-width body of the SETTINGS tab.
 pub fn render_panel(ui: &DeckUi, area: Rect, buf: &mut Buffer) {
     let e = &ui.engine;
     let (w, h) = (area.width, area.height);
@@ -1009,15 +1009,12 @@ pub fn render_panel(ui: &DeckUi, area: Rect, buf: &mut Buffer) {
         if e.focused {
             " tab agent · ⏎ edit · space toggle · x clear · s save user · S save project · r reload · esc done"
         } else {
-            " e edit engine config"
+            " e edit agents config"
         },
         theme::muted(),
     )));
 
-    let title = format!(
-        " agent engine{} ",
-        if e.dirty() { " · modified" } else { "" }
-    );
+    let title = format!(" agents{} ", if e.dirty() { " · modified" } else { "" });
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(if e.focused {
@@ -1268,12 +1265,12 @@ mod tests {
         }
     }
 
-    /// A deck on the AGENT ENGINE tab with the panel already focused over a
+    /// A deck on the SETTINGS tab with the panel already focused over a
     /// loaded snapshot — the state most key tests start from.
     fn open_ui() -> (WorkspaceModel, DeckUi) {
         let model = WorkspaceModel::new();
         let mut ui = ready_ui();
-        ui.set_tab(DeckTab::Agents);
+        ui.set_tab(DeckTab::Settings);
         ui.engine.focused = true;
         ui.engine.state = Some(sample_state());
         ui.engine.pristine = Some(sample_state());
@@ -1359,10 +1356,10 @@ mod tests {
     }
 
     #[test]
-    fn e_on_the_agent_engine_tab_focuses_the_panel_and_esc_unfocuses() {
+    fn e_on_the_settings_tab_focuses_the_panel_and_esc_unfocuses() {
         let model = WorkspaceModel::new();
         let mut ui = ready_ui();
-        ui.set_tab(DeckTab::Agents);
+        ui.set_tab(DeckTab::Settings);
         let action = handle_deck_key(ch('e'), &model, &mut ui);
         assert_eq!(
             action,
@@ -1373,13 +1370,13 @@ mod tests {
         assert_eq!(ui.engine.tab, EngineTab::Global);
         assert!(ui.engine.picker.is_none());
 
-        // Esc hands the keyboard back to the tab's left column.
+        // Esc hands the keyboard back to the tab.
         handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
-        assert!(!ui.engine.focused, "esc returns focus to the left column");
+        assert!(!ui.engine.focused, "esc hands the keyboard back to the tab");
     }
 
     #[test]
-    fn slash_model_worker_opens_the_agent_tab_with_the_picker() {
+    fn slash_model_worker_opens_the_settings_tab_with_the_picker() {
         let model = WorkspaceModel::new();
         let mut ui = ready_ui();
         ui.slash_commands = vec![SlashCommand::new("/model-worker", "pick the worker model")];
@@ -1391,6 +1388,7 @@ mod tests {
             action,
             DeckAction::Send(WorkspaceInput::EngineConfigRefresh)
         );
+        assert_eq!(ui.tab, DeckTab::Settings, "jumps to the SETTINGS tab");
         assert!(ui.engine.focused);
         assert_eq!(ui.engine.tab, EngineTab::Agent(EngineRole::Worker));
         assert_eq!(ui.engine.row, 0, "the model row is preselected");
@@ -1677,7 +1675,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_panel(&ui, area, &mut buf);
         let text = buffer_text(&buf);
-        assert!(text.contains("agent engine"), "title drawn");
+        assert!(text.contains("agents"), "title drawn");
         assert!(text.contains("temperature"), "agent rows drawn");
         assert!(text.contains("(provider default)"), "unset renders dimmed");
 

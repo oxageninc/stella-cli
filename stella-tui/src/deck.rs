@@ -37,10 +37,11 @@ pub enum DeckTab {
     Skills,
     Mcp,
     Issues,
+    Settings,
 }
 
 impl DeckTab {
-    pub const ALL: [DeckTab; 8] = [
+    pub const ALL: [DeckTab; 9] = [
         DeckTab::Session,
         DeckTab::Agents,
         DeckTab::Traces,
@@ -49,22 +50,25 @@ impl DeckTab {
         DeckTab::Skills,
         DeckTab::Mcp,
         DeckTab::Issues,
+        DeckTab::Settings,
     ];
 
     /// The tab-bar label. Deck tab labels are UPPERCASE by convention —
     /// every tab added later must follow (e.g. `SKILLS`, `MCP`).
-    /// `Agents` renders as AGENT ENGINE: the tab pairs the executions
-    /// dashboard with the permanent engine-config panel (60/40).
+    /// `Agents` renders as AGENTS: the executions dashboard paired with the
+    /// installed-agents view. `Settings` is the home of all config — it hosts
+    /// the `agent_engine_config` editor that used to share the Agents tab.
     pub fn title(self) -> &'static str {
         match self {
             DeckTab::Session => "SESSION",
-            DeckTab::Agents => "AGENT ENGINE",
+            DeckTab::Agents => "AGENTS",
             DeckTab::Traces => "TRACES",
             DeckTab::Graph => "GRAPH",
             DeckTab::Files => "FILES",
             DeckTab::Skills => "SKILLS",
             DeckTab::Mcp => "MCP",
             DeckTab::Issues => "ISSUES",
+            DeckTab::Settings => "SETTINGS",
         }
     }
 
@@ -1687,13 +1691,14 @@ mod tests {
     #[test]
     fn deck_tab_cycles_both_ways() {
         assert_eq!(DeckTab::Session.next(), DeckTab::Agents);
-        // Tab order ends …Files → Skills → Mcp → Issues; Issues wraps to
+        // Tab order ends …Skills → Mcp → Issues → Settings; Settings wraps to
         // Session and is Session's predecessor backward.
         assert_eq!(DeckTab::Files.next(), DeckTab::Skills);
         assert_eq!(DeckTab::Skills.next(), DeckTab::Mcp);
         assert_eq!(DeckTab::Mcp.next(), DeckTab::Issues);
-        assert_eq!(DeckTab::Issues.next(), DeckTab::Session);
-        assert_eq!(DeckTab::Session.prev(), DeckTab::Issues);
+        assert_eq!(DeckTab::Issues.next(), DeckTab::Settings);
+        assert_eq!(DeckTab::Settings.next(), DeckTab::Session);
+        assert_eq!(DeckTab::Session.prev(), DeckTab::Settings);
     }
 
     #[test]

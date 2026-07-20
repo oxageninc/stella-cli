@@ -60,11 +60,9 @@ fn deck_renders_every_tab_with_real_content() {
             "the {tab:?} tab should show {needle:?}, got:\n{text}"
         );
         // The comfy-tabs bar labels are always present — UPPERCASE by the
-        // deck's tab-label convention.
-        assert!(
-            text.contains("AGENT ENGINE"),
-            "tab bar should render on {tab:?}"
-        );
+        // deck's tab-label convention. (Assert on a left-anchored label: at
+        // 120 cols the 9-tab bar overflows, so the rightmost SETTINGS clips.)
+        assert!(text.contains("SESSION"), "tab bar should render on {tab:?}");
     }
 
     // Write all five tabs to a human-readable artifact at the repo root.
@@ -83,34 +81,52 @@ fn deck_renders_every_tab_with_real_content() {
 #[test]
 fn agents_dashboard_shows_status_and_spend_columns() {
     let model = folded_model();
-    // The dashboard is dense (11 columns) and shares the tab with the engine
-    // panel (60/40) — render at a roomy width so the executions table's left
-    // 60% still clears the full-column threshold; the engine panel must
-    // render beside it.
+    // The dashboard is dense (11 columns) and now fills the whole tab (the
+    // engine panel moved to SETTINGS) — render at a roomy width so every
+    // column shows.
     let text = render_tab(&model, DeckTab::Agents, 240, 20);
-    // Column headers, at least one agent's live status, and the engine
-    // panel's title all render.
-    for needle in [
-        "CPU%",
-        "MEM",
-        "In/Out",
-        "Activity",
-        "needs input",
-        "agent engine",
-    ] {
+    // Column headers and at least one agent's live status all render.
+    for needle in ["CPU%", "MEM", "In/Out", "Activity", "needs input"] {
         assert!(
             text.contains(needle),
             "dashboard missing {needle:?}:\n{text}"
         );
     }
+    // The config editor no longer shares this tab — its focus hint (unique to
+    // the engine panel) must not appear here; it lives on SETTINGS now.
+    assert!(
+        !text.contains("edit agents config"),
+        "the config panel must not render on the AGENTS tab:\n{text}"
+    );
 
-    // At a typical terminal width the table drops to its compact column set
-    // (the Goal column must survive, the density columns go).
-    let text = render_tab(&model, DeckTab::Agents, 160, 20);
+    // Below the compact threshold the table drops its density columns (the
+    // Goal column must survive, CPU%/MEM/etc. go). The dashboard now fills the
+    // whole tab, so this needs a genuinely narrow terminal to trip.
+    let text = render_tab(&model, DeckTab::Agents, 130, 20);
     assert!(!text.contains("CPU%"), "compact set drops CPU%:\n{text}");
     assert!(
         text.contains("Goal"),
         "compact set keeps the Goal column:\n{text}"
+    );
+}
+
+#[test]
+fn settings_tab_hosts_the_agents_config_editor() {
+    let model = folded_model();
+    // The config editor is the full-width body of the SETTINGS tab now.
+    let text = render_tab(&model, DeckTab::Settings, 120, 24);
+    assert!(
+        text.contains("agents"),
+        "the config panel title renders on SETTINGS:\n{text}"
+    );
+    // Its GLOBAL / per-agent sub-tabs and the focus hint render.
+    assert!(
+        text.contains("GLOBAL"),
+        "the engine panel's GLOBAL sub-tab renders:\n{text}"
+    );
+    assert!(
+        text.contains("edit agents config"),
+        "the unfocused focus hint renders:\n{text}"
     );
 }
 

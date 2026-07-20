@@ -3106,7 +3106,7 @@ const DECK_BUILTINS: &[(&str, &str)] = &[
     ("/init", "index the workspace: domains + code graph"),
     (
         "/agents",
-        "open the AGENT ENGINE tab: executions, installed agents & engine config",
+        "open the AGENTS tab: executions & installed agents",
     ),
     (
         "/pipeline",
@@ -3131,9 +3131,13 @@ const DECK_BUILTINS: &[(&str, &str)] = &[
     ),
     ("/inbox", "notifications — messages persist until read"),
     ("/mcp-search", "search the MCP registry & install servers"),
-    // The engine-config editor lives permanently in the AGENT ENGINE tab's
-    // right column (no `/engine` popup anymore); the /model-* commands jump
-    // straight to it with that agent's model picker open.
+    (
+        "/settings",
+        "open the SETTINGS tab — the home of all config",
+    ),
+    // The engine-config editor lives on the SETTINGS tab, full-width (no
+    // `/engine` popup anymore); the /model-* commands jump straight to it
+    // with that agent's model picker open.
     ("/model-default", "pick the default agent's model"),
     ("/model-worker", "pick the pipeline worker model"),
     ("/model-judge", "pick the pipeline judge model"),
@@ -3146,7 +3150,7 @@ fn deck_reserved() -> Vec<&'static str> {
     DECK_BUILTINS.iter().map(|(name, _)| *name).collect()
 }
 
-// ── Agent-engine config (the AGENT ENGINE panel) ──────────────────────────────
+// ── Agent-engine config (the SETTINGS tab's config panel) ─────────────────────
 
 /// Build an [`Inbound::EngineConfig`] snapshot: the freshly merged
 /// `agent_engine_config` from the settings scope chain, plus the picker

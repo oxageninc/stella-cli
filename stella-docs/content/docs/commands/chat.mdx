@@ -23,7 +23,7 @@ stella chat --plain
 
 `stella chat` opens a conversational session. You type a message, the agent runs its step loop — proposing tool calls, executing them, and feeding results back until the turn is done — and then hands the prompt back to you. Conversation history is retained across turns within the session.
 
-The default **Command Deck** presents the session as a set of tabs — **SESSION** (the transcript), **AGENT ENGINE** (executions, installed agents, and the embedded engine-config panel), **TRACES**, **GRAPH**, **FILES**, **SKILLS**, **MCP**, and **ISSUES** (your connected GitHub/Linear tracker, with instant type-ahead). Slash commands jump between tabs and run actions, and `?` opens a tab-aware key list. The **plain REPL** (`--plain`) is a single scrolling line-based loop with a smaller command set — handy for narrow terminals, screen readers, and recordings.
+The default **Command Deck** presents the session as a set of tabs — **SESSION** (the transcript), **AGENTS** (executions & installed agents), **TRACES**, **GRAPH**, **FILES**, **SKILLS**, **MCP**, **ISSUES** (your connected GitHub/Linear tracker, with instant type-ahead), and **SETTINGS** (the home of all config, incl. the engine-config panel). Slash commands jump between tabs and run actions, and `?` opens a tab-aware key list. The **plain REPL** (`--plain`) is a single scrolling line-based loop with a smaller command set — handy for narrow terminals, screen readers, and recordings.
 
 ### Multimodal input
 
@@ -60,7 +60,8 @@ Open a tab or run an action:
 | `/models` | List providers and models (same output as `stella models`). |
 | `/init` | Run workspace initialization. |
 | `/pipeline` | Toggle the staged pipeline on or off for subsequent turns. |
-| `/agents` | Open the AGENT ENGINE tab — executions, installed agents, and the engine-config panel. |
+| `/agents` | Open the AGENTS tab — executions & installed agents. |
+| `/settings` | Open the SETTINGS tab — the home of all config, incl. the engine-config panel. |
 | `/files` | Open the FILES (files-touched) tab. |
 | `/diff` | Show the working diff. |
 | `/graph` | Open the GRAPH (code-graph) tab. |

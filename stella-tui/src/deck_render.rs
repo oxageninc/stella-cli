@@ -86,6 +86,7 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
         DeckTab::Skills => views::skills::render(model, ui, content, buf),
         DeckTab::Mcp => views::mcp::render(model, ui, content, buf),
         DeckTab::Issues => views::issues::render(model, ui, content, buf),
+        DeckTab::Settings => views::settings::render(model, ui, content, buf),
     }
 
     render_trace_strip(model, bands[2], buf);
@@ -119,8 +120,8 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
     if ui.context_open {
         render_context_overlay(ui, area, buf);
     }
-    // (The former ENGINE overlay is gone: the engine panel renders inside
-    // the AGENT ENGINE tab's right column — see `views::agents::render`.)
+    // (The former ENGINE overlay is gone: the engine panel is the full-width
+    // body of the SETTINGS tab — see `views::settings::render`.)
 
     // Deck motion (crate::fx), scrubbed like the splash: each frame builds a
     // fresh effect and processes it once at its wall-clock elapsed, so no
@@ -1296,13 +1297,11 @@ fn tab_shortcuts(tab: DeckTab) -> &'static [(&'static str, &'static str)] {
         DeckTab::Agents => &[
             ("← →", "switch panes — executions / installed"),
             ("↑ ↓", "select an agent"),
-            ("e", "focus the engine panel — models, prompts & params"),
             ("s", "stop the selected running agent"),
             ("⏎", "edit the selected installed agent"),
             ("v", "show the selected agent's versions"),
             ("n", "new agent — drafted by the LLM"),
             ("r", "reload installed agents"),
-            ("esc", "in the engine panel: back to the left column"),
         ],
         DeckTab::Traces => &[
             ("↑ ↓ ⇞ ⇟", "scroll the event log"),
@@ -1341,6 +1340,19 @@ fn tab_shortcuts(tab: DeckTab) -> &'static [(&'static str, &'static str)] {
             ("c", "comment on the selected issue"),
             ("s", "set the selected issue's status"),
             ("w", "start work on the selected issue"),
+        ],
+        DeckTab::Settings => &[
+            ("e", "edit the agents config — models, prompts & params"),
+            (
+                "tab",
+                "in the editor: switch agent — global / default / worker / …",
+            ),
+            ("⏎", "in the editor: edit the selected row / pick a model"),
+            ("space", "in the editor: toggle the selected row"),
+            ("x", "in the editor: clear the selected row"),
+            ("s / S", "in the editor: save to user / project settings"),
+            ("r", "in the editor: reload from disk"),
+            ("esc", "in the editor: hand the keyboard back to the tab"),
         ],
     }
 }

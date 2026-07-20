@@ -1,16 +1,14 @@
-//! AGENT ENGINE tab — a 60/40 two-column grid. The left 60% is the two-pane
-//! view behind a one-line secondary nav (EXECUTIONS | INSTALLED AGENTS,
-//! switched with ←/→); the right 40% is the permanent engine-config panel
-//! ([`crate::views::engine`]) that used to live behind the `/engine` popup:
+//! AGENTS tab — the two-pane agents view behind a one-line secondary nav
+//! (EXECUTIONS | INSTALLED AGENTS, switched with ←/→):
 //!
 //! - **EXECUTIONS** (this module): the flagship `htop`/`claudectl`-style
 //!   dashboard — one dense row per ACTIVE agent with live status, spend,
 //!   resource usage, and activity.
 //! - **INSTALLED AGENTS** ([`crate::views::installed`]): the agents
 //!   configured on disk at the user/project level.
-//! - **ENGINE** (right column): the `agent_engine_config` editor — global
-//!   routing toggles plus per-agent model / prompt / sampling overrides.
-//!   `e` focuses it; its Esc hands the keyboard back.
+//!
+//! The `agent_engine_config` editor that used to occupy this tab's right
+//! column now lives full-width on the SETTINGS tab ([`crate::views::settings`]).
 //!
 //! Every color comes from [`crate::theme`]; every number is read straight off
 //! [`crate::deck::AgentEntry`] (no shadow state, no re-derivation of what the
@@ -38,35 +36,20 @@ const HEADERS: [&str; 11] = [
 /// cut wherever the terminal happens to clip the column.
 const GOAL_MAX_CHARS: usize = 56;
 
-/// Below this width a 40% engine column is too narrow to read — the left
-/// view takes the whole tab and the engine panel steps aside (still one
-/// `e` press away: focusing re-renders, and wider terminals show it live).
-const ENGINE_COLUMN_MIN_WIDTH: u16 = 90;
-
 pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    // The one-line secondary nav, then the active pane below it.
+    // The one-line secondary nav, then the active pane below it — the pane
+    // fills the whole tab now that the engine-config panel has moved to
+    // SETTINGS.
     let bands = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
     render_pane_nav(ui.agents_pane, bands[0], buf);
 
-    // The 60/40 grid: left — executions / installed; right — the permanent
-    // engine-config panel (the old `/engine` popup's content, always on).
     let body = bands[1];
-    let (left, engine_col) = if body.width >= ENGINE_COLUMN_MIN_WIDTH {
-        let cols = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(body);
-        (cols[0], Some(cols[1]))
-    } else {
-        (body, None)
-    };
     match ui.agents_pane {
-        AgentsPane::Executions => render_executions(model, ui, left, buf),
-        AgentsPane::Installed => crate::views::installed::render(ui, left, buf),
-    }
-    if let Some(engine_col) = engine_col {
-        crate::views::engine::render_panel(ui, engine_col, buf);
+        AgentsPane::Executions => render_executions(model, ui, body, buf),
+        AgentsPane::Installed => crate::views::installed::render(ui, body, buf),
     }
 }
 
@@ -90,7 +73,7 @@ fn render_pane_nav(pane: AgentsPane, area: Rect, buf: &mut Buffer) {
         Span::styled("EXECUTIONS", style_for(pane == AgentsPane::Executions)),
         Span::styled("  │  ", theme::muted()),
         Span::styled("INSTALLED AGENTS", style_for(pane == AgentsPane::Installed)),
-        Span::styled("   ←/→ · e engine", theme::muted()),
+        Span::styled("   ←/→", theme::muted()),
     ]);
     Paragraph::new(line).render(area, buf);
 }

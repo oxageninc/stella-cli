@@ -41,7 +41,7 @@ came through:
 - **Everything is recorded.** Each turn opens an execution record (files
   touched, tool use, memory citations, cost, outcome) in the workspace
   store, feeding [telemetry](/docs/telemetry), `stella stats`, and the
-  deck's AGENT ENGINE tab. Sessions are durable and resumable
+  deck's AGENTS tab. Sessions are durable and resumable
   (`stella resume`).
 - **Per-role model routing applies.** The
   [agent engine config](/docs/configuration/agent-engine-config) pins models
@@ -92,9 +92,10 @@ TUI over the engine. Each prompt becomes a lead-agent turn; `/pipeline`
 toggles between staged turns (the default) and the raw step loop. The deck
 is more than a chat surface: prompts queue while a turn runs, `!` lines run
 shell commands in their own lane, Esc cancels, and tabs expose the session's
-files, diff, code graph, skills, MCP servers, and the
-[AGENT ENGINE panel](/docs/configuration/agent-engine-config) with live
-executions and per-role model pickers.
+files, diff, code graph, skills, MCP servers, the AGENTS tab with live
+executions, and the SETTINGS tab's
+[config panel](/docs/configuration/agent-engine-config) with per-role model
+pickers.
 
 Two things are unique to deck turns:
 
@@ -121,7 +122,7 @@ keeps working, its spend metered into the session's **shared** budget guard
 (child spend always reaches the parent's ledger; fleet children, by
 contrast, each run under their own slice of the cap). Results return to the
 lead for review; every sub-agent turn is recorded (`deck-sub`) and visible in the
-AGENT ENGINE tab. You don't invoke this path directly — you ask for work
+AGENTS tab. You don't invoke this path directly — you ask for work
 that warrants it, and the lead fans out.
 
 **Use it when** (implicitly) a deck task decomposes into independent chunks —
@@ -222,7 +223,7 @@ If you're changing engine behavior, these are the seams:
 The execution-kind strings in [the map](#the-map) are what these paths stamp
 on their execution records — the same strings you'll see in
 `stella stats`, the exported [dashboard](/docs/telemetry/dashboard), and the
-deck's AGENT ENGINE tab, so a telemetry row always traces back to the door
+deck's AGENTS tab, so a telemetry row always traces back to the door
 the work came through.
 
 ## Where to go next

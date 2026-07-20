@@ -1,6 +1,6 @@
 ---
 title: Agent engine config
-description: Configure each engine agent — default, worker, judge, triage — with its own model, gateway, prompt, reasoning effort, and sampling parameters via agent_engine_config in settings.json, or interactively in the AGENT ENGINE tab's engine panel.
+description: Configure each engine agent — default, worker, judge, triage — with its own model, gateway, prompt, reasoning effort, and sampling parameters via agent_engine_config in settings.json, or interactively in the SETTINGS tab's config panel.
 ---
 
 The `agent_engine_config` object in [`settings.json`](/docs/configuration/settings)
@@ -169,17 +169,18 @@ their built-in output contracts (the classification token, the `PASS`/`FAIL`
 verdict line); a custom prompt for those agents is prepended as an extra
 system message rather than replacing the task prompt.
 
-## The engine panel in the Command Deck
+## The config panel in the Command Deck
 
-Everything above is editable interactively. The editor lives permanently in
-the **AGENT ENGINE** tab's right column (a 60/40 split beside the
-executions dashboard — the former `/engine` popup, now always in view):
+Everything above is editable interactively. The editor is the full-width body
+of the **SETTINGS** tab — the home of all config (the former `/engine` popup,
+then the AGENT ENGINE tab's right column, now a tab of its own; open it with
+`/settings` or by tabbing to it):
 
-- **`e`** on the AGENT ENGINE tab focuses the panel — a tab per agent plus
+- **`e`** on the SETTINGS tab focuses the panel — a tab per agent plus
   a GLOBAL tab (auto modes, `allowed_models`). Navigate with ↑/↓, press ⏎
   to edit a row (enum rows cycle; numeric and text rows take inline input),
-  `x` clears a field back to "provider default", Esc returns focus to the
-  executions list.
+  `x` clears a field back to "provider default", Esc hands the keyboard back
+  to the tab.
 - **`/model-default`**, **`/model-worker`**, **`/model-judge`**,
   **`/model-triage`** jump straight into a type-to-filter model picker for
   that agent, listing your `allowed_models` (or the full catalog when the
