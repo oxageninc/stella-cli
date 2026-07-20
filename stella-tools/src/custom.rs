@@ -570,9 +570,27 @@ async fn run_custom(tool: &CustomTool, input: &Value, workspace_root: &Path) -> 
 /// `schemas()` is the inner's plus the customs', and `execute()` routes an
 /// exact custom-name match, otherwise falls through to the inner executor.
 pub struct CustomToolSet<'a> {
-    inner: &'a dyn ToolExecutor,
+    inner: Inner<'a>,
     tools: Vec<CustomTool>,
     workspace_root: PathBuf,
+}
+
+/// The wrapped executor, held either by borrow (the session's per-turn tool
+/// chain, a stack local) or owned via `Arc` (a best-of-N candidate, whose
+/// chain is built dynamically and outlives every borrow — the workspace owns
+/// `Arc<ToolRegistry>` + this set together with no self-reference).
+enum Inner<'a> {
+    Borrowed(&'a dyn ToolExecutor),
+    Owned(std::sync::Arc<dyn ToolExecutor>),
+}
+
+impl Inner<'_> {
+    fn get(&self) -> &dyn ToolExecutor {
+        match self {
+            Inner::Borrowed(inner) => *inner,
+            Inner::Owned(inner) => inner.as_ref(),
+        }
+    }
 }
 
 impl<'a> CustomToolSet<'a> {
@@ -582,7 +600,25 @@ impl<'a> CustomToolSet<'a> {
         workspace_root: PathBuf,
     ) -> Self {
         Self {
-            inner,
+            inner: Inner::Borrowed(inner),
+            tools,
+            workspace_root,
+        }
+    }
+}
+
+impl CustomToolSet<'static> {
+    /// Own the inner executor by `Arc` — for callers that must hold the whole
+    /// chain (registry + customs) as one value, e.g. a boxed best-of-N
+    /// candidate workspace. `workspace_root` re-roots custom-tool subprocesses
+    /// (they spawn with it as cwd), so a snapshot root isolates them there.
+    pub fn new_owned(
+        inner: std::sync::Arc<dyn ToolExecutor>,
+        tools: Vec<CustomTool>,
+        workspace_root: PathBuf,
+    ) -> Self {
+        Self {
+            inner: Inner::Owned(inner),
             tools,
             workspace_root,
         }
@@ -592,7 +628,7 @@ impl<'a> CustomToolSet<'a> {
 #[async_trait]
 impl ToolExecutor for CustomToolSet<'_> {
     fn schemas(&self) -> Vec<ToolSchema> {
-        let mut schemas = self.inner.schemas();
+        let mut schemas = self.inner.get().schemas();
         schemas.extend(self.tools.iter().map(CustomTool::schema));
         schemas
     }
@@ -601,7 +637,7 @@ impl ToolExecutor for CustomToolSet<'_> {
         if let Some(tool) = self.tools.iter().find(|t| t.name == name) {
             return run_custom(tool, input, &self.workspace_root).await;
         }
-        self.inner.execute(name, input).await
+        self.inner.get().execute(name, input).await
     }
 }
 
@@ -1127,6 +1163,28 @@ command = []"#;
         match fell {
             ToolOutput::Ok { content } => assert_eq!(content, "inner ran bash"),
             ToolOutput::Error { message } => panic!("expected fallthrough: {message}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_inner_delegates_schemas_and_fallthrough() {
+        // The Arc-owned variant (best-of-N candidates) must behave exactly
+        // like the borrowed one: inner schemas + customs, and unknown names
+        // fall through to the owned inner.
+        let dir = tempfile::tempdir().unwrap();
+        let mut tool = script_tool(dir.path(), "s.sh", "#!/bin/sh\necho from_custom\n", 5000);
+        tool.name = "my_tool".into();
+        tool.command = vec!["./s.sh".into()];
+        let inner: std::sync::Arc<dyn ToolExecutor> = std::sync::Arc::new(FakeInner);
+        let set = CustomToolSet::new_owned(inner, vec![tool], dir.path().to_path_buf());
+
+        let names: Vec<String> = set.schemas().into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"bash".to_string()), "owned inner's schema");
+        assert!(names.contains(&"my_tool".to_string()), "custom schema");
+
+        match set.execute("bash", &serde_json::json!({})).await {
+            ToolOutput::Ok { content } => assert_eq!(content, "inner ran bash"),
+            ToolOutput::Error { message } => panic!("expected owned-inner fallthrough: {message}"),
         }
     }
 

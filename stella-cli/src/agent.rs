@@ -1056,6 +1056,10 @@ pub(crate) struct WorkspacePorts {
 /// Build the [`WorkspacePorts`] bundle rooted at `root` (the session
 /// workspace, or a fleet worker's own worktree).
 pub(crate) fn workspace_ports(root: std::path::PathBuf, cfg: &Config) -> WorkspacePorts {
+    // The candidate registry mirrors the session's custom tool surface —
+    // discovered from the same root, so a candidate sees exactly the custom
+    // tools the session does (re-rooted at its snapshot at create time).
+    let custom_tools = stella_tools::custom::discover(&root).tools;
     WorkspacePorts {
         repo_structure: GitRepoStructure { root: root.clone() },
         repo_status: GitRepoStatus { root: root.clone() },
@@ -1063,6 +1067,7 @@ pub(crate) fn workspace_ports(root: std::path::PathBuf, cfg: &Config) -> Workspa
         candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces::new(
             root,
             registry_options(cfg),
+            custom_tools,
         ),
     }
 }
