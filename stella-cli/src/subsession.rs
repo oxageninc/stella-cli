@@ -176,15 +176,13 @@ impl SubSessions {
     }
 }
 
-/// `stella_core::ports::TurnGate` over a watch channel: the worker's turn
-/// parks at its next step boundary while the driver holds `true` (Pause)
-/// and continues on `false` (Resume). A dropped sender (driver gone) reads
-/// as resumed — a worker must never park forever on teardown.
-/// The deck's [`stella_core::ports::TurnSteering`] implementation: a
-/// per-turn tap the input loop feeds (composer `>` steers, Esc soft-stops)
-/// and the lead engine drains at each step boundary. Interior mutability
-/// because the turn future and the input arms share it immutably across
-/// one `tokio::select!` loop.
+/// The deck's [`stella_core::ports::TurnSteering`] implementation: a tap the
+/// input loop feeds (`>` steers) and an engine drains at each step boundary.
+/// Interior mutability because the turn future and the input arms share it
+/// immutably. Shared by reference for the lead turn (a per-turn stack local)
+/// and by `Arc` for each worker lane (the deck feeds the worker's tap while
+/// the worker task drains it). `soft_stop` is latched only for the lead; a
+/// worker's stop stays the immediate hard cancel (`SubSessions::stop`).
 #[derive(Default)]
 pub(crate) struct SteeringTap {
     queue: std::sync::Mutex<Vec<String>>,
@@ -214,6 +212,10 @@ impl stella_core::ports::TurnSteering for SteeringTap {
     }
 }
 
+/// `stella_core::ports::TurnGate` over a watch channel: the worker's turn
+/// parks at its next step boundary while the driver holds `true` (Pause)
+/// and continues on `false` (Resume). A dropped sender (driver gone) reads
+/// as resumed — a worker must never park forever on teardown.
 struct WatchGate(watch::Receiver<bool>);
 
 #[async_trait::async_trait]

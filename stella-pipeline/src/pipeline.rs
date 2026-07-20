@@ -119,6 +119,15 @@ pub struct PipelinePorts<'a> {
     /// single-shot run (`candidates <= 1`); a multi-candidate run without it
     /// degrades to the historical shared-tree behavior with a loud warning.
     pub candidate_workspaces: Option<&'a dyn CandidateWorkspacePort>,
+    /// Step-boundary steering for the EXECUTE engine only — mid-turn user
+    /// messages injected as the model's next observation (`stella_core`'s
+    /// `TurnSteering`). `None` on non-interactive paths (headless `run`,
+    /// fleet). Attached to execute turns alone: triage, planning, the
+    /// witness author, and the judge are autonomous sub-steps with no
+    /// user-facing "steer this" moment. The pipeline's stop remains the
+    /// caller's hard cancel — a pipeline is triage→…→judge, so a
+    /// mid-execute soft stop has no single obvious continuation.
+    pub steering: Option<&'a dyn stella_core::ports::TurnSteering>,
 }
 
 /// Per-role request overrides for the pipeline's raw completion calls
@@ -430,6 +439,7 @@ pub struct Pipeline<'a> {
     sleeper: &'a dyn Sleeper,
     hooks: Option<(&'a Hooks, &'a dyn HookRunner)>,
     candidate_workspaces: Option<&'a dyn CandidateWorkspacePort>,
+    steering: Option<&'a dyn stella_core::ports::TurnSteering>,
     events: UnboundedSender<AgentEvent>,
     config: PipelineConfig,
 }
@@ -453,6 +463,7 @@ impl<'a> Pipeline<'a> {
             sleeper: ports.sleeper,
             hooks: ports.hooks,
             candidate_workspaces: ports.candidate_workspaces,
+            steering: ports.steering,
             events,
             config,
         }
@@ -803,6 +814,9 @@ impl<'a> Pipeline<'a> {
         if let Some((hooks, runner)) = self.hooks {
             engine = engine.with_hooks(hooks, runner);
         }
+        if let Some(steering) = self.steering {
+            engine = engine.with_steering(steering);
+        }
         let surface = CandidateSurface {
             commands: self.commands,
             repo_status: self.repo_status,
@@ -905,6 +919,9 @@ impl<'a> Pipeline<'a> {
                 );
                 if let Some((hooks, runner)) = self.hooks {
                     engine = engine.with_hooks(hooks, runner);
+                }
+                if let Some(steering) = self.steering {
+                    engine = engine.with_steering(steering);
                 }
                 let surface = CandidateSurface {
                     commands: ws.commands(),

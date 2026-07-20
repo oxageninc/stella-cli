@@ -554,6 +554,8 @@ async fn run_pipeline_one_shot(
                 .as_ref()
                 .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
             candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+            // Headless / fleet: no concurrent input channel to steer from.
+            steering: None,
         };
 
         let pipeline = Pipeline::new(ports, tx.clone(), pipeline_config);
@@ -3442,6 +3444,8 @@ async fn run_goal_pipeline_turn(
                     .as_ref()
                     .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
                 candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+                // Goal pipeline rounds run without an interactive steer tap.
+                steering: None,
             };
             let pipeline = Pipeline::new(ports, tx.clone(), pipeline_config);
             let round_goal = format!(
