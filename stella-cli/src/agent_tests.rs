@@ -431,34 +431,6 @@ async fn untrusted_project_custom_tools_are_absent_from_the_runtime_surface() {
     );
 }
 
-#[test]
-fn non_tty_text_output_is_headless_without_losing_text_rendering() {
-    let cfg = cfg_for("zai");
-    let format = OutputFormat::Text;
-    let non_tty = pipeline_config_for_approval_capability(
-        &cfg,
-        PipelineApprovalCapability::Unavailable,
-        None,
-    );
-    assert!(
-        non_tty.headless,
-        "text redirected through a non-TTY host cannot prompt for approval"
-    );
-    assert!(
-        !non_tty.headless_bypass_scope_review,
-        "output serialization must never grant execution authority"
-    );
-    assert_eq!(format, OutputFormat::Text, "rendering remains text");
-
-    let interactive =
-        pipeline_config_for_approval_capability(&cfg, PipelineApprovalCapability::Stdio, None);
-    assert!(
-        !interactive.headless,
-        "an explicit interactive approval host retains scope review"
-    );
-    assert!(!interactive.headless_bypass_scope_review);
-}
-
 #[tokio::test]
 async fn candidate_rules_reuse_the_parent_snapshot_after_source_removal() {
     let root = tempfile::tempdir().unwrap();

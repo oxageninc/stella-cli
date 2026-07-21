@@ -100,30 +100,6 @@ pub(crate) fn pipeline_engine_config_for(cfg: &Config, worker_model: &ModelRef) 
 pub(crate) const HEADLESS_SCOPE_REVIEW_BYPASS: bool = false;
 pub(crate) const HEADLESS_APPROVAL_GATE: AlwaysAbortGate = AlwaysAbortGate;
 
-/// Approval port the one-shot host can actually service. This is explicit so
-/// output serialization cannot silently stand in for execution authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PipelineApprovalCapability {
-    Stdio,
-    Unavailable,
-}
-
-/// Build the one-shot pipeline config from the host's approval capability.
-/// Rendering remains a separate concern owned by the event renderer.
-pub(crate) fn pipeline_config_for_approval_capability(
-    cfg: &Config,
-    approval: PipelineApprovalCapability,
-    test_command: Option<&str>,
-) -> PipelineConfig {
-    PipelineConfig {
-        engine: pipeline_engine_config_for(cfg),
-        headless: approval == PipelineApprovalCapability::Unavailable,
-        headless_bypass_scope_review: HEADLESS_SCOPE_REVIEW_BYPASS,
-        test_command: test_command.map(str::to_string),
-        ..Default::default()
-    }
-}
-
 /// EngineConfig for the goal loop's standalone judge engine — the JUDGE
 /// agent's tuning.
 pub(crate) fn judge_engine_config_for(cfg: &Config) -> EngineConfig {
