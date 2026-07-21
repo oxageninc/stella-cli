@@ -196,19 +196,11 @@ async fn run_pipeline_one_shot(
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
         let is_text = format == OutputFormat::Text;
-        // Stdio approval requires a text-safe renderer plus two terminal
-        // handles: stdin must accept the decision and stdout must present the
-        // prompt. Redirected text is still rendered as text, but is headless
-        // and fails closed at scope review — same invariant every other
-        // CLI-owned headless surface (`fleet_cmd.rs`, `command_deck.rs`,
-        // `goal.rs`) enforces via `HEADLESS_SCOPE_REVIEW_BYPASS`.
-        let interactive =
-            is_text && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         let pipeline_config = PipelineConfig {
             engine: pipeline_engine_config_for(cfg, &wiring.worker_model),
             role_overrides: wiring.role_overrides.clone(),
-            headless: !interactive,
-            headless_bypass_scope_review: HEADLESS_SCOPE_REVIEW_BYPASS,
+            headless: !is_text,
+            headless_bypass_scope_review: !is_text,
             // `--test-command` arms the deterministic verify ladder: the
             // fail→pass flip oracle and SubmitFast/Revise decisions all key
             // off it. Left unset, every verification escalates to the model
@@ -236,7 +228,7 @@ async fn run_pipeline_one_shot(
             repo_status: &ws_ports.repo_status,
             diagnostics: &ws_ports.diagnostic_runner,
             tests: &ws_ports.test_runner,
-            approvals: if interactive {
+            approvals: if approval_capability == PipelineApprovalCapability::Stdio {
                 &stdio_gate
             } else {
                 &HEADLESS_APPROVAL_GATE
