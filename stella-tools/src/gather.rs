@@ -452,7 +452,10 @@ async fn gather(
             )
         }
     }));
-    let graph_on = crate::graph::graph_available(root);
+    let graph_on = match crate::graph::graph_available(root) {
+        Ok(available) => available,
+        Err(message) => return ToolOutput::Error { message },
+    };
     let graph_results = futures_util::future::join_all(inputs.symbols.iter().map(|symbol| {
         let symbol = symbol.clone();
         async move {

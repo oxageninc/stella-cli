@@ -1,4 +1,4 @@
-//! Schema versioning for `.stella/store.db`: the ordered [`MIGRATIONS`]
+//! Schema versioning for `.stella/private/store.db`: the ordered [`MIGRATIONS`]
 //! list, the fresh-file bootstrap ([`create_latest_schema`]), and the
 //! transactional runner ([`apply_migration`]) that stamps
 //! `PRAGMA user_version` inside the same transaction as the reshape — a

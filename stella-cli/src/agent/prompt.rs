@@ -117,14 +117,19 @@ pub(crate) const STELLA_AB_RECALL_RATE: u32 = 10;
 /// carries durable lessons, the recall block carries turn-relevant memories
 /// and skills. The rules rendered here are the same set whose Tier-2 guards
 /// `crate::rules::enforce_workspace_rules` arms at the tool boundary.
-pub(crate) fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> String {
+pub(crate) fn assemble_system_prompt(
+    base: &str,
+    workspace_root: &std::path::Path,
+    authority: &crate::settings::AuthorityPolicy,
+    active_rules: &crate::rules::ResolvedRules,
+) -> String {
     let mut prompt = base.to_string();
-    append_project_scripts(&mut prompt, workspace_root);
-    append_workspace_memories(&mut prompt, workspace_root);
-    append_exploration_index(&mut prompt, workspace_root);
-    let rules_section = stella_core::rules::render_rules_section(
-        &crate::rules::load_workspace_rules(workspace_root),
-    );
+    if authority.project_prompts_allowed {
+        append_project_scripts(&mut prompt, workspace_root);
+        append_workspace_memories(&mut prompt, workspace_root);
+        append_exploration_index(&mut prompt, workspace_root);
+    }
+    let rules_section = stella_core::rules::render_rules_section(active_rules.as_slice());
     if !rules_section.is_empty() {
         prompt.push('\n');
         prompt.push_str(&rules_section);
@@ -242,9 +247,18 @@ fn custom_prompt_base(cfg: &Config, kind: crate::settings::EngineAgentKind) -> O
 /// the Command Deck session assembles the same prompt). `workspace_root`
 /// is a parameter (not read off `cfg`) because fleet workers assemble the
 /// prompt for their own worktree root.
-pub(crate) fn build_system_prompt(cfg: &Config, workspace_root: &std::path::Path) -> String {
+pub(crate) fn build_system_prompt(
+    cfg: &Config,
+    workspace_root: &std::path::Path,
+    active_rules: &crate::rules::ResolvedRules,
+) -> String {
     let base = custom_prompt_base(cfg, crate::settings::EngineAgentKind::Default);
-    assemble_system_prompt(base.as_deref().unwrap_or(SYSTEM_PROMPT), workspace_root)
+    assemble_system_prompt(
+        base.as_deref().unwrap_or(SYSTEM_PROMPT),
+        workspace_root,
+        &cfg.authority,
+        active_rules,
+    )
 }
 
 /// The pipeline-mode system prompt plus workspace memories — the WORKER
@@ -252,11 +266,14 @@ pub(crate) fn build_system_prompt(cfg: &Config, workspace_root: &std::path::Path
 pub(crate) fn build_pipeline_system_prompt(
     cfg: &Config,
     workspace_root: &std::path::Path,
+    active_rules: &crate::rules::ResolvedRules,
 ) -> String {
     let base = custom_prompt_base(cfg, crate::settings::EngineAgentKind::Worker);
     assemble_system_prompt(
         base.as_deref().unwrap_or(PIPELINE_SYSTEM_PROMPT),
         workspace_root,
+        &cfg.authority,
+        active_rules,
     )
 }
 

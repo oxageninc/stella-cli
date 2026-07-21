@@ -51,6 +51,27 @@ fn every_seeded_provider_declares_a_cache_posture() {
     }
 }
 
+/// The reasoning-axis sibling of the cache-posture guard: every seeded
+/// provider must declare how its reasoning/thinking budget is controlled (or
+/// that the shared adapter deliberately drops it). Born from the same silent
+/// per-provider divergence — a pinned effort reaching only Z.ai and OpenRouter
+/// and being dropped everywhere else with nothing enforcing the omission stays
+/// deliberate. A new provider cannot land without stating its reasoning
+/// posture and naming the witness that proves a `Controllable` control on the
+/// wire.
+#[test]
+fn every_seeded_provider_declares_a_reasoning_posture() {
+    for provider in PROVIDERS.iter().chain(std::iter::once(&LOCAL_PROVIDER)) {
+        assert!(
+            stella_model::provider_parity::reasoning_posture(provider.id).is_some(),
+            "provider `{}` has no ReasoningPosture row in \
+             stella-model/src/provider_parity.rs — add it (with a witness test for a \
+             Controllable control, or a note for a no-control posture) in this PR",
+            provider.id
+        );
+    }
+}
+
 #[test]
 fn alias_env_var_resolves_when_the_primary_is_unset() {
     // Synthetic provider with unique var names so parallel tests can't
@@ -104,11 +125,36 @@ fn config_debug_never_leaks_the_api_key() {
         engine_settings: None,
         tools_bash: false,
         tools_web: false,
+        authority: crate::settings::AuthorityPolicy::default(),
         credential_source: Some(stella_model::credential::CredentialSource::EnvVar),
     };
     let dbg = format!("{cfg:?}");
     assert!(!dbg.contains(secret), "Config Debug leaked the key: {dbg}");
     assert!(dbg.contains("redacted"));
+}
+
+#[test]
+fn resolved_config_carries_the_authority_computed_during_settings_load() {
+    let authority = crate::settings::AuthorityPolicy {
+        project_prompts_allowed: true,
+        project_custom_tools_allowed: false,
+        bash_allowed: false,
+        web_allowed: true,
+        media_requires_host_approval: true,
+    };
+    let mut settings = crate::settings::Settings::default();
+    settings.authority_policy = authority;
+
+    let cfg = Config::load_with_settings(
+        Some("local/test-model"),
+        None,
+        Some("http://localhost:11434/v1"),
+        &settings,
+        std::path::PathBuf::from("/tmp/ws"),
+    )
+    .unwrap();
+
+    assert_eq!(cfg.authority, authority);
 }
 
 /// Helper: a Settings value parsed from JSON, as the scope-merge would

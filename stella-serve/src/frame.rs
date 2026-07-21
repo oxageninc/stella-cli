@@ -55,8 +55,15 @@ pub enum ServerFrame {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TurnOutcomeWire {
-    Completed { text: String, cost_usd: f64 },
-    Aborted { reason: String },
+    Completed {
+        text: String,
+        cost_usd: f64,
+    },
+    Aborted {
+        reason: String,
+        #[serde(default)]
+        cost_usd: f64,
+    },
 }
 
 impl From<TurnOutcome> for TurnOutcomeWire {
@@ -65,7 +72,9 @@ impl From<TurnOutcome> for TurnOutcomeWire {
             TurnOutcome::Completed { text, cost_usd } => {
                 TurnOutcomeWire::Completed { text, cost_usd }
             }
-            TurnOutcome::Aborted { reason } => TurnOutcomeWire::Aborted { reason },
+            TurnOutcome::Aborted { reason, cost_usd } => {
+                TurnOutcomeWire::Aborted { reason, cost_usd }
+            }
         }
     }
 }
@@ -163,5 +172,45 @@ impl From<&ProviderError> for ProviderErrorWire {
             ProviderError::Cancelled => ProviderErrorWire::Cancelled,
             ProviderError::Terminal(m) => ProviderErrorWire::Terminal { message: m.clone() },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aborted_turn_wire_retains_settled_cost() {
+        let wire = TurnOutcomeWire::from(TurnOutcome::Aborted {
+            reason: "budget exceeded".into(),
+            cost_usd: 1.25,
+        });
+
+        assert_eq!(
+            wire,
+            TurnOutcomeWire::Aborted {
+                reason: "budget exceeded".into(),
+                cost_usd: 1.25,
+            }
+        );
+        let json = serde_json::to_value(wire).expect("wire outcome serializes");
+        assert_eq!(json["cost_usd"], 1.25);
+    }
+
+    #[test]
+    fn legacy_aborted_turn_without_cost_deserializes_as_zero() {
+        let wire: TurnOutcomeWire = serde_json::from_value(serde_json::json!({
+            "status": "aborted",
+            "reason": "old client"
+        }))
+        .expect("legacy aborted wire shape remains readable");
+
+        assert_eq!(
+            wire,
+            TurnOutcomeWire::Aborted {
+                reason: "old client".into(),
+                cost_usd: 0.0,
+            }
+        );
     }
 }

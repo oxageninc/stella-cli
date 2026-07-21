@@ -92,7 +92,7 @@ pub struct Ledger {
 
 impl Ledger {
     /// Open (creating if absent) the ledger at `path` — the CLI opens
-    /// `<workspace>/.stella/fleet.db`. Enables WAL
+    /// `<workspace>/.stella/private/fleet.db`. Enables WAL
     /// and foreign keys, then applies the schema.
     pub fn open(path: &Path) -> Result<Self, LedgerError> {
         let conn = Connection::open(path)?;

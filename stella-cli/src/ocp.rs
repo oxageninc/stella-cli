@@ -234,39 +234,58 @@ pub fn session_host(
     host
 }
 
+/// A frame paired with the OCP provider leg that returned it. Provider
+/// identity is host-owned metadata rather than frame content, so flattening a
+/// fan-out to bare frames would irreversibly misattribute graph hits as
+/// workspace memory at the pipeline/event boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributedContextFrame {
+    pub provider: String,
+    pub frame: ContextFrame,
+}
+
 /// Fan `query` out through the host and fuse the surviving frames: highest
 /// score first, deduped by frame id, re-capped to the query's own frame and
 /// token budget (each provider already respected it individually; the merge
 /// must too). Failed, timed-out, or budget-lying providers contribute
 /// nothing — their isolation is the point of routing through the host.
-pub async fn recall_via_host(host: &Host, query: &ContextQuery) -> Vec<ContextFrame> {
+pub async fn recall_via_host(host: &Host, query: &ContextQuery) -> Vec<AttributedContextFrame> {
     let fanout = host.query_all(query).await;
-    let mut frames: Vec<ContextFrame> = Vec::new();
+    let mut frames: Vec<AttributedContextFrame> = Vec::new();
     for outcome in fanout.outcomes {
         if let ProviderResult::Frames(result) = outcome.result {
-            frames.extend(result.frames);
+            frames.extend(
+                result
+                    .frames
+                    .into_iter()
+                    .map(|frame| AttributedContextFrame {
+                        provider: outcome.provider_id.clone(),
+                        frame,
+                    }),
+            );
         }
     }
     frames.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
+        b.frame
+            .score
+            .partial_cmp(&a.frame.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let mut seen = std::collections::HashSet::new();
-    let mut kept: Vec<ContextFrame> = Vec::new();
+    let mut kept: Vec<AttributedContextFrame> = Vec::new();
     let mut spent_tokens: u32 = 0;
     for frame in frames {
         if kept.len() >= query.max_frames as usize {
             break;
         }
-        if spent_tokens.saturating_add(frame.token_cost) > query.max_tokens {
+        if spent_tokens.saturating_add(frame.frame.token_cost) > query.max_tokens {
             continue;
         }
-        if !seen.insert(frame.id.clone()) {
+        if !seen.insert((frame.provider.clone(), frame.frame.id.clone())) {
             continue;
         }
-        spent_tokens += frame.token_cost;
+        spent_tokens += frame.frame.token_cost;
         kept.push(frame);
     }
     kept
@@ -346,7 +365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merges_providers_by_score_and_dedupes_by_id() {
+    async fn merges_providers_by_score_and_dedupes_only_within_a_provider() {
         let mut host = Host::new();
         host.register(scripted(
             "a",
@@ -357,8 +376,28 @@ mod tests {
             vec![frame("high", 0.9, 10), frame("shared", 0.5, 10)],
         ));
         let kept = recall_via_host(&host, &query(10, 1_000)).await;
-        let ids: Vec<&str> = kept.iter().map(|f| f.id.as_str()).collect();
-        assert_eq!(ids, vec!["high", "shared", "low"], "score-ordered, deduped");
+        let ids: Vec<&str> = kept.iter().map(|f| f.frame.id.as_str()).collect();
+        assert_eq!(ids.first(), Some(&"high"), "highest score remains first");
+        assert_eq!(ids.last(), Some(&"low"), "lowest score remains last");
+        let mut shared_providers: Vec<&str> = kept
+            .iter()
+            .filter(|f| f.frame.id == "shared")
+            .map(|f| f.provider.as_str())
+            .collect();
+        shared_providers.sort_unstable();
+        assert_eq!(
+            shared_providers,
+            vec!["a", "b"],
+            "provider-local ids must not collide across host legs"
+        );
+        assert_eq!(kept[0].provider, "b", "host provider identity survives");
+        assert_eq!(
+            kept.iter()
+                .find(|f| f.frame.id == "low")
+                .map(|f| f.provider.as_str()),
+            Some("a"),
+            "each frame keeps its own leg"
+        );
     }
 
     #[tokio::test]
@@ -370,7 +409,8 @@ mod tests {
         // not exceed it either.
         let kept = recall_via_host(&host, &query(10, 1_000)).await;
         assert_eq!(kept.len(), 1, "second frame would blow the merged budget");
-        assert_eq!(kept[0].id, "a1");
+        assert_eq!(kept[0].frame.id, "a1");
+        assert_eq!(kept[0].provider, "a");
     }
 
     #[tokio::test]
@@ -424,7 +464,7 @@ mod tests {
         // production path, end to end.
         let kept = recall_via_host(&host, &q).await;
         assert!(
-            kept.iter().any(|f| f.content.contains("sqlite")),
+            kept.iter().any(|f| f.frame.content.contains("sqlite")),
             "the seeded node surfaces through the registry-routed path"
         );
     }

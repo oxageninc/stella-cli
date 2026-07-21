@@ -174,7 +174,9 @@ impl SkillRegistry {
         // dropped and the child must die with it — otherwise a wedged npx
         // install keeps running (and downloading) long after the tool
         // reported failure.
-        let child = tokio::process::Command::new(program)
+        let mut command = tokio::process::Command::new(program);
+        stella_tools::exec::scrub_sensitive_env(&mut command);
+        let child = command
             .args(args)
             .current_dir(&self.workspace_root)
             .stdin(std::process::Stdio::null())
@@ -237,7 +239,9 @@ impl<'a> InteractiveToolSet<'a> {
 
     /// Enable the skills-registry tools (search_skills / install_skill).
     pub fn with_skill_registry(mut self, registry: SkillRegistry) -> Self {
-        self.skills = Some(registry);
+        if !crate::enterprise_telemetry::process_free_authority_active() {
+            self.skills = Some(registry);
+        }
         self
     }
 

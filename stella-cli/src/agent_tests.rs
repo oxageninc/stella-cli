@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::{ConfiguredProvider, PROVIDERS, ProviderConfig};
 use stella_model::credential::ApiKey;
+use stella_pipeline::CandidateWorkspacePort;
 
 /// The store write path for `StepUsage`: every token field on the event
 /// — cache writes included — lands in the telemetry row verbatim.
@@ -60,15 +61,20 @@ fn assemble_system_prompt_carries_a_byte_stable_scripts_section() {
     .unwrap();
     std::fs::write(root.path().join("pnpm-lock.yaml"), "").unwrap();
 
-    let first = assemble_system_prompt(SYSTEM_PROMPT, root.path());
-    let second = assemble_system_prompt(SYSTEM_PROMPT, root.path());
+    let authority = crate::settings::AuthorityPolicy {
+        project_prompts_allowed: true,
+        ..crate::settings::AuthorityPolicy::default()
+    };
+    let rules = crate::rules::ResolvedRules::default();
+    let first = assemble_system_prompt(SYSTEM_PROMPT, root.path(), &authority, &rules);
+    let second = assemble_system_prompt(SYSTEM_PROMPT, root.path(), &authority, &rules);
     assert_eq!(first, second, "same workspace state ⇒ identical bytes");
     assert!(first.contains("## Project scripts"), "section present");
     assert!(first.contains("build → pnpm run build"), "{first}");
     assert!(first.contains("install → pnpm install"), "{first}");
 
     let empty = tempfile::tempdir().expect("tempdir");
-    let bare = assemble_system_prompt(SYSTEM_PROMPT, empty.path());
+    let bare = assemble_system_prompt(SYSTEM_PROMPT, empty.path(), &authority, &rules);
     assert!(
         !bare.contains("## Project scripts"),
         "no scripts → no section, no noise"
@@ -85,8 +91,7 @@ fn graph_fixture() -> tempfile::TempDir {
     )
     .unwrap();
     std::fs::write(root.path().join("leaf.rs"), "pub fn d() {}\n").unwrap();
-    std::fs::create_dir_all(root.path().join(".stella")).unwrap();
-    let db = root.path().join(".stella").join("codegraph.db");
+    let db = stella_store::workspace_private_sqlite_path(root.path(), "codegraph.db").unwrap();
     let graph = stella_graph::CodeGraph::open(root.path(), &db).expect("open graph");
     graph.index_all().expect("index");
     graph.shutdown();
@@ -130,8 +135,28 @@ fn graph_snapshot_is_none_without_an_index() {
     assert!(graph_snapshot_focus(root.path(), Some("x.rs")).is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn schema_index_population_visibly_rejects_unsafe_legacy_codegraph() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let dot = root.path().join(".stella");
+    std::fs::create_dir_all(&dot).unwrap();
+    std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::write(dot.join("codegraph.db"), b"unsafe legacy graph").unwrap();
+    let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
+
+    let error = populate_schema_index(&registry, root.path()).unwrap_err();
+    assert!(
+        error.contains("legacy") && error.contains("private"),
+        "{error}"
+    );
+    assert!(dot.join("codegraph.db").exists());
+}
+
 /// Auto-build on session start (task part A): a workspace with a source
-/// file but NO `.stella/codegraph.db` does not advertise `graph_query` on
+/// file but NO `.stella/private/codegraph.db` does not advertise `graph_query` on
 /// turn 1; once [`spawn_session_graph`]'s background build completes the
 /// tool is advertised AND dispatchable — no manual `stella init`, no
 /// restart. Awaiting the returned handle is the deterministic "index
@@ -146,7 +171,7 @@ async fn spawn_session_graph_auto_builds_and_enables_graph_query() {
     let advertises = |r: &ToolRegistry| r.schemas().iter().any(|s| s.name == "graph_query");
 
     // Turn 1: absent — no index on disk yet.
-    assert!(!stella_tools::graph::graph_available(&root));
+    assert!(!stella_tools::graph::graph_available(&root).unwrap());
     assert!(
         !advertises(&registry),
         "graph_query must be absent before the index is built"
@@ -159,8 +184,8 @@ async fn spawn_session_graph_auto_builds_and_enables_graph_query() {
     // After the build: the db exists, the tool is advertised, and it
     // dispatches against the freshly built index.
     assert!(
-        stella_tools::graph::graph_available(&root),
-        "the background build must create .stella/codegraph.db"
+        stella_tools::graph::graph_available(&root).unwrap(),
+        "the background build must create .stella/private/codegraph.db"
     );
     assert!(
         advertises(&registry),
@@ -235,7 +260,10 @@ fn system_prompt_carries_the_workspace_rules_section() {
     )
     .unwrap();
 
-    let prompt = build_system_prompt(&cfg_for("zai"), root.path());
+    let mut cfg = cfg_for("zai");
+    cfg.authority.project_prompts_allowed = true;
+    let rules = crate::rules::load_workspace_rules(root.path(), &cfg.authority);
+    let prompt = build_system_prompt(&cfg, root.path(), &rules);
     assert!(
         prompt.starts_with(SYSTEM_PROMPT),
         "rules append to the prompt; the base prefix must stay intact"
@@ -245,6 +273,74 @@ fn system_prompt_carries_the_workspace_rules_section() {
         prompt.contains("Never force-push.  [enforced]"),
         "a guarded rule must render with the enforced marker: {prompt}"
     );
+}
+
+/// An untrusted checkout cannot append repository-authored content to the
+/// privileged system prompt. Explicit repository trust restores those
+/// sources within the already-computed managed ceiling.
+#[test]
+fn untrusted_project_prompt_sources_are_absent_from_the_system_prompt() {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        root.path().join("package.json"),
+        r#"{"scripts": {"authority-marker": "echo project-script"}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join(".stella/memories")).unwrap();
+    std::fs::write(
+        root.path().join(".stella/memories/project.md"),
+        "PROJECT_MEMORY_AUTHORITY_MARKER",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join(".stella/rules")).unwrap();
+    std::fs::write(
+        root.path().join(".stella/rules/project.md"),
+        "PROJECT_RULE_AUTHORITY_MARKER",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join(".stella/explorations")).unwrap();
+    std::fs::write(
+        root.path().join(".stella/explorations/project.json"),
+        serde_json::json!({
+            "slice": "authority-map",
+            "title": "PROJECT_MAP_AUTHORITY_MARKER",
+            "summary": "project map",
+            "content": "body",
+            "files": [],
+            "created_at_ms": 1u64
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut cfg = cfg_for("zai");
+    cfg.workspace_root = root.path().to_path_buf();
+    cfg.authority.project_prompts_allowed = false;
+    let untrusted_rules = crate::rules::load_workspace_rules(root.path(), &cfg.authority);
+    let untrusted = build_system_prompt(&cfg, root.path(), &untrusted_rules);
+    for marker in [
+        "authority-marker",
+        "PROJECT_MEMORY_AUTHORITY_MARKER",
+        "PROJECT_RULE_AUTHORITY_MARKER",
+        "PROJECT_MAP_AUTHORITY_MARKER",
+    ] {
+        assert!(
+            !untrusted.contains(marker),
+            "untrusted project marker reached system prompt: {marker}\n{untrusted}"
+        );
+    }
+
+    cfg.authority.project_prompts_allowed = true;
+    let trusted_rules = crate::rules::load_workspace_rules(root.path(), &cfg.authority);
+    let trusted = build_system_prompt(&cfg, root.path(), &trusted_rules);
+    for marker in [
+        "authority-marker",
+        "PROJECT_MEMORY_AUTHORITY_MARKER",
+        "PROJECT_RULE_AUTHORITY_MARKER",
+        "PROJECT_MAP_AUTHORITY_MARKER",
+    ] {
+        assert!(trusted.contains(marker), "trusted marker missing: {marker}");
+    }
 }
 
 #[test]
@@ -263,7 +359,10 @@ fn system_prompt_carries_the_workspace_maps_index() {
     )
     .unwrap();
 
-    let prompt = build_system_prompt(&cfg_for("zai"), root.path());
+    let mut cfg = cfg_for("zai");
+    cfg.authority.project_prompts_allowed = true;
+    let rules = crate::rules::ResolvedRules::default();
+    let prompt = build_system_prompt(&cfg, root.path(), &rules);
     assert!(
         prompt.contains("## Workspace maps"),
         "index section missing"
@@ -276,7 +375,11 @@ fn system_prompt_carries_the_workspace_maps_index() {
 
     // No maps → no section, no tokens.
     let bare = tempfile::tempdir().expect("tempdir");
-    let empty = build_system_prompt(&cfg_for("zai"), bare.path());
+    let empty = build_system_prompt(
+        &cfg_for("zai"),
+        bare.path(),
+        &crate::rules::ResolvedRules::default(),
+    );
     assert!(!empty.contains("## Workspace maps"));
 }
 
@@ -294,14 +397,150 @@ fn cfg_for(provider_id: &str) -> Config {
         provider,
         model_id,
         api_key: ApiKey::new("dummy-key-unused-offline"),
+        credential_source: None,
         workspace_root: std::path::PathBuf::from("/tmp"),
         base_url_override: None,
         hooks: None,
         engine_settings: None,
         tools_bash: false,
         tools_web: false,
-        credential_source: None,
+        authority: crate::settings::AuthorityPolicy::default(),
     }
+}
+
+#[tokio::test]
+async fn untrusted_project_custom_tools_are_absent_from_the_runtime_surface() {
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace_tools = workspace.path().join(".stella/tools");
+    std::fs::create_dir_all(&workspace_tools).unwrap();
+    std::fs::write(
+        workspace_tools.join("workspace.toml"),
+        "name = \"workspace_tool\"\ndescription = \"d\"\ncommand = [\"./workspace.sh\"]",
+    )
+    .unwrap();
+    let mut cfg = cfg_for("zai");
+    cfg.workspace_root = workspace.path().to_path_buf();
+    cfg.authority.project_custom_tools_allowed = false;
+
+    let tools = discover_custom_tools(&cfg, false).await;
+
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    assert!(
+        !names.contains(&"workspace_tool"),
+        "runtime tools: {names:?}"
+    );
+}
+
+#[test]
+fn non_tty_text_output_is_headless_without_losing_text_rendering() {
+    let cfg = cfg_for("zai");
+    let format = OutputFormat::Text;
+    let non_tty = pipeline_config_for_approval_capability(
+        &cfg,
+        PipelineApprovalCapability::Unavailable,
+        None,
+    );
+    assert!(
+        non_tty.headless,
+        "text redirected through a non-TTY host cannot prompt for approval"
+    );
+    assert!(
+        !non_tty.headless_bypass_scope_review,
+        "output serialization must never grant execution authority"
+    );
+    assert_eq!(format, OutputFormat::Text, "rendering remains text");
+
+    let interactive =
+        pipeline_config_for_approval_capability(&cfg, PipelineApprovalCapability::Stdio, None);
+    assert!(
+        !interactive.headless,
+        "an explicit interactive approval host retains scope review"
+    );
+    assert!(!interactive.headless_bypass_scope_review);
+}
+
+#[tokio::test]
+async fn candidate_rules_reuse_the_parent_snapshot_after_source_removal() {
+    let root = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t.t"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(root.path().join("base.txt"), "base\n").unwrap();
+    git(&["add", "base.txt"]);
+    git(&["commit", "-q", "-m", "base"]);
+
+    let rule_path = root.path().join(".stella/rules/protect-session.md");
+    std::fs::create_dir_all(rule_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &rule_path,
+        "---\nguard-tool: Write\nguard-deny-path: protected/**\n---\nOriginal session guard.",
+    )
+    .unwrap();
+    let mut cfg = cfg_for("zai");
+    cfg.workspace_root = root.path().to_path_buf();
+    cfg.authority.project_prompts_allowed = true;
+
+    let parent_rules = crate::rules::load_workspace_rules(root.path(), &cfg.authority);
+    let parent = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
+    crate::rules::attach_rule_guards(&parent, &parent_rules);
+    let parent_denied = parent
+        .execute(
+            "write_file",
+            &serde_json::json!({"path": "protected/parent.txt", "content": "no\n"}),
+        )
+        .await;
+    assert!(parent_denied.is_error(), "parent guard was not attached");
+
+    // Mutate the source after the parent session has resolved and attached
+    // it. Candidate creation must retain that original session snapshot.
+    std::fs::remove_file(&rule_path).unwrap();
+    let prompt = build_system_prompt(&cfg, root.path(), &parent_rules);
+    assert!(
+        prompt.contains("Original session guard.  [enforced]"),
+        "prompt rendering diverged from the parent rule snapshot: {prompt}"
+    );
+    let ws_ports = workspace_ports(
+        root.path().to_path_buf(),
+        &cfg,
+        stella_tools::RegistryOptions::default(),
+        parent_rules.clone(),
+    )
+    .unwrap();
+    let candidate = ws_ports.candidate_workspaces.create().await.unwrap();
+    let output = candidate
+        .tools()
+        .execute(
+            "write_file",
+            &serde_json::json!({"path": "protected/candidate.txt", "content": "no\n"}),
+        )
+        .await;
+    candidate.seal().await.unwrap();
+    let adopted = candidate.adopt().await.unwrap();
+    let landed = root.path().join("protected/candidate.txt").exists();
+    candidate.remove().await;
+
+    assert!(
+        output.is_error(),
+        "candidate reloaded weakened sources instead of retaining the parent snapshot: {output:?}"
+    );
+    assert!(
+        adopted.is_empty(),
+        "prohibited candidate edit was adoptable: {adopted:?}"
+    );
+    assert!(!landed, "prohibited candidate edit reached the parent tree");
 }
 
 #[test]
@@ -469,6 +708,72 @@ fn judge_build_failure_falls_back_to_the_worker() {
     );
 }
 
+/// A `Config` selecting `provider_id` at its default model, carrying
+/// `engine_settings` — the `agent_engine_config` variant of [`cfg_for`] for
+/// `resolve_engine_wiring` tests.
+fn cfg_with_engine(provider_id: &str, engine_settings_json: &str) -> Config {
+    let mut cfg = cfg_for(provider_id);
+    cfg.engine_settings =
+        Some(serde_json::from_str(engine_settings_json).expect("valid agent_engine_config json"));
+    cfg
+}
+
+#[test]
+fn pipeline_worker_model_is_inert_without_the_fix_but_routes_with_it() {
+    // Issue #276: `pipeline_worker_model` (and `agents.worker.*`) must
+    // actually change what `Role::Worker` resolves to — previously the
+    // worker always rode `worker_ref` (the session default), no matter what
+    // this setting said.
+    let cfg = cfg_with_engine(
+        "zai", // session default: zai/glm-5.2
+        r#"{ "pipeline_worker_model": "anthropic/claude-fable-5" }"#,
+    );
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+    let configured = vec![configured_provider("zai"), configured_provider("anthropic")];
+
+    let wiring = resolve_engine_wiring(&cfg, &model_ref, &configured);
+
+    let overridden = ModelRef::new("anthropic", "claude-fable-5");
+    assert_eq!(
+        wiring.worker_model, overridden,
+        "the wiring's own worker_model must reflect the pipeline_worker_model override"
+    );
+    assert_eq!(
+        wiring.pins.get(Role::Worker),
+        Some(&overridden),
+        "Role::Worker must be pinned to the configured worker model"
+    );
+    assert_eq!(
+        wiring.pins.get(Role::Plan),
+        Some(&overridden),
+        "Role::Plan shares the worker's tier and must follow the override too, or plan/witness \
+         turns would silently keep running on the session default"
+    );
+    assert!(
+        wiring
+            .extra_providers
+            .iter()
+            .any(|(model_ref, _)| *model_ref == overridden),
+        "an adapter for the overridden worker model must be built"
+    );
+
+    // The full round trip through the actual router (what `resolve_provider`
+    // in `stella-pipeline` calls) must resolve BOTH roles to the override,
+    // not just the raw pin table.
+    let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
+    let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
+    assert_eq!(
+        router.resolve(Role::Worker).unwrap().model_ref,
+        overridden,
+        "the router must actually route worker turns to the override"
+    );
+    assert_eq!(
+        router.resolve(Role::Plan).unwrap().model_ref,
+        overridden,
+        "the router must actually route plan turns to the override"
+    );
+}
+
 /// Issue #272: `stella init`'s summary line must surface generated/minified
 /// exclusion count, not let excluded files silently vanish from the totals.
 /// Tested on the pure builder/output functions, never a live TTY.
@@ -504,6 +809,118 @@ fn format_graph_stats_omits_the_skip_clause_when_nothing_was_skipped() {
     assert!(
         !line.contains("skipped"),
         "no skip clause when nothing was excluded: {line}"
+    );
+}
+
+#[test]
+fn worker_model_unset_falls_back_to_the_session_default() {
+    // No `pipeline_worker_model`/`agents.worker.*` configured at all: the
+    // worker must behave exactly as before this fix — riding the session
+    // default, no pin, no extra adapter.
+    let cfg = cfg_with_engine(
+        "zai",
+        r#"{ "pipeline_judge_model": "anthropic/claude-fable-5" }"#,
+    );
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+    let configured = vec![configured_provider("zai"), configured_provider("anthropic")];
+
+    let wiring = resolve_engine_wiring(&cfg, &model_ref, &configured);
+
+    assert_eq!(
+        wiring.worker_model, model_ref,
+        "with no worker override, worker_model falls back to the session default"
+    );
+    assert!(
+        wiring.pins.get(Role::Worker).is_none(),
+        "no worker pin is recorded when unconfigured"
+    );
+    assert!(
+        wiring.pins.get(Role::Plan).is_none(),
+        "no plan pin is recorded when unconfigured"
+    );
+}
+
+#[test]
+fn worker_model_with_no_resolvable_credential_falls_back_and_notices() {
+    // The configured worker provider has no credential available: the
+    // override must degrade to the session default (soft failure), with a
+    // human-readable notice — never a hard error, matching triage/judge's
+    // existing posture. An explicit `agents.worker.provider` pin (rather
+    // than a flat-key `provider/slug` string) is what exercises this path:
+    // an unconfigured provider named only inside a flat-key string is not
+    // even recognized as a provider prefix (`model_spec_for`'s `is_provider`
+    // gate), so it never reaches `pin_role`'s credential lookup at all.
+    let cfg = cfg_with_engine(
+        "zai",
+        r#"{ "agents": { "worker": { "provider": "anthropic" } } }"#,
+    );
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+    let configured = vec![configured_provider("zai")]; // anthropic NOT configured
+
+    let wiring = resolve_engine_wiring(&cfg, &model_ref, &configured);
+
+    assert_eq!(
+        wiring.worker_model, model_ref,
+        "an unroutable worker override must fall back to the session default"
+    );
+    assert!(wiring.pins.get(Role::Worker).is_none());
+    assert!(
+        wiring
+            .notices
+            .iter()
+            .any(|n| n.contains("worker") && n.contains("anthropic")),
+        "a skipped worker override must be reported: {:?}",
+        wiring.notices
+    );
+}
+
+#[test]
+fn worker_override_equal_to_the_session_default_still_pins_without_a_duplicate_adapter() {
+    // Configuring the worker to the SAME model the session already defaults
+    // to must not build a redundant second adapter (mirrors the existing
+    // triage/judge "same instance" optimization) — but the pin is still
+    // recorded, matching that established behavior.
+    let cfg = cfg_with_engine("zai", r#"{ "pipeline_worker_model": "zai/glm-5.2" }"#);
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+    let configured = vec![configured_provider("zai")];
+
+    let wiring = resolve_engine_wiring(&cfg, &model_ref, &configured);
+
+    assert_eq!(wiring.worker_model, model_ref);
+    assert_eq!(wiring.pins.get(Role::Worker), Some(&model_ref));
+    assert!(
+        wiring.extra_providers.is_empty(),
+        "no extra adapter is needed when the override equals the session default"
+    );
+}
+
+#[test]
+fn worker_override_shifts_the_judges_cross_family_comparison() {
+    // Issue #276's router-correctness corollary: once the worker is
+    // overridden, auto-mode judge selection (and the router's own unpinned-
+    // judge cross-family fallback) must compare against the model the
+    // worker ACTUALLY resolves to, not the stale session default — else a
+    // judge could silently collapse to the same family as the real worker.
+    let cfg = cfg_with_engine(
+        "zai",
+        r#"{ "pipeline_worker_model": "anthropic/claude-fable-5",
+             "auto_mode": "on",
+             "allowed_models": ["anthropic/claude-fable-5", "zai/glm-5.2"] }"#,
+    );
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+    let configured = vec![configured_provider("zai"), configured_provider("anthropic")];
+
+    let wiring = resolve_engine_wiring(&cfg, &model_ref, &configured);
+
+    // The worker now runs on Anthropic; auto-mode must pick the cross-family
+    // candidate (zai) as judge, not Anthropic again (which the STALE
+    // "worker family = zai" comparison would have wrongly treated as
+    // cross-family).
+    assert_eq!(
+        wiring.pins.get(Role::Judge),
+        Some(&ModelRef::new("zai", "glm-5.2")),
+        "auto-mode judge selection must be cross-family from the OVERRIDDEN worker, not the \
+         session default"
     );
 }
 

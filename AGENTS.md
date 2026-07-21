@@ -102,10 +102,15 @@ regardless of how good the feature is:
    property-testable. Anything that spawns processes, reads files, or hits the
    network belongs in `stella-tools`, `stella-model`, `stella-cli`, or
    `stella-store` — injected as a port/trait, not called directly.
-3. **No phone-home. Ever.** The only outbound network traffic Stella may
-   produce is to the model provider the user chose. A PR adding any other
-   outbound call (telemetry, update checks, "anonymous" analytics) is
-   rejected outright.
+3. **Zero telemetry egress by default.** Community/default Stella sends no
+   telemetry anywhere; model-provider traffic remains the normal network
+   exception selected by the user. The sole additional egress is an explicitly
+   enrolled Oxagen Enterprise managed mode: a signed org-managed document may
+   authorize a minimal operational rollup to one exact allowlisted HTTPS sink,
+   and only while the process-free execution authority is active. Prompts,
+   paths, tool payloads/results, reasoning, errors, git state, memories, rules,
+   and local identifiers are never exportable. Update checks and anonymous
+   analytics remain prohibited.
 4. **Serde-first.** Every type crossing a crate boundary round-trips through
    `serde_json` byte-for-byte. Add a round-trip test when you add a type to
    `stella-protocol`.
@@ -124,18 +129,30 @@ regardless of how good the feature is:
    and `stella-cli/src/memory.rs` for the L-E8 discipline).
 
 8. **Provider feature parity is declared, not assumed.** Providers diverge
-   in sneaky ways (Anthropic's prompt cache is explicit opt-in; DeepSeek
-   spells its cache-hit telemetry differently; only OpenRouter speaks the
-   normalized `reasoning` object). Any per-provider feature divergence is
-   recorded as a matrix in `stella-model/src/provider_parity.rs`, where each
-   provider id declares its posture and names the **witness test** proving
-   it on the wire. Tests enforce the matrix from both sides: `stella-cli`'s
-   config tests fail if a seeded provider lacks a row, and `stella-model`'s
-   parity tests fail if a row's witness test no longer exists. Adding a
-   provider — or a new divergent feature axis — means updating the matrix
-   in the same PR. Born from a real defect: OpenRouter ran Claude models
-   with ZERO prompt caching for months because nothing enforced the cache
-   axis.
+   in sneaky ways, and this is guarded on **two axes** today in
+   `stella-model/src/provider_parity.rs`:
+   - **`CachePosture`** — how the prompt cache is engaged/observed
+     (Anthropic's cache is explicit opt-in; DeepSeek spells its cache-hit
+     telemetry differently; OpenRouter needs a request-root `cache_control`
+     plus a sticky `session_id`).
+   - **`ReasoningPosture`** — how reasoning/thinking is controlled on the
+     wire (`Controllable`/`FixedOn`/`FixedOff`/`Unsupported`). Only Z.ai
+     (`thinking`), OpenRouter (`reasoning`), Anthropic/Gemini/Vertex
+     (thinking budget / `thinkingLevel`), OpenAI and now xAI
+     (`reasoning[_]effort`) honor a pinned effort; the shared adapter drops
+     it for `Unsupported` providers (bedrock/deepseek/local) — and a pinned
+     effort against one surfaces a one-line boot notice, never a silent drop.
+
+   Each provider id declares a posture on **every** axis and, for a
+   controllable/opt-in/implicit posture, names the **witness test** proving
+   it on the wire. Tests enforce each matrix from both sides: `stella-cli`'s
+   config tests fail if a seeded provider lacks a row on either axis, and
+   `stella-model`'s parity tests fail if a row's witness test no longer
+   exists. Adding a provider — or a new divergent feature axis — means
+   updating the matrix in the same PR. Born from a real defect: OpenRouter
+   ran Claude models with ZERO prompt caching for months because nothing
+   enforced the cache axis; the reasoning axis was added after the same
+   silent-drop shape recurred for pinned `effort`.
 
 ---
 
@@ -217,9 +234,18 @@ editing Stella's own code should know what lives where:
 | `.stella/settings.json` | Project-scope provider config (overrides built-ins or defines new providers) and tool switches (`tools.bash: "on"` opts the shell tool in — it is off by default in every scope). Merged per-field with org-managed and user scopes. |
 | `.stella/mcp.toml` | MCP server config — extra tools merged into the registry at session start. |
 | `.stella/domains.toml` | Domain taxonomy for memory/reflection tagging, inferred by `stella init`. |
-| `.stella/reflections.jsonl` | Per-turn reflection mining log (one JSON object per line). |
-| `.stella/store.db` | Local SQLite telemetry (executions, events, cost/tokens). No phone-home. |
-| `.stella/codegraph.db` | Tree-sitter code-graph index, built on `stella init`. |
+| `.stella/private/` | Owner-only generated local state (`0700`; files `0600`). The generated `.stella/.gitignore` excludes this whole directory. |
+| `.stella/private/reflections.jsonl` | Per-turn reflection mining log (one JSON object per line). |
+| `.stella/private/store.db` | Canonical local SQLite telemetry (executions, events, cost/tokens). Community/default has zero telemetry egress; an enrolled Enterprise seat may derive only the documented content-free operational rollup. |
+| `.stella/private/context.db` | Recallable memories, episodes, facts, and temporal context. |
+| `.stella/private/codegraph.db` | Tree-sitter code-graph index, built on `stella init`. |
+| `.stella/private/fleet.db` | Fleet run, attempt, commit, and spend ledger. |
+| `.stella/private/mcp_oauth.json` | MCP OAuth tokens. Secret local state; never commit it. |
+
+Older releases wrote these private artifacts directly under `.stella/`. Path
+resolvers migrate a safe, closed legacy file into `.stella/private/`; unsafe
+permissions or live SQLite WAL/SHM sidecars fail closed with an actionable
+error and leave the legacy files untouched.
 
 ---
 
@@ -285,5 +311,6 @@ seconds; `cargo test --workspace` rebuilds everything.
 - **Settings 3-scope merge**: user → org-managed (`STELLA_MANAGED_SETTINGS`) →
   project (`.stella/settings.json`). Project wins per-field.
 - **`context.db` vs `codegraph.db`**: `stella-context` and `stella-graph` used
-  to share `.stella/context.db` — they now use separate files
-  (`context.db` and `codegraph.db` respectively). Don't revert this.
+  to share `.stella/private/context.db` — they now use separate files
+  (`.stella/private/context.db` and `.stella/private/codegraph.db`
+  respectively). Don't revert this.

@@ -6,7 +6,7 @@
   </picture>
 </p>
 
-<p align="center"><strong>Open Source. No Phone Home. BYOK. RUST. and Damn Good.</strong></p>
+<p align="center"><strong>Open Source. Zero Telemetry Egress by Default. BYOK. RUST. and Damn Good.</strong></p>
 <p align="center">
   <a href="https://github.com/macanderson/stella/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/macanderson/stella/ci.yml?branch=main&style=flat-square&logo=github&label=ci" alt="CI status"></a>
   <a href="https://github.com/macanderson/stella/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/macanderson/stella/release.yml?style=flat-square&logo=github&label=release" alt="Release status"></a>
@@ -23,9 +23,11 @@
 
 Stella is an open-source, bring-your-own-key (BYOK) coding agent that runs in
 your terminal. It supports nine hosted model providers plus any local
-OpenAI-compatible server, keeps all telemetry in a local SQLite database (no
-phone-home), and enforces a hard per-run budget. It is built in Rust as a
-workspace of focused crates.
+OpenAI-compatible server, keeps canonical telemetry in a local SQLite database,
+and enforces a hard per-run budget. Community/default installs have zero
+telemetry egress. An explicitly enrolled Oxagen Enterprise managed install may
+export only a minimal operational rollup under the governed boundary described
+below. It is built in Rust as a workspace of focused crates.
 
 ## Features
 
@@ -41,9 +43,10 @@ workspace of focused crates.
   session start into a byte-stable system prompt (~0.1× input cost).
 - **Code graph** — A tree-sitter symbol/import index (Rust, TS/JS, Python, SQL)
   queried by the agent and the `stella graph` command instead of grepping.
-- **Local-only telemetry** — Executions, events, token/cost telemetry, and the
-  files-touched ledger in `.stella/store.db`. The only network traffic Stella
-  produces is to the model provider you chose.
+- **Local-first telemetry** — Executions, events, token/cost telemetry, and the
+  files-touched ledger stay canonical in `.stella/private/store.db`.
+  Community/default sends none of it anywhere. Only explicitly enrolled Oxagen
+  Enterprise managed mode can derive a closed, content-free operational rollup.
 - **Budget enforcement** — A `--budget` flag aborts cleanly between steps, never
   mid-tool.
 - **Goal & fleet modes** — `goal` works in judged rounds; `fleet` fans a task DAG
@@ -54,6 +57,9 @@ workspace of focused crates.
 ## Prerequisites
 
 - **macOS or Linux**, `x86_64` or `arm64`.
+- Private persistence currently depends on Unix owner/mode and no-follow
+  primitives. Non-Unix builds fail closed for sensitive state writes; Windows
+  persistence is not currently supported or claimed.
 - For prebuilt / Homebrew install: `curl`.
 - For building from source: **Rust 1.90+** (via [rustup](https://rustup.rs)) and `git`.
 - An API key for any supported provider, *or* a local OpenAI-compatible model
@@ -312,7 +318,7 @@ stella fleet --plan .stella/fleet.toml --max-concurrency 2 --budget 5.0
 ```
 
 One git worktree + `fleet/<task>` branch per task, wave-scheduled by dependency,
-recorded in `.stella/fleet.db`. A plan file is the serde form of the fleet DAG:
+recorded in `.stella/private/fleet.db`. A plan file is the serde form of the fleet DAG:
 `[[tasks]]` entries with `id`, `title`, `prompt`, optional `depends_on`, and
 `isolation`.
 
@@ -403,16 +409,44 @@ prompt, so every model call considers them at prompt-cache prices. New memories
 take effect the next session — hot-injection would invalidate the cache.
 
 Every working turn is also recorded as an **episode** (summary, files touched,
-outcome, time window) in `.stella/context.db`, and `stella init` writes the
+outcome, time window) in `.stella/private/context.db`, and `stella init` writes the
 domain taxonomy as bi-temporal facts. Recall fans out through the OCP host to
 the memory store and the code graph, fused by score under one budget.
 
 ## Telemetry
 
-Executions are recorded, best-effort, in `.stella/store.db`: the full event
+Executions are recorded, best-effort, in `.stella/private/store.db`: the full event
 stream, per-model-call telemetry (tokens, cache hits, cost), and the
 Files-Touched ledger. The store is never a dependency of a turn — a session
 runs even if the file can't be opened. Query it with any SQLite client.
+
+Community/default mode constructs no enterprise spool or HTTP client and has
+zero telemetry egress. A seat becomes enrolled only through a valid signed
+`enterprise_telemetry` document in the org-managed settings scope. That
+document binds issuer, audience, organization/workspace, expiry, the single
+`execution_rollup` event class, a managed model catalog, `process_free`
+isolation, bearer-secret references, and one endpoint that must exactly match
+the administrator's credential-free HTTPS allowlist.
+
+While enrolled, only `stella run --no-pipeline` is eligible. Stella rejects
+pipeline, goal, fleet, deck/chat, interactive, workspace-port, and candidate
+workspace execution paths because they cannot prove the process-free boundary.
+Eligible finalized runs may export only managed organization/workspace/enrollment
+identifiers; allowlisted provider/model or `other`; outcome; duration; input and
+output token counts; cost in micro-USD; tool-call and changed-file counts; and a
+produced-output boolean. Prompts, paths, tool names/arguments/results, reasoning,
+errors, git state, memories, rules, full local events, and local execution or
+installation identifiers are excluded.
+
+Delivery is at-least-once from an owner-only host spool outside the workspace.
+Retained event payloads are bounded to 10,000 rows and 16 MiB; SQLite overhead
+may make the physical database larger. Startup flush is detached and never
+delays execution or process exit; `stella telemetry flush` attempts one bounded
+batch explicitly. `stella telemetry status` reports enrolled/disabled state,
+pending and stranded rows/bytes, quarantine and physical size, and durable drop,
+corruption, and rollover counters. See the
+[Telemetry documentation](https://stella.oxagen.sh/docs/telemetry) for backfill,
+retry, rollover, and server-side companion requirements.
 
 ## Lifecycle hooks
 
@@ -462,7 +496,7 @@ flowchart TD
     MCP["stella-mcp<br/>external MCP servers"] -.->|merges tools into registry| TOOLS
     CORE -->|emits AgentEvent stream| STORE["stella-store<br/>SQLite: executions · events · telemetry"]
     U -->|"recall · episodes · bi-temporal facts"| CTX["stella-context — context plane<br/>recall · embeddings · memory"]
-    GRAPH["stella-graph — tree-sitter code index"] -->|"auto-indexed at session start · queried via `graph_query` + `stella graph`"| DB[("SQLite code graph<br/>.stella/codegraph.db")]
+    GRAPH["stella-graph — tree-sitter code index"] -->|"auto-indexed at session start · queried via `graph_query` + `stella graph`"| DB[("SQLite code graph<br/>.stella/private/codegraph.db")]
     MODEL -.->|versioned serde| PROTO["stella-protocol — shared types + Provider/tool ports"]
     TOOLS -.-> PROTO
     STORE -.-> PROTO
@@ -474,7 +508,10 @@ flowchart TD
   filesystem call, or a terminal library; it drives through traits.
 - **No I/O in the engine** — all decision logic is synchronous functions over
   owned data, so the whole engine is property-testable.
-- **No phone-home** — zero network calls other than your chosen model provider.
+- **Zero telemetry egress by default** — Community/default makes no telemetry
+  calls. Explicitly enrolled Oxagen Enterprise managed mode is the only governed
+  exception, limited to its exact allowlisted HTTPS sink and minimal operational
+  rollup. Your chosen model provider remains the normal BYOK network path.
 - **BYOK** — any provider key, any combination, no account.
 - **Serde-first** — every cross-boundary type round-trips through `serde_json`
   byte-for-byte.

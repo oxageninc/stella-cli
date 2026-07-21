@@ -257,7 +257,11 @@ mod tests {
     fn frame(label: &str, content: &str) -> RecalledFrame {
         RecalledFrame {
             citation_label: label.into(),
+            provider: "code-graph".into(),
             source: "code-graph".into(),
+            kind: "symbol".into(),
+            uri: None,
+            method: None,
             content: content.into(),
             token_cost: 10,
             id: None,

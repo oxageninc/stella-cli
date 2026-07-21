@@ -601,7 +601,7 @@ Deliver, in stella-core/src/context/ (new submodule):
    same extractor version creates zero duplicates.
 2. Pure normalizers for the v1 sources: AgentEvent streams (tool failures/
    recoveries, verification and judge outcomes), journal records, reflection
-   lessons (the .stella/reflections.jsonl shape), explicit user actions
+   lessons (the .stella/private/reflections.jsonl shape), explicit user actions
    (Keep/Edit/Ignore/accept/reject/correct), and git-diff FEATURE structs
    (the I/O half computes features; you interpret conservatively per
    implementation-plan Phase 5: follow-up edits are inferred signals unless
@@ -640,7 +640,7 @@ Deliver, in stella-cli:
 
 1. A harvest orchestrator (new file, e.g. src/context_harvest.rs): read
    store.db events through the new cursored API, the session journal sidecar
-   when present, and .stella/reflections.jsonl; feed the stella-core
+   when present, and .stella/private/reflections.jsonl; feed the stella-core
    normalizers; persist observations and evidence idempotently via the
    canonical repositories, advancing extraction_cursors per (source,
    extractor, version). Bounded and best-effort: wall-clock capped, cursor

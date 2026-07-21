@@ -15,13 +15,13 @@ Everything is on your disk, under `.stella/`:
 | Path | What it holds |
 | --- | --- |
 | `.stella/memories/*.md` | Workspace memories — one Markdown lesson per file, written by `save_memory` |
-| `.stella/context.db` | The **bi-temporal** context store: episodes, reflection memories, domain facts |
-| `.stella/reflections.jsonl` | The reflection mining log — one JSON lesson per line |
-| `.stella/codegraph.db` | The tree-sitter code-graph index |
+| `.stella/private/context.db` | The **bi-temporal** context store: episodes, reflection memories, domain facts |
+| `.stella/private/reflections.jsonl` | The reflection mining log — one JSON lesson per line |
+| `.stella/private/codegraph.db` | The tree-sitter code-graph index |
 | `.stella/rules/*.md` | Rules — promoted memories and guard rules |
 | `.stella/skills/` | Project [skills](/docs/agent-tools/skills) |
 | `.stella/domains.toml` | The domain taxonomy — the shared tagging vocabulary |
-| `.stella/store.db` | The citation ledger and [telemetry](/docs/telemetry) |
+| `.stella/private/store.db` | The citation ledger and [telemetry](/docs/telemetry) |
 
 *Bi-temporal* means the context store keeps both when a fact was true and
 when Stella believed it: re-running `stella init` **supersedes** stale facts
@@ -141,7 +141,7 @@ Memory in Stella is not write-only. It is a feedback loop:
 - Recalled memories carry a stable id (`nod_…`). When one actually informs a
   turn, the model calls **`cite_memory`** with a usefulness score (1–5), a
   truthfulness flag, and a remark. Citations aggregate into a ledger in
-  `.stella/store.db`.
+  `.stella/private/store.db`.
 - **`stella memory list`** ranks memories by citation count, average
   usefulness, and truthful rate. **`stella memory validate`** flags memories
   whose file-path anchors no longer exist.
@@ -171,7 +171,7 @@ Concretely, over a few sessions:
 3. **Cite.** The lesson actually informs the turn, so the model calls
    `cite_memory` with that `nod_…` id, a usefulness score (1–5), a
    truthfulness flag, and a one-line remark. The citation lands in the
-   ledger in `.stella/store.db`.
+   ledger in `.stella/private/store.db`.
 4. **Inspect.** `stella memory list` shows the memory climbing the ranking
    — citation count, average usefulness, truthful rate — and flags it once
    it has earned promotion.
@@ -189,7 +189,7 @@ Concretely, over a few sessions:
 After any turn that did real work (tool calls happened — a pure chat turn is
 skipped to save the call), Stella spends one cheap, deterministic model call
 to extract **0–3 lessons**, tagged with allowed domains, written to both the
-context store and `.stella/reflections.jsonl`. Failed turns get a dedicated
+context store and `.stella/private/reflections.jsonl`. Failed turns get a dedicated
 root-cause prompt — failure is treated as the highest-value learning signal,
 not something to forget.
 

@@ -1,5 +1,5 @@
 //! The Stella Observatory — a local, loopback-only dashboard over the
-//! workspace's own telemetry (`.stella/store.db`, `.stella/fleet.db`).
+//! workspace's own telemetry (`.stella/private/store.db`, `.stella/private/fleet.db`).
 //!
 //! Design constraints, in order:
 //!
@@ -290,13 +290,13 @@ mod tests {
         }
     }
 
-    /// Build a workspace with a seeded `.stella/store.db` shaped like the
+    /// Build a workspace with a seeded `.stella/private/store.db` shaped like the
     /// real schema (the subset the observatory reads).
     fn seeded_workspace() -> TempDir {
         let dir = TempDir::new().unwrap();
         let dot = dir.path().join(".stella");
-        std::fs::create_dir_all(&dot).unwrap();
-        let conn = Connection::open(dot.join("store.db")).unwrap();
+        std::fs::create_dir_all(dot.join("private")).unwrap();
+        let conn = Connection::open(dot.join("private/store.db")).unwrap();
         conn.execute_batch(
             "CREATE TABLE executions (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -404,7 +404,7 @@ mod tests {
         std::fs::create_dir_all(dot.join("rules")).unwrap();
         std::fs::write(dot.join("rules/style.md"), "Prefer witness tests.").unwrap();
         std::fs::write(
-            dot.join("reflections.jsonl"),
+            dot.join("private/reflections.jsonl"),
             r#"{"lesson":"check the test's invariant first","domains":["testing"],"occurred_at":1700000000}
 {"lesson":"verify dependency chains before citing them","domains":["docs"],"occurred_at":1700000100}
 "#,
@@ -421,7 +421,7 @@ mod tests {
             r#"{"providers":{"zai":{"api_key":"sk-live-topsecret","api_key_env":"ZAI_KEY"}},"agent_engine_config":{"agents":{"judge":{"model":"glm-5.2"}}}}"#,
         )
         .unwrap();
-        let graph = Connection::open(dot.join("codegraph.db")).unwrap();
+        let graph = Connection::open(dot.join("private/codegraph.db")).unwrap();
         graph
             .execute_batch(
                 "CREATE TABLE code_graph_files (

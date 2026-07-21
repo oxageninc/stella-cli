@@ -131,7 +131,9 @@ pub fn detect_issue_backend() -> Option<IssueBackend> {
     if let Some(github) = detect_github_connected_backend() {
         return Some(github);
     }
-    let gh_authed = std::process::Command::new("gh")
+    let mut gh = std::process::Command::new("gh");
+    crate::exec::scrub_sensitive_std_env(&mut gh);
+    let gh_authed = gh
         .args(["auth", "status"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

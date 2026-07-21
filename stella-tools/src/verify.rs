@@ -68,6 +68,7 @@ fn tail(s: &str) -> &str {
 /// ([`crate::exec::GIT_REPO_ENV_VARS`]).
 fn git_in(dir: &std::path::Path) -> Command {
     let mut cmd = Command::new("git");
+    crate::exec::scrub_sensitive_env(&mut cmd);
     cmd.current_dir(dir);
     for var in crate::exec::GIT_REPO_ENV_VARS {
         cmd.env_remove(var);
@@ -344,6 +345,7 @@ mod tests {
         // hook (the pre-push gate) re-targets `git init` at the HOST repo.
         let scratch_git = |args: &[&str]| {
             let mut cmd = std::process::Command::new("git");
+            crate::exec::scrub_sensitive_std_env(&mut cmd);
             cmd.args(args).current_dir(&root);
             for var in crate::exec::GIT_REPO_ENV_VARS {
                 cmd.env_remove(var);

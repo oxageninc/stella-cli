@@ -384,6 +384,10 @@ pub struct Config {
     /// Same threading as `tools_bash` — the default tool surface has no
     /// network egress.
     pub tools_web: bool,
+    /// Monotonic authority computed while loading the scope chain. Runtime
+    /// adapters consume this instead of reinterpreting trust environment
+    /// variables or repository settings independently.
+    pub authority: crate::settings::AuthorityPolicy,
     /// Which step in the credential chain produced `api_key` — `stella
     /// config` displays this next to the redacted key preview so the
     /// command can never disagree with what actually resolved it. `None`
@@ -481,10 +485,15 @@ impl Config {
             settings,
             workspace_root,
         )?;
-        cfg.hooks = settings.hooks.clone();
+        cfg.hooks = if crate::enterprise_telemetry::process_free_authority_active() {
+            None
+        } else {
+            settings.hooks.clone()
+        };
         cfg.engine_settings = settings.agent_engine_config.clone();
-        cfg.tools_bash = settings.bash_tool_enabled();
-        cfg.tools_web = settings.web_tools_enabled();
+        cfg.authority = settings.authority_policy;
+        cfg.tools_bash = settings.bash_tool_enabled() && cfg.authority.bash_allowed;
+        cfg.tools_web = settings.web_tools_enabled() && cfg.authority.web_allowed;
         Ok(cfg)
     }
 
@@ -593,6 +602,7 @@ impl Config {
                     engine_settings: None,
                     tools_bash: false,
                     tools_web: false,
+                    authority: crate::settings::AuthorityPolicy::default(),
                     credential_source,
                 });
             }
@@ -786,6 +796,7 @@ impl Config {
             engine_settings: None,
             tools_bash: false,
             tools_web: false,
+            authority: crate::settings::AuthorityPolicy::default(),
             credential_source: Some(source),
         })
     }

@@ -75,8 +75,7 @@ use stella_core::router::CircuitBreaker;
 use stella_core::{BudgetGuard, CalibrationMap, Engine, Router, TurnOutcome};
 use stella_model::provider::Provider;
 use stella_pipeline::{
-    AutoApproveGate, ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig, PipelinePorts,
-    PipelineStatus,
+    ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig, PipelinePorts, PipelineStatus,
 };
 use stella_protocol::{
     AgentEvent, CiStatus, CompletionMessage, CompletionRequest, FileChangeKind, ModelRef, PrStatus,
@@ -141,12 +140,29 @@ fn debug_log_path() -> Option<PathBuf> {
     if std::env::var_os("OXAGEN_DEBUG").is_none_or(|v| v.is_empty() || v == "0") {
         return None;
     }
-    let state_home = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    let dir = state_home.join("stella").join("logs");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join(format!("deck-{}.jsonl", std::process::id())))
+    #[cfg(not(unix))]
+    return None;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let state_home = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+        let dir = state_home.join("stella").join("logs");
+        match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder.create(&dir).ok()?;
+            }
+            Err(_) => return None,
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+        Some(dir.join(format!("deck-{}.jsonl", std::process::id())))
+    }
 }
 
 /// How one dispatched turn ended, as seen by the driver loop.
@@ -257,30 +273,37 @@ pub async fn run_deck_session(
     no_anim: bool,
     resume: Option<crate::session_persist::ResumeRequest>,
 ) -> Result<(), String> {
-    // ── Session assembly (still on the normal screen — prints are fine) ────
-    // MCP connect is NOT here: it can block up to 10s per server, so it runs
-    // after the deck task spawns, narrated as transcript events (#98).
+    crate::enterprise_telemetry::authorize_execution_surface(
+        crate::enterprise_telemetry::ExecutionSurface::Deck,
+    )?;
     let provider = agent::build_provider(cfg)?;
+    let registry_options = agent::registry_options(cfg);
     let registry: Arc<ToolRegistry> = Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), agent::registry_options(cfg)).await,
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
-    agent::populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    agent::populate_schema_index(&registry, &cfg.workspace_root)?;
+    let active_rules =
+        crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     let custom_tools = agent::discover_custom_tools(cfg, true).await;
     let mut budget = agent::build_budget_guard(budget_limit);
     let store = agent::open_store(&cfg.workspace_root);
     let calibration = agent::seed_calibration(&store, cfg);
 
-    let system_prompt =
-        agent::with_session_hook_context(agent::build_system_prompt(cfg, &cfg.workspace_root), cfg)
-            .await;
+    let system_prompt = agent::with_session_hook_context(
+        agent::build_system_prompt(cfg, &cfg.workspace_root, &active_rules),
+        cfg,
+    )
+    .await;
     let mut messages = vec![CompletionMessage::system(system_prompt.clone())];
     // `warn: false`: past this point diagnostics would land on the alternate
     // screen; a memory-less session degrades silently here.
-    let mut memory = SessionMemory::open(&cfg.workspace_root, false);
+    let mut memory = SessionMemory::open_with_authority(&cfg.workspace_root, false, &cfg.authority);
     // Custom extensions: ⚡ commands/skills in the slash menu, custom agents
     // behind `/agents`. Reloaded after `/init`, which may adopt new ones.
-    let mut custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
+    let mut custom = crate::extensions::CustomExtensions::load_with_authority(
+        &cfg.workspace_root,
+        &cfg.authority,
+    );
     // The npx skills registry (search/install), constructed once for the whole
     // session — the SKILLS tab's ops route through it (see `handle_skills_input`).
     let skill_registry = SkillRegistry::from_env(cfg.workspace_root.clone());
@@ -408,6 +431,22 @@ pub async fn run_deck_session(
     // re-checked every boot, so it never journals.
     if let Some(report) = custom.problems_report() {
         let _ = deck_tx.send(chrome_note(report));
+    }
+    // Honest degradation (#266): a user who pinned a reasoning effort for the
+    // lead but chose a provider whose adapter has no reasoning control gets a
+    // one-line notice instead of a silently-dropped setting. Keyed on the
+    // explicit settings pin for the lead (Default kind), never the
+    // auto-resolved effort — session chrome, re-checked every boot, never
+    // journaled.
+    if let Some(notice) = crate::engine_config::unsupported_effort_notice(
+        cfg.provider.id,
+        cfg.provider.display_name,
+        cfg.engine_settings
+            .as_ref()
+            .and_then(|e| e.agent(crate::settings::EngineAgentKind::Default))
+            .and_then(|a| a.effort),
+    ) {
+        let _ = deck_tx.send(chrome_note(notice));
     }
     // An idle lead is waiting on the human, not queued behind a supervisor
     // (sent after the problems report — a Text event folds to `Running`).
@@ -622,7 +661,7 @@ pub async fn run_deck_session(
     let mut pending_create: Option<(String, AgentScope)> = None;
     // Sub-session bookkeeping: live-worker slots, and `task_assign` requests
     // waiting for one (drained oldest-first as workers end).
-    let mut subs = SubSessions::new();
+    let mut subs = SubSessions::with_registry_options(registry_options.clone());
     let mut pending_spawns: VecDeque<stella_core::tasks::SpawnRequest> = VecDeque::new();
     // Lanes whose Restart arrived while the worker was still live: stop
     // first, respawn on its Ended.
@@ -1047,7 +1086,8 @@ pub async fn run_deck_session(
                 // `/init` changed the taxonomy and rebuilt the index. Re-open
                 // memory so recall/reflection use the new domains this session
                 // (not just the next), and push a fresh Graph-tab snapshot.
-                memory = SessionMemory::open(&cfg.workspace_root, false);
+                memory =
+                    SessionMemory::open_with_authority(&cfg.workspace_root, false, &cfg.authority);
                 if let Some(snapshot) = agent::graph_snapshot(&cfg.workspace_root) {
                     let _ = in_tx.send(Inbound::GraphSnapshot(snapshot));
                 }
@@ -1055,7 +1095,10 @@ pub async fn run_deck_session(
                 // reload them and refresh the deck's slash menu in place,
                 // reporting anything that failed to load (then restoring the
                 // idle status the report's Text event flipped).
-                custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
+                custom = crate::extensions::CustomExtensions::load_with_authority(
+                    &cfg.workspace_root,
+                    &cfg.authority,
+                );
                 let _ = in_tx.send(Inbound::SlashCommands(deck_slash_commands(&custom)));
                 if let Some(report) = custom.problems_report() {
                     let _ = in_tx.send(Inbound::Event {
@@ -1165,6 +1208,8 @@ pub async fn run_deck_session(
             });
         }
 
+        let dispatch_spend_usd = budget.session_spent_usd();
+
         // Shared with the live input arms below: `>` steers, Esc soft-stops.
         // Per-turn by construction — a stop latched here can't leak into
         // the next turn.
@@ -1184,6 +1229,8 @@ pub async fn run_deck_session(
                         &mut messages,
                         &mut budget,
                         cfg,
+                        &active_rules,
+                        &registry_options,
                         execution.clone(),
                         &in_tx,
                         &ask_io,
@@ -1610,12 +1657,18 @@ pub async fn run_deck_session(
                     requeue_front(&mut queue, &in_tx, dispatch.stop_and_hold(Some(&submitted)));
                 } else {
                     // A plain cancel: retain the dropped prompt so the
-                    // pair's escalation — which always arrives after this
-                    // point (the channel is FIFO) — can still requeue it.
                     dispatch.cancelled(&submitted);
                 }
+                let cancelled_cost =
+                    agent::settled_cost_since(dispatch_spend_usd, budget.session_spent_usd());
                 if let Some((store, id)) = &execution
-                    && store.finish_execution(*id, "cancelled", 0.0).is_err()
+                    && !agent::record_execution_end(
+                        store,
+                        *id,
+                        registry.as_ref(),
+                        "cancelled",
+                        cancelled_cost,
+                    )
                 {
                     let _ = in_tx.send(Inbound::Event {
                         agent: LEAD.to_string(),
@@ -1750,18 +1803,28 @@ fn spawn_mcp_connect(
                     "connecting {} MCP server(s)…",
                     servers.len()
                 )));
-                let set = agent::connect_mcp_servers(
-                    &servers,
-                    registry.clone(),
-                    Some(registry.mcp_usage_ledger()),
-                    Some(disabled.clone()),
-                    Some(crate::mcp_cmd::oauth_manager(&cfg.workspace_root)),
-                )
-                .await;
-                let _ = chrome_tx.send(chrome_note(mcp_outcome_report(
-                    &set.connected_names(),
-                    set.failed_servers(),
-                )));
+                match crate::mcp_cmd::oauth_manager(&cfg.workspace_root) {
+                    Ok(auth) => {
+                        let set = agent::connect_mcp_servers(
+                            &servers,
+                            registry.clone(),
+                            Some(registry.mcp_usage_ledger()),
+                            Some(disabled.clone()),
+                            Some(auth),
+                        )
+                        .await;
+                        let _ = chrome_tx.send(chrome_note(crate::mcp_cmd::mcp_outcome_report(
+                            &set.connected_names(),
+                            set.failed_servers(),
+                        )));
+                        let _ = slot.set(set);
+                    }
+                    Err(error) => {
+                        let _ = chrome_tx.send(chrome_note(format!(
+                            "MCP authentication unavailable: {error} — continuing with native tools only"
+                        )));
+                    }
+                }
                 // The Text events above fold the lead to `Running`, but no
                 // turn is in flight — restore the idle status or the
                 // dashboard would show a busy lead forever.
@@ -1769,10 +1832,6 @@ fn spawn_mcp_connect(
                     agent: LEAD.to_string(),
                     status: AgentStatus::WaitingInput,
                 });
-                // `set` is infallible here (the cell is set exactly once,
-                // by this task); an in-flight turn keeps its resolved
-                // executor and the NEXT turn picks the servers up.
-                let _ = slot.set(set);
             }
         }
         // Seed the MCP tab with the configured servers and their live state.
@@ -1784,26 +1843,6 @@ fn spawn_mcp_connect(
     configured
 }
 
-/// The transcript report for a finished MCP connect attempt: the connected
-/// servers by name, then one row per failure with its reason — the deck-mode
-/// analogue of the diagnostics [`agent::connect_mcp`] prints in the plain
-/// REPL. Zero connections is stated outright: the degraded session must be
-/// visible in the transcript, never inferred from silence.
-fn mcp_outcome_report(connected: &[&str], failed: &[(String, String)]) -> String {
-    let mut lines = Vec::new();
-    match connected.len() {
-        0 => lines.push("no MCP servers connected — continuing with native tools only".to_string()),
-        n => lines.push(format!(
-            "{n} MCP server(s) connected: {}",
-            connected.join(", ")
-        )),
-    }
-    for (name, reason) in failed {
-        lines.push(format!("MCP server `{name}` unavailable: {reason}"));
-    }
-    lines.join("\n")
-}
-
 /// Build the MCP tab snapshot: every configured server (`.stella/mcp.toml`)
 /// joined with its live session state — enabled (not in the disabled set),
 /// connected (in the live tool set), health, per-server tool count (derived
@@ -1813,8 +1852,8 @@ async fn mcp_snapshot(
     cfg: &Config,
     mcp: Option<&stella_mcp::McpToolSet>,
     disabled: &stella_mcp::DisabledServers,
-) -> Vec<stella_tui::McpServerInfo> {
-    let config = crate::mcp_cmd::load_config(&cfg.workspace_root).unwrap_or_default();
+) -> Result<Vec<stella_tui::McpServerInfo>, String> {
+    let config = crate::mcp_cmd::load_config(&cfg.workspace_root)?;
     let connected: std::collections::HashSet<String> = mcp
         .map(|s| {
             s.connected_names()
@@ -1828,14 +1867,14 @@ async fn mcp_snapshot(
         None => Vec::new(),
     };
     let schemas = mcp.map(|s| s.schemas()).unwrap_or_default();
-    let usage = crate::mcp_cmd::usage_stats(&cfg.workspace_root).unwrap_or_default();
+    let usage = crate::mcp_cmd::usage_stats(&cfg.workspace_root)?;
     let disabled_set = disabled.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let oauth_logins: std::collections::HashSet<String> =
-        crate::mcp_cmd::oauth_logged_in(&cfg.workspace_root)
+        crate::mcp_cmd::oauth_logged_in(&cfg.workspace_root)?
             .into_iter()
             .collect();
 
-    config
+    Ok(config
         .names()
         .into_iter()
         .map(|name| {
@@ -1876,7 +1915,7 @@ async fn mcp_snapshot(
                 calls,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Build and push a fresh MCP tab snapshot.
@@ -1886,7 +1925,19 @@ async fn send_mcp_snapshot(
     disabled: &stella_mcp::DisabledServers,
     in_tx: &mpsc::UnboundedSender<Inbound>,
 ) {
-    let _ = in_tx.send(Inbound::McpServers(mcp_snapshot(cfg, mcp, disabled).await));
+    match mcp_snapshot(cfg, mcp, disabled).await {
+        Ok(rows) => {
+            let _ = in_tx.send(Inbound::McpServers(rows));
+        }
+        Err(error) => {
+            let _ = in_tx.send(Inbound::McpServers(Vec::new()));
+            let _ = in_tx.send(Inbound::McpOauthStatus {
+                server: "MCP state".to_string(),
+                message: error,
+                outcome: Some(false),
+            });
+        }
+    }
 }
 
 /// Run a registry search and shape it for the tab, flagging already-configured
@@ -2505,11 +2556,10 @@ fn ci_status_token(ci: CiStatus) -> &'static str {
     }
 }
 
-/// One `gh` JSON read in `root`. For `gh pr checks`, pending checks exit
-/// non-zero (code 8) while still printing the JSON — so parse whatever
-/// stdout holds instead of gating on exit status.
 async fn gh_json(root: &std::path::Path, args: &[&str]) -> Option<Value> {
-    let output = tokio::process::Command::new("gh")
+    let mut command = tokio::process::Command::new("gh");
+    stella_tools::exec::scrub_sensitive_env(&mut command);
+    let output = command
         .args(args)
         .current_dir(root)
         .kill_on_drop(true)
@@ -2834,7 +2884,7 @@ fn symbol_hit(frame: &ocp_types::ContextFrame) -> EntityHit {
 }
 
 /// The local (non-tracker) assignee sources, read synchronously (call on
-/// the blocking pool): memories from `.stella/context.db` — with citation
+/// the blocking pool): memories from `.stella/private/context.db` — with citation
 /// stats joined from `store.db` by `public_id` — and code-graph symbol
 /// definitions when an index exists. Read-only politeness (the `stella
 /// stats` discipline): a missing database reads as "no hits", never a
@@ -2844,14 +2894,19 @@ fn local_assignee_hits(root: &std::path::Path, query: &str) -> Vec<EntityHit> {
     let mut hits = Vec::new();
 
     // Memories: substring over display_name/content; empty query lists all.
-    let context_db = root.join(".stella").join("context.db");
-    if context_db.exists()
+    let context_db = stella_store::existing_workspace_private_sqlite_path(root, "context.db")
+        .ok()
+        .flatten();
+    if let Some(context_db) = context_db
         && let Ok(context) = stella_context::ContextStore::open(&context_db)
         && let Ok(nodes) = context.memory_nodes()
     {
         let stats: std::collections::HashMap<String, (i64, f64)> = {
-            let store_db = root.join(".stella").join("store.db");
-            if store_db.exists() {
+            if stella_store::existing_workspace_private_sqlite_path(root, "store.db")
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 stella_store::Store::open(root)
                     .and_then(|store| store.memory_citation_stats())
                     .map(|rows| {
@@ -3952,7 +4007,8 @@ async fn run_deck_command(
                 "staged pipeline ON — turns now run triage → recall → (plan → scope review) → \
                  witness → execute → verify → judge, with bounded revision. The witness stage \
                  authors a failing test that must flip to green before work counts as done; \
-                 large plans auto-approve in the deck (scope review is narrated, not gated). \
+                 large plans stop with a named scope-review error until a deck-native host \
+                 approval gate is available. \
                  `/pipeline` again to return to the raw engine loop."
                     .to_string()
             } else {
@@ -3975,11 +4031,18 @@ async fn run_deck_command(
                 Ok(_) => {
                     // A fresh index may name tables/types the schema gate
                     // should know about this session, not just the next one.
-                    agent::populate_schema_index(registry, &cfg.workspace_root);
+                    if let Err(error) = agent::populate_schema_index(registry, &cfg.workspace_root)
+                    {
+                        say(format!("schema governance unavailable: {error}"));
+                        return DeckCommand::Handled;
+                    }
                     // Expose the `graph_query` tool for the rest of the session
                     // now that the index exists (it is registered only when an
                     // index is present at construction).
-                    registry.enable_code_graph_if_available(&cfg.workspace_root);
+                    if let Err(error) = registry.enable_code_graph_if_available(&cfg.workspace_root)
+                    {
+                        say(format!("graph tool unavailable: {error}"));
+                    }
                     return DeckCommand::InitCompleted;
                 }
                 Err(e) => say(format!("init failed: {e}")),
@@ -4130,6 +4193,7 @@ async fn run_lead_turn(
         // catalog), below the taps (searches are read-only; taps watch writes).
         let tools =
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed)
                 .with_activation(activated.clone());
         let tapped = FileChangeTap {
             inner: &tools,
@@ -4163,7 +4227,7 @@ async fn run_lead_turn(
     if let Some((store, id)) = &execution {
         let (outcome_label, cost) = match &outcome {
             TurnOutcome::Completed { cost_usd, .. } => ("completed", *cost_usd),
-            TurnOutcome::Aborted { .. } => ("aborted", 0.0),
+            TurnOutcome::Aborted { cost_usd, .. } => ("aborted", *cost_usd),
         };
         if !agent::record_execution_end(store, *id, registry, outcome_label, cost) {
             let _ = in_tx.send(Inbound::Event {
@@ -4191,7 +4255,7 @@ async fn run_lead_turn(
 
     match outcome {
         TurnOutcome::Completed { .. } => Ok(()),
-        TurnOutcome::Aborted { reason } => Err(reason),
+        TurnOutcome::Aborted { reason, .. } => Err(reason),
     }
 }
 
@@ -4202,11 +4266,10 @@ async fn run_lead_turn(
 /// place of the raw `Engine::run_turn`.
 ///
 /// Deck-mode seams, all named:
-/// - **Scope review auto-approves.** The deck cannot block a turn on a stdio
-///   gate (the alternate screen owns the terminal), so `headless_bypass` is
-///   set and the `ScopeReview` event is narrated, not gated — the same seam
-///   the driver's `ScopeDecision` no-op documents. Deck-native scope review
-///   is the fleet-supervisor follow-up.
+/// - **Scope review fails closed.** The deck cannot block a turn on a stdio
+///   gate (the alternate screen owns the terminal), so a large plan returns
+///   `ScopeReviewRequiredHeadless`. Deck-native host approval remains the
+///   follow-up; output/event rendering is never treated as authority.
 /// - **The session's system prompt stays.** It was assembled once at deck
 ///   startup (byte-stable for the cache prefix, L-E8); toggling `/pipeline`
 ///   must not rewrite history. The pipeline's stage prompts (witness, judge,
@@ -4224,6 +4287,8 @@ async fn run_lead_pipeline_turn(
     messages: &mut Vec<CompletionMessage>,
     budget: &mut BudgetGuard,
     cfg: &Config,
+    active_rules: &crate::rules::ResolvedRules,
+    registry_options: &stella_tools::RegistryOptions,
     execution: Option<(Arc<Store>, i64)>,
     in_tx: &UnboundedSender<Inbound>,
     ask_io: &DeckAskUserIo,
@@ -4259,6 +4324,7 @@ async fn run_lead_pipeline_turn(
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
         let tools =
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed)
                 .with_activation(activated.clone());
         let tapped = FileChangeTap {
             inner: &tools,
@@ -4273,10 +4339,11 @@ async fn run_lead_pipeline_turn(
         };
 
         let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
-        // Role wiring from `agent_engine_config`: triage/judge pins + their
-        // adapters + per-role request overrides. Notices land in the
+        // Role wiring from `agent_engine_config`: worker/triage/judge pins +
+        // their adapters + per-role request overrides. Notices land in the
         // transcript — stderr is invisible under the alternate screen.
-        let wiring = agent::resolve_engine_wiring(cfg, &model_ref);
+        let configured = crate::config::discover_configured_providers();
+        let wiring = agent::resolve_engine_wiring(cfg, &model_ref, &configured);
         for notice in &wiring.notices {
             let _ = tx.send(AgentEvent::Text {
                 delta: format!("! {notice}\n"),
@@ -4287,7 +4354,12 @@ async fn run_lead_pipeline_turn(
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
-        let ws_ports = agent::workspace_ports(cfg.workspace_root.clone(), cfg);
+        let ws_ports = agent::workspace_ports(
+            cfg.workspace_root.clone(),
+            cfg,
+            registry_options.clone(),
+            active_rules.clone(),
+        )?;
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = match memory {
             Some(m) => m,
@@ -4301,8 +4373,9 @@ async fn run_lead_pipeline_turn(
             recall,
             repo: &ws_ports.repo_structure,
             repo_status: &ws_ports.repo_status,
-            commands: &ws_ports.command_runner,
-            approvals: &AutoApproveGate,
+            diagnostics: &ws_ports.diagnostic_runner,
+            tests: &ws_ports.test_runner,
+            approvals: &agent::HEADLESS_APPROVAL_GATE,
             sleeper: &TokioSleeper,
             hooks: cfg
                 .hooks
@@ -4314,10 +4387,10 @@ async fn run_lead_pipeline_turn(
             steering: Some(steering),
         };
         let config = PipelineConfig {
-            engine: agent::pipeline_engine_config_for(cfg),
+            engine: agent::pipeline_engine_config_for(cfg, &wiring.worker_model),
             role_overrides: wiring.role_overrides.clone(),
             headless: true,
-            headless_bypass_scope_review: true,
+            headless_bypass_scope_review: agent::HEADLESS_SCOPE_REVIEW_BYPASS,
             ..PipelineConfig::default()
         };
         let pipeline = Pipeline::new(ports, tx.clone(), config);
@@ -4328,16 +4401,7 @@ async fn run_lead_pipeline_turn(
     claims.release_all();
 
     if let Some((store, id)) = &execution {
-        let (outcome_label, cost) = match &result {
-            Ok(outcome) => {
-                let label = match outcome.status {
-                    PipelineStatus::Completed => "completed",
-                    PipelineStatus::Aborted { .. } => "aborted",
-                };
-                (label, outcome.total_cost_usd)
-            }
-            Err(_) => ("error", 0.0),
-        };
+        let (outcome_label, cost) = agent::pipeline_execution_closeout(&result);
         if !agent::record_execution_end(store, *id, registry, outcome_label, cost) {
             let _ = in_tx.send(Inbound::Event {
                 agent: LEAD.to_string(),
@@ -4365,6 +4429,9 @@ async fn run_lead_pipeline_turn(
     match result {
         Ok(outcome) => match outcome.status {
             PipelineStatus::Completed => Ok(()),
+            PipelineStatus::VerificationFailed { verdict } => {
+                Err(format!("verification failed: {}", verdict.summary))
+            }
             PipelineStatus::Aborted { reason } => Err(reason),
         },
         Err(e) => Err(e.to_string()),

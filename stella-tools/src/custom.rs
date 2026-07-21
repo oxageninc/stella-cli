@@ -314,7 +314,7 @@ pub fn parse_manifest(text: &str, source: &Path) -> Result<CustomTool, String> {
 /// inject a home directory directly rather than mutating the process env.
 pub fn discover(workspace_root: &Path) -> DiscoveryReport {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    discover_in(workspace_root, home.as_deref())
+    discover_in_scopes(workspace_root, home.as_deref(), true)
 }
 
 /// Discover custom tools from the workspace directory then the (optional)
@@ -322,11 +322,27 @@ pub fn discover(workspace_root: &Path) -> DiscoveryReport {
 /// global scan entirely. Never fails: unreadable or malformed manifests become
 /// diagnostics, not errors.
 pub fn discover_in(workspace_root: &Path, home: Option<&Path>) -> DiscoveryReport {
+    discover_in_scopes(workspace_root, home, true)
+}
+
+/// Discover custom tools from the allowed configuration scopes.
+///
+/// `include_workspace` must come from the host's authority policy. When it is
+/// false, only the user-global directory is scanned; repository manifests are
+/// neither parsed nor reported as diagnostics.
+pub fn discover_in_scopes(
+    workspace_root: &Path,
+    home: Option<&Path>,
+    include_workspace: bool,
+) -> DiscoveryReport {
     let mut report = DiscoveryReport::default();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Workspace first so it wins collisions, then user-global.
-    let mut dirs: Vec<PathBuf> = vec![workspace_root.join(".stella").join("tools")];
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if include_workspace {
+        dirs.push(workspace_root.join(".stella").join("tools"));
+    }
     if let Some(home) = home {
         dirs.push(home.join(".config").join("stella").join("tools"));
     }
@@ -459,6 +475,7 @@ async fn run_custom(tool: &CustomTool, input: &Value, workspace_root: &Path) -> 
     let mut cmd = Command::new(&tool.command[0]);
     cmd.args(&tool.command[1..]);
     cmd.current_dir(workspace_root);
+    crate::exec::scrub_sensitive_env(&mut cmd);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -835,6 +852,27 @@ command = []"#;
         let names: Vec<&str> = report.tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"a_tool"), "names: {names:?}");
         assert!(names.contains(&"b_tool"), "names: {names:?}");
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn workspace_tools_are_excluded_when_project_scope_is_not_allowed() {
+        let ws = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_manifest(
+            &ws_tools(ws.path()),
+            "workspace.toml",
+            "name = \"workspace_tool\"\ndescription = \"d\"\ncommand = [\"./workspace.sh\"]",
+        );
+        write_manifest(
+            &global_tools(home.path()),
+            "global.toml",
+            "name = \"global_tool\"\ndescription = \"d\"\ncommand = [\"./global.sh\"]",
+        );
+
+        let report = discover_in_scopes(ws.path(), Some(home.path()), false);
+        let names: Vec<&str> = report.tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, vec!["global_tool"]);
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
 

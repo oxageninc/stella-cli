@@ -2,9 +2,9 @@
 //! `stella-fleet`'s one dispatch seam: a DAG of tasks (from positional
 //! prompts or a `--plan` file), a git worktree per isolated task, wave
 //! scheduling with bounded concurrency, and every attempt/commit/dollar
-//! stamped into the SQLite ledger (`.stella/fleet.db`). A task that declares
+//! stamped into the SQLite ledger (`.stella/private/fleet.db`). A task that declares
 //! `claims` (workspace-relative paths it will touch) holds them as
-//! cooperative file locks in `.stella/store.db` for the attempt's duration —
+//! cooperative file locks in `.stella/private/store.db` for the attempt's duration —
 //! a path another task (or another run) already claims fails that dispatch
 //! by name instead of letting two agents edit the same file.
 //!
@@ -70,6 +70,9 @@ pub async fn run_fleet(
     watch: bool,
     use_pipeline: bool,
 ) -> Result<(), String> {
+    crate::enterprise_telemetry::authorize_execution_surface(
+        crate::enterprise_telemetry::ExecutionSurface::Fleet,
+    )?;
     let root = cfg.workspace_root.clone();
     let plan = load_plan(prompts, plan_file)?;
     plan.validate().map_err(|e| format!("invalid plan: {e}"))?;
@@ -103,11 +106,10 @@ pub async fn run_fleet(
     }
     println!();
 
-    let dot_stella = root.join(".stella");
-    std::fs::create_dir_all(&dot_stella)
-        .map_err(|e| format!("could not create {}: {e}", dot_stella.display()))?;
-    let ledger = Ledger::open(&dot_stella.join("fleet.db"))
-        .map_err(|e| format!("could not open the fleet ledger: {e}"))?;
+    let ledger_path = stella_store::workspace_private_sqlite_path(&root, "fleet.db")
+        .map_err(|e| format!("could not prepare private fleet state: {e}"))?;
+    let ledger =
+        Ledger::open(&ledger_path).map_err(|e| format!("could not open the fleet ledger: {e}"))?;
 
     // Millisecond + pid: two runs in the same second (scripted/CI) must not
     // share a ledger run id — `record_run` is INSERT OR REPLACE, so a
@@ -139,7 +141,7 @@ pub async fn run_fleet(
         FleetConfig::new(&run_id, &base_sha).with_max_concurrency(max_concurrency.max(1)),
     )
     .map_err(|e| format!("could not start the fleet: {e}"))?;
-    // File claims live in the workspace store (`.stella/store.db`), opened
+    // File claims live in the workspace store (`.stella/private/store.db`), opened
     // only when the plan declares any: enforcing claims requires the store
     // (a claim silently unenforced defeats its purpose), but a claim-free
     // run must not grow a new failure mode.
@@ -157,7 +159,7 @@ pub async fn run_fleet(
         .await
         .map_err(|e| format!("fleet run failed: {e}"))?;
 
-    render_report(&plan, &report, &dot_stella);
+    render_report(&plan, &report, &ledger_path);
     if report.budget_aborted {
         return Err(format!(
             "budget cap reached after ${:.4} — remaining waves were not launched",
@@ -471,9 +473,9 @@ async fn run_task(
     let mut cfg = cfg.clone();
     cfg.workspace_root = root.to_path_buf();
     let provider = agent::build_provider(&cfg)?;
-    let registry =
-        ToolRegistry::new_detected(root.to_path_buf(), agent::registry_options(&cfg)).await;
-    crate::rules::enforce_workspace_rules(&registry, root);
+    let registry_options = agent::registry_options(&cfg);
+    let registry = ToolRegistry::new_detected(root.to_path_buf(), registry_options.clone()).await;
+    let active_rules = crate::rules::enforce_workspace_rules(&registry, root, &cfg.authority);
     // Claim-on-first-write (crate::claims): tool-level write claims + the
     // transient build lane, coordinated across every writer in the
     // workspace. Same holder as the fleet's declared claims — re-entrant.
@@ -482,7 +484,11 @@ async fn run_task(
     let mut messages = vec![CompletionMessage::system(
         // Each worker is its own session in its own workspace, so its
         // SessionStart hooks fire here, in the worktree.
-        agent::with_session_hook_context(agent::build_system_prompt(&cfg, root), &cfg).await,
+        agent::with_session_hook_context(
+            agent::build_system_prompt(&cfg, root, &active_rules),
+            &cfg,
+        )
+        .await,
     )];
     // The raw step-loop path needs the task prompt as a user message in the
     // history; the pipeline path takes the goal separately and appends its own
@@ -524,13 +530,13 @@ async fn run_task(
     let (summary, success): (String, bool) = if use_pipeline {
         use stella_core::router::{CircuitBreaker, Router};
         use stella_pipeline::{
-            AutoApproveGate, NoContextRecall, Pipeline, PipelineConfig, PipelinePorts,
-            PipelineStatus,
+            NoContextRecall, Pipeline, PipelineConfig, PipelinePorts, PipelineStatus,
         };
         let model_ref = stella_protocol::ModelRef::new(cfg.provider.id, cfg.model_id.clone());
         // Role wiring from `agent_engine_config` — fleet workers honor the
-        // same triage/judge pins and per-role overrides as `stella run`.
-        let wiring = agent::resolve_engine_wiring(&cfg, &model_ref);
+        // same worker/triage/judge pins and per-role overrides as `stella run`.
+        let configured = crate::config::discover_configured_providers();
+        let wiring = agent::resolve_engine_wiring(&cfg, &model_ref, &configured);
         for notice in &wiring.notices {
             eprintln!("  ! {notice}");
         }
@@ -543,7 +549,12 @@ async fn run_task(
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
         // Rooted at the fleet worker's own worktree, so a candidate snapshot
         // nests off that worktree's checkout, never the primary repo's.
-        let ws_ports = agent::workspace_ports(root.to_path_buf(), &cfg);
+        let ws_ports = agent::workspace_ports(
+            root.to_path_buf(),
+            &cfg,
+            registry_options,
+            active_rules.clone(),
+        )?;
         let recall = NoContextRecall;
         let hook_runner = ShellHookRunner;
         let ports = PipelinePorts {
@@ -553,8 +564,9 @@ async fn run_task(
             recall: &recall,
             repo: &ws_ports.repo_structure,
             repo_status: &ws_ports.repo_status,
-            commands: &ws_ports.command_runner,
-            approvals: &AutoApproveGate,
+            diagnostics: &ws_ports.diagnostic_runner,
+            tests: &ws_ports.test_runner,
+            approvals: &agent::HEADLESS_APPROVAL_GATE,
             sleeper: &TokioSleeper,
             hooks: cfg
                 .hooks
@@ -565,10 +577,10 @@ async fn run_task(
             steering: None,
         };
         let config = PipelineConfig {
-            engine: agent::pipeline_engine_config_for(&cfg),
+            engine: agent::pipeline_engine_config_for(&cfg, &wiring.worker_model),
             role_overrides: wiring.role_overrides.clone(),
             headless: true,
-            headless_bypass_scope_review: true,
+            headless_bypass_scope_review: agent::HEADLESS_SCOPE_REVIEW_BYPASS,
             ..PipelineConfig::default()
         };
         let pipeline = Pipeline::new(ports, tx.clone(), config);
@@ -590,6 +602,10 @@ async fn run_task(
         match raced {
             Raced::Outcome(Ok(outcome)) => match outcome.status {
                 PipelineStatus::Completed => (truncate(&outcome.final_text), true),
+                PipelineStatus::VerificationFailed { verdict } => (
+                    truncate(&format!("verification failed: {}", verdict.summary)),
+                    false,
+                ),
                 PipelineStatus::Aborted { reason } => (truncate(&reason), false),
             },
             Raced::Outcome(Err(e)) => (truncate(&e.to_string()), false),
@@ -620,7 +636,7 @@ async fn run_task(
         };
         match raced {
             Raced::Outcome(TurnOutcome::Completed { text, .. }) => (truncate(&text), true),
-            Raced::Outcome(TurnOutcome::Aborted { reason }) => (truncate(&reason), false),
+            Raced::Outcome(TurnOutcome::Aborted { reason, .. }) => (truncate(&reason), false),
             Raced::Stopped => (STOPPED.to_string(), false),
         }
     };
@@ -699,7 +715,7 @@ fn truncate(s: &str) -> String {
 /// The end-of-run report: per task its outcome, spend, commits, and (when
 /// isolated) the worktree that holds the work, then the totals and where the
 /// receipts live.
-fn render_report(plan: &Plan, report: &FleetRunReport, dot_stella: &Path) {
+fn render_report(plan: &Plan, report: &FleetRunReport, ledger_path: &Path) {
     println!();
     for handle in &report.handles {
         let ok = handle.outcome.success;
@@ -750,7 +766,7 @@ fn render_report(plan: &Plan, report: &FleetRunReport, dot_stella: &Path) {
     println!(
         "\n  total ${:.4} · ledger {} · worktrees kept for review (`git worktree list`)\n",
         report.total_cost_usd(),
-        dot_stella.join("fleet.db").display(),
+        ledger_path.display(),
     );
 }
 
