@@ -64,6 +64,22 @@ to this repo's GitHub Releases and need no extra secrets — only the Homebrew
 tap push does. If neither secret is set, the release still succeeds and
 the `homebrew` job skips with a warning.
 
+**Optional — auto-merging the version-sync PR without a manual `--admin`.**
+`auto-tag.yml`'s `bot/version-sync` PR only carries a Cargo.toml/Cargo.lock
+diff, and branch protection's required `ci` checks never run on it the normal
+way (see #275): the workflow dispatches them itself, but the PR's own
+GITHUB_TOKEN authorship also spawns an unrunnable `pull_request`-triggered
+check suite that can leave `mergeable_state` stuck on "blocked" even once the
+dispatched run is green. The workflow verifies that dispatched run itself and
+then bypasses whatever is blocking with an admin-privileged merge — for that
+bypass to actually succeed (rather than fall back to arming ordinary
+auto-merge, which will just sit there the same way `--admin` used to be
+needed), add a **classic PAT with `repo` scope, owned by an account with
+admin/bypass rights on this repository**, as the `RELEASE_ADMIN_TOKEN` secret.
+Without it, sync PRs still get merged — just by a human running
+`gh pr merge bot/version-sync --squash --admin` once checks are green, same
+as before this workflow existed.
+
 ## Cut a release
 
 1. Bump the version if needed — `version` in `[workspace.package]` of the root
