@@ -43,6 +43,8 @@ use crate::domains::Domains;
 
 mod private_state;
 mod projection;
+#[cfg(test)]
+mod quarantine_tests;
 use private_state::resolve_context_db_path;
 use projection::{is_quarantined_local_memory, project_recalled_frame};
 
@@ -644,11 +646,18 @@ impl SessionMemory {
         }
     }
 
-    /// The single authoritative recall operation for both prompt rendering
-    /// and the staged pipeline. It owns host fan-out, provenance projection,
-    /// A/B suppression, and a FRESH quarantine read so feedback written by a
-    /// previous turn takes effect on the very next recall.
+    /// Authoritative prompt and pipeline recall, including a fresh quarantine
+    /// read so prior-turn feedback applies immediately.
     async fn recalled_frames(&self, goal: &str) -> Vec<RecalledFrame> {
+        self.recalled_frames_reporting(goal, |message| eprintln!("  {} {message}", "!".yellow()))
+            .await
+    }
+    /// Recall with an injectable diagnostic sink to avoid global stderr capture in tests.
+    async fn recalled_frames_reporting(
+        &self,
+        goal: &str,
+        mut report: impl FnMut(String),
+    ) -> Vec<RecalledFrame> {
         if self.ab_suppressed {
             return Vec::new();
         }
@@ -662,9 +671,17 @@ impl SessionMemory {
             max_tokens: 1200,
             as_of: None,
         };
-        let quarantined = stella_store::Store::open(&self.workspace_root)
-            .map(|store| store.quarantined_memory_ids())
-            .unwrap_or_default();
+        let quarantined = match stella_store::Store::open(&self.workspace_root)
+            .and_then(|store| store.quarantined_memory_ids())
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                report(format!(
+                    "memory recall disabled: quarantine state unavailable: {error}"
+                ));
+                return Vec::new();
+            }
+        };
         crate::ocp::recall_via_host(&self.host, &query)
             .await
             .into_iter()
@@ -678,7 +695,7 @@ impl SessionMemory {
 /// split-context planner (L-E6) receives the same durable lessons the
 /// worker's injected recall block carries, as structured frames instead of a
 /// rendered string. Frames without a citation label are dropped (L-C4), and
-/// a failed recall degrades to no frames, never an error (L-C6).
+/// failed recall, including quarantine verification, degrades to no frames (L-C6).
 #[async_trait::async_trait]
 impl ContextRecallPort for SessionMemory {
     async fn recall(&self, goal: &str) -> Vec<RecalledFrame> {

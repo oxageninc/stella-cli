@@ -96,6 +96,8 @@ mod migrations;
 mod private;
 #[cfg(test)]
 mod private_state_tests;
+#[cfg(test)]
+mod quarantine_tests;
 
 pub mod catalog;
 pub mod enterprise_telemetry;
@@ -905,19 +907,17 @@ impl Store {
         Ok(stats)
     }
 
-    /// The public ids (`nod_…`) of memories that are quarantined from recall:
-    /// cited untruthful at least [`QUARANTINE_NEGATIVES_THRESHOLD`] times.
-    /// These are excluded from the recall block so a stale/wrong memory that
-    /// multiple agents verified as false stops misleading future turns.
-    /// Best-effort: a query failure returns an empty set (recall proceeds
-    /// unfiltered rather than failing).
-    pub fn quarantined_memory_ids(&self) -> std::collections::HashSet<String> {
-        self.memory_citation_stats()
-            .unwrap_or_default()
+    /// Public ids (`nod_…`) cited untruthful at least
+    /// [`QUARANTINE_NEGATIVES_THRESHOLD`] times and excluded from recall.
+    /// A query failure is explicit because an empty set means the query
+    /// succeeded and no memories are quarantined.
+    pub fn quarantined_memory_ids(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(self
+            .memory_citation_stats()?
             .into_iter()
             .filter(|s| s.quarantined)
             .map(|s| s.memory_id)
-            .collect()
+            .collect())
     }
 
     /// Persist the MCP tool calls recorded during an execution: one row per
