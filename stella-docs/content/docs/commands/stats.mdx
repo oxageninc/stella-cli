@@ -22,6 +22,22 @@ stella stats [--format <table|json|csv>] [--provider <id>]
 | `--format <table\|json\|csv>` | Output format. `table` (default) prints an aligned table with a `TOTAL` row; `json` and `csv` are for piping into other tools. |
 | `--provider <id>` | Only include executions for this provider id (e.g. `zai`, `anthropic`, `local`). |
 
+## Reading the cache columns
+
+Every row also carries three cache-economics columns, derived at display time from your local telemetry (they aren't stored — `stella stats` computes them fresh from the raw token counts each run):
+
+| Column | Meaning |
+| --- | --- |
+| `HIT%` | Cache-read tokens over total input tokens for that row — the same figure the deck's `CACHE` statline cell shows for the live session. |
+| `SAVED ($)` | Estimated USD saved by prompt caching, priced at **today's** catalog rates (not the price in effect when each call actually ran). Signed: negative means the provider's cache-write premium outran the reads it bought — the "cache never actually helped" incident worth investigating. `-` when the model isn't in the running catalog. |
+| `TTL REWRITES` | Calls whose cache prefix went cold — the gap since that session's previous call exceeded the provider's cache TTL — and got rewritten instead of read back. `0` for a provider with no documented TTL. This is the tax cache-TTL-aware fleet scheduling exists to cut: a session parked too long between turns pays the write premium again for no reason. |
+
+A `0%` `HIT%` across several turns on an opt-in provider (Anthropic, Bedrock, or Claude-via-OpenRouter) with `CACHE WR` also at `0` usually means the opt-in cache marker never reached the wire — check your adapter config before assuming the model just isn't cacheable. If `CACHE WR` is nonzero but `HIT%` stays low, the prompt prefix is likely being rewritten between turns instead of reused.
+
+<Callout type="info">
+The deck's statline shows the same `CACHE`/`SAVED`/`WARMTH` cells live per session, plus a per-agent breakdown in the Agents tab (`Cache`/`Warmth` columns) and a countdown to when each agent's cached prefix expires.
+</Callout>
+
 ## Examples
 
 Print the aligned summary with a total row:
@@ -40,6 +56,12 @@ Emit JSON for a dashboard or a jq pipeline:
 
 ```bash
 stella stats --format json | jq '.[] | {model, total_cost_usd, resolve_rate}'
+```
+
+Find providers/models with a suspiciously low cache hit rate:
+
+```bash
+stella stats --format json | jq '.[] | select(.cache_hit_rate < 0.2) | {provider, model, cache_hit_rate, cache_expired_rewrites}'
 ```
 
 <Callout type="info">
