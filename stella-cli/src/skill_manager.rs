@@ -639,7 +639,7 @@ mod tests {
 
         // The recall/selection loader now filters disabled skills (the file
         // stays on disk — the tab still shows it above), keeping the enabled one.
-        let recalled = crate::memory::load_workspace_skills(&ws);
+        let recalled = crate::memory::load_workspace_skills_with_authority(&ws, true).skills;
         assert!(
             !recalled.iter().any(|s| s.name == "sql-style"),
             "disabled excluded from recall"
@@ -659,7 +659,8 @@ mod tests {
                 .enabled
         );
         assert!(
-            crate::memory::load_workspace_skills(&ws)
+            crate::memory::load_workspace_skills_with_authority(&ws, true)
+                .skills
                 .iter()
                 .any(|s| s.name == "sql-style")
         );

@@ -1,19 +1,30 @@
 ---
 title: Telemetry & budget
-description: Local-only telemetry in a SQLite store on your disk — tokens, cost, steps, tool calls, files, memory, reflections — and how --budget turns metering into a hard spend cap.
+description: Local-first metering, the opt-in Oxagen Enterprise operational export boundary, spool diagnostics, and how --budget becomes a hard spend cap.
 ---
 
-Stella meters every run **locally**. Token usage, cost, and per-step accounting land in a
-SQLite store on your disk — nothing is sent anywhere.
+Stella meters every run **locally**. Token usage, cost, per-step accounting, and the
+full execution record land in SQLite on your disk.
+
+**Community/default mode has zero telemetry egress.** It constructs no enterprise
+spool or HTTP client. The model provider you selected remains Stella's normal BYOK
+network path; the local Observatory remains loopback-only.
+
+The sole telemetry-egress exception is **explicit Oxagen Enterprise managed
+enrollment**. It is not a user preference and cannot come from a project file: a valid
+signed document in the org-managed settings scope must authorize one minimal
+operational event class, one exact HTTPS sink, and process-free execution. Invalid,
+missing, expired, or unsupported enrollment leaves export inactive.
 
 ## Local metering
 
-Everything lands in one SQLite file: `<workspace>/.stella/store.db`. Because the store is
+Everything lands in one SQLite file: `<workspace>/.stella/private/store.db`. Because the store is
 a real SQLite file, you can inspect it with any SQLite client after a run — e.g.
-`sqlite3 <workspace>/.stella/store.db` — and every execution, its model, and its cost are
+`sqlite3 <workspace>/.stella/private/store.db` — and every execution, its model, and its cost are
 queryable on your own machine. WAL is enabled, so a read-only reader like
-[`stella stats`](/docs/commands/stats) is never blocked by a live session. Stella never
-transmits this data.
+[`stella stats`](/docs/commands/stats) is never blocked by a live session. This local
+store stays canonical even when an Enterprise seat is enrolled; the managed adapter
+can only derive the closed rollup described below.
 
 ### What's in the store
 
@@ -38,7 +49,159 @@ same tables:
 | `tasks` | The latest task-board snapshot, one row per task per session |
 | `pull_requests` | Tracked pull requests — status and CI verdict, keyed by URL |
 | `file_locks` | Cooperative file claims for multi-agent work |
-| `graph_nodes` / `graph_edges` | Reserved schema for a future context-plane seam — the code graph itself lives in `.stella/codegraph.db` |
+| `graph_nodes` / `graph_edges` | Reserved schema for a future context-plane seam — the code graph itself lives in `.stella/private/codegraph.db` |
+
+## Oxagen Enterprise managed export
+
+Managed mode exists for cross-seat operational visibility, capacity planning, and
+cost/reliability diagnostics. It does not ingest `stella fleet` runs; that execution
+surface is rejected under the current process-free authority. This is **operational
+telemetry, not compliance evidence**: it does not produce an audit trail, attest policy
+conformance, capture content for investigations, or replace an organization's SIEM or
+records-retention controls. The `compliance_audit` event class is explicitly
+unsupported.
+
+### Option A product boundary
+
+Stella remains the local execution product: provider calls, tools, workspace access,
+the full event stream, context, and the Observatory stay on the developer host. Oxagen
+is the optional Enterprise control plane: it may provision signed enrollment and
+receive the minimal operational envelope described here.
+
+This repository implements Stella's enrollment verification, projection, durable
+spool, and HTTPS delivery client. A production Oxagen intake with matching
+authentication, schema validation, idempotency, tenancy, retention, and observability
+is a **companion server requirement**; these Stella docs do not claim that intake is
+already deployed.
+
+### Enrollment and sink authorization
+
+Only the org-managed settings file can carry `enterprise_telemetry` (normally
+`/Library/Application Support/stella/settings.json` on macOS or
+`/etc/stella/settings.json` on Linux). Project and user scopes cannot enroll a seat.
+Provisioning writes a shape like this; the signature is generated over canonical claim
+bytes, so this is an administrator/provisioning artifact rather than a hand-edited
+example:
+
+```json title="org-managed settings.json (provisioning shape)"
+{
+  "enterprise_telemetry": {
+    "verification_secret_env": "STELLA_ENTERPRISE_SIGNING_SECRET",
+    "allowed_issuers": ["oxagen-enterprise"],
+    "allowed_audiences": ["stella-cli"],
+    "allowed_endpoints": ["https://telemetry.example.com/v1/stella/operational"],
+    "host_data_isolation": "process_free",
+    "enrollment": {
+      "claims": {
+        "schema": "stella.enterprise.telemetry.enrollment.v1",
+        "issuer": "oxagen-enterprise",
+        "audience": "stella-cli",
+        "enrollment_id": "enrollment-42",
+        "organization_id": "org-42",
+        "workspace_id": "workspace-7",
+        "endpoint": "https://telemetry.example.com/v1/stella/operational",
+        "credential_env": "STELLA_ENTERPRISE_BEARER_TOKEN",
+        "event_classes": ["execution_rollup"],
+        "host_data_isolation": "process_free",
+        "model_catalog": [
+          { "provider": "anthropic", "model": "claude-sonnet-4-5" }
+        ],
+        "issued_at_unix_s": 1784592000,
+        "expires_at_unix_s": 1787184000
+      },
+      "signature_hex": "<64 lowercase hex characters generated by provisioning>"
+    }
+  }
+}
+```
+
+The signed endpoint and an administrator allowlist entry must parse to the **same exact
+credential-free HTTPS URL**. Redirects, URL credentials, query strings, fragments,
+HTTP endpoints, proxy-derived destinations, and merely matching hosts are refused.
+Issuer, audience, event class, process-free mode, lifetime, signature, signing-secret
+reference, and distinct bearer-secret reference are also verified before activation.
+An enrollment is valid for at most 90 days and must be renewed by provisioning.
+
+### Eligible execution path
+
+An enrolled process activates a restricted execution authority. Today the only eligible
+surface is the raw one-shot step loop:
+
+```bash
+stella run --no-pipeline "update the parser and run its in-process checks"
+```
+
+The registry proof disables shell/process, test-process, skill-install/search, web, and
+host-readable media paths. Pipeline runs, `goal`, `fleet`, Command Deck/chat,
+interactive sessions, workspace-port assembly, and candidate-workspace execution are
+rejected while managed export authority is active. Enrollment therefore narrows what
+may execute; it never silently exports from an ineligible path.
+
+### Exported envelope
+
+Only a finalized, post-enrollment run can produce one
+`stella.operational.v1` / `execution_rollup` event. Its closed schema contains:
+
+- managed enrollment, organization, and workspace identifiers;
+- an allowlisted provider/model pair, or the bounded `other` bucket;
+- finalized outcome, duration, input/output token totals, and cost in micro-USD;
+- tool-call count, changed-file count, and whether output was produced; and
+- a deterministic, sink-scoped event ID used for idempotent at-least-once delivery.
+
+It has no fields for prompts, responses, paths or filenames, tool names, tool
+arguments/results, reasoning, errors, git state, memories, rules, full local events,
+local execution IDs, or raw installation/store identifiers. Those values are not
+redacted after collection; they are unrepresentable in the export type.
+
+### Durable spool, retry, and rollover
+
+Finalization first records a durable local export intent, then projects an eligible
+rollup into an owner-only SQLite spool outside the model-writable workspace. On a later
+runtime, up to 256 pending intents are backfilled before delivery. Retained event
+payloads are bounded to **10,000 rows and 16 MiB**; SQLite pages, indexes, WAL/SHM, and
+quarantine metadata can make the physical database larger, so `status` reports physical
+bytes separately. When the payload bound is exceeded, the oldest unleased row for the
+active sink is discarded and the durable `dropped` counter increments.
+
+Delivery is at least once and sink-scoped. A flush leases at most **50 events** and
+**256 KiB** for 30 seconds, refuses redirects, and acknowledges rows only after a
+successful HTTPS response. Credential, transport, or server failures release the exact
+lease with deterministic exponential backoff plus jitter: from one second up to five
+minutes, with jitter capped at 25%. Clock rollback is repaired under a sink-specific
+generation fence.
+
+Changing the signed sink fingerprint never sends old rows to the new sink. Those rows
+become **stranded** until the old enrollment is restored or an administrator explicitly
+discards them:
+
+```bash
+stella telemetry rollover-discard
+```
+
+That destructive action increments a durable `rollover_discarded` counter. Capacity,
+corruption, and rollover loss therefore remain visible rather than being silently
+treated as delivery.
+
+### Status and flushing
+
+These commands need no model provider or API key:
+
+```bash
+stella telemetry status
+stella telemetry flush
+```
+
+`status` reports either `disabled (no managed enrollment)` or `enrolled`, followed by
+pending and stranded rows/bytes, quarantined diagnostic rows/bytes, physical spool
+bytes, and cumulative dropped, corrupt-dropped, and rollover-discarded counts. Invalid
+or expired managed configuration fails with a diagnostic rather than reporting an
+enrolled state.
+
+`flush` attempts one bounded delivery batch immediately and reports sent, pending, and
+dropped counts. Stella also starts a detached best-effort flush after enrollment is
+verified at process startup. That background attempt is non-blocking: it never delays
+agent execution and Stella does not wait for it during shutdown. Use explicit `flush`
+when an operator needs a synchronous delivery attempt before maintenance.
 
 ## Budget: observed vs. enforced
 
@@ -75,7 +238,7 @@ SQLite store, so the number you see matches what was recorded locally.
 
 ## Seeing your usage
 
-Three ways to read the telemetry back, all local:
+Three ways to read the canonical local telemetry back:
 
 - **[`stella observe`](/docs/telemetry/dashboard)** — the Observatory, a loopback-only web
   dashboard (default `http://127.0.0.1:7787/`): runs, spend, resolve rates, **$/resolved**

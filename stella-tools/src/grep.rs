@@ -157,6 +157,7 @@ impl Tool for Grep {
 
         // Try ripgrep first — it's the fast path.
         let mut rg = Command::new("rg");
+        crate::exec::scrub_sensitive_env(&mut rg);
         rg.arg("--line-number")
             .arg("--no-heading")
             .arg("--color")
@@ -208,6 +209,7 @@ impl Tool for Grep {
             Err(_) => {
                 // rg not installed — fall back to grep
                 let mut grep = Command::new("grep");
+                crate::exec::scrub_sensitive_env(&mut grep);
                 grep.arg("-rn").arg("--color=never");
                 if let Some(g) = glob_filter {
                     grep.arg("--include").arg(g);

@@ -5,6 +5,8 @@
 //! [`run_argv`] execs an argv vector directly with NO shell anywhere
 //! (`run_script`, `run_lint`, `format_code`).
 
+use std::collections::BTreeSet;
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -55,6 +57,77 @@ pub const GIT_REPO_ENV_VARS: [&str; 8] = [
 /// column 1". Scrubbing only the *force* overrides restores standard
 /// pipe detection; tools stay colorless on pipes, as they'd be anywhere.
 pub const FORCED_COLOR_ENV_VARS: [&str; 3] = ["CLICOLOR_FORCE", "FORCE_COLOR", "GH_FORCE_TTY"];
+
+const DEFAULT_SENSITIVE_ENV_VARS: [&str; 15] = [
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "ZAI_API_KEY",
+    "XAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "LOCAL_API_KEY",
+    "BRAVE_API_KEY",
+    "TAVILY_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+];
+
+fn sensitive_env_names() -> &'static RwLock<BTreeSet<String>> {
+    static NAMES: OnceLock<RwLock<BTreeSet<String>>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        RwLock::new(
+            DEFAULT_SENSITIVE_ENV_VARS
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+    })
+}
+
+/// Add host-owned credential references that model-controlled subprocesses
+/// must never inherit. Names are process-global and only become stricter.
+pub fn register_sensitive_env_names<I, S>(names: I)
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut registered = sensitive_env_names()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registered.extend(names.into_iter().map(Into::into));
+}
+
+/// Whether a name is currently classified as a host credential.
+pub fn is_sensitive_env_name(name: &str) -> bool {
+    sensitive_env_names()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(name)
+}
+
+/// Remove every registered host credential from a model-controlled child.
+pub fn scrub_sensitive_env(cmd: &mut Command) {
+    let registered = sensitive_env_names()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for name in registered.iter() {
+        cmd.env_remove(name);
+    }
+}
+
+/// Synchronous-command counterpart used by fixed helper probes.
+pub fn scrub_sensitive_std_env(cmd: &mut std::process::Command) {
+    let registered = sensitive_env_names()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for name in registered.iter() {
+        cmd.env_remove(name);
+    }
+}
 
 /// Run `command` via `bash -c` in `dir`. Returns `(exit_code, combined
 /// stdout+stderr)`; `Err` is spawn failure or timeout (the process group is
@@ -128,6 +201,7 @@ async fn drive(
     for var in FORCED_COLOR_ENV_VARS {
         cmd.env_remove(var);
     }
+    scrub_sensitive_env(&mut cmd);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     #[cfg(unix)]
@@ -258,6 +332,32 @@ mod tests {
         .unwrap();
         assert_eq!(code, 0);
         assert!(out.contains("$(id); `id`; && ||"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn model_controlled_commands_cannot_inherit_registered_host_credentials() {
+        let secret_name = "STELLA_TEST_ENROLLMENT_VERIFY_SECRET";
+        let token_name = "STELLA_TEST_ENROLLMENT_BEARER";
+        register_sensitive_env_names([secret_name, token_name]);
+        unsafe {
+            std::env::set_var(secret_name, "verification-secret-value");
+            std::env::set_var(token_name, "bearer-secret-value");
+        }
+        let result = run_argv("env", &[], std::path::Path::new("/tmp"), 30).await;
+        unsafe {
+            std::env::remove_var(secret_name);
+            std::env::remove_var(token_name);
+        }
+        let (code, output) = result.unwrap();
+        assert_eq!(code, 0);
+        for forbidden in [
+            secret_name,
+            token_name,
+            "verification-secret-value",
+            "bearer-secret-value",
+        ] {
+            assert!(!output.contains(forbidden), "credential leaked: {output}");
+        }
     }
 
     /// Dropping the future mid-wait (a cancelled turn) must kill the whole

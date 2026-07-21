@@ -125,6 +125,7 @@ fn run_session(spec: SessionSpec, frame_tx: mpsc::UnboundedSender<ServerFrame>, 
             let _ = frame_tx.send(ServerFrame::TurnComplete {
                 outcome: TurnOutcomeWire::Aborted {
                     reason: ServeError::RuntimeBuild(err.to_string()).to_string(),
+                    cost_usd: 0.0,
                 },
             });
             return;

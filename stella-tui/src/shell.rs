@@ -114,12 +114,14 @@ impl DebugLog {
 
 /// Append one structured JSON line to `path` (best-effort). Also used by the
 /// panic hook in [`crate::term`] to record panics into the same log.
+#[cfg(unix)]
 pub(crate) fn append_json_line(
     path: &PathBuf,
     kind: &str,
     payload: serde_json::Value,
 ) -> io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -127,9 +129,33 @@ pub(crate) fn append_json_line(
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(io::Error::other(
+            "debug log must be a single-link regular file",
+        ));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let line = serde_json::json!({ "ts_ms": ts_ms, "kind": kind, "payload": payload });
     writeln!(file, "{line}")
+}
+
+#[cfg(not(unix))]
+pub(crate) fn append_json_line(
+    path: &PathBuf,
+    _kind: &str,
+    _payload: serde_json::Value,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "secure debug-log persistence is unsupported on this platform: {}",
+            path.display()
+        ),
+    ))
 }
 
 /// Run the interactive TUI to completion.
@@ -337,6 +363,30 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["event", "input", "note"]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn debug_log_rejects_a_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.jsonl");
+        std::fs::write(&target, "outside\n").unwrap();
+        let path = dir.path().join("debug.jsonl");
+        symlink(&target, &path).unwrap();
+
+        assert!(append_json_line(&path, "note", serde_json::json!({})).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "outside\n");
     }
 
     /// The one interactive path a unit test cannot drive: it needs a real TTY

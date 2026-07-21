@@ -59,7 +59,7 @@ came through:
 | Deck sub-agents | `task_assign` (agent-initiated) | One raw turn per delegated task, own context | The lead reviews results | `deck-sub` | Follows the deck |
 | Goal mode | `stella goal "…"` | Judged **rounds** until the goal is met; pipeline rounds by default, `--no-pipeline` for raw | An independent judge, from evidence, over read-only tools | `goal` | Yes |
 | CI monitor | `stella monitor [target]` | Goal mode with a fixed objective | The judge reads `ci_status`; ends only on a fully green latest run | `goal` | Yes |
-| Fleet workers | `stella fleet …` | One worker per task, wave-scheduled by dependency | Per task (pipeline when available, else raw); attempts recorded in `.stella/fleet.db` | fleet ledger | Yes |
+| Fleet workers | `stella fleet …` | One worker per task, wave-scheduled by dependency | Per task (pipeline when available, else raw); attempts recorded in `.stella/private/fleet.db` | fleet ledger | Yes |
 
 ## One-shot: `stella run`
 
@@ -166,7 +166,7 @@ fan a dependency-ordered task DAG out to parallel workers — in one shared
 tree coordinated by cooperative file claims, or in dedicated worktrees for
 tasks marked `isolation = "isolated"`. Each worker drives the same engine
 per task (staged pipeline when available, raw step loop otherwise), and
-every attempt, commit, and dollar lands in `.stella/fleet.db` for review.
+every attempt, commit, and dollar lands in `.stella/private/fleet.db` for review.
 
 **Use it when** you have a backlog, not a task: migrations across many
 modules, a list of independent fixes, wide refactors.

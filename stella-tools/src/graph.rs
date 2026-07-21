@@ -1,5 +1,5 @@
 //! `graph_query` — query the workspace's code graph (tree-sitter symbols +
-//! import edges, auto-indexed at session start into `.stella/codegraph.db`
+//! import edges, auto-indexed at session start into `.stella/private/codegraph.db`
 //! and kept fresh by the live watcher).
 //!
 //! This is the runtime retrieval surface of `stella-graph`: instead of
@@ -28,12 +28,25 @@ const MAX_FRAMES: usize = 30;
 
 /// The index location `stella init` writes and the schema gate reads.
 pub fn graph_db_path(root: &Path) -> PathBuf {
-    root.join(".stella").join("codegraph.db")
+    root.join(".stella").join("private").join("codegraph.db")
 }
 
-/// Whether the workspace has an index — the registration condition.
-pub fn graph_available(root: &Path) -> bool {
-    graph_db_path(root).exists()
+/// Whether the workspace has an index — the registration condition. Resolver
+/// failures stay distinct from absence so security errors cannot disable
+/// graph-backed governance by masquerading as an uninitialized workspace.
+pub fn graph_available(root: &Path) -> Result<bool, String> {
+    stella_store::existing_workspace_private_sqlite_path(root, "codegraph.db")
+        .map(|path| path.is_some())
+        .map_err(|error| format!("cannot resolve private code graph state: {error}"))
+}
+
+/// Fallible storage-map assembly for every governance caller. The graph crate's
+/// lower loader remains format-focused and best-effort; this boundary performs
+/// private-state migration and rejects unsafe legacy layouts before delegating.
+pub fn load_storage_snapshot(root: &Path) -> Result<stella_graph::StorageSnapshot, String> {
+    stella_store::existing_workspace_private_sqlite_path(root, "codegraph.db")
+        .map_err(|error| format!("cannot resolve private code graph state: {error}"))?;
+    Ok(stella_graph::load_storage_snapshot(root))
 }
 
 pub struct CodeGraphQuery;
@@ -88,12 +101,21 @@ impl Tool for CodeGraphQuery {
 /// Shared by the tool and the `stella graph` subcommand so both render the
 /// exact same frames.
 pub fn run_query(root: &Path, op: &str, target: &str) -> ToolOutput {
-    let db_path = graph_db_path(root);
-    if !db_path.exists() {
-        return ToolOutput::Error {
-            message: "no code graph index — run `stella init` to build .stella/codegraph.db".into(),
-        };
-    }
+    let db_path = match stella_store::existing_workspace_private_sqlite_path(root, "codegraph.db") {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return ToolOutput::Error {
+                message:
+                    "no code graph index — run `stella init` to build .stella/private/codegraph.db"
+                        .into(),
+            };
+        }
+        Err(error) => {
+            return ToolOutput::Error {
+                message: format!("cannot resolve private code graph state: {error}"),
+            };
+        }
+    };
     let graph = match stella_graph::CodeGraph::open(root, &db_path) {
         Ok(g) => g,
         Err(e) => {
@@ -196,6 +218,26 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
+    fn legacy_indexed_workspace(dot_mode: u32) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn legacy_greet() -> &'static str { \"hi\" }\n",
+        )
+        .expect("write source");
+        let dot = dir.path().join(".stella");
+        std::fs::create_dir_all(&dot).expect("mkdir");
+        std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(dot_mode)).unwrap();
+        let legacy = dot.join("codegraph.db");
+        let graph = stella_graph::CodeGraph::open(dir.path(), &legacy).expect("open graph");
+        graph.index_all().expect("index");
+        graph.shutdown();
+        dir
+    }
+
     #[test]
     fn schema_is_read_only_and_named() {
         let schema = CodeGraphQuery.schema();
@@ -233,6 +275,45 @@ mod tests {
             }
             ToolOutput::Error { message } => panic!("expected frames, got: {message}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_query_migrates_a_safe_legacy_index_before_opening_it() {
+        let dir = legacy_indexed_workspace(0o700);
+        let output = run_query(dir.path(), "definitions", "legacy_greet");
+        match output {
+            ToolOutput::Ok { content } => assert!(content.contains("legacy_greet")),
+            ToolOutput::Error { message } => panic!("safe legacy index should migrate: {message}"),
+        }
+        assert!(!dir.path().join(".stella/codegraph.db").exists());
+        assert!(graph_db_path(dir.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_query_reports_unsafe_legacy_index_instead_of_claiming_it_is_absent() {
+        let dir = legacy_indexed_workspace(0o777);
+        let output = run_query(dir.path(), "definitions", "legacy_greet");
+        match output {
+            ToolOutput::Error { message } => {
+                assert!(
+                    message.contains("legacy") && message.contains("private"),
+                    "{message}"
+                );
+                assert!(!message.contains("no code graph index"), "{message}");
+            }
+            ToolOutput::Ok { .. } => panic!("unsafe legacy index must fail closed"),
+        }
+        assert!(dir.path().join(".stella/codegraph.db").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn availability_preflight_migrates_a_safe_legacy_index() {
+        let dir = legacy_indexed_workspace(0o700);
+        assert!(graph_available(dir.path()).unwrap());
+        assert!(graph_db_path(dir.path()).exists());
     }
 
     #[tokio::test]

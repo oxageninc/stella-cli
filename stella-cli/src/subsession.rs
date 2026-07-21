@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use stella_core::Engine;
 use stella_core::tasks::SpawnRequest;
 use stella_protocol::{AgentEvent, CompletionMessage, TaskItem};
-use stella_tools::ToolRegistry;
+use stella_tools::{RegistryOptions, ToolRegistry};
 use stella_tui::{AgentMeta, AgentStatus, Inbound};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::{oneshot, watch};
@@ -84,17 +84,28 @@ pub(crate) struct SubSessions {
     pauses: HashMap<String, watch::Sender<bool>>,
     /// Every lane's spec, retained past its end — what Restart respawns.
     specs: HashMap<String, SubSessionSpec>,
+    registry_options: RegistryOptions,
 }
 
 impl SubSessions {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_registry_options(RegistryOptions::default())
+    }
+
+    pub(crate) fn with_registry_options(registry_options: RegistryOptions) -> Self {
         Self {
             active: 0,
             next_req: 0,
             stops: HashMap::new(),
             pauses: HashMap::new(),
             specs: HashMap::new(),
+            registry_options,
         }
+    }
+
+    fn worker_registry_options(&self) -> RegistryOptions {
+        self.registry_options.clone()
     }
 
     pub(crate) fn has_slot(&self) -> bool {
@@ -275,6 +286,7 @@ pub(crate) fn task_prompt(req: &SpawnRequest) -> String {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     cfg: &Config,
+    registry_options: RegistryOptions,
     spec: SubSessionSpec,
     budget_limit: Option<f64>,
     session_id: String,
@@ -303,6 +315,7 @@ pub(crate) fn spawn(
         {
             Ok(rt) => rt.block_on(run_worker(
                 &cfg,
+                registry_options,
                 &spec,
                 budget_limit,
                 &session_id,
@@ -374,8 +387,10 @@ pub(crate) fn spawn(
 /// shared persist-and-forward event path, one raw engine turn raced against
 /// the driver's stop signal (the same clean drop-at-await cancel the lead
 /// uses). Returns `(execution_id, cost_usd, end)`.
+#[allow(clippy::too_many_arguments)]
 async fn run_worker(
     cfg: &Config,
+    registry_options: RegistryOptions,
     spec: &SubSessionSpec,
     budget_limit: Option<f64>,
     session_id: &str,
@@ -387,20 +402,25 @@ async fn run_worker(
         Ok(p) => p,
         Err(e) => return (None, 0.0, WorkerEnd::Failed(e)),
     };
-    let registry =
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), agent::registry_options(cfg)).await;
-    agent::populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    let registry = ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options).await;
+    if let Err(error) = agent::populate_schema_index(&registry, &cfg.workspace_root) {
+        return (None, 0.0, WorkerEnd::Failed(error));
+    }
+    let active_rules =
+        crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
 
-    let system_prompt =
-        agent::with_session_hook_context(agent::build_system_prompt(cfg, &cfg.workspace_root), cfg)
-            .await;
+    let system_prompt = agent::with_session_hook_context(
+        agent::build_system_prompt(cfg, &cfg.workspace_root, &active_rules),
+        cfg,
+    )
+    .await;
     let mut messages = vec![
         CompletionMessage::system(system_prompt),
         crate::attachments::user_message(&spec.prompt),
     ];
     let mut budget = agent::build_budget_guard(budget_limit);
     budget.begin_turn();
+    let dispatch_spend_usd = budget.session_spent_usd();
 
     let store = agent::open_store(&cfg.workspace_root);
     let calibration = agent::seed_calibration(&store, cfg);
@@ -481,10 +501,14 @@ async fn run_worker(
         RacedTurn::Outcome(stella_core::TurnOutcome::Completed { cost_usd, .. }) => {
             ("completed", cost_usd, WorkerEnd::Done)
         }
-        RacedTurn::Outcome(stella_core::TurnOutcome::Aborted { reason }) => {
-            ("aborted", 0.0, WorkerEnd::Failed(reason))
+        RacedTurn::Outcome(stella_core::TurnOutcome::Aborted { reason, cost_usd }) => {
+            ("aborted", cost_usd, WorkerEnd::Failed(reason))
         }
-        RacedTurn::Stopped => ("cancelled", 0.0, WorkerEnd::Stopped),
+        RacedTurn::Stopped => (
+            "cancelled",
+            agent::settled_cost_since(dispatch_spend_usd, budget.session_spent_usd()),
+            WorkerEnd::Stopped,
+        ),
     };
     if let Some((store, id)) = &execution {
         let _ = agent::record_execution_end(store, *id, &registry, label, cost);
@@ -545,6 +569,7 @@ pub(crate) fn drain_queue(
         subs.started(&lane, stop_tx, pause_tx, spec.clone());
         spawn(
             cfg,
+            subs.worker_registry_options(),
             spec,
             budget_limit,
             session_id.to_string(),
@@ -578,9 +603,11 @@ pub(crate) fn respawn(
     };
     let (stop_tx, stop_rx) = oneshot::channel();
     let (pause_tx, pause_rx) = watch::channel(false);
+    let registry_options = subs.worker_registry_options();
     subs.started(lane, stop_tx, pause_tx, spec.clone());
     spawn(
         cfg,
+        registry_options,
         spec,
         budget_limit,
         session_id.to_string(),
@@ -619,9 +646,11 @@ pub(crate) fn spawn_task_worker(
             prompt_line(&req.subject, 40)
         ),
     };
+    let registry_options = subs.worker_registry_options();
     subs.started(&lane, stop_tx, pause_tx, spec.clone());
     spawn(
         cfg,
+        registry_options,
         spec,
         budget_limit,
         session_id.to_string(),
@@ -636,6 +665,24 @@ pub(crate) fn spawn_task_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workers_clone_the_exact_parent_media_journal() {
+        let journal: std::sync::Arc<dyn stella_media::MediaOperationJournal> = std::sync::Arc::new(
+            stella_media::SqliteMediaOperationJournal::open_in_memory(Default::default()).unwrap(),
+        );
+        let subs = SubSessions::with_registry_options(RegistryOptions {
+            media_operation_journal: Some(journal.clone()),
+            ..Default::default()
+        });
+
+        let worker = subs.worker_registry_options();
+
+        assert!(std::sync::Arc::ptr_eq(
+            &journal,
+            worker.media_operation_journal.as_ref().unwrap()
+        ));
+    }
 
     fn dummy_spec(lane: &str) -> SubSessionSpec {
         SubSessionSpec {

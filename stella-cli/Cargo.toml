@@ -31,6 +31,7 @@ stella-tools = { path = "../stella-tools" }
 stella-store = { path = "../stella-store" }
 stella-observatory = { path = "../stella-observatory" }
 stella-mcp = { path = "../stella-mcp" }
+stella-media = { path = "../stella-media" }
 stella-context = { path = "../stella-context" }
 stella-graph = { path = "../stella-graph" }
 stella-fleet = { path = "../stella-fleet" }
@@ -38,6 +39,10 @@ stella-pipeline = { path = "../stella-pipeline" }
 stella-tui = { path = "../stella-tui" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 async-trait.workspace = true
 clap.workspace = true
@@ -52,3 +57,4 @@ rpassword.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+rusqlite.workspace = true

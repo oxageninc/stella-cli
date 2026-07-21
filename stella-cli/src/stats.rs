@@ -1,5 +1,5 @@
 //! `stella stats` — cost/$-per-resolved-task analytics straight from the
-//! workspace's local SQLite telemetry (`.stella/store.db`).
+//! workspace's local SQLite telemetry (`.stella/private/store.db`).
 //!
 //! Reads what `stella-store` recorded — nothing else. Works with zero API
 //! keys configured (no provider is ever resolved), never writes: if the
@@ -31,8 +31,9 @@ pub fn run_stats(format: StatsFormat, provider: Option<&str>) -> Result<(), Stri
 
     // Stats is read-only: opening the store would create `.stella/` as a
     // side effect, so bail out politely when there's nothing to read.
-    let db_path = workspace_root.join(".stella").join("store.db");
-    let rows = if db_path.exists() {
+    let db_path = stella_store::existing_workspace_private_sqlite_path(&workspace_root, "store.db")
+        .map_err(|e| format!("cannot resolve local store: {e}"))?;
+    let rows = if db_path.is_some() {
         let store =
             Store::open(&workspace_root).map_err(|e| format!("cannot open local store: {e}"))?;
         let mut rows = store
@@ -90,7 +91,7 @@ fn empty_message(provider: Option<&str>) -> String {
              chat/goal) to generate local telemetry."
         ),
         None => "No executions recorded yet — run `stella run \"...\"` (or chat/goal) to \
-                 generate local telemetry in .stella/store.db."
+                 generate local telemetry in .stella/private/store.db."
             .to_string(),
     }
 }
@@ -106,9 +107,9 @@ fn legacy_duckdb_message(provider: Option<&str>) -> String {
     };
     format!(
         "No executions in the SQLite store{scope}, but a legacy .stella/stella.duckdb was \
-         found. Stella migrated its telemetry store from DuckDB to SQLite (.stella/store.db); \
+         found. Stella migrated its telemetry store from DuckDB to SQLite (.stella/private/store.db); \
          the old DuckDB file is not read by this version and is not migrated automatically. \
-         New runs record to .stella/store.db; the historical DuckDB data is preserved on disk \
+         New runs record to .stella/private/store.db; the historical DuckDB data is preserved on disk \
          but not shown here."
     )
 }

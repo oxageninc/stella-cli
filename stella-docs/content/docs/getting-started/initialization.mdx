@@ -18,8 +18,8 @@ stella init
    reflections, and every code-graph node — so the
    [context engine](/docs/context-engine) can relate a memory, a reflection,
    and a file to the same area of your project. Also persisted into the
-   context plane at `.stella/context.db`.
-2. **Builds the code-graph index** → `.stella/codegraph.db`. A tree-sitter
+   context plane at `.stella/private/context.db`.
+2. **Builds the code-graph index** → `.stella/private/codegraph.db`. A tree-sitter
    symbol/import index the agent queries through `graph_query` (and you query
    through [`stella graph`](/docs/commands/graph)) instead of grepping blind.
 3. **Adopts existing agent extensions.** Commands, skills, and agents already
@@ -45,9 +45,9 @@ files and SQLite databases you can inspect, version, or delete at will:
 | Path | What it holds |
 | --- | --- |
 | `.stella/domains.toml` | The domain taxonomy (tagging vocabulary) |
-| `.stella/codegraph.db` | The tree-sitter code-graph index |
-| `.stella/context.db` | The context plane — memory nodes, reflections, episodes, bi-temporal facts |
-| `.stella/store.db` | Executions, events, token/cost telemetry, the files-touched ledger |
+| `.stella/private/codegraph.db` | The tree-sitter code-graph index |
+| `.stella/private/context.db` | The context plane — memory nodes, reflections, episodes, bi-temporal facts |
+| `.stella/private/store.db` | Executions, events, token/cost telemetry, the files-touched ledger |
 | `.stella/memories/*.md` | Workspace [memories](/docs/context-engine) (plain Markdown) |
 | `.stella/rules/*.md` | Workspace rules — promoted memories and guard rules |
 | `.stella/skills/` | Project-scope [skills](/docs/agent-tools/skills) |
@@ -55,11 +55,16 @@ files and SQLite databases you can inspect, version, or delete at will:
 | `.stella/mcp.toml` | [MCP servers](/docs/agent-tools/mcp) to connect at session start |
 | `.stella/tools/*.toml` | [Custom script tools](/docs/agent-tools/custom-tools) |
 | `.stella/commands/` · `.stella/agents/` | [Custom commands](/docs/agent-tools/commands) and [custom agents](/docs/agent-tools/custom-agents) |
-| `.stella/fleet.db` | The [fleet](/docs/agent-fleets) ledger — runs, attempts, commits |
+| `.stella/private/fleet.db` | The [fleet](/docs/agent-fleets) ledger — runs, attempts, commits |
 | `.stella/worktrees/` | Dedicated worktrees for fleet tasks marked `isolation = "isolated"` |
 | `.stella/exports/` | Session telemetry [exports](/docs/telemetry/dashboard) (ZIP + HTML) |
-| `.stella/reflections.jsonl` | Post-turn reflection log (lessons the [context engine](/docs/context-engine) distills) |
-| `.stella/mcp_oauth.json` | **OAuth tokens** for MCP servers you've logged into — a secret, never commit it |
+| `.stella/private/reflections.jsonl` | Post-turn reflection log (lessons the [context engine](/docs/context-engine) distills) |
+| `.stella/private/mcp_oauth.json` | **OAuth tokens** for MCP servers you've logged into — a secret, never commit it |
+
+When upgrading from a release that wrote private files directly under
+`.stella/`, Stella migrates safe, closed legacy files into `.stella/private/`
+on first use. Unsafe permissions or live SQLite WAL/SHM sidecars fail closed
+with an actionable error and remain untouched.
 
 User-scope counterparts live under `~/.config/stella/` (settings, skills,
 agents, credentials).
@@ -71,16 +76,14 @@ agents, credentials).
 `.stella/tools/` are team-shareable and version-control-friendly — with one caveat:
 if `.stella/settings.json` carries an inline `api_key`, keep it out of version control
 (prefer [`api_key_env` or `credentials.toml`](/docs/configuration/credentials)). The
-`.db` files are local state, and `.stella/mcp_oauth.json` holds **OAuth tokens** — add
-all of them to `.gitignore`:
+Everything under `.stella/private/` is local state, including MCP OAuth
+tokens. `stella` generates `.stella/.gitignore` with `private/`; if the
+repository uses a root ignore file, exclude the whole private directory:
 
 ```text title=".gitignore"
-.stella/*.db
-.stella/*.db-*
-.stella/mcp_oauth.json
+.stella/private/
 .stella/worktrees/
 .stella/exports/
-.stella/reflections.jsonl
 ```
 
 ## Verify the result

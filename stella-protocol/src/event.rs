@@ -326,9 +326,23 @@ pub struct ContextFrameRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub citation_label: String,
-    /// Which provider produced the frame (e.g. `"code-graph"`, `"memory"`,
-    /// `"git-history"`, or an external OCP provider id).
+    /// The OCP provider leg that returned the frame. Empty only when reading
+    /// a stream recorded before provider provenance was added.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    /// The original source named by the frame's provenance chain. This is
+    /// deliberately distinct from [`Self::provider`]: a host adapter may be
+    /// `workspace-memory` while the record source remains `stella-context`.
     pub source: String,
+    /// The protocol frame kind (`symbol`, `memory`, `graph`, ...).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    /// Canonical source URI when the frame supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// The most-derived provenance method, when declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
     pub token_cost: u32,
 }
 
@@ -634,7 +648,11 @@ mod tests {
             frames: vec![ContextFrameRef {
                 id: None, // not-yet-materialized frames carry no id (L-C4)
                 citation_label: "engine step-driver (driver.rs)".into(),
+                provider: "code-graph".into(),
                 source: "code-graph".into(),
+                kind: "symbol".into(),
+                uri: Some("file:///repo/stella-core/src/driver.rs".into()),
+                method: Some("tree-sitter/symbol-extract".into()),
                 token_cost: 120,
             }],
             provider_mix: vec![ProviderShare {
@@ -649,6 +667,37 @@ mod tests {
             !json.contains("\"id\""),
             "absent id must be omitted: {json}"
         );
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentEvent::ContextRecall { frames, .. } => {
+                let frame = &frames[0];
+                assert_eq!(frame.provider, "code-graph");
+                assert_eq!(frame.source, "code-graph");
+                assert_eq!(frame.kind, "symbol");
+                assert_eq!(
+                    frame.uri.as_deref(),
+                    Some("file:///repo/stella-core/src/driver.rs")
+                );
+                assert_eq!(frame.method.as_deref(), Some("tree-sitter/symbol-extract"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_recall_from_a_pre_provenance_stream_still_parses() {
+        let legacy = r#"{"type":"context_recall","frames":[{"citation_label":"driver.rs","source":"code-graph","token_cost":12}],"provider_mix":[{"provider":"code-graph","frames":1}],"tokens":12}"#;
+        match serde_json::from_str::<AgentEvent>(legacy) {
+            Ok(AgentEvent::ContextRecall { frames, .. }) => {
+                let frame = &frames[0];
+                assert!(frame.provider.is_empty());
+                assert_eq!(frame.source, "code-graph");
+                assert!(frame.kind.is_empty());
+                assert_eq!(frame.uri, None);
+                assert_eq!(frame.method, None);
+            }
+            other => panic!("old stream must parse: {other:?}"),
+        }
     }
 
     #[test]

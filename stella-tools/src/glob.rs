@@ -88,6 +88,7 @@ impl Tool for Glob {
         // `--glob` tells fd to interpret the pattern as a glob, not a regex,
         // so `*.rs` matches the same way as `find -name "*.rs"`.
         let mut fd = Command::new("fd");
+        crate::exec::scrub_sensitive_env(&mut fd);
         fd.arg("--glob");
         fd.arg("--type").arg("f");
         fd.arg("--color").arg("never");
@@ -117,6 +118,7 @@ impl Tool for Glob {
             Err(_) => {
                 // fd not installed — fall back to find (same pinned dir).
                 let mut find = Command::new("find");
+                crate::exec::scrub_sensitive_env(&mut find);
                 find.arg(&search_dir);
                 find.arg("-type").arg("f");
                 find.arg("-name").arg(pattern);

@@ -12,7 +12,23 @@ use super::*;
 /// max_tokens override the engine defaults only when set (the "Include"
 /// contract), effort/reasoning/params land verbatim (they default to
 /// `None` anyway).
-fn tuned_engine_config(cfg: &Config, kind: crate::settings::EngineAgentKind) -> EngineConfig {
+///
+/// `catalog_ref` is the `(provider_id, model_id)` the catalog-based clamps
+/// below (context-window compaction budget, reasoning capability) are
+/// computed against — the model THIS kind's calls actually land on, not
+/// necessarily `cfg`'s. For `Default`/`Judge` that is `cfg.provider.id`/
+/// `cfg.model_id`; for `Worker` it is the wiring's resolved worker model
+/// (issue #276 — honoring `pipeline_worker_model`/`agents.worker.*` must
+/// also clamp against the model it actually routes to, or a worker pinned to
+/// a smaller-context or non-reasoning model still gets the DEFAULT model's
+/// clamps, which is exactly the wire-shape/400 class issue #273 exists to
+/// warn about).
+fn tuned_engine_config(
+    cfg: &Config,
+    kind: crate::settings::EngineAgentKind,
+    catalog_ref: (&str, &str),
+) -> EngineConfig {
+    let (provider_id, model_id) = catalog_ref;
     let mut engine = EngineConfig {
         cwd: cfg.workspace_root.display().to_string(),
         ..EngineConfig::default()
@@ -22,8 +38,7 @@ fn tuned_engine_config(cfg: &Config, kind: crate::settings::EngineAgentKind) -> 
     // is 128k), where provider-side overflow would land before compaction
     // ever triggered. The window only ever LOWERS the default — 3/4 leaves
     // headroom for the estimator's error band plus the next step's output.
-    if let Ok(entry) =
-        stella_model::catalog::Catalog::current().resolve_for(cfg.provider.id, &cfg.model_id)
+    if let Ok(entry) = stella_model::catalog::Catalog::current().resolve_for(provider_id, model_id)
     {
         let window = entry.context_window as u64;
         if window > 0 {
@@ -50,8 +65,7 @@ fn tuned_engine_config(cfg: &Config, kind: crate::settings::EngineAgentKind) -> 
     // (the auto modes set effort for every role without knowing the
     // model). Unknown capability passes through: the provider stays the
     // authority.
-    if crate::engine_config::model_supports_reasoning(cfg.provider.id, &cfg.model_id) == Some(false)
-    {
+    if crate::engine_config::model_supports_reasoning(provider_id, model_id) == Some(false) {
         engine.effort = None;
         engine.reasoning = None;
     }
@@ -60,19 +74,64 @@ fn tuned_engine_config(cfg: &Config, kind: crate::settings::EngineAgentKind) -> 
 
 /// EngineConfig for a session's default (interactive/step-loop) agent.
 pub(crate) fn engine_config_for(cfg: &Config) -> EngineConfig {
-    tuned_engine_config(cfg, crate::settings::EngineAgentKind::Default)
+    tuned_engine_config(
+        cfg,
+        crate::settings::EngineAgentKind::Default,
+        (cfg.provider.id, &cfg.model_id),
+    )
 }
 
 /// EngineConfig for a pipeline's execute turns — the WORKER agent's tuning
 /// (plan and witness ride it too, matching the router's tiering).
-pub(crate) fn pipeline_engine_config_for(cfg: &Config) -> EngineConfig {
-    tuned_engine_config(cfg, crate::settings::EngineAgentKind::Worker)
+/// `worker_model` is [`EngineWiring::worker_model`]: the model the worker
+/// role actually resolves to, honoring `pipeline_worker_model`/
+/// `agents.worker.*` when set (issue #276), falling back to the session
+/// default (`cfg.provider`/`cfg.model_id`) when unset.
+pub(crate) fn pipeline_engine_config_for(cfg: &Config, worker_model: &ModelRef) -> EngineConfig {
+    tuned_engine_config(
+        cfg,
+        crate::settings::EngineAgentKind::Worker,
+        (&worker_model.provider, &worker_model.model_id),
+    )
+}
+
+/// CLI-owned headless surfaces have no host approval port, so scope expansion
+/// always stops at the named pipeline error. Output modes never alter this.
+pub(crate) const HEADLESS_SCOPE_REVIEW_BYPASS: bool = false;
+pub(crate) const HEADLESS_APPROVAL_GATE: AlwaysAbortGate = AlwaysAbortGate;
+
+/// Approval port the one-shot host can actually service. This is explicit so
+/// output serialization cannot silently stand in for execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipelineApprovalCapability {
+    Stdio,
+    Unavailable,
+}
+
+/// Build the one-shot pipeline config from the host's approval capability.
+/// Rendering remains a separate concern owned by the event renderer.
+pub(crate) fn pipeline_config_for_approval_capability(
+    cfg: &Config,
+    approval: PipelineApprovalCapability,
+    test_command: Option<&str>,
+) -> PipelineConfig {
+    PipelineConfig {
+        engine: pipeline_engine_config_for(cfg),
+        headless: approval == PipelineApprovalCapability::Unavailable,
+        headless_bypass_scope_review: HEADLESS_SCOPE_REVIEW_BYPASS,
+        test_command: test_command.map(str::to_string),
+        ..Default::default()
+    }
 }
 
 /// EngineConfig for the goal loop's standalone judge engine — the JUDGE
 /// agent's tuning.
 pub(crate) fn judge_engine_config_for(cfg: &Config) -> EngineConfig {
-    tuned_engine_config(cfg, crate::settings::EngineAgentKind::Judge)
+    tuned_engine_config(
+        cfg,
+        crate::settings::EngineAgentKind::Judge,
+        (cfg.provider.id, &cfg.model_id),
+    )
 }
 
 /// Fire `SessionStart` hooks once and return their stdout — the additional
@@ -121,29 +180,136 @@ pub(crate) struct EngineWiring {
     /// construction, so each distinct ref needs its own instance).
     pub(crate) extra_providers: Vec<(ModelRef, Box<dyn Provider>)>,
     pub(crate) role_overrides: stella_pipeline::PipelineRoleOverrides,
+    /// The model `Role::Worker`/`Role::Plan` actually resolve to: the
+    /// worker's own `pipeline_worker_model`/`agents.worker.*` pin when one
+    /// is configured and its provider is credentialed (issue #276), else
+    /// the session default this wiring was built with. Callers building the
+    /// worker's own [`EngineConfig`] (catalog-based context-window and
+    /// reasoning-capability clamps) must key off THIS, not `cfg` directly —
+    /// see `pipeline_engine_config_for`.
+    pub(crate) worker_model: ModelRef,
     pub(crate) notices: Vec<String>,
 }
 
-/// Resolve the engine wiring for a pipeline run whose worker is
-/// `worker_ref` (already resolved by `Config` — an explicit `--model`
-/// flag beats the settings, see `Config::load_with_settings`).
+/// Resolve one role's already-computed [`ModelSpec`] into a pin: find the
+/// credentialed provider, and build its adapter unless the pin names the
+/// exact same model the primary resolver entry already serves (`base_ref` —
+/// always the literal session-default `ModelRef` the pre-built primary
+/// provider is bound to, never an already-overridden ref, so this check
+/// stays "does this need a NEW adapter instance" regardless of which role is
+/// being pinned). `roles` lets one resolved model pin more than one router
+/// role at once (`Role::Plan` shares `Role::Worker`'s tier — see
+/// `resolve_engine_wiring`'s worker-override handling). Every failure here
+/// is soft — a missing credential or a build error pushes a notice and
+/// leaves every role in `roles` unpinned, degrading to `fallback` in the
+/// router, never a hard error. Returns the resolved [`ModelRef`] on success.
+fn pin_role(
+    wiring: &mut EngineWiring,
+    roles: &[Role],
+    label: &str,
+    spec: &crate::engine_config::ModelSpec,
+    base_ref: &ModelRef,
+    configured: &[crate::config::ConfiguredProvider],
+    fallback: &str,
+) -> Option<ModelRef> {
+    let Some(entry) = configured.iter().find(|c| c.config.id == spec.provider) else {
+        wiring.notices.push(format!(
+            "engine config: {label} model `{}/{}` skipped — no resolvable credential for \
+             provider `{}`; {label} {fallback}",
+            spec.provider, spec.model, spec.provider
+        ));
+        return None;
+    };
+    // An empty slug is the "provider pin without a model" form — the
+    // provider's own default model.
+    let slug = if spec.model.is_empty() {
+        entry.config.default_model.to_string()
+    } else {
+        spec.model.clone()
+    };
+    let pinned = ModelRef::new(entry.config.id, slug.clone());
+    if pinned == *base_ref {
+        // Same instance the primary resolver entry already serves: no new
+        // adapter needed, the pin(s) still record the explicit choice.
+        for &role in roles {
+            wiring.pins.pin(role, pinned.clone());
+        }
+        return Some(pinned);
+    }
+    match build_provider_parts(
+        &entry.config,
+        &slug,
+        entry.api_key.clone(),
+        entry.config.base_url.to_string(),
+        None,
+    ) {
+        Ok(provider) => {
+            for &role in roles {
+                wiring.pins.pin(role, pinned.clone());
+            }
+            // A profile for the routed provider keeps the router's provider
+            // list honest (breaker bookkeeping, `providers()` introspection,
+            // and — critically — the router's own unpinned-judge cross-
+            // family lookup, which matches `resolve(Worker)`'s result against
+            // a profile's `worker_model` field) even though the pin itself
+            // short-circuits normal tiered resolution.
+            wiring.profiles.push(
+                ProviderProfile::new(
+                    entry.config.id,
+                    pinned.clone(),
+                    pinned.clone(),
+                    pinned.clone(),
+                )
+                .with_family(provider_family(entry.config.id)),
+            );
+            wiring.extra_providers.push((pinned.clone(), provider));
+            Some(pinned)
+        }
+        Err(e) => {
+            wiring.notices.push(format!(
+                "engine config: {label} model `{}/{slug}` skipped — {e}; {label} {fallback}",
+                entry.config.id
+            ));
+            None
+        }
+    }
+}
+
+/// Resolve the engine wiring for a pipeline run whose session-default worker
+/// is `worker_ref` (already resolved by `Config` — an explicit `--model`
+/// flag beats the settings, see `Config::load_with_settings`). `configured`
+/// is the caller's own [`crate::config::discover_configured_providers`]
+/// snapshot — injected rather than rediscovered here so this function is a
+/// plain, testable one over owned data.
 ///
 /// Routing rules, in order:
-/// - TRIAGE and JUDGE pins come from their configured model specs
-///   ([`crate::engine_config::model_spec_for`]).
+/// - WORKER (and `Role::Plan`, which shares the worker's tier when unpinned
+///   — `resolve_tier` in `stella-core`'s router) honors
+///   `pipeline_worker_model`/`agents.worker.*`
+///   ([`crate::engine_config::model_spec_for`]) when configured and its
+///   provider is credentialed; unset or unroutable falls back to the
+///   session default `worker_ref` (issue #276 — previously the worker
+///   always rode `worker_ref` regardless of these settings).
+/// - TRIAGE and JUDGE pins come from their configured model specs the same
+///   way, but always fall back to the (possibly worker-overridden) worker
+///   model on any failure — the pre-existing behavior.
 /// - `auto_mode: on` replaces the judge spec with
 ///   [`crate::engine_config::auto_judge_spec`]'s pick from
-///   `allowed_models` (cross-family from the worker, then price tier);
-///   when the allowed list yields nothing usable it falls back to the
-///   explicit judge spec, then to normal router degradation.
-/// - A pin equal to the worker's own model needs no extra adapter — the
+///   `allowed_models` (cross-family from the ACTUAL worker model, then
+///   price tier); when the allowed list yields nothing usable it falls back
+///   to the explicit judge spec, then to normal router degradation.
+/// - A pin equal to the session-default model needs no extra adapter — the
 ///   primary resolver entry already serves it.
 ///
 /// Pins deliberately bypass the circuit breaker (`RoleTable` semantics —
 /// an explicit pin wins unconditionally). If a pinned judge's provider
 /// fails, the pipeline's judge call degrades to its heuristic verdict,
 /// the same soft path an unreachable judge always took.
-pub(crate) fn resolve_engine_wiring(cfg: &Config, worker_ref: &ModelRef) -> EngineWiring {
+pub(crate) fn resolve_engine_wiring(
+    cfg: &Config,
+    worker_ref: &ModelRef,
+    configured: &[crate::config::ConfiguredProvider],
+) -> EngineWiring {
     use crate::engine_config::{
         ModelSpec, auto_judge_spec, model_spec_for, spec_family, tuning_for,
     };
@@ -162,11 +328,41 @@ pub(crate) fn resolve_engine_wiring(cfg: &Config, worker_ref: &ModelRef) -> Engi
         pins: RoleTable::new(),
         extra_providers: Vec::new(),
         role_overrides: stella_pipeline::PipelineRoleOverrides::default(),
+        worker_model: worker_ref.clone(),
         notices: Vec::new(),
     };
     let Some(engine) = cfg.engine_settings.clone() else {
         return wiring;
     };
+
+    // Credentialed providers only — a model spec naming a provider without
+    // a resolvable key is reported and skipped, never a hard error.
+    let is_provider = |id: &str| configured.iter().any(|c| c.config.id == id);
+
+    // Issue #276: resolve the WORKER's own override first, before anything
+    // that needs to know the worker's actual model (judge cross-family
+    // selection, the capability clamp's "rides the worker" fallback below).
+    // `Role::Plan` is pinned alongside `Role::Worker` to the same model —
+    // unpinned, it shares the worker's tier (`resolve_tier` treats
+    // `Worker`/`Plan` identically), so leaving it out would silently revert
+    // plan/witness turns to the session default the moment the worker is
+    // overridden, defeating "plan rides the worker" (`pipeline_engine_config_for`'s
+    // doc comment).
+    let worker_spec = model_spec_for(&engine, EngineAgentKind::Worker, &is_provider);
+    let effective_worker_ref = match &worker_spec {
+        Some(spec) => pin_role(
+            &mut wiring,
+            &[Role::Worker, Role::Plan],
+            "worker",
+            spec,
+            worker_ref,
+            configured,
+            &format!("rides the session default (`{worker_ref}`)"),
+        )
+        .unwrap_or_else(|| worker_ref.clone()),
+        None => worker_ref.clone(),
+    };
+    wiring.worker_model = effective_worker_ref.clone();
 
     let triage_tuning = tuning_for(&engine, EngineAgentKind::Triage);
     let judge_tuning = tuning_for(&engine, EngineAgentKind::Judge);
@@ -187,14 +383,14 @@ pub(crate) fn resolve_engine_wiring(cfg: &Config, worker_ref: &ModelRef) -> Engi
         params: judge_tuning.params,
     };
 
-    // Credentialed providers only — a model spec naming a provider without
-    // a resolvable key is reported and skipped, never a hard error.
-    let configured = crate::config::discover_configured_providers();
-    let is_provider = |id: &str| configured.iter().any(|c| c.config.id == id);
-
+    // The judge's cross-family preference must compare against the model the
+    // worker ACTUALLY resolves to — comparing against the stale session
+    // default here would let auto-mode pick a judge that turns out to share
+    // the overridden worker's family (or vice versa), defeating the
+    // bias-resistance the family comparison exists for.
     let worker_family = spec_family(&ModelSpec {
-        provider: worker_ref.provider.clone(),
-        model: worker_ref.model_id.clone(),
+        provider: effective_worker_ref.provider.clone(),
+        model: effective_worker_ref.model_id.clone(),
     });
     let judge_spec = if engine.auto_mode_on() {
         auto_judge_spec(&engine, &worker_family, &is_provider)
@@ -207,7 +403,8 @@ pub(crate) fn resolve_engine_wiring(cfg: &Config, worker_ref: &ModelRef) -> Engi
     // Capability clamp, mirroring `tuned_engine_config`: a role whose
     // model (pinned, provider-default, or riding the worker) is a
     // catalog-confirmed non-reasoning model must not carry effort or
-    // reasoning onto the wire. Unknown capability passes through.
+    // reasoning onto the wire. Unknown capability passes through. "Riding
+    // the worker" means the ACTUAL (possibly overridden) worker model.
     {
         let clamp = |overrides: &mut stella_pipeline::RoleCallOverrides,
                      spec: Option<&ModelSpec>| {
@@ -218,7 +415,10 @@ pub(crate) fn resolve_engine_wiring(cfg: &Config, worker_ref: &ModelRef) -> Engi
                     .iter()
                     .find(|p| p.id == s.provider && !p.default_model.is_empty())
                     .map(|p| (s.provider.clone(), p.default_model.to_string())),
-                None => Some((worker_ref.provider.clone(), worker_ref.model_id.clone())),
+                None => Some((
+                    effective_worker_ref.provider.clone(),
+                    effective_worker_ref.model_id.clone(),
+                )),
             };
             if let Some((provider, model)) = resolved
                 && crate::engine_config::model_supports_reasoning(&provider, &model) == Some(false)
@@ -238,56 +438,15 @@ pub(crate) fn resolve_engine_wiring(cfg: &Config, worker_ref: &ModelRef) -> Engi
 
     for (role, label, spec) in role_specs {
         let Some(spec) = spec else { continue };
-        let Some(entry) = configured.iter().find(|c| c.config.id == spec.provider) else {
-            wiring.notices.push(format!(
-                "engine config: {label} model `{}/{}` skipped — no resolvable credential for \
-                 provider `{}`; {label} rides the worker",
-                spec.provider, spec.model, spec.provider
-            ));
-            continue;
-        };
-        // An empty slug is the "provider pin without a model" form — the
-        // provider's own default model.
-        let slug = if spec.model.is_empty() {
-            entry.config.default_model.to_string()
-        } else {
-            spec.model.clone()
-        };
-        let pinned = ModelRef::new(entry.config.id, slug.clone());
-        if pinned == *worker_ref {
-            // Same instance as the worker: the primary resolver entry
-            // serves it; the pin still records the explicit choice.
-            wiring.pins.pin(role, pinned);
-            continue;
-        }
-        match build_provider_parts(
-            &entry.config,
-            &slug,
-            entry.api_key.clone(),
-            entry.config.base_url.to_string(),
-            None,
-        ) {
-            Ok(provider) => {
-                wiring.pins.pin(role, pinned.clone());
-                // A profile for the routed provider keeps the router's
-                // provider list honest (breaker bookkeeping, `providers()`
-                // introspection) even though the pin short-circuits it.
-                wiring.profiles.push(
-                    ProviderProfile::new(
-                        entry.config.id,
-                        pinned.clone(),
-                        pinned.clone(),
-                        pinned.clone(),
-                    )
-                    .with_family(provider_family(entry.config.id)),
-                );
-                wiring.extra_providers.push((pinned, provider));
-            }
-            Err(e) => wiring.notices.push(format!(
-                "engine config: {label} model `{}/{slug}` skipped — {e}; {label} rides the worker",
-                entry.config.id
-            )),
-        }
+        pin_role(
+            &mut wiring,
+            &[role],
+            label,
+            &spec,
+            worker_ref,
+            configured,
+            "rides the worker",
+        );
     }
     wiring
 }

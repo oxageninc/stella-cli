@@ -135,7 +135,7 @@ struct ExplorationRecord {
     /// Session that produced/last updated it (`ses-<ms>-<pid>` from the
     /// registry, stella-store/src/sessions.rs:97-110) — provenance + liveness.
     session_id: Option<String>,
-    /// Execution row in .stella/store.db that produced it — provenance into
+    /// Execution row in .stella/private/store.db that produced it — provenance into
     /// the event log.
     execution_id: Option<i64>,
     /// Key symbols the map covers (graph anchors for §6). Optional.

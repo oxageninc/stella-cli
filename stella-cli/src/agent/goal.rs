@@ -16,14 +16,16 @@ pub(crate) async fn run_raw_one_shot(
     format: OutputFormat,
 ) -> Result<(), String> {
     let provider = build_provider(cfg)?;
+    let registry_options = registry_options(cfg);
     // Concrete `Arc<ToolRegistry>` (not `Arc<dyn ToolExecutor>`) so the
     // files-touched ledger is reachable after the turn — the trait object
     // hides it. It still coerces to `&dyn ToolExecutor` for the engine.
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
-    populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    populate_schema_index(&registry, &cfg.workspace_root)?;
+    let active_rules =
+        crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build + live-refresh the code graph in the background so a
     // multi-step one-shot turn can reach for `graph_query` once the index is
     // ready. Status goes to stderr — stdout may be machine-readable JSON.
@@ -33,18 +35,27 @@ pub(crate) async fn run_raw_one_shot(
         Box::new(|line| eprintln!("  {line}")),
         Box::new(|| {}),
     );
-    let mcp = connect_mcp(
-        cfg,
-        registry.clone(),
-        Some(registry.mcp_usage_ledger()),
-        format == OutputFormat::Text,
-    )
-    .await;
+    let process_free = crate::enterprise_telemetry::process_free_authority_active();
+    let mcp = if process_free {
+        None
+    } else {
+        connect_mcp(
+            cfg,
+            registry.clone(),
+            Some(registry.mcp_usage_ledger()),
+            format == OutputFormat::Text,
+        )
+        .await?
+    };
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
     };
-    let custom_tools = discover_custom_tools(cfg, format == OutputFormat::Text).await;
+    let custom_tools = if process_free {
+        Vec::new()
+    } else {
+        discover_custom_tools(cfg, format == OutputFormat::Text).await
+    };
     let mut budget = build_budget_guard(budget_limit);
     let store = open_store(&cfg.workspace_root);
     let calibration = seed_calibration(&store, cfg);
@@ -56,14 +67,22 @@ pub(crate) async fn run_raw_one_shot(
 
     let mut messages = vec![
         CompletionMessage::system(
-            with_session_hook_context(build_system_prompt(cfg, &cfg.workspace_root), cfg).await,
+            with_session_hook_context(
+                build_system_prompt(cfg, &cfg.workspace_root, &active_rules),
+                cfg,
+            )
+            .await,
         ),
         crate::attachments::user_message(prompt),
     ];
 
     // The self-improvement loop (memory.rs): recall relevant memories +
     // skills into a volatile block after the stable system prefix (L-E8)…
-    let mut memory = SessionMemory::open(&cfg.workspace_root, format == OutputFormat::Text);
+    let mut memory = SessionMemory::open_with_authority(
+        &cfg.workspace_root,
+        format == OutputFormat::Text,
+        &cfg.authority,
+    );
     if let Some(m) = &memory {
         inject_recall_block(&mut messages, m.recall_block(prompt).await);
     }
@@ -165,12 +184,17 @@ pub async fn run_goal_cmd(
     budget_limit: Option<f64>,
     use_pipeline: bool,
 ) -> Result<(), String> {
+    crate::enterprise_telemetry::authorize_execution_surface(
+        crate::enterprise_telemetry::ExecutionSurface::Goal,
+    )?;
     let provider = build_provider(cfg)?;
+    let registry_options = registry_options(cfg);
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
-    populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    populate_schema_index(&registry, &cfg.workspace_root)?;
+    let active_rules =
+        crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build + live-refresh the code-graph index in the background so
     // `graph_query` is available for the goal loop without a manual `stella
     // init`. Non-blocking; status to stderr. Kept alive until the goal returns.
@@ -186,7 +210,7 @@ pub async fn run_goal_cmd(
         Some(registry.mcp_usage_ledger()),
         true,
     )
-    .await;
+    .await?;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -200,9 +224,13 @@ pub async fn run_goal_cmd(
     println!("  {}\n", goal.dimmed());
 
     let mut messages = vec![CompletionMessage::system(
-        with_session_hook_context(build_system_prompt(cfg, &cfg.workspace_root), cfg).await,
+        with_session_hook_context(
+            build_system_prompt(cfg, &cfg.workspace_root, &active_rules),
+            cfg,
+        )
+        .await,
     )];
-    let mut memory = SessionMemory::open(&cfg.workspace_root, true);
+    let mut memory = SessionMemory::open_with_authority(&cfg.workspace_root, true, &cfg.authority);
     if let Some(m) = &memory {
         inject_recall_block(&mut messages, m.recall_block(goal).await);
     }
@@ -224,6 +252,8 @@ pub async fn run_goal_cmd(
             &store,
             goal,
             Some(presence.id()),
+            registry_options.clone(),
+            active_rules.clone(),
         )
         .await
     } else {
@@ -347,7 +377,8 @@ pub(crate) async fn run_goal_turn(
         let interactive = InteractiveToolSet::new(&customs, tx.clone(), default_ask_io(true))
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
         let tools =
-            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone());
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed);
         let hook_runner = ShellHookRunner;
         let mut engine =
             Engine::with_sleeper(provider, &tools, engine_config_for(cfg), &TokioSleeper)
@@ -435,6 +466,8 @@ async fn run_goal_pipeline_turn(
     store: &Option<Arc<Store>>,
     goal: &str,
     session: Option<&str>,
+    registry_options: stella_tools::RegistryOptions,
+    active_rules: crate::rules::ResolvedRules,
 ) -> Result<(), String> {
     let turn_start = Instant::now();
     let execution = begin_execution(store, "goal", goal, cfg, session);
@@ -442,7 +475,8 @@ async fn run_goal_pipeline_turn(
 
     // Role wiring from `agent_engine_config` — the pinned/auto judge (when
     // configured) also serves as the goal loop's round judge below.
-    let wiring = resolve_engine_wiring(cfg, &model_ref);
+    let configured = crate::config::discover_configured_providers();
+    let wiring = resolve_engine_wiring(cfg, &model_ref, &configured);
     for notice in &wiring.notices {
         eprintln!("  ! {notice}");
     }
@@ -504,12 +538,18 @@ async fn run_goal_pipeline_turn(
         let interactive = InteractiveToolSet::new(&customs, tx.clone(), default_ask_io(true))
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
         let tools =
-            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone());
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed);
 
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
-        let ws_ports = workspace_ports(cfg.workspace_root.clone(), cfg);
+        let ws_ports = workspace_ports(
+            cfg.workspace_root.clone(),
+            cfg,
+            registry_options,
+            active_rules.clone(),
+        )?;
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = &no_recall;
         let hook_runner = ShellHookRunner;
@@ -533,10 +573,10 @@ async fn run_goal_pipeline_turn(
         for round in 1..=goal_config.max_rounds {
             budget.begin_turn();
             let pipeline_config = PipelineConfig {
-                engine: pipeline_engine_config_for(cfg),
+                engine: pipeline_engine_config_for(cfg, &wiring.worker_model),
                 role_overrides: wiring.role_overrides.clone(),
                 headless: true,
-                headless_bypass_scope_review: true,
+                headless_bypass_scope_review: HEADLESS_SCOPE_REVIEW_BYPASS,
                 ..PipelineConfig::default()
             };
             let ports = PipelinePorts {
@@ -546,8 +586,9 @@ async fn run_goal_pipeline_turn(
                 recall,
                 repo: &ws_ports.repo_structure,
                 repo_status: &ws_ports.repo_status,
-                commands: &ws_ports.command_runner,
-                approvals: &AutoApproveGate,
+                diagnostics: &ws_ports.diagnostic_runner,
+                tests: &ws_ports.test_runner,
+                approvals: &HEADLESS_APPROVAL_GATE,
                 sleeper: &TokioSleeper,
                 hooks: cfg
                     .hooks
@@ -566,11 +607,21 @@ async fn run_goal_pipeline_turn(
             match pipeline.run(&round_goal, messages, budget).await {
                 Ok(outcome) => {
                     total_cost_usd += outcome.total_cost_usd;
-                    if let PipelineStatus::Aborted { reason } = outcome.status {
-                        result = Some(Err(format!(
-                            "goal not met: working round aborted: {reason}"
-                        )));
-                        break;
+                    match outcome.status {
+                        PipelineStatus::Completed => {}
+                        PipelineStatus::VerificationFailed { verdict } => {
+                            result = Some(Err(format!(
+                                "goal not met: verification failed: {}",
+                                verdict.summary
+                            )));
+                            break;
+                        }
+                        PipelineStatus::Aborted { reason } => {
+                            result = Some(Err(format!(
+                                "goal not met: working round aborted: {reason}"
+                            )));
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
@@ -651,13 +702,16 @@ async fn run_goal_pipeline_turn(
 
     drop(tx);
     let _ = renderer.await;
+    // The shared guard is the settled ledger, including a judge turn that
+    // aborted after spending and therefore returned no `judge_cost` value.
+    let total_cost_usd = budget.session_spent_usd();
     let files = registry.files_touched();
     if let Some((store, id)) = &execution {
-        let (outcome_label, _) = match &goal_result {
-            Ok(()) => ("goal_met", 0.0),
-            Err(_) => ("goal_unmet", 0.0),
+        let outcome_label = match &goal_result {
+            Ok(()) => "goal_met",
+            Err(_) => "goal_unmet",
         };
-        if !record_execution_end(store, *id, registry, outcome_label, 0.0) {
+        if !record_execution_end(store, *id, registry, outcome_label, total_cost_usd) {
             warn_store_write_failed(
                 "the audit record (files touched / memory citations / outcome)",
             );

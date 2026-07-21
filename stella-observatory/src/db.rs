@@ -37,8 +37,8 @@ impl Observatory {
     pub fn new(workspace_root: &Path) -> Self {
         let dot = workspace_root.join(".stella");
         Self {
-            store_db: dot.join("store.db"),
-            fleet_db: dot.join("fleet.db"),
+            store_db: dot.join("private").join("store.db"),
+            fleet_db: dot.join("private").join("fleet.db"),
             workspace_root: workspace_root.to_path_buf(),
         }
     }

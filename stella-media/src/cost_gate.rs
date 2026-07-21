@@ -1,137 +1,116 @@
-//! The video cost gate. Video generation spends real
-//! money, so before a job is submitted its estimated cost is checked against a
-//! configurable USD threshold; above the threshold, the job requires explicit
-//! confirmation through a [`CostGate`] port. Headless callers deny by default
-//! unless they pass an explicit bypass (the `--yes` flag).
+//! Host-owned approval for paid media generation.
 //!
-//! The gate is a port so the CLI can wire an interactive stdin prompt and the
-//! agent-tool path can wire a budget-aware policy, without this crate
-//! depending on either. [`evaluate_video_cost`] is the pure decision function
-//! the caller runs before `generate_video`.
+//! Model tool arguments are untrusted requests, not authority. Every image
+//! and video provider submission therefore crosses this asynchronous port
+//! before it can spend money. Hosts may inject an interactive or governed
+//! implementation; unattended callers receive [`DenyMediaSpendGate`].
 
-use crate::error::MediaError;
-use crate::provider::CostEstimate;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use stella_protocol::MediaKind;
 
-/// Default confirmation threshold ("default: any
-/// video"). At `$0.00`, every video with a positive estimate consults the
-/// gate; a caller can raise it to auto-approve cheap jobs.
-pub const DEFAULT_VIDEO_COST_THRESHOLD_USD: f64 = 0.0;
+/// A content-free description of a proposed provider submission.
+///
+/// Prompts and artifact labels are deliberately excluded: an approval host
+/// needs the provider, media kind, and estimated charge, not user content.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaSpendRequest {
+    pub operation_id: String,
+    pub kind: MediaKind,
+    pub provider_id: String,
+    pub estimated_usd: Option<f64>,
+    pub detail: String,
+}
 
-/// A confirm/deny decision for a cost-gated job.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl MediaSpendRequest {
+    pub fn new(
+        operation_id: impl Into<String>,
+        kind: MediaKind,
+        provider_id: impl Into<String>,
+        estimated_usd: Option<f64>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            kind,
+            provider_id: provider_id.into(),
+            estimated_usd,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// A host's decision for one proposed media submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CostDecision {
     Approve,
     Deny,
 }
 
-/// The confirmation port. An implementation decides whether a job whose
-/// estimate exceeds the threshold may proceed. Kept synchronous: an
-/// interactive implementation reads stdin (the caller can wrap it in
-/// `spawn_blocking` if it must not block an async runtime).
-pub trait CostGate: Send + Sync {
-    fn confirm(&self, estimate: &CostEstimate) -> CostDecision;
+/// Host approval port for paid media submissions.
+#[async_trait]
+pub trait MediaSpendGate: Send + Sync {
+    async fn authorize(&self, request: &MediaSpendRequest) -> CostDecision;
 }
 
-/// Headless gate: approves only when constructed with `bypass = true` (the
-/// `--yes` flag). The safe default — an unattended run never silently spends
-/// on video.
-#[derive(Clone, Copy, Debug)]
-pub struct HeadlessCostGate {
-    bypass: bool,
-}
+/// Secure default for callers without an explicit host approval surface.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DenyMediaSpendGate;
 
-impl HeadlessCostGate {
-    /// `bypass = true` corresponds to `--yes`; `false` denies every gated job.
-    pub fn new(bypass: bool) -> Self {
-        Self { bypass }
-    }
-}
-
-impl CostGate for HeadlessCostGate {
-    fn confirm(&self, _estimate: &CostEstimate) -> CostDecision {
-        if self.bypass {
-            CostDecision::Approve
-        } else {
-            CostDecision::Deny
-        }
-    }
-}
-
-/// The pure gate decision: if the estimate is at or
-/// below `threshold_usd`, the job passes without consulting the gate;
-/// otherwise the gate decides. A denial is a terminal
-/// [`MediaError::CostDenied`] carrying the numbers.
-pub fn evaluate_video_cost(
-    estimate: &CostEstimate,
-    threshold_usd: f64,
-    gate: &dyn CostGate,
-) -> Result<(), MediaError> {
-    if estimate.estimated_usd <= threshold_usd {
-        return Ok(());
-    }
-    match gate.confirm(estimate) {
-        CostDecision::Approve => Ok(()),
-        CostDecision::Deny => Err(MediaError::CostDenied {
-            estimated_usd: estimate.estimated_usd,
-            threshold_usd,
-        }),
+#[async_trait]
+impl MediaSpendGate for DenyMediaSpendGate {
+    async fn authorize(&self, _request: &MediaSpendRequest) -> CostDecision {
+        CostDecision::Deny
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stella_protocol::MediaKind;
 
-    fn estimate(usd: f64) -> CostEstimate {
-        CostEstimate {
-            kind: MediaKind::Video,
-            model: "cogvideox".into(),
-            estimated_usd: usd,
-            detail: "10s video".into(),
-        }
+    fn request() -> MediaSpendRequest {
+        MediaSpendRequest::new(
+            "mop_deadbeef",
+            MediaKind::Video,
+            "zai",
+            Some(0.4),
+            "5s video @ $0.0800/s",
+        )
     }
 
-    #[test]
-    fn below_or_at_threshold_passes_without_consulting_the_gate() {
-        // A DenyAll gate would reject if consulted; it must not be consulted.
-        let deny = HeadlessCostGate::new(false);
-        assert!(evaluate_video_cost(&estimate(0.10), 0.10, &deny).is_ok());
-        assert!(evaluate_video_cost(&estimate(0.05), 0.10, &deny).is_ok());
-    }
-
-    #[test]
-    fn above_threshold_headless_denies_by_default() {
-        let deny = HeadlessCostGate::new(false);
-        let err = evaluate_video_cost(&estimate(0.40), 0.0, &deny).unwrap_err();
-        match err {
-            MediaError::CostDenied {
-                estimated_usd,
-                threshold_usd,
-            } => {
-                assert!((estimated_usd - 0.40).abs() < 1e-9);
-                assert!((threshold_usd - 0.0).abs() < 1e-9);
-            }
-            other => panic!("expected CostDenied, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn above_threshold_with_bypass_approves() {
-        let approve = HeadlessCostGate::new(true);
-        assert!(evaluate_video_cost(&estimate(5.0), 0.0, &approve).is_ok());
-    }
-
-    #[test]
-    fn default_threshold_gates_any_positive_cost_video() {
-        let deny = HeadlessCostGate::new(false);
-        // The default threshold is 0.0, so any positive estimate is gated.
-        assert!(
-            evaluate_video_cost(&estimate(0.01), DEFAULT_VIDEO_COST_THRESHOLD_USD, &deny).is_err()
+    #[tokio::test]
+    async fn default_gate_denies() {
+        assert_eq!(
+            DenyMediaSpendGate.authorize(&request()).await,
+            CostDecision::Deny
         );
-        // A zero-cost job (free tier / estimate unavailable) is not gated.
+    }
+
+    #[test]
+    fn spend_request_round_trips_through_json_byte_stably() {
+        let encoded = serde_json::to_vec(&request()).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&encoded).unwrap(),
+            r#"{"operation_id":"mop_deadbeef","kind":"video","provider_id":"zai","estimated_usd":0.4,"detail":"5s video @ $0.0800/s"}"#
+        );
+        let decoded: MediaSpendRequest = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, request());
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
         assert!(
-            evaluate_video_cost(&estimate(0.0), DEFAULT_VIDEO_COST_THRESHOLD_USD, &deny).is_ok()
+            serde_json::from_str::<MediaSpendRequest>(
+                r#"{"operation_id":"mop_deadbeef","kind":"video","provider_id":"zai","estimated_usd":0.4,"detail":"x","unexpected":true}"#
+            )
+            .is_err(),
+            "authority requests must reject unknown fields"
+        );
+
+        let decision = serde_json::to_vec(&CostDecision::Approve).unwrap();
+        assert_eq!(std::str::from_utf8(&decision).unwrap(), r#""approve""#);
+        assert_eq!(
+            serde_json::from_slice::<CostDecision>(&decision).unwrap(),
+            CostDecision::Approve
         );
     }
 }

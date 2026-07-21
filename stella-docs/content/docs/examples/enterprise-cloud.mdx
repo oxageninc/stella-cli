@@ -1,6 +1,6 @@
 ---
 title: "Enterprise cloud (Vertex & Bedrock)"
-description: Stella through your cloud contract — Vertex AI and Amazon Bedrock setups, the env-only credential rule, and org-managed settings your whole team inherits.
+description: Stella through your cloud contract — Vertex AI and Amazon Bedrock, org-managed settings, and governed Oxagen Enterprise telemetry enrollment.
 ---
 
 When the models must flow through your existing cloud agreement — GCP or AWS billing,
@@ -90,8 +90,37 @@ stella models    # ✓ configured rows for vertex/bedrock, org gateway URLs visi
 stella config    # the resolved provider, model, and a redacted key preview
 ```
 
+## Optional managed operational telemetry
+
+Community/default Stella keeps telemetry local and has zero telemetry egress. An
+organization can separately enroll an Oxagen Enterprise managed seat by provisioning a
+signed `enterprise_telemetry` document in this same org-managed file. The document
+binds the organization/workspace, issuer, audience, expiry, `process_free` authority,
+the single `execution_rollup` class, secret environment references, and one endpoint
+that must exactly equal a credential-free HTTPS URL in the administrator's allowlist.
+Project and user settings cannot opt themselves in.
+
+Enrollment does not move Stella execution into the cloud. Under the Option A boundary,
+Stella still runs locally and retains its complete store and loopback Observatory;
+Oxagen is the optional enterprise control plane and may receive only the closed
+content-free operational rollup. Today managed enrollment permits only
+`stella run --no-pipeline`; process-capable pipeline, goal, fleet, deck/chat, and
+interactive paths are rejected.
+
+```bash
+stella telemetry status   # disabled or enrolled + spool/drop diagnostics
+stella telemetry flush    # one synchronous bounded delivery attempt
+```
+
+See [Telemetry & budget](/docs/telemetry#oxagen-enterprise-managed-export) for the
+provisioning shape, exact exported/excluded fields, spool/backfill/retry/rollover
+semantics, and operational-not-compliance non-goal. The Stella repository provides the
+client boundary; production Oxagen intake remains a companion server requirement and
+is not asserted by this example.
+
 ## Related
 
 - [Vertex reference](/docs/api-providers/vertex) · [Bedrock reference](/docs/api-providers/bedrock)
 - [Team-shared settings](/docs/examples/team-settings) — the project/repo half of this story
 - [settings.json](/docs/configuration/settings) — scope semantics in full
+- [Telemetry & budget](/docs/telemetry) — managed enrollment and delivery contract

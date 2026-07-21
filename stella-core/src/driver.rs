@@ -72,6 +72,9 @@ use crate::ports::ToolExecutor;
 use crate::retry::{RetryOutcome, RetryPolicy, Sleeper, retry_with_backoff};
 use crate::speculation::{SpeculationGate, SpeculationPool, SpeculativeResult};
 
+mod settlement;
+use settlement::{check_budget, record_settled_cost};
+
 /// Everything about a turn's execution that isn't the provider/tools
 /// themselves: prompt shape, retry/compaction/loop tuning, and hard
 /// backstops. `Default` gives sensible starting values for `stella-cli`.
@@ -152,7 +155,7 @@ pub enum TurnOutcome {
     /// The turn ended before completion: budget enforced, a loop was
     /// detected, retries were exhausted, or the step cap was hit. Always a
     /// *clean* abort — never mid-tool (see module docs).
-    Aborted { reason: String },
+    Aborted { reason: String, cost_usd: f64 },
 }
 
 /// The two references a turn needs to fire lifecycle hooks: the parsed
@@ -214,6 +217,7 @@ const MAX_CONCURRENT_TOOL_CALLS: usize = 8;
 /// the `StepUsage` metering record.
 struct CommittedStep {
     result: CompletionResultAlias,
+    budget_outcome: BudgetOutcome,
     /// Names of tools whose schemas declare `read_only`, snapshotted from
     /// the same `schemas()` call the request itself was built from.
     read_only_tools: HashSet<String>,
@@ -367,29 +371,38 @@ impl<'a> Engine<'a> {
                     // cancel, which drops the future and truncates).
                     return TurnOutcome::Aborted {
                         reason: SOFT_STOP_REASON.to_string(),
+                        cost_usd: total_cost_usd,
                     };
                 }
+            }
+            if let Some(aborted) = check_budget(budget, total_cost_usd, events) {
+                return aborted;
             }
             total_cost_usd += self
                 .run_compaction_pass(messages, calibration_model.as_deref(), budget, events)
                 .await;
 
-            if let Some(aborted) = self.check_loop_detection(messages, events) {
+            if let Some(aborted) = self.check_loop_detection(messages, total_cost_usd, events) {
                 return aborted;
             }
-            if let Some(aborted) = check_budget(budget, events) {
+            if let Some(aborted) = check_budget(budget, total_cost_usd, events) {
                 return aborted;
             }
 
-            let committed = match self.run_model_call(messages, events).await {
+            let committed = match self.run_model_call(messages, budget, events).await {
                 Ok(committed) => committed,
-                Err(aborted) => return aborted,
+                Err(reason) => {
+                    return TurnOutcome::Aborted {
+                        reason,
+                        cost_usd: total_cost_usd,
+                    };
+                }
             };
             calibration_model = Some(committed.result.model.clone());
             total_cost_usd += committed.result.cost_usd;
 
             if let Some(aborted) =
-                self.handle_committed_result(step, &committed, budget, messages, events)
+                self.handle_committed_result(step, &committed, total_cost_usd, messages, events)
             {
                 return aborted;
             }
@@ -411,7 +424,10 @@ impl<'a> Engine<'a> {
             message: reason.clone(),
             retryable: false,
         });
-        TurnOutcome::Aborted { reason }
+        TurnOutcome::Aborted {
+            reason,
+            cost_usd: total_cost_usd,
+        }
     }
 
     /// Compaction, before every model call, per the running estimate
@@ -559,6 +575,7 @@ impl<'a> Engine<'a> {
     fn check_loop_detection(
         &self,
         messages: &[CompletionMessage],
+        total_cost_usd: f64,
         events: &UnboundedSender<AgentEvent>,
     ) -> Option<TurnOutcome> {
         let recent_calls = recent_tool_calls(messages);
@@ -575,6 +592,7 @@ impl<'a> Engine<'a> {
         });
         Some(TurnOutcome::Aborted {
             reason: format!("stuck-loop detected: {reason}"),
+            cost_usd: total_cost_usd,
         })
     }
 
@@ -593,8 +611,9 @@ impl<'a> Engine<'a> {
     async fn run_model_call(
         &self,
         messages: &[CompletionMessage],
+        budget: &mut BudgetGuard,
         events: &UnboundedSender<AgentEvent>,
-    ) -> Result<CommittedStep, TurnOutcome> {
+    ) -> Result<CommittedStep, String> {
         let tools_schema = self.tools.schemas();
         let read_only_tools: HashSet<String> = tools_schema
             .iter()
@@ -633,27 +652,28 @@ impl<'a> Engine<'a> {
             let delta_tx = delta_events.clone();
             Box::pin(async move {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                let pump = self.pump_speculations(rx);
-                let complete = async move {
+                let mut pump: SpeculationFuture<'_> = Box::pin(self.pump_speculations(rx));
+                let mut complete = Box::pin(async move {
                     let gate = SpeculationGate::new(read_only, tx, delta_tx);
                     self.provider.complete_observed(req, &gate).await
                     // `gate` (and its sender) drop here → the pump's
                     // stream ends once in-flight executions drain.
+                });
+                let result = tokio::select! {
+                    result = &mut complete => result,
+                    _ = &mut pump => unreachable!("the gate keeps the speculation channel open"),
                 };
-                let (result, speculation) = futures_util::join!(complete, pump);
-                result.map(|result| (result, speculation))
+                drop(complete);
+                result.map(|result| (result, pump))
             })
         });
 
         let call_started = std::time::Instant::now();
-        let outcome = retry_with_backoff(&self.config.retry_policy, self.sleeper, attempt).await;
-        let call_duration_ms = call_started.elapsed().as_millis() as u64;
-
         let RetryOutcome {
-            value: (result, speculation),
+            value: (result, speculation_future),
             retries,
             ..
-        } = match outcome {
+        } = match retry_with_backoff(&self.config.retry_policy, self.sleeper, attempt).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 let message = error.to_string();
@@ -661,11 +681,12 @@ impl<'a> Engine<'a> {
                     message: message.clone(),
                     retryable: error.is_retryable(),
                 });
-                return Err(TurnOutcome::Aborted {
-                    reason: format!("model call failed: {message}"),
-                });
+                return Err(format!("model call failed: {message}"));
             }
         };
+        let budget_outcome = record_settled_cost(budget, result.cost_usd, events);
+        let speculation = speculation_future.await;
+        let call_duration_ms = call_started.elapsed().as_millis() as u64;
 
         // Deferred-flush: these `Retry` events only reach the wire now
         // that the step has actually committed (see module docs).
@@ -678,6 +699,7 @@ impl<'a> Engine<'a> {
 
         Ok(CommittedStep {
             result,
+            budget_outcome,
             read_only_tools,
             speculation,
             estimated_input_tokens,
@@ -721,16 +743,17 @@ impl<'a> Engine<'a> {
     }
 
     /// Bookkeeping for the call that just committed: drift feedback into
-    /// the attached calibration, exactly one `StepUsage` metering record
-    /// per landed step, and budget accounting. `Some` is the turn's clean
-    /// abort — this call's spend pushed the turn over an enforced limit —
-    /// issued only after delivering what was already paid for (see body);
-    /// never a mid-tool kill.
+    /// the attached calibration and exactly one `StepUsage` metering record
+    /// per landed step. Its cost was already settled synchronously at the
+    /// provider-success boundary, before this method can be reached; the
+    /// carried outcome decides whether `Some` is the turn's clean abort.
+    /// That abort is issued only after delivering what was already paid for
+    /// (see body), never as a mid-tool kill.
     fn handle_committed_result(
         &self,
         step: usize,
         committed: &CommittedStep,
-        budget: &mut BudgetGuard,
+        total_cost_usd: f64,
         messages: &mut Vec<CompletionMessage>,
         events: &UnboundedSender<AgentEvent>,
     ) -> Option<TurnOutcome> {
@@ -763,17 +786,11 @@ impl<'a> Engine<'a> {
             tool_calls: result.tool_calls.len(),
         });
 
-        let outcome = budget.record_spend(result.cost_usd);
-        let _ = events.send(AgentEvent::BudgetTick {
-            spent_usd: budget.spent_usd(),
-            limit_usd: budget.turn_limit_usd(),
-            mode: budget.mode(),
-        });
         let BudgetOutcome::AbortTurn {
             spent_usd,
             limit_usd,
             ..
-        } = outcome
+        } = committed.budget_outcome
         else {
             return None;
         };
@@ -830,7 +847,10 @@ impl<'a> Engine<'a> {
             message: reason.clone(),
             retryable: false,
         });
-        Some(TurnOutcome::Aborted { reason })
+        Some(TurnOutcome::Aborted {
+            reason,
+            cost_usd: total_cost_usd,
+        })
     }
 
     /// Deliver a committed step's result: emit its text, then either
@@ -883,7 +903,10 @@ impl<'a> Engine<'a> {
                     message: reason.clone(),
                     retryable: true,
                 });
-                return Some(TurnOutcome::Aborted { reason });
+                return Some(TurnOutcome::Aborted {
+                    reason,
+                    cost_usd: total_cost_usd,
+                });
             }
             // A non-empty answer that was still truncated at the limit: keep the
             // partial answer (already emitted above) but tell the user it was
@@ -1120,40 +1143,24 @@ impl<'a> Engine<'a> {
 
 /// The boxed-future shape `retry_with_backoff` needs from its `attempt_fn`
 /// — named here purely to keep the call site in `run_turn` readable. Each
-/// attempt yields the completion AND the speculative executions performed
-/// while that attempt streamed, as one value: the pool is only meaningful
-/// for the attempt that produced it.
+/// attempt yields the completion AND its still-live speculation future as
+/// one value. The caller settles the billed completion synchronously before
+/// awaiting that future, closing the cancellation window without moving the
+/// mutable budget ledger into concurrent work.
 type RetryAttemptFn<'a> = Box<
     dyn FnMut() -> Pin<
             Box<
-                dyn Future<Output = Result<(CompletionResultAlias, SpeculationPool), ProviderError>>
-                    + 'a,
+                dyn Future<
+                        Output = Result<
+                            (CompletionResultAlias, SpeculationFuture<'a>),
+                            ProviderError,
+                        >,
+                    > + 'a,
             >,
         > + 'a,
 >;
 type CompletionResultAlias = stella_protocol::CompletionResult;
-
-/// The between-steps budget check (never mid-tool — see module docs).
-/// `Some` is the turn's clean abort. A free function like
-/// [`recent_tool_calls`] because it reads no engine state; the wording
-/// differs from the post-call abort in `Engine::handle_committed_result`
-/// because here nothing new was spent.
-fn check_budget(budget: &BudgetGuard, events: &UnboundedSender<AgentEvent>) -> Option<TurnOutcome> {
-    let BudgetOutcome::AbortTurn {
-        spent_usd,
-        limit_usd,
-        ..
-    } = budget.evaluate()
-    else {
-        return None;
-    };
-    let reason = format!("budget exceeded: spent ${spent_usd:.4} against a ${limit_usd:.2} limit");
-    let _ = events.send(AgentEvent::Error {
-        message: reason.clone(),
-        retryable: false,
-    });
-    Some(TurnOutcome::Aborted { reason })
-}
+type SpeculationFuture<'a> = Pin<Box<dyn Future<Output = SpeculationPool> + 'a>>;
 
 /// Flatten the tool calls of the CURRENT turn — assistant messages after
 /// the last user message — in chronological order, for
@@ -1784,7 +1791,7 @@ mod tests {
 
         let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
         match outcome {
-            TurnOutcome::Aborted { reason } => assert_eq!(reason, SOFT_STOP_REASON),
+            TurnOutcome::Aborted { reason, .. } => assert_eq!(reason, SOFT_STOP_REASON),
             other => panic!("expected soft-stop abort, got {other:?}"),
         }
         assert_eq!(provider_calls.load(Ordering::SeqCst), 1, "one step ran");
@@ -2224,7 +2231,7 @@ mod tests {
 
         let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
         match outcome {
-            TurnOutcome::Aborted { reason } => assert!(reason.contains("stuck-loop")),
+            TurnOutcome::Aborted { reason, .. } => assert!(reason.contains("stuck-loop")),
             other => panic!("expected a stuck-loop abort, got {other:?}"),
         }
         // Well under the 200-step cap — loop detection caught it early.
@@ -2257,7 +2264,13 @@ mod tests {
 
         let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
         match outcome {
-            TurnOutcome::Aborted { reason } => assert!(reason.contains("budget")),
+            TurnOutcome::Aborted { reason, cost_usd } => {
+                assert!(reason.contains("budget"));
+                assert!(
+                    (cost_usd - 0.0001).abs() < 1e-9,
+                    "the abort must retain the settled over-cap call: {cost_usd}"
+                );
+            }
             other => panic!("expected a budget abort, got {other:?}"),
         }
         let events = drain_events(&mut rx);
@@ -3146,4 +3159,6 @@ mod tests {
         );
         assert!(payloads[0].contains("\"event\":\"SessionStart\""));
     }
+
+    mod task4;
 }

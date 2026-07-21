@@ -340,7 +340,7 @@ async fn tap_emits_a_diffless_read_event_for_successful_reads_only() {
 
 #[test]
 fn mcp_outcome_report_lists_connected_servers_by_name() {
-    let report = mcp_outcome_report(&["files", "search"], &[]);
+    let report = crate::mcp_cmd::mcp_outcome_report(&["files", "search"], &[]);
     assert_eq!(report, "2 MCP server(s) connected: files, search");
 }
 
@@ -350,7 +350,7 @@ fn mcp_outcome_report_names_each_failure_with_its_reason() {
         "slow".to_string(),
         "connect timed out after 10000ms".to_string(),
     )];
-    let report = mcp_outcome_report(&["files"], &failed);
+    let report = crate::mcp_cmd::mcp_outcome_report(&["files"], &failed);
     let lines: Vec<&str> = report.lines().collect();
     assert_eq!(lines[0], "1 MCP server(s) connected: files");
     assert_eq!(
@@ -362,7 +362,7 @@ fn mcp_outcome_report_names_each_failure_with_its_reason() {
 #[test]
 fn mcp_outcome_report_states_total_failure_outright() {
     let failed = vec![("a".to_string(), "spawn failed".to_string())];
-    let report = mcp_outcome_report(&[], &failed);
+    let report = crate::mcp_cmd::mcp_outcome_report(&[], &failed);
     assert!(
         report.starts_with("no MCP servers connected"),
         "the degraded mode is stated, not implied: {report}"
