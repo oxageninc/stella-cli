@@ -60,15 +60,19 @@ fn assemble_system_prompt_carries_a_byte_stable_scripts_section() {
     .unwrap();
     std::fs::write(root.path().join("pnpm-lock.yaml"), "").unwrap();
 
-    let first = assemble_system_prompt(SYSTEM_PROMPT, root.path());
-    let second = assemble_system_prompt(SYSTEM_PROMPT, root.path());
+    let authority = crate::settings::AuthorityPolicy {
+        project_prompts_allowed: true,
+        ..crate::settings::AuthorityPolicy::default()
+    };
+    let first = assemble_system_prompt(SYSTEM_PROMPT, root.path(), &authority);
+    let second = assemble_system_prompt(SYSTEM_PROMPT, root.path(), &authority);
     assert_eq!(first, second, "same workspace state ⇒ identical bytes");
     assert!(first.contains("## Project scripts"), "section present");
     assert!(first.contains("build → pnpm run build"), "{first}");
     assert!(first.contains("install → pnpm install"), "{first}");
 
     let empty = tempfile::tempdir().expect("tempdir");
-    let bare = assemble_system_prompt(SYSTEM_PROMPT, empty.path());
+    let bare = assemble_system_prompt(SYSTEM_PROMPT, empty.path(), &authority);
     assert!(
         !bare.contains("## Project scripts"),
         "no scripts → no section, no noise"
@@ -235,7 +239,9 @@ fn system_prompt_carries_the_workspace_rules_section() {
     )
     .unwrap();
 
-    let prompt = build_system_prompt(&cfg_for("zai"), root.path());
+    let mut cfg = cfg_for("zai");
+    cfg.authority.project_prompts_allowed = true;
+    let prompt = build_system_prompt(&cfg, root.path());
     assert!(
         prompt.starts_with(SYSTEM_PROMPT),
         "rules append to the prompt; the base prefix must stay intact"
@@ -245,6 +251,72 @@ fn system_prompt_carries_the_workspace_rules_section() {
         prompt.contains("Never force-push.  [enforced]"),
         "a guarded rule must render with the enforced marker: {prompt}"
     );
+}
+
+/// An untrusted checkout cannot append repository-authored content to the
+/// privileged system prompt. Explicit repository trust restores those
+/// sources within the already-computed managed ceiling.
+#[test]
+fn untrusted_project_prompt_sources_are_absent_from_the_system_prompt() {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        root.path().join("package.json"),
+        r#"{"scripts": {"authority-marker": "echo project-script"}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join(".stella/memories")).unwrap();
+    std::fs::write(
+        root.path().join(".stella/memories/project.md"),
+        "PROJECT_MEMORY_AUTHORITY_MARKER",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join(".stella/rules")).unwrap();
+    std::fs::write(
+        root.path().join(".stella/rules/project.md"),
+        "PROJECT_RULE_AUTHORITY_MARKER",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join(".stella/explorations")).unwrap();
+    std::fs::write(
+        root.path().join(".stella/explorations/project.json"),
+        serde_json::json!({
+            "slice": "authority-map",
+            "title": "PROJECT_MAP_AUTHORITY_MARKER",
+            "summary": "project map",
+            "content": "body",
+            "files": [],
+            "created_at_ms": 1u64
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut cfg = cfg_for("zai");
+    cfg.workspace_root = root.path().to_path_buf();
+    cfg.authority.project_prompts_allowed = false;
+    let untrusted = build_system_prompt(&cfg, root.path());
+    for marker in [
+        "authority-marker",
+        "PROJECT_MEMORY_AUTHORITY_MARKER",
+        "PROJECT_RULE_AUTHORITY_MARKER",
+        "PROJECT_MAP_AUTHORITY_MARKER",
+    ] {
+        assert!(
+            !untrusted.contains(marker),
+            "untrusted project marker reached system prompt: {marker}\n{untrusted}"
+        );
+    }
+
+    cfg.authority.project_prompts_allowed = true;
+    let trusted = build_system_prompt(&cfg, root.path());
+    for marker in [
+        "authority-marker",
+        "PROJECT_MEMORY_AUTHORITY_MARKER",
+        "PROJECT_RULE_AUTHORITY_MARKER",
+        "PROJECT_MAP_AUTHORITY_MARKER",
+    ] {
+        assert!(trusted.contains(marker), "trusted marker missing: {marker}");
+    }
 }
 
 #[test]
@@ -263,7 +335,9 @@ fn system_prompt_carries_the_workspace_maps_index() {
     )
     .unwrap();
 
-    let prompt = build_system_prompt(&cfg_for("zai"), root.path());
+    let mut cfg = cfg_for("zai");
+    cfg.authority.project_prompts_allowed = true;
+    let prompt = build_system_prompt(&cfg, root.path());
     assert!(
         prompt.contains("## Workspace maps"),
         "index section missing"
@@ -325,6 +399,24 @@ async fn untrusted_project_custom_tools_are_absent_from_the_runtime_surface() {
         !names.contains(&"workspace_tool"),
         "runtime tools: {names:?}"
     );
+}
+
+#[test]
+fn json_output_is_headless_without_granting_scope_approval() {
+    let cfg = cfg_for("zai");
+    let json = pipeline_config_for_output(&cfg, OutputFormat::Json, None);
+    assert!(
+        json.headless,
+        "JSON is a machine/headless presentation mode"
+    );
+    assert!(
+        !json.headless_bypass_scope_review,
+        "output serialization must never grant execution authority"
+    );
+
+    let text = pipeline_config_for_output(&cfg, OutputFormat::Text, None);
+    assert!(!text.headless, "text mode retains interactive scope review");
+    assert!(!text.headless_bypass_scope_review);
 }
 
 #[test]

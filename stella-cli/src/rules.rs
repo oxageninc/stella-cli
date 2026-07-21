@@ -108,37 +108,54 @@ fn store_rule_files(workspace_root: &Path) -> Vec<RuleFile> {
 /// keep final say over machine-written rules.
 struct SessionRuleSource {
     store_files: Vec<RuleFile>,
+    include_project: bool,
 }
 
 impl RuleSource for SessionRuleSource {
     fn read_rule_files(&self, dirs: &[String]) -> Vec<RuleFile> {
         let mut out = self.store_files.clone();
-        out.extend(FsRuleSource.read_rule_files(dirs));
+        let visible_dirs = if self.include_project {
+            dirs
+        } else {
+            dirs.get(..1).unwrap_or(dirs)
+        };
+        out.extend(FsRuleSource.read_rule_files(visible_dirs));
         out
     }
 }
 
-/// Load every workspace rule visible from `workspace_root`, merged by id
-/// through the engine's precedence merging: store rules, then the user
-/// (`~/.config/stella/rules`), `.claude/rules`, and `.stella/rules`
-/// directories — later wins (`stella_core::rules::rule_search_dirs`).
+/// Load the user rule directory and, when the effective authority permits
+/// project prompts, the workspace store plus `.claude/rules` and
+/// `.stella/rules`. Visible sources merge by id in precedence order.
 /// Called once per session: the result feeds both the Tier-1 prompt
 /// section and the Tier-2 guards, so the two enforcement surfaces can
 /// never disagree about what was loaded.
-pub(crate) fn load_workspace_rules(workspace_root: &Path) -> Vec<Rule> {
+pub(crate) fn load_workspace_rules(
+    workspace_root: &Path,
+    authority: &crate::settings::AuthorityPolicy,
+) -> Vec<Rule> {
     let user_rules_dir = std::env::var_os("HOME").map(|home| {
         PathBuf::from(home)
             .join(".config")
             .join("stella")
             .join("rules")
     });
-    load_rules_from(workspace_root, user_rules_dir)
+    load_rules_from_with_authority(
+        workspace_root,
+        user_rules_dir,
+        authority.project_prompts_allowed,
+    )
 }
 
-/// [`load_workspace_rules`] over an explicit user rules directory — the
-/// seam tests use so precedence is provable without touching `$HOME`.
-/// `None` (no home directory) degrades to workspace + store rules only.
-fn load_rules_from(workspace_root: &Path, user_rules_dir: Option<PathBuf>) -> Vec<Rule> {
+/// [`load_workspace_rules`] over an explicit user rules directory — the seam
+/// tests use so precedence and both authority branches are provable without
+/// touching `$HOME`. `None` omits user rules; project sources still follow
+/// `include_project`.
+fn load_rules_from_with_authority(
+    workspace_root: &Path,
+    user_rules_dir: Option<PathBuf>,
+    include_project: bool,
+) -> Vec<Rule> {
     let opts = LoadRulesOptions {
         cwd: workspace_root.display().to_string(),
         user_rules_dir: user_rules_dir
@@ -146,7 +163,12 @@ fn load_rules_from(workspace_root: &Path, user_rules_dir: Option<PathBuf>) -> Ve
             .unwrap_or_default(),
     };
     let source = SessionRuleSource {
-        store_files: store_rule_files(workspace_root),
+        store_files: if include_project {
+            store_rule_files(workspace_root)
+        } else {
+            Vec::new()
+        },
+        include_project,
     };
     load_rules(&source, &opts)
 }
@@ -154,8 +176,12 @@ fn load_rules_from(workspace_root: &Path, user_rules_dir: Option<PathBuf>) -> Ve
 /// Session wiring shorthand: load the workspace rules and attach their
 /// Tier-2 guards to `registry`. Every session driver calls this right after
 /// constructing its registry (same rhythm as `populate_schema_index`).
-pub(crate) fn enforce_workspace_rules(registry: &ToolRegistry, workspace_root: &Path) {
-    attach_rule_guards(registry, load_workspace_rules(workspace_root));
+pub(crate) fn enforce_workspace_rules(
+    registry: &ToolRegistry,
+    workspace_root: &Path,
+    authority: &crate::settings::AuthorityPolicy,
+) {
+    attach_rule_guards(registry, load_workspace_rules(workspace_root, authority));
 }
 
 /// Map a registry tool name to the canonical vocabulary guards are authored
@@ -208,6 +234,13 @@ pub(crate) fn attach_rule_guards(registry: &ToolRegistry, rules: Vec<Rule>) {
 mod tests {
     use super::*;
     use stella_protocol::ToolOutput;
+
+    fn trusted_project_authority() -> crate::settings::AuthorityPolicy {
+        crate::settings::AuthorityPolicy {
+            project_prompts_allowed: true,
+            ..crate::settings::AuthorityPolicy::default()
+        }
+    }
 
     fn write_rule(dir: &Path, name: &str, contents: &str) {
         std::fs::create_dir_all(dir).unwrap();
@@ -262,7 +295,7 @@ mod tests {
             "no-applied-migration.md",
             "---\ndescription: Never edit an applied migration\nguard-tool: Edit\nguard-deny-path: migrations/*-applied/**\n---\nAdd a new forward migration instead of editing an applied one.",
         );
-        let rules = load_rules_from(root.path(), None);
+        let rules = load_rules_from_with_authority(root.path(), None, true);
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].id, "no-applied-migration", "id = filename stem");
         assert_eq!(rules[0].description, "Never edit an applied migration");
@@ -287,15 +320,84 @@ mod tests {
         write_rule(&user.path().join("rules"), "r.md", "user text");
         write_rule(&root.path().join(".claude/rules"), "r.md", "claude text");
         write_rule(&root.path().join(".stella/rules"), "r.md", "stella text");
-        let rules = load_rules_from(root.path(), Some(user.path().join("rules")));
+        let rules =
+            load_rules_from_with_authority(root.path(), Some(user.path().join("rules")), true);
         assert_eq!(rules.len(), 1, "one id merges across all three dirs");
         assert_eq!(rules[0].text, "stella text");
     }
 
     #[test]
+    fn untrusted_project_rules_are_excluded_while_user_rules_remain() {
+        let root = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        {
+            let store = stella_store::Store::open(root.path()).unwrap();
+            store
+                .upsert_rule("store", "untrusted store rule", "ext:policy")
+                .unwrap();
+        }
+        write_rule(&user.path().join("rules"), "user.md", "trusted user rule");
+        write_rule(
+            &root.path().join(".claude/rules"),
+            "claude.md",
+            "untrusted claude rule",
+        );
+        write_rule(
+            &root.path().join(".stella/rules"),
+            "project.md",
+            "untrusted project rule",
+        );
+
+        let rules =
+            load_rules_from_with_authority(root.path(), Some(user.path().join("rules")), false);
+        let texts: Vec<&str> = rules.iter().map(|rule| rule.text.as_str()).collect();
+        assert_eq!(texts, vec!["trusted user rule"], "loaded rules: {texts:?}");
+    }
+
+    #[tokio::test]
+    async fn untrusted_project_guard_is_not_armed_at_the_tool_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_rule(
+            &root.path().join(".stella/rules"),
+            "deny-write.md",
+            "---\nguard-tool: Write\nguard-deny-path: blocked/**\n---\nProject guard.",
+        );
+        let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
+        {
+            let _env = crate::test_env::lock();
+            let previous_home = std::env::var_os("HOME");
+            // SAFETY: serialized behind the binary-wide environment lock.
+            unsafe { std::env::set_var("HOME", home.path()) };
+            enforce_workspace_rules(
+                &registry,
+                root.path(),
+                &crate::settings::AuthorityPolicy::default(),
+            );
+            match previous_home {
+                Some(previous) => unsafe { std::env::set_var("HOME", previous) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+
+        let result = registry
+            .execute(
+                "write_file",
+                &serde_json::json!({"path": "blocked/allowed.txt", "content": "ok\n"}),
+            )
+            .await;
+
+        assert!(
+            !result.is_error(),
+            "untrusted guard blocked the tool: {result:?}"
+        );
+        assert!(root.path().join("blocked/allowed.txt").exists());
+    }
+
+    #[test]
     fn no_rule_dirs_at_all_loads_nothing() {
         let root = tempfile::tempdir().unwrap();
-        assert!(load_rules_from(root.path(), None).is_empty());
+        assert!(load_rules_from_with_authority(root.path(), None, false).is_empty());
         assert!(
             !root.path().join(".stella").exists(),
             "rule loading must not create .stella (or a store.db) as a side effect"
@@ -322,7 +424,7 @@ mod tests {
             "file text",
         );
 
-        let rules = load_rules_from(root.path(), None);
+        let rules = load_rules_from_with_authority(root.path(), None, true);
         assert_eq!(rules.len(), 2, "store + file rules merge by id");
         let ext = rules.iter().find(|r| r.id == "from-ext").unwrap();
         assert_eq!(ext.text, "Extension-published rule.");
@@ -351,7 +453,7 @@ mod tests {
                 .unwrap();
         }
         let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
-        enforce_workspace_rules(&registry, root.path());
+        enforce_workspace_rules(&registry, root.path(), &trusted_project_authority());
 
         let denied = registry
             .execute(
@@ -385,7 +487,7 @@ mod tests {
         std::fs::write(&target, "SELECT 1;\n").unwrap();
 
         let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
-        enforce_workspace_rules(&registry, root.path());
+        enforce_workspace_rules(&registry, root.path(), &trusted_project_authority());
 
         let denied = registry
             .execute(
@@ -447,7 +549,7 @@ mod tests {
                 web: false,
             },
         );
-        enforce_workspace_rules(&registry, root.path());
+        enforce_workspace_rules(&registry, root.path(), &trusted_project_authority());
 
         let denied = registry
             .execute(

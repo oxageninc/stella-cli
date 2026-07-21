@@ -473,7 +473,7 @@ async fn run_task(
     let provider = agent::build_provider(&cfg)?;
     let registry =
         ToolRegistry::new_detected(root.to_path_buf(), agent::registry_options(&cfg)).await;
-    crate::rules::enforce_workspace_rules(&registry, root);
+    crate::rules::enforce_workspace_rules(&registry, root, &cfg.authority);
     // Claim-on-first-write (crate::claims): tool-level write claims + the
     // transient build lane, coordinated across every writer in the
     // workspace. Same holder as the fleet's declared claims — re-entrant.
@@ -524,8 +524,7 @@ async fn run_task(
     let (summary, success): (String, bool) = if use_pipeline {
         use stella_core::router::{CircuitBreaker, Router};
         use stella_pipeline::{
-            AutoApproveGate, NoContextRecall, Pipeline, PipelineConfig, PipelinePorts,
-            PipelineStatus,
+            NoContextRecall, Pipeline, PipelineConfig, PipelinePorts, PipelineStatus,
         };
         let model_ref = stella_protocol::ModelRef::new(cfg.provider.id, cfg.model_id.clone());
         // Role wiring from `agent_engine_config` — fleet workers honor the
@@ -554,7 +553,7 @@ async fn run_task(
             repo: &ws_ports.repo_structure,
             repo_status: &ws_ports.repo_status,
             commands: &ws_ports.command_runner,
-            approvals: &AutoApproveGate,
+            approvals: &agent::HEADLESS_APPROVAL_GATE,
             sleeper: &TokioSleeper,
             hooks: cfg
                 .hooks
@@ -568,7 +567,7 @@ async fn run_task(
             engine: agent::pipeline_engine_config_for(&cfg),
             role_overrides: wiring.role_overrides.clone(),
             headless: true,
-            headless_bypass_scope_review: true,
+            headless_bypass_scope_review: agent::HEADLESS_SCOPE_REVIEW_BYPASS,
             ..PipelineConfig::default()
         };
         let pipeline = Pipeline::new(ports, tx.clone(), config);

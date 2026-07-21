@@ -69,6 +69,27 @@ pub(crate) fn pipeline_engine_config_for(cfg: &Config) -> EngineConfig {
     tuned_engine_config(cfg, crate::settings::EngineAgentKind::Worker)
 }
 
+/// CLI-owned headless surfaces have no host approval port, so scope expansion
+/// always stops at the named pipeline error. Output modes never alter this.
+pub(crate) const HEADLESS_SCOPE_REVIEW_BYPASS: bool = false;
+pub(crate) const HEADLESS_APPROVAL_GATE: AlwaysAbortGate = AlwaysAbortGate;
+
+/// Build the one-shot pipeline config without treating output serialization
+/// as execution authority.
+pub(crate) fn pipeline_config_for_output(
+    cfg: &Config,
+    format: OutputFormat,
+    test_command: Option<&str>,
+) -> PipelineConfig {
+    PipelineConfig {
+        engine: pipeline_engine_config_for(cfg),
+        headless: format != OutputFormat::Text,
+        headless_bypass_scope_review: HEADLESS_SCOPE_REVIEW_BYPASS,
+        test_command: test_command.map(str::to_string),
+        ..Default::default()
+    }
+}
+
 /// EngineConfig for the goal loop's standalone judge engine — the JUDGE
 /// agent's tuning.
 pub(crate) fn judge_engine_config_for(cfg: &Config) -> EngineConfig {

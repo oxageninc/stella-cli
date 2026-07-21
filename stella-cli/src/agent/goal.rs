@@ -23,7 +23,7 @@ pub(crate) async fn run_raw_one_shot(
         ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build + live-refresh the code graph in the background so a
     // multi-step one-shot turn can reach for `graph_query` once the index is
     // ready. Status goes to stderr — stdout may be machine-readable JSON.
@@ -63,7 +63,11 @@ pub(crate) async fn run_raw_one_shot(
 
     // The self-improvement loop (memory.rs): recall relevant memories +
     // skills into a volatile block after the stable system prefix (L-E8)…
-    let mut memory = SessionMemory::open(&cfg.workspace_root, format == OutputFormat::Text);
+    let mut memory = SessionMemory::open_with_authority(
+        &cfg.workspace_root,
+        format == OutputFormat::Text,
+        &cfg.authority,
+    );
     if let Some(m) = &memory {
         inject_recall_block(&mut messages, m.recall_block(prompt).await);
     }
@@ -170,7 +174,7 @@ pub async fn run_goal_cmd(
         ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build + live-refresh the code-graph index in the background so
     // `graph_query` is available for the goal loop without a manual `stella
     // init`. Non-blocking; status to stderr. Kept alive until the goal returns.
@@ -202,7 +206,7 @@ pub async fn run_goal_cmd(
     let mut messages = vec![CompletionMessage::system(
         with_session_hook_context(build_system_prompt(cfg, &cfg.workspace_root), cfg).await,
     )];
-    let mut memory = SessionMemory::open(&cfg.workspace_root, true);
+    let mut memory = SessionMemory::open_with_authority(&cfg.workspace_root, true, &cfg.authority);
     if let Some(m) = &memory {
         inject_recall_block(&mut messages, m.recall_block(goal).await);
     }
@@ -347,7 +351,8 @@ pub(crate) async fn run_goal_turn(
         let interactive = InteractiveToolSet::new(&customs, tx.clone(), default_ask_io(true))
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
         let tools =
-            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone());
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed);
         let hook_runner = ShellHookRunner;
         let mut engine =
             Engine::with_sleeper(provider, &tools, engine_config_for(cfg), &TokioSleeper)
@@ -504,7 +509,8 @@ async fn run_goal_pipeline_turn(
         let interactive = InteractiveToolSet::new(&customs, tx.clone(), default_ask_io(true))
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
         let tools =
-            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone());
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed);
 
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
@@ -536,7 +542,7 @@ async fn run_goal_pipeline_turn(
                 engine: pipeline_engine_config_for(cfg),
                 role_overrides: wiring.role_overrides.clone(),
                 headless: true,
-                headless_bypass_scope_review: true,
+                headless_bypass_scope_review: HEADLESS_SCOPE_REVIEW_BYPASS,
                 ..PipelineConfig::default()
             };
             let ports = PipelinePorts {
@@ -547,7 +553,7 @@ async fn run_goal_pipeline_turn(
                 repo: &ws_ports.repo_structure,
                 repo_status: &ws_ports.repo_status,
                 commands: &ws_ports.command_runner,
-                approvals: &AutoApproveGate,
+                approvals: &HEADLESS_APPROVAL_GATE,
                 sleeper: &TokioSleeper,
                 hooks: cfg
                     .hooks

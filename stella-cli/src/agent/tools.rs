@@ -134,6 +134,7 @@ pub(crate) fn workspace_ports(root: std::path::PathBuf, cfg: &Config) -> Workspa
             root,
             registry_options(cfg),
             custom_tools,
+            cfg.authority,
         ),
     }
 }

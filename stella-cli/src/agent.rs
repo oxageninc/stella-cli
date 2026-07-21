@@ -25,7 +25,7 @@ use stella_mcp::{McpConfig, McpServerConfig, McpToolSet};
 use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
 use stella_pipeline::{
-    AutoApproveGate, CmdOutcome, CommandRunner, ContextRecallPort, NoContextRecall, Pipeline,
+    AlwaysAbortGate, CmdOutcome, CommandRunner, ContextRecallPort, NoContextRecall, Pipeline,
     PipelineConfig, PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort,
     RepoStructurePort, StdioApprovalGate,
 };
@@ -96,7 +96,7 @@ async fn run_pipeline_one_shot(
         ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build + live-refresh the code graph in the background so the
     // pipeline's localize step can reach for `graph_query` once it is ready.
     // Status goes to stderr — stdout may be machine-readable JSON.
@@ -153,7 +153,11 @@ async fn run_pipeline_one_shot(
         with_session_hook_context(build_pipeline_system_prompt(cfg, &cfg.workspace_root), cfg)
             .await,
     )];
-    let mut memory = SessionMemory::open(&cfg.workspace_root, format == OutputFormat::Text);
+    let mut memory = SessionMemory::open_with_authority(
+        &cfg.workspace_root,
+        format == OutputFormat::Text,
+        &cfg.authority,
+    );
     if let Some(m) = &memory {
         inject_recall_block(&mut messages, m.recall_block(prompt).await);
     }
@@ -171,7 +175,8 @@ async fn run_pipeline_one_shot(
         // Outermost: the discovery layer (tool_search/skill_search/mcp_search)
         // must see the complete advertised catalog below it.
         let tools =
-            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone());
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed);
 
         let ws_ports = workspace_ports(cfg.workspace_root.clone(), cfg);
 
@@ -179,18 +184,8 @@ async fn run_pipeline_one_shot(
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
         let is_text = format == OutputFormat::Text;
-        let pipeline_config = PipelineConfig {
-            engine: pipeline_engine_config_for(cfg),
-            role_overrides: wiring.role_overrides.clone(),
-            headless: !is_text,
-            headless_bypass_scope_review: !is_text,
-            // `--test-command` arms the deterministic verify ladder: the
-            // fail→pass flip oracle and SubmitFast/Revise decisions all key
-            // off it. Left unset, every verification escalates to the model
-            // judge.
-            test_command: test_command.map(str::to_string),
-            ..Default::default()
-        };
+        let mut pipeline_config = pipeline_config_for_output(cfg, format, test_command);
+        pipeline_config.role_overrides = wiring.role_overrides.clone();
 
         let stdio_gate = StdioApprovalGate;
         let no_recall = NoContextRecall;
@@ -213,7 +208,7 @@ async fn run_pipeline_one_shot(
             approvals: if is_text {
                 &stdio_gate
             } else {
-                &AutoApproveGate
+                &HEADLESS_APPROVAL_GATE
             },
             sleeper: &TokioSleeper,
             hooks: cfg
@@ -415,7 +410,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     )
     .await;
     populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build the code-graph index in the background (a cheap incremental
     // refresh if it already exists) and keep it fresh via the live watcher, so
     // `graph_query` becomes available this session without a manual `stella
@@ -450,12 +445,15 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     let system_prompt =
         with_session_hook_context(build_system_prompt(cfg, &cfg.workspace_root), cfg).await;
     let mut messages = vec![CompletionMessage::system(system_prompt.clone())];
-    let mut memory = SessionMemory::open(&cfg.workspace_root, true);
+    let mut memory = SessionMemory::open_with_authority(&cfg.workspace_root, true, &cfg.authority);
     // Custom extensions: ⚡ commands/skills invocable as `/name args`, custom
     // agents behind `/agents`. Reloaded after `/init`, which may adopt new
     // ones from `.claude/`/`.agents/`. Load problems print up front so a
     // definition that failed to parse is visible, not silently absent.
-    let mut custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
+    let mut custom = crate::extensions::CustomExtensions::load_with_authority(
+        &cfg.workspace_root,
+        &cfg.authority,
+    );
     if let Some(report) = custom.problems_report() {
         for line in report.lines() {
             println!("  {line}");
@@ -547,11 +545,18 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                     // Re-open memory so recall/reflection use the taxonomy
                     // `/init` just wrote — otherwise the cached domains stay
                     // stale until the next launch.
-                    memory = SessionMemory::open(&cfg.workspace_root, true);
+                    memory = SessionMemory::open_with_authority(
+                        &cfg.workspace_root,
+                        true,
+                        &cfg.authority,
+                    );
                     // `/init` may also have adopted new custom
                     // commands/skills/agents — make them invocable now, and
                     // report anything that failed to load.
-                    custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
+                    custom = crate::extensions::CustomExtensions::load_with_authority(
+                        &cfg.workspace_root,
+                        &cfg.authority,
+                    );
                     if let Some(report) = custom.problems_report() {
                         for line in report.lines() {
                             println!("  {line}");
@@ -1794,6 +1799,7 @@ async fn run_turn(
         // keeps lean-mode activations across the per-turn stack rebuild.
         let tools =
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed)
                 .with_activation(activated.clone());
         let hook_runner = ShellHookRunner;
         let mut engine =

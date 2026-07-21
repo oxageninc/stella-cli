@@ -209,6 +209,7 @@ pub(crate) struct GitCandidateWorkspaces {
     /// stay isolated). Cloned per candidate; the manifests are identical to
     /// the session's because the snapshot is a copy of the real tree.
     custom_tools: Vec<CustomTool>,
+    authority: crate::settings::AuthorityPolicy,
 }
 
 impl GitCandidateWorkspaces {
@@ -216,11 +217,13 @@ impl GitCandidateWorkspaces {
         root: PathBuf,
         options: RegistryOptions,
         custom_tools: Vec<CustomTool>,
+        authority: crate::settings::AuthorityPolicy,
     ) -> Self {
         Self {
             root,
             options,
             custom_tools,
+            authority,
         }
     }
 
@@ -270,7 +273,7 @@ impl GitCandidateWorkspaces {
                 // not be a way around them. Applied while `registry` is still
                 // a plain `ToolRegistry`, before it moves into the `Arc`.
                 crate::agent::populate_schema_index(&registry, &ws_root);
-                crate::rules::enforce_workspace_rules(&registry, &ws_root);
+                crate::rules::enforce_workspace_rules(&registry, &ws_root, &self.authority);
                 // The candidate's tool surface: the snapshot-rooted registry
                 // plus the session's custom script tools, owned as one value
                 // (the workspace outlives every borrow). Custom tools re-root
@@ -697,8 +700,12 @@ mod tests {
     async fn snapshot_mirrors_dirty_staged_and_untracked_state_without_touching_the_real_tree() {
         let root = scaffold("snap");
         let before = tree_state(&root);
-        let port =
-            GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default(), Vec::new());
+        let port = GitCandidateWorkspaces::new(
+            root.clone(),
+            RegistryOptions::default(),
+            Vec::new(),
+            crate::settings::AuthorityPolicy::default(),
+        );
 
         let ws = port.create_workspace().await.unwrap();
         // Uncommitted tracked edit, staged-but-uncommitted new file, and the
@@ -759,8 +766,12 @@ mod tests {
         let custom_tools = stella_tools::custom::discover(&root).tools;
         assert_eq!(custom_tools.len(), 1, "the writer tool must be discovered");
 
-        let port =
-            GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default(), custom_tools);
+        let port = GitCandidateWorkspaces::new(
+            root.clone(),
+            RegistryOptions::default(),
+            custom_tools,
+            crate::settings::AuthorityPolicy::default(),
+        );
         let ws = port.create_workspace().await.unwrap();
 
         // The candidate model sees the custom tool in its schema…
@@ -796,8 +807,12 @@ mod tests {
     #[tokio::test]
     async fn winner_adoption_lands_only_the_winners_changes() {
         let root = scaffold("adopt");
-        let port =
-            GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default(), Vec::new());
+        let port = GitCandidateWorkspaces::new(
+            root.clone(),
+            RegistryOptions::default(),
+            Vec::new(),
+            crate::settings::AuthorityPolicy::default(),
+        );
         let loser = port.create_workspace().await.unwrap();
         let winner = port.create_workspace().await.unwrap();
 
@@ -847,8 +862,12 @@ mod tests {
     #[tokio::test]
     async fn a_mid_run_user_edit_fails_adoption_atomically_naming_the_path() {
         let root = scaffold("conflict");
-        let port =
-            GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default(), Vec::new());
+        let port = GitCandidateWorkspaces::new(
+            root.clone(),
+            RegistryOptions::default(),
+            Vec::new(),
+            crate::settings::AuthorityPolicy::default(),
+        );
         let ws = port.create_workspace().await.unwrap();
 
         std::fs::write(ws.dir().join("tracked.txt"), "base\ndirty\ncandidate\n").unwrap();
@@ -894,8 +913,12 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         scratch_git(&root, &["init", "-q"]);
-        let port =
-            GitCandidateWorkspaces::new(root.clone(), RegistryOptions::default(), Vec::new());
+        let port = GitCandidateWorkspaces::new(
+            root.clone(),
+            RegistryOptions::default(),
+            Vec::new(),
+            crate::settings::AuthorityPolicy::default(),
+        );
         match port.create_workspace().await {
             Err(WorkspaceError::Snapshot { reason }) => {
                 assert!(reason.contains("at least one commit"), "{reason}")

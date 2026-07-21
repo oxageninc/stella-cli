@@ -75,8 +75,7 @@ use stella_core::router::CircuitBreaker;
 use stella_core::{BudgetGuard, CalibrationMap, Engine, Router, TurnOutcome};
 use stella_model::provider::Provider;
 use stella_pipeline::{
-    AutoApproveGate, ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig, PipelinePorts,
-    PipelineStatus,
+    ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig, PipelinePorts, PipelineStatus,
 };
 use stella_protocol::{
     AgentEvent, CiStatus, CompletionMessage, CompletionRequest, FileChangeKind, ModelRef, PrStatus,
@@ -265,7 +264,7 @@ pub async fn run_deck_session(
         ToolRegistry::new_detected(cfg.workspace_root.clone(), agent::registry_options(cfg)).await,
     );
     agent::populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     let custom_tools = agent::discover_custom_tools(cfg, true).await;
     let mut budget = agent::build_budget_guard(budget_limit);
     let store = agent::open_store(&cfg.workspace_root);
@@ -277,10 +276,13 @@ pub async fn run_deck_session(
     let mut messages = vec![CompletionMessage::system(system_prompt.clone())];
     // `warn: false`: past this point diagnostics would land on the alternate
     // screen; a memory-less session degrades silently here.
-    let mut memory = SessionMemory::open(&cfg.workspace_root, false);
+    let mut memory = SessionMemory::open_with_authority(&cfg.workspace_root, false, &cfg.authority);
     // Custom extensions: ⚡ commands/skills in the slash menu, custom agents
     // behind `/agents`. Reloaded after `/init`, which may adopt new ones.
-    let mut custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
+    let mut custom = crate::extensions::CustomExtensions::load_with_authority(
+        &cfg.workspace_root,
+        &cfg.authority,
+    );
     // The npx skills registry (search/install), constructed once for the whole
     // session — the SKILLS tab's ops route through it (see `handle_skills_input`).
     let skill_registry = SkillRegistry::from_env(cfg.workspace_root.clone());
@@ -1047,7 +1049,8 @@ pub async fn run_deck_session(
                 // `/init` changed the taxonomy and rebuilt the index. Re-open
                 // memory so recall/reflection use the new domains this session
                 // (not just the next), and push a fresh Graph-tab snapshot.
-                memory = SessionMemory::open(&cfg.workspace_root, false);
+                memory =
+                    SessionMemory::open_with_authority(&cfg.workspace_root, false, &cfg.authority);
                 if let Some(snapshot) = agent::graph_snapshot(&cfg.workspace_root) {
                     let _ = in_tx.send(Inbound::GraphSnapshot(snapshot));
                 }
@@ -1055,7 +1058,10 @@ pub async fn run_deck_session(
                 // reload them and refresh the deck's slash menu in place,
                 // reporting anything that failed to load (then restoring the
                 // idle status the report's Text event flipped).
-                custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
+                custom = crate::extensions::CustomExtensions::load_with_authority(
+                    &cfg.workspace_root,
+                    &cfg.authority,
+                );
                 let _ = in_tx.send(Inbound::SlashCommands(deck_slash_commands(&custom)));
                 if let Some(report) = custom.problems_report() {
                     let _ = in_tx.send(Inbound::Event {
@@ -3952,7 +3958,8 @@ async fn run_deck_command(
                 "staged pipeline ON — turns now run triage → recall → (plan → scope review) → \
                  witness → execute → verify → judge, with bounded revision. The witness stage \
                  authors a failing test that must flip to green before work counts as done; \
-                 large plans auto-approve in the deck (scope review is narrated, not gated). \
+                 large plans stop with a named scope-review error until a deck-native host \
+                 approval gate is available. \
                  `/pipeline` again to return to the raw engine loop."
                     .to_string()
             } else {
@@ -4130,6 +4137,7 @@ async fn run_lead_turn(
         // catalog), below the taps (searches are read-only; taps watch writes).
         let tools =
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed)
                 .with_activation(activated.clone());
         let tapped = FileChangeTap {
             inner: &tools,
@@ -4202,11 +4210,10 @@ async fn run_lead_turn(
 /// place of the raw `Engine::run_turn`.
 ///
 /// Deck-mode seams, all named:
-/// - **Scope review auto-approves.** The deck cannot block a turn on a stdio
-///   gate (the alternate screen owns the terminal), so `headless_bypass` is
-///   set and the `ScopeReview` event is narrated, not gated — the same seam
-///   the driver's `ScopeDecision` no-op documents. Deck-native scope review
-///   is the fleet-supervisor follow-up.
+/// - **Scope review fails closed.** The deck cannot block a turn on a stdio
+///   gate (the alternate screen owns the terminal), so a large plan returns
+///   `ScopeReviewRequiredHeadless`. Deck-native host approval remains the
+///   follow-up; output/event rendering is never treated as authority.
 /// - **The session's system prompt stays.** It was assembled once at deck
 ///   startup (byte-stable for the cache prefix, L-E8); toggling `/pipeline`
 ///   must not rewrite history. The pipeline's stage prompts (witness, judge,
@@ -4259,6 +4266,7 @@ async fn run_lead_pipeline_turn(
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
         let tools =
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed)
                 .with_activation(activated.clone());
         let tapped = FileChangeTap {
             inner: &tools,
@@ -4302,7 +4310,7 @@ async fn run_lead_pipeline_turn(
             repo: &ws_ports.repo_structure,
             repo_status: &ws_ports.repo_status,
             commands: &ws_ports.command_runner,
-            approvals: &AutoApproveGate,
+            approvals: &agent::HEADLESS_APPROVAL_GATE,
             sleeper: &TokioSleeper,
             hooks: cfg
                 .hooks
@@ -4317,7 +4325,7 @@ async fn run_lead_pipeline_turn(
             engine: agent::pipeline_engine_config_for(cfg),
             role_overrides: wiring.role_overrides.clone(),
             headless: true,
-            headless_bypass_scope_review: true,
+            headless_bypass_scope_review: agent::HEADLESS_SCOPE_REVIEW_BYPASS,
             ..PipelineConfig::default()
         };
         let pipeline = Pipeline::new(ports, tx.clone(), config);

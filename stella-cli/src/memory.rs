@@ -86,6 +86,7 @@ pub struct SessionMemory {
     host: ocp_host::Host,
     domains: Domains,
     workspace_root: PathBuf,
+    include_workspace_skills: bool,
     skills_created: usize,
     /// Memory ids (`nod_…`) quarantined from recall: cited untruthful ≥
     /// [`stella_store::QUARANTINE_NEGATIVES_THRESHOLD`] times (Proposal 3).
@@ -164,24 +165,19 @@ pub(crate) fn user_skills_dir() -> String {
         .unwrap_or_default()
 }
 
-/// Load every skill visible from `workspace_root` (user-global + workspace,
-/// workspace wins) — shared by [`SessionMemory::load_skills`] and the
-/// custom-extensions surface (`crate::extensions`), which offers the same
-/// files as ⚡ slash-menu entries.
-pub(crate) fn load_workspace_skills(workspace_root: &Path) -> Vec<Skill> {
-    load_workspace_skills_with_diagnostics(workspace_root).skills
-}
-
-/// Same load, keeping the per-file skip diagnostics — the custom-extensions
-/// surface reports these so a malformed `SKILL.md` is visible instead of
-/// silently absent from the slash menu.
-pub(crate) fn load_workspace_skills_with_diagnostics(
+/// Load user-global skills and, when permitted, workspace skill definitions.
+pub(crate) fn load_workspace_skills_with_authority(
     workspace_root: &Path,
+    include_workspace: bool,
 ) -> skills::LoadedSkills {
     let mut loaded = skills::load_skills_with_diagnostics(
         &FsSkillSource,
         &LoadSkillsOptions {
-            workspace_skills_dir: workspace_skills_dir(workspace_root),
+            workspace_skills_dir: if include_workspace {
+                workspace_skills_dir(workspace_root)
+            } else {
+                String::new()
+            },
             user_skills_dir: user_skills_dir(),
         },
     );
@@ -195,6 +191,24 @@ impl SessionMemory {
     /// Open the workspace's memory. `None` (with a one-line warning) when
     /// the store can't open — a session without memory beats no session.
     pub fn open(workspace_root: &Path, warn: bool) -> Option<Self> {
+        Self::open_with_workspace_skills(workspace_root, warn, false)
+    }
+
+    /// Open memory with workspace skill injection governed by the session's
+    /// immutable authority snapshot. Context recall itself remains evidence.
+    pub fn open_with_authority(
+        workspace_root: &Path,
+        warn: bool,
+        authority: &crate::settings::AuthorityPolicy,
+    ) -> Option<Self> {
+        Self::open_with_workspace_skills(workspace_root, warn, authority.project_prompts_allowed)
+    }
+
+    fn open_with_workspace_skills(
+        workspace_root: &Path,
+        warn: bool,
+        include_workspace_skills: bool,
+    ) -> Option<Self> {
         let db_path = workspace_root.join(".stella").join("context.db");
         if let Some(parent) = db_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -227,6 +241,7 @@ impl SessionMemory {
                     host,
                     domains,
                     workspace_root: workspace_root.to_path_buf(),
+                    include_workspace_skills,
                     skills_created: 0,
                     quarantined_ids,
                     ab_suppressed: false,
@@ -250,7 +265,8 @@ impl SessionMemory {
     /// fresh so a just-installed or just-auto-created skill is live on the
     /// very next turn).
     pub fn load_skills(&self) -> Vec<Skill> {
-        load_workspace_skills(&self.workspace_root)
+        load_workspace_skills_with_authority(&self.workspace_root, self.include_workspace_skills)
+            .skills
     }
 
     /// Build the volatile recalled-context block for a prompt: relevant
@@ -1118,6 +1134,50 @@ mod tests {
         let mut unlabeled = frame("nod_ddd", ocp_types::FrameKind::Memory, "x", "y");
         unlabeled.citation_label = None;
         assert!(render_context_section(&[unlabeled]).is_none());
+    }
+
+    #[test]
+    fn untrusted_project_skill_bodies_are_absent_while_recalled_context_still_renders() {
+        let _env = crate::test_env::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(home.join(".config/stella/skills/user")).unwrap();
+        std::fs::write(
+            home.join(".config/stella/skills/user/SKILL.md"),
+            "---\nname: user\ndescription: user skill\n---\nUSER_SKILL_BODY",
+        )
+        .unwrap();
+        std::fs::create_dir_all(workspace.join(".stella/skills/project")).unwrap();
+        std::fs::write(
+            workspace.join(".stella/skills/project/SKILL.md"),
+            "---\nname: project\ndescription: project skill\n---\nPROJECT_SKILL_BODY",
+        )
+        .unwrap();
+        // SAFETY: serialized behind the binary-wide environment lock.
+        let previous_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let skills = load_workspace_skills_with_authority(&workspace, false).skills;
+        let trusted = load_workspace_skills_with_authority(&workspace, true).skills;
+
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("HOME", previous) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(names, vec!["user"], "loaded skills: {names:?}");
+        let trusted_names: Vec<&str> = trusted.iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(trusted_names, vec!["user", "project"]);
+
+        let ordinary = frame(
+            "nod_context",
+            ocp_types::FrameKind::Snippet,
+            "src/lib.rs",
+            "ordinary recalled evidence",
+        );
+        let section = render_context_section(&[ordinary]).expect("ordinary recall renders");
+        assert!(section.contains("ordinary recalled evidence"), "{section}");
     }
 
     #[test]
