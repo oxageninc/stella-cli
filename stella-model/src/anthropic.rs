@@ -732,6 +732,7 @@ impl AnthropicProvider {
                 status,
                 retry_after_ms,
                 &body,
+                &self.model,
             ));
         }
 

@@ -549,6 +549,7 @@ pub(crate) fn build_generation_config(req: &CompletionRequest) -> Option<GeminiG
 pub(crate) async fn classify_google_error(
     label: &str,
     response: reqwest::Response,
+    model: &str,
 ) -> ProviderError {
     let status = response.status();
     let retry_after_ms = crate::http::parse_retry_after_ms(response.headers());
@@ -562,7 +563,7 @@ pub(crate) async fn classify_google_error(
     if status == reqwest::StatusCode::BAD_REQUEST && body.contains("API_KEY_INVALID") {
         return ProviderError::Auth(format!("{label} rejected the API key: {body}"));
     }
-    crate::http::classify_http_status(label, status, retry_after_ms, &body)
+    crate::http::classify_http_status(label, status, retry_after_ms, &body, model)
 }
 
 #[async_trait]
@@ -593,7 +594,7 @@ impl Provider for GeminiProvider {
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         if !response.status().is_success() {
-            return Err(classify_google_error("Gemini", response).await);
+            return Err(classify_google_error("Gemini", response, &self.model).await);
         }
 
         let (text, tool_calls, usage, finish_reason) =

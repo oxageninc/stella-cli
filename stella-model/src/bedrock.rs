@@ -670,6 +670,7 @@ impl Provider for BedrockProvider {
                 status,
                 retry_after_ms,
                 &body,
+                &self.model,
             ));
         }
 
