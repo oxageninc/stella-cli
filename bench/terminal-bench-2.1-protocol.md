@@ -51,12 +51,17 @@ raw trials, and disclosed comparator below.
   atomically created empty `-X pycache_prefix`: ambient `PYTHONPATH`, user site,
   `sitecustomize`, `.pth` startup, and adjacent unchecked bytecode are not
   executable launch inputs. Only the explicit adapter and pinned Harbor
-  site-package roots enter `sys.path`. The wrapper accepts the selected provider secret, writes a
-  typed bundle to an anonymous unlinked seekable file descriptor, removes all
-  credential-shaped variables from Harbor's environment, and then replaces
-  itself with Harbor. The adapter reads that bundle without consuming shared
-  offset state and passes only the selected key to Stella over a second
-  anonymous descriptor. Before installing Stella, a preflight must prove
+  site-package roots enter `sys.path`. Two distinct OpenRouter credentials are
+  required. The normal benchmark key is the selected provider secret: the
+  wrapper writes it to a typed bundle on an anonymous unlinked seekable file
+  descriptor. `OPENROUTER_MANAGEMENT_API_KEY` remains host-only and is used
+  only for launch-time control-plane GETs. The wrapper removes named and
+  aliased copies of both secrets from Harbor's environment and argv, then
+  replaces itself with Harbor. The adapter reads only the benchmark-key bundle
+  without consuming shared offset state and passes only that key to Stella over
+  a second anonymous descriptor. The management key never enters the bundle,
+  child environment, argv, public evidence, receipts, sidecars, or runtime
+  identity. Before installing Stella, a preflight must prove
   that the exact active key is absent from every project container's complete
   Docker `Config`, including stopped containers.
   Harbor metadata and ATIF must agree on source
@@ -78,8 +83,14 @@ raw trials, and disclosed comparator below.
   and completion times for the safety wait and final GET. It also binds the
   completed prior-stage outcome, exact runtime identity, live no-reset `$180`
   key and account-credit evidence, and a full runtime rehash after the final
-  GET. Before a later-stage reservation, it reopens every referenced prior
-  Harbor job under the same fixed jobs root, recomputes each artifact-tree
+  GET. The normal key authenticates `GET /api/v1/key`; the management key
+  authenticates `GET /api/v1/keys/<benchmark-key-sha256>` and
+  `GET /api/v1/credits`. The management key-record `hash` must equal the
+  runtime benchmark-key fingerprint. The v2 evidence field `label` is retained
+  unchanged but means the management-verified key-record `name`; the masked
+  current-key `label` is not trusted. Before a later-stage reservation, it
+  reopens every referenced prior Harbor job under the same fixed jobs root,
+  recomputes each artifact-tree
   digest, and replays readiness plus the full 60-slot calibration and excluded
   ledger. A ledger assertion without matching local artifacts cannot authorize
   more spend. Those controls attest that
@@ -246,9 +257,17 @@ Shared-key usage outside this study is not silently attributed to Stella.
 
 The executable v6 study has exactly three paid stages: readiness, calibration,
 and the fixed-GLM-5.1 primary. All three use one dedicated, spend-limited
-OpenRouter benchmark key created after this protocol freeze. Its
-non-secret key ID/label, limit, and usage snapshots are recorded; the raw value
-is never published. The historical excluded jobs used the prior shared key and
+OpenRouter benchmark key created after this protocol freeze by a separate
+Management API key. The benchmark key creation controls are exact:
+`name = "stella-tb21-dedicated-key-v1"`, `limit = 180`,
+`limit_reset = null`, and `include_byok_in_limit = true`; the returned key
+record must remain `disabled = false`. Its non-secret key fingerprint,
+management-verified name (stored in the existing `label` evidence field),
+limit, and usage snapshots are recorded; raw values for both credentials are
+never published. The Management API key is
+supplied only as host environment variable `OPENROUTER_MANAGEMENT_API_KEY` and
+must be non-empty and distinct from `OPENROUTER_API_KEY`. The historical
+excluded jobs used the prior shared key and
 remain explicitly separated. If a dedicated-key baseline and final usage cannot
 be obtained, the comparative claim is ineligible because completeness of the
 paid-run ledger cannot be established.

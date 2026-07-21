@@ -26,9 +26,9 @@ from typing import Any, Protocol
 
 from .credential_bundle import (
     create_anonymous_credential_bundle,
+    credential_values_from_environment,
     is_credential_env_name,
     provider_credential_for_model,
-    provider_credentials_from_environment,
     sanitized_harbor_environment,
 )
 from .host_attestation import (
@@ -53,6 +53,7 @@ _CANONICAL_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _CANONICAL_PROVIDER_ROUTE_POLICY = "openrouter-auto"
 _DEDICATED_KEY_HARD_LIMIT_USD = 180.0
 _OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
+_OPENROUTER_KEYS_URL = "https://openrouter.ai/api/v1/keys"
 _OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 _FIXED_REPOSITORY = "macanderson/stella"
 _FIXED_WEB_ROOT = f"https://github.com/{_FIXED_REPOSITORY}"
@@ -632,6 +633,8 @@ class _ProviderKeyReader(Protocol):
 
     def get_key(self, credential: str) -> dict[str, Any]: ...
 
+    def get_key_record(self, credential: str, fingerprint: str) -> dict[str, Any]: ...
+
     def get_credits(self, credential: str) -> dict[str, Any]: ...
 
 
@@ -850,6 +853,15 @@ class _OpenRouterProviderKeyReader:
             _OPENROUTER_KEY_URL,
             credential,
             label="OpenRouter key-control response",
+        )
+
+    def get_key_record(self, credential: str, fingerprint: str) -> dict[str, Any]:
+        if re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+            raise _ProviderKeyReadError("provider key fingerprint is invalid")
+        return self._get(
+            f"{_OPENROUTER_KEYS_URL}/{fingerprint}",
+            credential,
+            label="OpenRouter management key-record response",
         )
 
     def get_credits(self, credential: str) -> dict[str, Any]:
@@ -2513,6 +2525,13 @@ def _reject_public_credential(raw: bytes, credential: str, *, label: str) -> Non
         raise RuntimeError(f"{label} contains the live provider credential")
 
 
+def _reject_public_credentials(
+    raw: bytes, credentials: Sequence[str], *, label: str
+) -> None:
+    for credential in credentials:
+        _reject_public_credential(raw, credential, label=label)
+
+
 def _canonical_source_tree_digest(files: Mapping[str, bytes], *, domain: str) -> str:
     digest = hashlib.sha256()
     digest.update(domain.encode("utf-8") + b"\0")
@@ -2533,7 +2552,7 @@ def _verify_public_runtime_sources(
     source_commit: str,
     subject_commit: str,
     runtime_identity: Mapping[str, Any],
-    provider_credential: str,
+    forbidden_credentials: Sequence[str],
 ) -> None:
     """Recompute the public adapter tree and compare every frozen source byte."""
     repository_root = Path(__file__).resolve().parents[3]
@@ -2634,8 +2653,10 @@ def _verify_public_runtime_sources(
                 raise RuntimeError(
                     f"public frozen source {relative} is unreadable"
                 ) from exc
-            _reject_public_credential(
-                raw, provider_credential, label=f"public frozen source {relative}"
+            _reject_public_credentials(
+                raw,
+                forbidden_credentials,
+                label=f"public frozen source {relative}",
             )
             if raw != local_bytes[relative]:
                 raise RuntimeError(
@@ -2661,6 +2682,7 @@ def _verify_public_runtime_sources(
 
 def _validate_live_provider_key(
     response: Mapping[str, Any],
+    key_record_response: Mapping[str, Any],
     credits_response: Mapping[str, Any],
     *,
     intent: Mapping[str, Any],
@@ -2670,22 +2692,22 @@ def _validate_live_provider_key(
     outer = _require_exact_object(
         response, frozenset({"data"}), label="OpenRouter key-control response"
     )
-    data = _require_exact_object(
-        outer.get("data"),
-        frozenset(
-            {
-                "label",
-                "limit",
-                "limit_remaining",
-                "limit_reset",
-                "usage",
-                "is_management_key",
-            }
-        ),
-        label="OpenRouter key-control data",
+    data = outer.get("data")
+    required_key_fields = frozenset(
+        {
+            "is_management_key",
+            "is_provisioning_key",
+            "limit",
+            "limit_remaining",
+            "limit_reset",
+            "usage",
+        }
     )
     if (
-        data.get("is_management_key") is not False
+        not isinstance(data, dict)
+        or not required_key_fields.issubset(data)
+        or data.get("is_management_key") is not False
+        or data.get("is_provisioning_key") is not False
         or data.get("limit_reset") is not None
     ):
         raise RuntimeError(
@@ -2703,18 +2725,55 @@ def _validate_live_provider_key(
     intended_usage = _finite_nonnegative_number(
         provider.get("usage_before_usd"), label="intent key usage"
     )
-    label = data.get("label")
+    record_outer = _require_exact_object(
+        key_record_response,
+        frozenset({"data"}),
+        label="OpenRouter management key-record response",
+    )
+    record = record_outer.get("data")
+    required_record_fields = frozenset(
+        {
+            "disabled",
+            "hash",
+            "include_byok_in_limit",
+            "limit",
+            "limit_remaining",
+            "limit_reset",
+            "name",
+            "usage",
+        }
+    )
+    if not isinstance(record, dict) or not required_record_fields.issubset(record):
+        raise RuntimeError("OpenRouter management key record lacks required fields")
+    record_limit = _finite_nonnegative_number(
+        record.get("limit"), label="management key record limit"
+    )
+    record_usage = _finite_nonnegative_number(
+        record.get("usage"), label="management key record usage"
+    )
+    record_remaining = _finite_nonnegative_number(
+        record.get("limit_remaining"),
+        label="management key record limit_remaining",
+    )
+    label = record.get("name")
     if (
-        label != _DEDICATED_KEY_LABEL
+        record.get("hash") != runtime_identity["provider_key_fingerprint_sha256"]
+        or label != _DEDICATED_KEY_LABEL
         or label != provider.get("label")
+        or record.get("disabled") is not False
+        or record.get("include_byok_in_limit") is not True
+        or record.get("limit_reset") is not None
         or live_limit != intended_limit
         or live_limit != _DEDICATED_KEY_HARD_LIMIT_USD
+        or record_limit != live_limit
         or not math.isclose(live_usage, intended_usage, rel_tol=0, abs_tol=1e-9)
+        or not math.isclose(record_usage, live_usage, rel_tol=0, abs_tol=1e-9)
+        or not math.isclose(record_remaining, live_remaining, rel_tol=0, abs_tol=1e-6)
         or not math.isclose(
             live_remaining, live_limit - live_usage, rel_tol=0, abs_tol=1e-6
         )
     ):
-        raise RuntimeError("live OpenRouter key label/limit/usage differs from intent")
+        raise RuntimeError("live OpenRouter management key record differs from intent")
     projected = float(intent["requested_trials"]) * float(
         intent["per_trial_budget_usd"]
     )
@@ -2761,6 +2820,7 @@ def _verify_public_intent(
     runtime_identity: Mapping[str, Any],
     runtime_revalidator: Callable[[], Mapping[str, Any]],
     provider_credential: str,
+    management_credential: str,
     reader: _PublicIntentReader | None = None,
     provider_key_reader: _ProviderKeyReader | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -2770,6 +2830,13 @@ def _verify_public_intent(
     source = reader or _AnonymousGitHubPublicIntentReader()
     provider_source = provider_key_reader or _OpenRouterProviderKeyReader()
     now = clock or (lambda: datetime.now(timezone.utc))
+    forbidden_credentials = (provider_credential, management_credential)
+    if any(not credential for credential in forbidden_credentials) or len(
+        set(forbidden_credentials)
+    ) != len(forbidden_credentials):
+        raise RuntimeError(
+            "provider control credentials must be non-empty and distinct"
+        )
     if set(runtime_identity) != RUNTIME_IDENTITY_FIELDS:
         raise RuntimeError("secure launcher runtime identity fields drifted")
     comment_url, issue_number, comment_id = _intent_comment_url(command)
@@ -2797,9 +2864,9 @@ def _verify_public_intent(
         issue_number=issue_number,
         comment_id=comment_id,
     )
-    _reject_public_credential(
+    _reject_public_credentials(
         initial_body.encode("utf-8"),
-        provider_credential,
+        forbidden_credentials,
         label="public intent comment",
     )
     body = _json_object(initial_body.encode("utf-8"), label="public intent comment")
@@ -2862,12 +2929,12 @@ def _verify_public_intent(
         )
     except Exception as exc:
         raise RuntimeError("anonymous public-intent GitHub GET failed") from exc
-    _reject_public_credential(
-        ledger_raw, provider_credential, label="public intent ledger snapshot"
+    _reject_public_credentials(
+        ledger_raw, forbidden_credentials, label="public intent ledger snapshot"
     )
-    _reject_public_credential(
+    _reject_public_credentials(
         publication_ledger_raw,
-        provider_credential,
+        forbidden_credentials,
         label="public publication ledger",
     )
     issue_user = issue.get("user")
@@ -2907,8 +2974,10 @@ def _verify_public_intent(
             manifest_raw = source.get_content(_FIXED_MANIFEST_PATH, subject_commit)
         except Exception as exc:
             raise RuntimeError("confirmatory freeze manifest is not public") from exc
-        _reject_public_credential(
-            manifest_raw, provider_credential, label="public confirmatory manifest"
+        _reject_public_credentials(
+            manifest_raw,
+            forbidden_credentials,
+            label="public confirmatory manifest",
         )
         manifest = _validate_confirmatory_manifest(
             manifest_raw,
@@ -2959,9 +3028,9 @@ def _verify_public_intent(
         raise RuntimeError(
             "current preregistration ledger snapshot is unreadable"
         ) from exc
-    _reject_public_credential(
+    _reject_public_credentials(
         preregistration_ledger_raw,
-        provider_credential,
+        forbidden_credentials,
         label="public preregistration ledger snapshot",
     )
     preregistration_ledger = _json_object(
@@ -2993,7 +3062,7 @@ def _verify_public_intent(
         source_commit=str(runtime_identity["source_commit"]),
         subject_commit=subject_commit,
         runtime_identity=runtime_identity,
-        provider_credential=provider_credential,
+        forbidden_credentials=forbidden_credentials,
     )
 
     safety_target = created_time + timedelta(seconds=_PUBLICATION_SAFETY_MARGIN_SECONDS)
@@ -3058,7 +3127,11 @@ def _verify_public_intent(
 
     try:
         provider_response = provider_source.get_key(provider_credential)
-        credits_response = provider_source.get_credits(provider_credential)
+        fingerprint = str(runtime_identity["provider_key_fingerprint_sha256"])
+        key_record_response = provider_source.get_key_record(
+            management_credential, fingerprint
+        )
+        credits_response = provider_source.get_credits(management_credential)
     except Exception as exc:
         raise RuntimeError("live provider key-control preflight failed") from exc
     provider_fetched_at = now()
@@ -3068,6 +3141,7 @@ def _verify_public_intent(
         raise RuntimeError("provider clock rolled back after final GitHub GET")
     provider_snapshot = _validate_live_provider_key(
         provider_response,
+        key_record_response,
         credits_response,
         intent=intent,
         runtime_identity=runtime_identity,
@@ -3138,7 +3212,7 @@ def _verify_public_host_preflight(
     command: Sequence[str],
     *,
     public_intent_attestation: Mapping[str, Any],
-    provider_credential: str,
+    forbidden_credentials: Sequence[str],
     docker_executable: Path,
     reader: _PublicIntentReader,
     host_probe: _HostProbe = probe_host,
@@ -3166,9 +3240,9 @@ def _verify_public_host_preflight(
         public_report_raw = reader.get_content(report_path, public_commit)
     except Exception as exc:
         raise RuntimeError("anonymous public host-report GET failed") from exc
-    _reject_public_credential(
+    _reject_public_credentials(
         public_report_raw,
-        provider_credential,
+        forbidden_credentials,
         label="public host report",
     )
     now = clock or (lambda: datetime.now(timezone.utc))
@@ -3238,7 +3312,7 @@ def _validate_claim_command(command: Sequence[str], environ: Mapping[str, str]) 
         if separator and is_credential_env_name(assignment_name.lstrip("-")):
             raise RuntimeError("secure launcher rejects credential assignments in argv")
 
-    credential_values = tuple(provider_credentials_from_environment(environ).values())
+    credential_values = credential_values_from_environment(environ)
     if any(
         secret in argument for secret in credential_values for argument in command[2:]
     ):
@@ -3869,7 +3943,7 @@ def _reserve_fresh_job(
     models: Sequence[str],
     public_intent_attestation: Mapping[str, Any],
     host_preflight: _VerifiedHostPreflight,
-    provider_credential: str,
+    forbidden_credentials: Sequence[str],
 ) -> Path:
     """Reserve one job and bind its receipt to verified native-host evidence."""
     if (
@@ -3877,7 +3951,7 @@ def _reserve_fresh_job(
         or public_intent_attestation.get("intent_sha256") != _intent_sha256(command)
         or public_intent_attestation.get("comment_url")
         != _intent_comment_url(command)[0]
-        or not provider_credential
+        or any(not credential for credential in forbidden_credentials)
     ):
         raise RuntimeError("secure launcher received an invalid public intent proof")
     intent_sha256 = _intent_sha256(command)
@@ -3934,6 +4008,9 @@ def _reserve_fresh_job(
         )
         + "\n"
     ).encode("utf-8")
+    _reject_public_credentials(
+        payload, forbidden_credentials, label="secure launch receipt"
+    )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -3958,7 +4035,7 @@ def _reserve_fresh_job(
         write_launch_binding_sidecar(
             job_dir,
             binding,
-            forbidden_values=(provider_credential,),
+            forbidden_values=tuple(forbidden_credentials),
         )
         pycache_prefix.mkdir(mode=0o700, exist_ok=False)
         directory_flags = os.O_RDONLY
@@ -4039,6 +4116,17 @@ def exec_harbor_securely(
     _validate_claim_command(command, source_env)
     models = _literal_model_arguments(command)
     credentials = provider_credential_for_model(source_env, models[0])
+    provider_credential = next(iter(credentials.values()))
+    management_credential = source_env.get("OPENROUTER_MANAGEMENT_API_KEY")
+    if (
+        not isinstance(management_credential, str)
+        or not management_credential
+        or management_credential == provider_credential
+    ):
+        raise RuntimeError(
+            "secure launcher requires a distinct non-empty "
+            "OPENROUTER_MANAGEMENT_API_KEY"
+        )
     _validate_stage_shape(command)
     runtime_identity, python_executable = _validated_runtime_identity(
         command, source_env, credentials
@@ -4059,12 +4147,12 @@ def exec_harbor_securely(
         return revalidated
 
     public_source = public_intent_reader or _AnonymousGitHubPublicIntentReader()
-    provider_credential = next(iter(credentials.values()))
     public_intent_attestation = _verify_public_intent(
         command,
         runtime_identity=runtime_identity,
         runtime_revalidator=revalidate_runtime,
         provider_credential=provider_credential,
+        management_credential=management_credential,
         reader=public_source,
         provider_key_reader=provider_key_reader,
         clock=clock,
@@ -4099,7 +4187,7 @@ def exec_harbor_securely(
         host_preflight = _verify_public_host_preflight(
             command,
             public_intent_attestation=public_intent_attestation,
-            provider_credential=provider_credential,
+            forbidden_credentials=(provider_credential, management_credential),
             docker_executable=docker_executable,
             reader=public_source,
             host_probe=host_probe or probe_host,
@@ -4110,7 +4198,7 @@ def exec_harbor_securely(
             models,
             public_intent_attestation,
             host_preflight,
-            provider_credential,
+            (provider_credential, management_credential),
         )
         forwarded_command = _isolated_harbor_command(
             python_executable,

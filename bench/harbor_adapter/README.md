@@ -69,8 +69,14 @@ build from contaminating the claim artifact.
 This is the one canonical command source for the three primary-study stages:
 readiness, calibration, and the mandatory fixed-GLM-5.1 primary. Complete the
 public preregistration and paid-intent records first, then provide their digests
-below. Load the dedicated OpenRouter key into the current shell without printing
-it or placing it in shell history.
+below. Use a separate OpenRouter Management API key to create the normal
+benchmark key with exact name `stella-tb21-dedicated-key-v1`, limit `180`,
+`limit_reset: null`, and `include_byok_in_limit: true`. The launcher also
+requires the returned key record to remain `disabled: false`.
+Load the resulting benchmark key as `OPENROUTER_API_KEY` and the distinct
+management key as `OPENROUTER_MANAGEMENT_API_KEY` without printing either or
+placing either in shell history. The management key is host-only control-plane
+authority; it never enters Harbor's anonymous credential bundle.
 
 For each stage, compute the immutable intent digest, then call
 `stella_harbor.host_attestation.collect_public_host_report` on the actual runner
@@ -92,6 +98,8 @@ test -d "$claim_jobs"
 test ! -L "$claim_jobs"
 chmod 700 "$claim_jobs"
 test -n "${OPENROUTER_API_KEY:-}"
+test -n "${OPENROUTER_MANAGEMENT_API_KEY:-}"
+test "$OPENROUTER_API_KEY" != "$OPENROUTER_MANAGEMENT_API_KEY"
 test "$(command -v harbor)" = "$claim_venv/bin/harbor"
 test "$(harbor --version)" = 0.6.1
 test -x "$STELLA_BINARY"
@@ -271,7 +279,12 @@ safety-wait/final-GET completion times, and SHA-256 of the
 exact UTF-8 comment-body string returned by GitHub, including whitespace.
 It also binds the completed prior-stage outcome, binary/source/adapter/Harbor/
 analyzer/verifier/engine runtime identity, exact `$180` no-reset key identity
-and usage, current account credits, and the post-GET runtime rehash. Both
+and usage, current account credits, and the post-GET runtime rehash. The normal
+benchmark key authenticates only `GET /api/v1/key`; the host-only management
+key authenticates `GET /api/v1/keys/<benchmark-key-sha256>` and
+`GET /api/v1/credits`. The key-record `hash` must equal the runtime benchmark
+fingerprint. The existing evidence field `label` means the management-verified
+key-record `name`, not the masked current-key `label`. Both
 launcher-only options are stripped before Harbor parses argv. Any private,
 edited, changed, auth-only, mismatched, or unreadable evidence fails without
 reserving a job directory. A calibration or primary launch additionally opens
@@ -307,7 +320,10 @@ claim analyzer requires these exact values.
    are recorded separately from their human-readable versions.
 4. **Holds** exactly one provider key in an unlinked, owner-only, seekable host
    temporary-file descriptor, then execs Harbor with every named or aliased
-   copy removed from its environment. On macOS this temporary backing can be
+   copy of either OpenRouter credential removed from its environment. The
+   distinct management key is used only by the host launcher's control-plane
+   GETs and never enters the bundle, child environment, argv, receipt, sidecar,
+   runtime identity, or public evidence. On macOS this temporary backing can be
    disk-backed, so claim runs require a trusted, encrypted host/temp volume.
    No pathname is exposed. The adapter verifies every project container's full
    Docker `Config` before binary upload and again before handing that one key to

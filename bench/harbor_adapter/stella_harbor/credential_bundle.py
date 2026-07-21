@@ -38,6 +38,7 @@ PROVIDER_CREDENTIAL_NAMES = frozenset(
         "LOCAL_API_KEY",
     }
 )
+HOST_ONLY_CONTROL_CREDENTIAL_NAMES = frozenset({"OPENROUTER_MANAGEMENT_API_KEY"})
 
 PROVIDER_CREDENTIAL_NAMES_BY_MODEL_PROVIDER: dict[str, tuple[str, ...]] = {
     "anthropic": ("ANTHROPIC_API_KEY",),
@@ -123,6 +124,12 @@ def provider_credentials_from_environment(
     return credentials
 
 
+def credential_values_from_environment(environ: Mapping[str, str]) -> tuple[str, ...]:
+    """Collect every provider or host-only control secret for byte scrubbing."""
+    names = PROVIDER_CREDENTIAL_NAMES | HOST_ONLY_CONTROL_CREDENTIAL_NAMES
+    return tuple(value for name in sorted(names) if (value := environ.get(name)))
+
+
 def provider_credential_for_model(
     environ: Mapping[str, str], model: str
 ) -> dict[str, str]:
@@ -160,7 +167,7 @@ def sanitized_harbor_environment(
     every other surviving name is explicit. Values containing a bundled secret
     are removed too, without ever including the secret in diagnostics.
     """
-    credential_values = tuple(provider_credentials_from_environment(environ).values())
+    credential_values = credential_values_from_environment(environ)
     sanitized = {
         str(name): str(value)
         for name, value in environ.items()

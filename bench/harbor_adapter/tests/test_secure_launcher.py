@@ -55,6 +55,7 @@ from stella_harbor.secure_launcher import (  # noqa: E402
 _TEST_INTENT_SHA256 = "a" * 64
 _TEST_SOURCE_COMMIT = "d" * 40
 _TEST_COMMENT_URL = "https://github.com/macanderson/stella/issues/123#issuecomment-456"
+_TEST_MANAGEMENT_CREDENTIAL = "test-management-secret"
 _CANONICAL_DATASET = (
     "terminal-bench/terminal-bench-2-1@"
     "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a"
@@ -181,6 +182,7 @@ def _write_runtime_assembled_claim_elf(
 def _claim_environment(binary: Path, **overrides: str) -> dict[str, str]:
     environment = {
         "OPENROUTER_API_KEY": "test-secret",
+        "OPENROUTER_MANAGEMENT_API_KEY": _TEST_MANAGEMENT_CREDENTIAL,
         "STELLA_BINARY": str(binary),
         "STELLA_SOURCE_COMMIT": _TEST_SOURCE_COMMIT,
         "STELLA_BUDGET": "0.17",
@@ -287,12 +289,54 @@ class _FakeProviderKeyReader:
     def __init__(self, *, usage: float = 0.0, credits: float = 200.0) -> None:
         self.key = {
             "data": {
-                "label": "stella-tb21-dedicated-key-v1",
+                "byok_usage": 0.0,
+                "byok_usage_daily": 0.0,
+                "byok_usage_monthly": 0.0,
+                "byok_usage_weekly": 0.0,
+                "creator_user_id": "user_test",
+                "include_byok_in_limit": True,
+                "is_free_tier": False,
+                "is_management_key": False,
+                "label": "sk-or-v1-tes...cret",
                 "limit": 180.0,
                 "limit_remaining": 180.0 - usage,
                 "limit_reset": None,
                 "usage": usage,
-                "is_management_key": False,
+                "usage_daily": usage,
+                "usage_monthly": usage,
+                "usage_weekly": usage,
+                "is_provisioning_key": False,
+                "rate_limit": {
+                    "interval": "1h",
+                    "note": "This field is deprecated and safe to ignore.",
+                    "requests": 1000,
+                },
+                "expires_at": None,
+            }
+        }
+        self.key_record = {
+            "data": {
+                "byok_usage": 0.0,
+                "byok_usage_daily": 0.0,
+                "byok_usage_monthly": 0.0,
+                "byok_usage_weekly": 0.0,
+                "created_at": "2026-07-21T00:00:00Z",
+                "creator_user_id": "user_test",
+                "disabled": False,
+                "hash": "",
+                "include_byok_in_limit": True,
+                "label": "sk-or-v1-tes...cret",
+                "limit": 180.0,
+                "limit_remaining": 180.0 - usage,
+                "limit_reset": None,
+                "name": "stella-tb21-dedicated-key-v1",
+                "updated_at": "2026-07-21T00:00:00Z",
+                "usage": usage,
+                "usage_daily": usage,
+                "usage_monthly": usage,
+                "usage_weekly": usage,
+                "workspace_id": "0df9e665-d932-5740-b2c7-b52af166bc11",
+                "expires_at": None,
             }
         }
         self.credits = {"data": {"total_credits": credits, "total_usage": usage}}
@@ -301,8 +345,40 @@ class _FakeProviderKeyReader:
         assert credential
         return deepcopy(self.key)
 
+    def get_key_record(self, credential: str, fingerprint: str) -> dict[str, object]:
+        assert credential
+        response = deepcopy(self.key_record)
+        response["data"]["hash"] = fingerprint
+        return response
+
     def get_credits(self, credential: str) -> dict[str, object]:
         assert credential
+        return deepcopy(self.credits)
+
+
+class _BoundProviderKeyReader(_FakeProviderKeyReader):
+    def __init__(self, benchmark_credential: str, management_credential: str) -> None:
+        super().__init__()
+        self.benchmark_credential = benchmark_credential
+        self.management_credential = management_credential
+        self.fingerprint = hashlib.sha256(benchmark_credential.encode()).hexdigest()
+        self.key_record["data"]["hash"] = self.fingerprint
+        self.calls: list[tuple[str, ...]] = []
+
+    def get_key(self, credential: str) -> dict[str, object]:
+        assert credential == self.benchmark_credential
+        self.calls.append(("key", credential))
+        return deepcopy(self.key)
+
+    def get_key_record(self, credential: str, fingerprint: str) -> dict[str, object]:
+        assert credential == self.management_credential
+        assert fingerprint == self.fingerprint
+        self.calls.append(("key_record", credential, fingerprint))
+        return deepcopy(self.key_record)
+
+    def get_credits(self, credential: str) -> dict[str, object]:
+        assert credential == self.management_credential
+        self.calls.append(("credits", credential))
         return deepcopy(self.credits)
 
 
@@ -998,6 +1074,7 @@ def _verify_fixture(
             else lambda: runtime_identity
         ),
         provider_credential="test-secret",
+        management_credential=_TEST_MANAGEMENT_CREDENTIAL,
         reader=public_reader,
         provider_key_reader=provider or _FakeProviderKeyReader(),
         clock=clock,  # type: ignore[arg-type]
@@ -1012,7 +1089,7 @@ def _host_preflight_fixture(
     return launcher_module._verify_public_host_preflight(
         command,
         public_intent_attestation=public_intent_attestation,
-        provider_credential="test-secret",
+        forbidden_credentials=("test-secret", _TEST_MANAGEMENT_CREDENTIAL),
         docker_executable=Path("/usr/bin/docker"),
         reader=reader,
         host_probe=_fake_host_probe,
@@ -1074,6 +1151,48 @@ def test_sanitizer_removes_named_and_arbitrary_alias_copies() -> None:
     )
 
     assert sanitized == {HOST_CREDENTIAL_BUNDLE_FD_ENV: "91"}
+
+
+def test_sanitizer_removes_management_key_aliases_from_allowlisted_values() -> None:
+    benchmark_secret = "test-openrouter-benchmark-secret"
+    management_secret = "test-openrouter-management-secret"
+    sanitized = sanitized_harbor_environment(
+        {
+            "OPENROUTER_API_KEY": benchmark_secret,
+            "OPENROUTER_MANAGEMENT_API_KEY": management_secret,
+            "HOME": f"/copied/{management_secret}",
+            "XDG_CACHE_HOME": f"/copied/{benchmark_secret}",
+        },
+        91,
+    )
+
+    assert sanitized == {HOST_CREDENTIAL_BUNDLE_FD_ENV: "91"}
+
+
+@pytest.mark.parametrize(
+    "management_secret",
+    [None, "", "test-openrouter-benchmark-secret"],
+)
+def test_secure_launch_requires_distinct_host_only_management_key(
+    tmp_path: Path, management_secret: str | None
+) -> None:
+    benchmark_secret = "test-openrouter-benchmark-secret"
+    binary = _write_claim_elf(tmp_path / "stella")
+    environment = _claim_environment(
+        binary,
+        OPENROUTER_API_KEY=benchmark_secret,
+    )
+    environment.pop("OPENROUTER_MANAGEMENT_API_KEY")
+    if management_secret is not None:
+        environment["OPENROUTER_MANAGEMENT_API_KEY"] = management_secret
+
+    with pytest.raises(RuntimeError, match="OPENROUTER_MANAGEMENT_API_KEY"):
+        exec_harbor_securely(
+            _readiness_command(tmp_path),
+            environ=environment,
+            public_intent_reader=object(),  # type: ignore[arg-type]
+            provider_key_reader=_FakeProviderKeyReader(),
+        )
 
 
 def test_sanitizer_allowlists_hostile_interpreter_loader_and_shell_environment() -> (
@@ -1150,6 +1269,7 @@ def test_exec_bundles_only_roster_key_and_scrubs_unrelated_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     openrouter_secret = "test-openrouter-secret"
+    management_secret = _TEST_MANAGEMENT_CREDENTIAL
     unrelated_secret = "test-anthropic-secret"
     observed: dict[str, object] = {}
     forbidden_sidecar_values: list[tuple[str, ...]] = []
@@ -1205,8 +1325,10 @@ def test_exec_bundles_only_roster_key_and_scrubs_unrelated_keys(
             environ={
                 **_claim_environment(binary),
                 "OPENROUTER_API_KEY": openrouter_secret,
+                "OPENROUTER_MANAGEMENT_API_KEY": management_secret,
                 "ANTHROPIC_API_KEY": unrelated_secret,
                 "ARBITRARY_ALIAS": f"copied:{openrouter_secret}",
+                "HOME": f"/copied/{management_secret}",
                 "BENIGN": "kept",
                 "PATH": "/attacker/bin",
                 "PYTHONPATH": "/attacker/python",
@@ -1227,7 +1349,9 @@ def test_exec_bundles_only_roster_key_and_scrubs_unrelated_keys(
     assert "/usr/bin" in child_env["PATH"].split(os.pathsep)
     assert child_env["TZ"] == "UTC"
     assert all(
-        openrouter_secret not in value and unrelated_secret not in value
+        openrouter_secret not in value
+        and management_secret not in value
+        and unrelated_secret not in value
         for value in child_env.values()
     )
     assert "ARBITRARY_ALIAS" not in child_env
@@ -1239,7 +1363,8 @@ def test_exec_bundles_only_roster_key_and_scrubs_unrelated_keys(
     assert _TEST_COMMENT_URL not in forwarded_command
     job_dir = tmp_path / "stella-tb21-calibration-20260721"
     receipt_path = job_dir / LAUNCH_RECEIPT_FILENAME
-    receipt = json.loads(receipt_path.read_text())
+    receipt_raw = receipt_path.read_bytes()
+    receipt = json.loads(receipt_raw)
     assert receipt == {
         "schema_version": LAUNCH_RECEIPT_SCHEMA,
         "job_name": "stella-tb21-calibration-20260721",
@@ -1254,9 +1379,12 @@ def test_exec_bundles_only_roster_key_and_scrubs_unrelated_keys(
     sidecar_raw = sidecar_path.read_bytes()
     sidecar = json.loads(sidecar_raw)
     assert stat.S_IMODE(sidecar_path.stat().st_mode) == 0o600
-    assert forbidden_sidecar_values == [(openrouter_secret,)]
+    assert forbidden_sidecar_values == [(openrouter_secret, management_secret)]
     assert openrouter_secret.encode() not in sidecar_raw
+    assert management_secret.encode() not in sidecar_raw
     assert unrelated_secret.encode() not in sidecar_raw
+    assert openrouter_secret.encode() not in receipt_raw
+    assert management_secret.encode() not in receipt_raw
     assert (
         sidecar["launch_receipt_sha256"]
         == hashlib.sha256(receipt_path.read_bytes()).hexdigest()
@@ -2210,6 +2338,7 @@ def test_public_intent_waits_two_seconds_then_records_final_get(tmp_path: Path) 
         runtime_identity=runtime_identity,
         runtime_revalidator=lambda: runtime_identity,
         provider_credential="test-secret",
+        management_credential=_TEST_MANAGEMENT_CREDENTIAL,
         reader=public_reader,
         provider_key_reader=_FakeProviderKeyReader(),
         clock=clock,
@@ -2394,6 +2523,18 @@ def test_public_evidence_rejects_raw_provider_credential_bytes(tmp_path: Path) -
         _verify_fixture(command, binary, reader=reader)
 
 
+def test_public_evidence_rejects_raw_management_credential_bytes(
+    tmp_path: Path,
+) -> None:
+    binary = _write_claim_elf(tmp_path / "stella")
+    command = _readiness_command(tmp_path)
+    reader = _public_reader(command, binary)
+    reader.snapshot_ledger += _TEST_MANAGEMENT_CREDENTIAL.encode()
+
+    with pytest.raises(RuntimeError, match="contains the live provider credential"):
+        _verify_fixture(command, binary, reader=reader)
+
+
 def test_public_adapter_tree_rejects_extra_python_source(tmp_path: Path) -> None:
     binary = _write_claim_elf(tmp_path / "stella")
     command = _readiness_command(tmp_path)
@@ -2450,18 +2591,145 @@ def test_public_intent_requires_account_credit_for_nominal_job(tmp_path: Path) -
         )
 
 
-@pytest.mark.parametrize("response", ["key", "credits"])
-def test_public_intent_rejects_openrouter_response_shape_extensions(
-    tmp_path: Path, response: str
+def test_public_intent_accepts_complete_current_key_shape_and_ignores_masked_label(
+    tmp_path: Path,
 ) -> None:
     binary = _write_claim_elf(tmp_path / "stella")
     command = _readiness_command(tmp_path)
     reader = _public_reader(command, binary)
     provider = _FakeProviderKeyReader()
-    if response == "key":
-        provider.key["data"]["usage_daily"] = 0.0
-    else:
-        provider.credits["data"]["unexpected"] = 0.0
+
+    attestation = _verify_fixture(command, binary, reader=reader, provider=provider)
+
+    assert (
+        attestation["provider_key_live_snapshot"]["label"]
+        == "stella-tb21-dedicated-key-v1"
+    )
+
+
+def test_secure_launch_separates_runtime_and_management_key_reads(
+    tmp_path: Path,
+) -> None:
+    benchmark_secret = "test-openrouter-benchmark-secret"
+    management_secret = "test-openrouter-management-secret"
+    binary = _write_claim_elf(tmp_path / "stella")
+    command = _readiness_command(tmp_path)
+    reader = _public_reader(command, binary, benchmark_secret)
+    provider = _BoundProviderKeyReader(benchmark_secret, management_secret)
+    observed: dict[str, object] = {}
+
+    def fake_execvpe(
+        _executable: str, _command: list[str], child_env: dict[str, str]
+    ) -> None:
+        observed["environment"] = child_env
+        observed["bundle"] = read_anonymous_credential_bundle(
+            child_env[HOST_CREDENTIAL_BUNDLE_FD_ENV]
+        )
+
+    with pytest.raises(RuntimeError, match="unexpectedly returned"):
+        exec_harbor_securely(
+            command,
+            environ=_claim_environment(
+                binary,
+                OPENROUTER_API_KEY=benchmark_secret,
+                OPENROUTER_MANAGEMENT_API_KEY=management_secret,
+            ),
+            execvpe=fake_execvpe,
+            public_intent_reader=reader,
+            provider_key_reader=provider,
+        )
+
+    assert provider.calls == [
+        ("key", benchmark_secret),
+        ("key_record", management_secret, provider.fingerprint),
+        ("credits", management_secret),
+    ]
+    assert observed["bundle"] == {"OPENROUTER_API_KEY": benchmark_secret}
+    child_env = observed["environment"]
+    assert isinstance(child_env, dict)
+    assert all(
+        benchmark_secret not in value and management_secret not in value
+        for value in child_env.values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("hash", "0" * 64),
+        ("name", "wrong-key-name"),
+        ("disabled", True),
+        ("include_byok_in_limit", False),
+        ("limit_reset", "daily"),
+        ("limit", 179.0),
+        ("usage", 1.0),
+        ("limit_remaining", 179.0),
+    ],
+)
+def test_secure_launch_rejects_unbound_management_key_record(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    benchmark_secret = "test-openrouter-benchmark-secret"
+    management_secret = "test-openrouter-management-secret"
+    binary = _write_claim_elf(tmp_path / "stella")
+    command = _readiness_command(tmp_path)
+    provider = _BoundProviderKeyReader(benchmark_secret, management_secret)
+    provider.key_record["data"][field] = value
+
+    with pytest.raises(RuntimeError, match="management key record"):
+        exec_harbor_securely(
+            command,
+            environ=_claim_environment(
+                binary,
+                OPENROUTER_API_KEY=benchmark_secret,
+                OPENROUTER_MANAGEMENT_API_KEY=management_secret,
+            ),
+            execvpe=lambda *_args: None,
+            public_intent_reader=_public_reader(command, binary, benchmark_secret),
+            provider_key_reader=provider,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("is_management_key", True),
+        ("is_provisioning_key", True),
+        ("limit_reset", "monthly"),
+    ],
+)
+def test_secure_launch_rejects_nonruntime_current_key_posture(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    benchmark_secret = "test-openrouter-benchmark-secret"
+    management_secret = "test-openrouter-management-secret"
+    binary = _write_claim_elf(tmp_path / "stella")
+    command = _readiness_command(tmp_path)
+    provider = _BoundProviderKeyReader(benchmark_secret, management_secret)
+    provider.key["data"][field] = value
+
+    with pytest.raises(RuntimeError, match="normal dedicated hard-limit key"):
+        exec_harbor_securely(
+            command,
+            environ=_claim_environment(
+                binary,
+                OPENROUTER_API_KEY=benchmark_secret,
+                OPENROUTER_MANAGEMENT_API_KEY=management_secret,
+            ),
+            execvpe=lambda *_args: None,
+            public_intent_reader=_public_reader(command, binary, benchmark_secret),
+            provider_key_reader=provider,
+        )
+
+
+def test_public_intent_rejects_credits_response_shape_extensions(
+    tmp_path: Path,
+) -> None:
+    binary = _write_claim_elf(tmp_path / "stella")
+    command = _readiness_command(tmp_path)
+    reader = _public_reader(command, binary)
+    provider = _FakeProviderKeyReader()
+    provider.credits["data"]["unexpected"] = 0.0
 
     with pytest.raises(RuntimeError, match="exact v2 schema"):
         _verify_fixture(command, binary, reader=reader, provider=provider)
@@ -2480,6 +2748,7 @@ def test_public_intent_rehashes_runtime_after_final_github_get(tmp_path: Path) -
             runtime_identity=runtime_identity,
             runtime_revalidator=lambda: changed,
             provider_credential="test-secret",
+            management_credential=_TEST_MANAGEMENT_CREDENTIAL,
             reader=reader,
             provider_key_reader=_FakeProviderKeyReader(),
         )
@@ -2615,7 +2884,7 @@ def test_default_github_reader_uses_no_auth_or_ambient_proxy(
 def test_provider_readers_disable_redirects_and_ambient_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    observed: dict[str, object] = {}
+    observed: dict[str, object] = {"requests": []}
 
     class _Response:
         status = 200
@@ -2640,7 +2909,9 @@ def test_provider_readers_disable_redirects_and_ambient_proxy(
 
     class _Opener:
         def open(self, request: object, *, timeout: int):
-            observed["request"] = request
+            requests = observed["requests"]
+            assert isinstance(requests, list)
+            requests.append(request)
             observed["timeout"] = timeout
             return _Response(request.full_url)
 
@@ -2656,9 +2927,22 @@ def test_provider_readers_disable_redirects_and_ambient_proxy(
         "stella_harbor.secure_launcher.urllib.request.build_opener", build_opener
     )
     reader = _OpenRouterProviderKeyReader()
-    assert reader.get_key("test-secret") == {"data": {}}
-    request = observed["request"]
-    assert request.get_header("Authorization") == "Bearer test-secret"
+    fingerprint = "a" * 64
+    assert reader.get_key("test-benchmark-secret") == {"data": {}}
+    assert reader.get_key_record("test-management-secret", fingerprint) == {"data": {}}
+    assert reader.get_credits("test-management-secret") == {"data": {}}
+    requests = observed["requests"]
+    assert isinstance(requests, list)
+    assert [request.full_url for request in requests] == [
+        "https://openrouter.ai/api/v1/key",
+        f"https://openrouter.ai/api/v1/keys/{fingerprint}",
+        "https://openrouter.ai/api/v1/credits",
+    ]
+    assert [request.get_header("Authorization") for request in requests] == [
+        "Bearer test-benchmark-secret",
+        "Bearer test-management-secret",
+        "Bearer test-management-secret",
+    ]
     handlers = observed["handlers"]
     assert any(type(handler).__name__ == "_NoRedirectHandler" for handler in handlers)
     proxy_handlers = [handler for handler in handlers if hasattr(handler, "proxies")]
@@ -2762,6 +3046,7 @@ def test_concurrent_paid_intent_reservations_allow_exactly_one(
         runtime_identity=runtime_identity,
         runtime_revalidator=lambda: runtime_identity,
         provider_credential="test-secret",
+        management_credential=_TEST_MANAGEMENT_CREDENTIAL,
         reader=reader,
         provider_key_reader=_FakeProviderKeyReader(),
     )
@@ -2774,7 +3059,7 @@ def test_concurrent_paid_intent_reservations_allow_exactly_one(
                 [_CANDIDATE_MODELS[0]],
                 attestation,
                 host_preflight,
-                "test-secret",
+                ("test-secret", _TEST_MANAGEMENT_CREDENTIAL),
             )
         except BaseException as exc:  # test captures the losing atomic reservation
             return exc
@@ -2802,6 +3087,7 @@ def test_harbor_accepts_precreated_job_dir_with_attestations(tmp_path: Path) -> 
         runtime_identity=runtime_identity,
         runtime_revalidator=lambda: runtime_identity,
         provider_credential="test-secret",
+        management_credential=_TEST_MANAGEMENT_CREDENTIAL,
         reader=public_reader,
         provider_key_reader=_FakeProviderKeyReader(),
     )
@@ -2811,7 +3097,7 @@ def test_harbor_accepts_precreated_job_dir_with_attestations(tmp_path: Path) -> 
         [_CANDIDATE_MODELS[0]],
         attestation,
         host_preflight,
-        "test-secret",
+        ("test-secret", _TEST_MANAGEMENT_CREDENTIAL),
     )
 
     job = Job(
@@ -2844,6 +3130,22 @@ def test_claim_command_rejects_key_material_or_assignments_in_argv() -> None:
         _validate_claim_command(
             [*base, "OPENROUTER_API_KEY=not-the-selected-value"],
             {"OPENROUTER_API_KEY": "test-secret"},
+        )
+
+
+def test_claim_command_rejects_management_key_alias_in_argv(tmp_path: Path) -> None:
+    management_secret = "test-openrouter-management-secret"
+    command = _readiness_command(tmp_path)
+    comment_index = command.index("--intent-comment-url") + 1
+    command[comment_index] = f"{command[comment_index]}?alias={management_secret}"
+
+    with pytest.raises(RuntimeError, match="credential material"):
+        _validate_claim_command(
+            command,
+            {
+                "OPENROUTER_API_KEY": "test-openrouter-benchmark-secret",
+                "OPENROUTER_MANAGEMENT_API_KEY": management_secret,
+            },
         )
 
 
