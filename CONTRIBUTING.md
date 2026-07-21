@@ -113,9 +113,14 @@ break them will be asked to restructure, no matter how good the feature is:
 2. **No I/O in the engine.** Decision logic (compaction, eviction, loop
    detection, budget) stays synchronous functions over owned data — that's
    what makes it property-testable.
-3. **No phone-home. Ever.** The only network traffic Stella may produce is to
-   the model provider the user chose. A PR adding any other outbound call —
-   telemetry, update checks, anything — will be rejected outright.
+3. **Zero telemetry egress by default.** Community/default Stella sends no
+   telemetry anywhere; the model provider selected by the user remains the
+   normal network exception. The only managed exception is explicit Oxagen
+   Enterprise enrollment: a signed org-managed document, an exact allowlisted
+   HTTPS sink, a closed content-free operational schema, and process-free
+   execution authority are all required. Prompts, paths, tool payloads/results,
+   reasoning, errors, git state, memories, rules, and local identifiers remain
+   local. Update checks and anonymous analytics are still out of bounds.
 4. **Serde-first.** Every type crossing a crate boundary round-trips through
    `serde_json` byte-for-byte. Add a round-trip test when you add a type.
 5. **Typed errors, no panics.** Library code returns typed, named errors —

@@ -102,10 +102,15 @@ regardless of how good the feature is:
    property-testable. Anything that spawns processes, reads files, or hits the
    network belongs in `stella-tools`, `stella-model`, `stella-cli`, or
    `stella-store` — injected as a port/trait, not called directly.
-3. **No phone-home. Ever.** The only outbound network traffic Stella may
-   produce is to the model provider the user chose. A PR adding any other
-   outbound call (telemetry, update checks, "anonymous" analytics) is
-   rejected outright.
+3. **Zero telemetry egress by default.** Community/default Stella sends no
+   telemetry anywhere; model-provider traffic remains the normal network
+   exception selected by the user. The sole additional egress is an explicitly
+   enrolled Oxagen Enterprise managed mode: a signed org-managed document may
+   authorize a minimal operational rollup to one exact allowlisted HTTPS sink,
+   and only while the process-free execution authority is active. Prompts,
+   paths, tool payloads/results, reasoning, errors, git state, memories, rules,
+   and local identifiers are never exportable. Update checks and anonymous
+   analytics remain prohibited.
 4. **Serde-first.** Every type crossing a crate boundary round-trips through
    `serde_json` byte-for-byte. Add a round-trip test when you add a type to
    `stella-protocol`.
@@ -219,7 +224,7 @@ editing Stella's own code should know what lives where:
 | `.stella/domains.toml` | Domain taxonomy for memory/reflection tagging, inferred by `stella init`. |
 | `.stella/private/` | Owner-only generated local state (`0700`; files `0600`). The generated `.stella/.gitignore` excludes this whole directory. |
 | `.stella/private/reflections.jsonl` | Per-turn reflection mining log (one JSON object per line). |
-| `.stella/private/store.db` | Local SQLite telemetry (executions, events, cost/tokens). No phone-home. |
+| `.stella/private/store.db` | Canonical local SQLite telemetry (executions, events, cost/tokens). Community/default has zero telemetry egress; an enrolled Enterprise seat may derive only the documented content-free operational rollup. |
 | `.stella/private/context.db` | Recallable memories, episodes, facts, and temporal context. |
 | `.stella/private/codegraph.db` | Tree-sitter code-graph index, built on `stella init`. |
 | `.stella/private/fleet.db` | Fleet run, attempt, commit, and spend ledger. |
