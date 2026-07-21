@@ -19,7 +19,7 @@ use stella_tools::tracker_auth::{
 pub fn run(cmd: &crate::ConnectCmd) -> Result<(), String> {
     match cmd {
         crate::ConnectCmd::Github { token } => run_github(*token),
-        crate::ConnectCmd::Linear { api_key } => run_linear(*api_key),
+        crate::ConnectCmd::Linear { paste_key } => run_linear(*paste_key),
         crate::ConnectCmd::Status => run_status(),
         crate::ConnectCmd::Remove { provider } => run_remove(provider),
     }

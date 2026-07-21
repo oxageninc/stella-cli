@@ -181,10 +181,10 @@ then the AGENT ENGINE tab's right column, now a tab of its own; open it with
   to edit a row (enum rows cycle; numeric and text rows take inline input),
   `x` clears a field back to "provider default", Esc hands the keyboard back
   to the tab.
-- **`/model-default`**, **`/model-worker`**, **`/model-judge`**,
-  **`/model-triage`** jump straight into a type-to-filter model picker for
+- **⏎ on an agent's model row** opens a type-to-filter model picker for
   that agent, listing your `allowed_models` (or the full catalog when the
-  list is empty).
+  list is empty). The SETTINGS tab is the one place models are configured —
+  there are no per-agent slash commands.
 - **`s`** saves to your user settings (`~/.config/stella/settings.json`);
   **`S`** saves to the project (`<workspace>/.stella/settings.json`). Saves
   preserve every other key in the file, and apply to runs started from then

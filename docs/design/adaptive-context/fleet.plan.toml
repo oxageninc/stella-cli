@@ -1,0 +1,1313 @@
+# ============================================================================
+# Adaptive Context Lifecycle — stella-fleet build plan (spec bundle v2)
+#
+# Deserializes into `stella_fleet::Plan` ([[tasks]]: id / title / prompt /
+# depends_on / isolation / claims). Built from the canonical spec bundle in
+# THIS directory. Normative inputs for every worker:
+#   docs/design/adaptive-context/stella-adaptive-context-lifecycle.md
+#   docs/design/adaptive-context/adaptive-context-implementation-plan.md
+# Authority/working rules for every worker:
+#   docs/design/adaptive-context/stella-adaptive-context-build-prompt.md
+# Background companions (informative, not normative):
+#   context-frame-spec.md, directive-schema.md
+# Excluded from this plan by the build prompt ("do not edit
+# context-graph-protocol from this repository"): the CGEP protocol work —
+# context-graph-protocol-build-prompt.md runs in that repo separately.
+#
+# HOW TO RUN
+#   git checkout -b feat/adaptive-context   # designated long-running
+#                                           # implementation branch (the build
+#                                           # prompt's multi-phase exception —
+#                                           # this fleet run IS that branch)
+#   stella fleet --plan docs/design/adaptive-context/fleet.plan.toml \
+#     --max-concurrency 3 --budget 200
+#
+#   - Shared tree; same-crate work serialized via depends_on; declared claims
+#     are dependency-ordered (a same-wave claim conflict permanently fails
+#     dispatch), and additionally guard against other sessions in this
+#     workspace.
+#   - Per-child budget = --budget / --max-concurrency. The fleet stops
+#     launching waves at the cap; in-flight tasks settle first.
+#   - No resume: a failed task skips its dependents; re-running re-dispatches
+#     everything, so every prompt instructs the worker to RECONCILE with
+#     already-landed work instead of duplicating it.
+#   - Tasks map 1:1 onto the implementation plan's phases and their gates
+#     (Phase 0 → t00 ... Phase 9 → t20/t21). Phase 10 (CGEP interop) is
+#     deliberately absent: separate repo, separate handoff prompt, and gated
+#     on a second provider use case.
+#
+# EVERYTHING SHIPS DISABLED: context.lifecycle.enabled=false is the master
+# flag; learning.mode (off | record_only | advisory) and governance.mode
+# (solo | team | regulated) are independent dimensions. No task may change
+# default behavior for a workspace without the new settings.
+#
+# CARRIED-FORWARD REVIEW NOTES (N1-N6) — the spec bundle resolved the earlier
+# D1-D7 pushback; these are the residual risks, each assigned to tasks:
+#   N1 RFC 8785 (JCS) canonical hashing has no existing crate dep in this
+#      workspace. t01 owns the strategy: hand-rolled minimal JCS (sorted keys,
+#      canonical string escapes, integer-only number policy documented) OR a
+#      small vetted dep with the AGENTS.md justification sentence. Golden
+#      vectors with real 64-hex digests either way.
+#   N2 Phase 2 re-roots storage authority (canonical_json) under the LIVE
+#      recall pipeline — the riskiest slice. t03/t04 are split and gated on
+#      byte-compat recall fixtures and a projection-rebuild witness.
+#   N3 The spec never names `.stella/memories/*.md` (save_memory prompt-prefix
+#      files) or the reflections→skills auto-creation pipeline. t00's ADR must
+#      settle their relationship (v1 recommendation: untouched, documented as
+#      adjacent systems; reclassification later via RecordProposal).
+#   N4 CompiledContextFrame is per-invocation in the spec; v1 compiles once
+#      per pipeline run at the existing ContextRecallPort seam (t06/t07), with
+#      the cached stable-base + delta optimization deferred until full-frame
+#      correctness (per the plan's own Phase 4 ordering).
+#   N5 The json_schema requirement kind needs a validator: t16 decides between
+#      a bounded structural checker (no dep) or a justified vetted dep.
+#   N6 Contract selection "by intent" has no intent taxonomy in Stella (triage
+#      knows SimpleLookup/SingleTask/MultiStep). v1 = explicit selection +
+#      triage class + the user's stated choice; a real taxonomy is follow-up.
+# ============================================================================
+
+[[tasks]]
+id = "t00-baseline"
+title = "Phase 0: baseline, ADRs, fixtures, disabled settings"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Normative inputs (read first, in this order): AGENTS.md;
+docs/design/adaptive-context/stella-adaptive-context-build-prompt.md (your
+authority and working rules); docs/design/adaptive-context/
+adaptive-context-implementation-plan.md section "Phase 0"; the lifecycle
+specification (stella-adaptive-context-lifecycle.md) sections 1-7 for
+vocabulary. Binding repo rules: typed errors, no unwrap on runtime data, no
+new dependencies without a justifying sentence, new .rs files <= 1500 lines,
+rustfmt + clippy -D warnings clean.
+
+Deliver Phase 0 exactly:
+
+1. Baseline record: run make gate (or its documented equivalents) and record
+   the result; record the current Cargo dependency graph (cargo tree -e
+   normal --depth 1 per crate is fine) in a docs note.
+2. Inventory, written as docs/design/adaptive-context/adr/0000-inventory.md:
+   every current memory, fact, rule-mining, journal, event, provider, and
+   context-frame code path with file references. Explicitly cover: the
+   unwired stella-core rules::mine_candidates; stella-cli memory.rs
+   reflection loop and skills auto-creation; `stella memory promote`; the
+   store.db `rules` table and any Store::list_rules path; `.stella/memories/
+   *.md` and the save_memory tool (the spec does not name these two — your
+   ADR must settle their v1 relationship; recommended: untouched adjacent
+   systems, later reclassification via RecordProposal).
+3. Characterization tests for the current ContextQuery.as_of behavior in
+   stella-context (tests only — pin what it actually means today; do NOT
+   assume knowledge vs validity semantics).
+4. Fixture copies committed to tests: a current-version context.db and
+   store.db fixture (schema-version-stamped, generated by a small test
+   helper, not a binary blob if the repo convention prefers SQL/seed fns),
+   plus representative .stella/rules/*.md files including hyphenated legacy
+   guard keys.
+5. ADRs under docs/design/adaptive-context/adr/ (one file each, short):
+   semantic taxonomy; scope vs sharing; bitemporal semantics; record revision
+   identity; storage authority (canonical_json); ContextFrame vs
+   CompiledContextFrame; immutable promotion history; Markdown rules remain
+   canonical; memories-files-and-skills relationship (N3).
+6. Disabled settings in stella-cli/src/settings.rs: the exact tuple from the
+   implementation plan Phase 0 — context.lifecycle.enabled (default false),
+   context.learning.mode (off | record_only | advisory, default off),
+   context.governance.mode (solo | team | regulated, default solo),
+   promotion.inferred_directive { min_observations 3, min_distinct_tasks 3,
+   auto_activate_at_confidence 85, initial_enforcement "advisory" },
+   promotion.blocking_directive.requires_explicit_confirmation true,
+   retention { raw_observation_days 30, proposal_days 30,
+   inferred_directive_review_days 180 }. Three-scope per-field merge like the
+   existing sections; absent section == everything off; expose is_enabled()
+   and learning/governance accessors. Tests: defaults preserve current
+   behavior; merge precedence; unknown-field tolerance.
+
+Phase 0 gate (verify and state results): existing workspace checks pass
+before your change; fixtures committed; settings deserialize with
+behavior-preserving defaults; no network or repository mutation introduced.
+
+Run: cargo test -p stella-cli -p stella-context && cargo fmt && cargo clippy
+-p stella-cli -p stella-context --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-cli): adaptive-context Phase 0 —
+baseline ADRs, fixtures, disabled settings". If prior fleet work already
+landed parts of this, reconcile and complete rather than duplicate.
+'''
+depends_on = []
+claims = ["stella-cli/src/settings.rs"]
+
+# ---------------------------------------------------------------------------
+# Phase 1 — pure domain types + internal events
+# ---------------------------------------------------------------------------
+
+[[tasks]]
+id = "t01-core-types"
+title = "Phase 1a: domain types, validators, JCS record hashing in stella-core"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: AGENTS.md; docs/design/adaptive-context/
+stella-adaptive-context-build-prompt.md (sections "Normative vocabulary" and
+"Canonical property contract" are your exact contract); the implementation
+plan Phase 1 (stella-core list); lifecycle spec sections 6-8. stella-core does
+NO I/O — pure types and functions over owned data, property-testable.
+
+Deliver, in a new module tree stella-core/src/context/ (mod.rs + focused
+submodules, each <= 1500 lines):
+
+1. The full domain vocabulary from implementation-plan Phase 1:
+   ContextRecordKind (12 kinds); KnowledgeKind (fact|assumption|decision);
+   MemoryKind (episode|summary); DirectiveKind
+   (preference|rule|constraint|procedure); ConstraintEffect (require|forbid —
+   never allow); RecordStatus (active|retracted|archived) and derived
+   EffectiveStatus (+superseded, expired); RecordProposalKind and
+   RecordProposalStatus (collecting|eligible|dismissed|expired);
+   PromotionAction (proposed|auto_activated|confirmed|published|rejected|
+   retired|reverted); DirectiveEnforcement (advisory|blocking); Scope (7 ids)
+   and SharingScope (user|repository|workspace|organization); Sensitivity
+   (public|internal|confidential|restricted); TemporalInterval and
+   TemporalQuery (known_at, valid_at, observed [from,until),
+   valid_overlaps [from,until) — half-open, exclusive until);
+   ContextUseKind (selected|rendered|cited) and ContextUseEvaluation;
+   ArtifactContract + requirement kinds + validation result types;
+   OutcomeAssessment with INDEPENDENT completion_assessment and
+   correctness_assessment each carrying its own assessment_level
+   (verified|user_confirmed|externally_confirmed|inferred|unknown);
+   frame Representation (full|compact|reference), ContentFidelity
+   (exact|normalized|summarized|omitted), minimum_content_fidelity,
+   inline_content_requirement; structured Provenance (origin_provider_id,
+   origin_authority_id, producer_kind, producer_ref, derivation_kind,
+   source_refs) with the producer/derivation validation matrix from the build
+   prompt; evidence links ({evidence_id, relation}) with the five portable
+   relations; the record envelope (record_id, lineage_id,
+   supersedes_record_id, record_status, record_hash, scope, sharing_scope,
+   sensitivity, observed_at, valid_from, valid_until, extensions).
+   DraftRecordBody for proposals (deliberately no id/time/hash).
+2. Cross-field validators as constructors or validate fns, exactly the
+   implementation-plan examples: valid_until > valid_from; inferred directive
+   cannot be blocking at creation; inferred record requires nonempty scope;
+   procedure steps unique and ordered; confidence 0..=100; a reference
+   representation has no inline-content placeholder; blocking/guarded
+   directives require exact minimum fidelity; sharing value requires its
+   matching scope id (user_id/repository_id/workspace_id/organization_id).
+3. Canonical record hashing (note N1 in the plan header): record_hash =
+   "sha256:<64 lowercase hex>" over RFC 8785 (JCS) bytes of the canonical
+   record with record_hash omitted, after alias normalization, absent-option
+   omission, null-as-absence, and UTC timestamp normalization (trailing
+   fractional zeros removed). Strategy is yours: a minimal hand-rolled JCS
+   (sorted keys, canonical escapes; document an integers-only number policy)
+   or a small vetted crate WITH the AGENTS.md justification sentence in the
+   commit body. Provide golden vectors with REAL 64-hex digests (the spec
+   bans sha256:... placeholders in fixtures) in a fixtures module that a
+   future protocol-side test can share.
+4. Serde: all types rename_all snake_case; flat record_kind-discriminated
+   union (type-specific fields at top level); unknown namespaced extensions
+   preserved losslessly; legacy input aliases recorded_at->observed_at and
+   valid_to->valid_until accepted on deserialization, never emitted.
+5. Tests: exhaustive validator tests; serde round-trips byte-stable on
+   canonical fixtures; alias fixtures reserialize canonically; property tests
+   for interval bounds, confidence bounds, scope non-widening helpers; the
+   hash golden vectors.
+
+Phase 1 gate items you own: no I/O added to stella-core; round trips
+byte-stable; alias fixtures pass; hash vectors pass.
+
+Run: cargo test -p stella-core && cargo fmt && cargo clippy -p stella-core
+--all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-core): adaptive-context domain types,
+validators, canonical JCS record hashing". Reconcile with landed work.
+'''
+depends_on = ["t00-baseline"]
+claims = ["stella-core/src/lib.rs"]
+
+[[tasks]]
+id = "t02-protocol-events"
+title = "Phase 1b: additive internal events + decoder characterization"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: AGENTS.md; the build prompt (docs/design/adaptive-context/
+stella-adaptive-context-build-prompt.md) — especially its warning: "Before
+adding AgentEvent variants, characterize every replay decoder. Tagged Serde
+enums commonly reject unknown variants." Implementation plan Phase 1,
+stella-protocol section. stella-protocol is types only.
+
+Deliver:
+
+1. FIRST, characterization: find every AgentEvent replay decoder (the store
+   events table readers, the session journal reader in stella-store/src/
+   journal.rs, session_persist consumers, TUI model folds). Write a test that
+   proves what happens TODAY when an unknown event line is decoded. If
+   unknown variants fail decoding, add the mitigation the plan prescribes: a
+   versioned unknown-event envelope (or documented gating of emission until
+   all replay consumers tolerate additions) and a legacy-decoder replay
+   fixture proving a new event is preserved or safely skipped without
+   failing journal replay.
+2. The nine additive internal events from implementation-plan Phase 1:
+   ObservationRecorded, RecordProposalCreated, PromotionRecorded,
+   ContextUseRecorded, ContextUseFeedbackRecorded, ArtifactContractSelected,
+   ContractValidationCompleted, OutcomeAssessed, CompiledContextFrameBuilt —
+   each with event id, schema_version, task/invocation identity where
+   applicable, observed_at, and ONLY stable ids (no embedded record
+   payloads). Also an AdvisoryNotice event for the TUI (proposal id,
+   statement, evidence count, distinct task count, confidence, enforcement,
+   sharing scope) since Phase 6's notice must disclose exactly those.
+3. serde(default) on optional fields, snake_case tag, additive-only; round
+   trips for every variant; a legacy-line tolerance test consistent with the
+   file's existing style.
+
+Run: cargo test -p stella-protocol -p stella-store && cargo fmt && cargo
+clippy -p stella-protocol --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-protocol): adaptive-context lifecycle
+events + replay decoder characterization". Reconcile with landed work.
+'''
+depends_on = ["t00-baseline"]
+claims = ["stella-protocol/src/lib.rs", "stella-protocol/src/event.rs"]
+
+# ---------------------------------------------------------------------------
+# Phase 2 — context.db canonical storage
+# ---------------------------------------------------------------------------
+
+[[tasks]]
+id = "t03-context-schema"
+title = "Phase 2a: canonical context_records schema + repositories"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: AGENTS.md; the build prompt "Storage contract"; implementation
+plan Phase 2 (the exact table list is normative); lifecycle spec section 7.6.
+Constraints: stella-context/src/store.rs is pinned by the file-size ratchet —
+register the new migration there minimally; ALL new DDL and repository code
+lives in new modules. Extend the existing PRAGMA user_version migration
+system (single transaction, version bump) — no new database file.
+
+Deliver:
+
+1. Cargo: add stella-core as a path dependency of stella-context (types live
+   in stella-core per the implementation plan crate matrix; core is I/O-free
+   so the edge is clean — one-sentence justification in the commit body).
+2. Migration V4 creating the implementation-plan Phase 2 tables exactly:
+   context_records (record_id PK, lineage_id nullable, schema_version,
+   record_kind, record_status, scope_json, sharing_scope, sensitivity,
+   observed_at, valid_from, valid_until, confidence, supersedes_record_id,
+   record_hash, canonical_json, source_of_truth_kind, source_of_truth_ref);
+   context_record_links; context_evidence_links; context_record_ingestions
+   (unique record_id+provider_id); extraction_cursors (unique source_kind+
+   source_id+extractor_id+extractor_version); compiled_context_frames (with
+   tokenizer_ref, known_at, valid_at, input_hash, frame_hash, frame_json,
+   budget_json, manifest_json); compiled_context_frame_items (full column
+   list from the plan, including representation, content_fidelity,
+   canonical_content_hash, minimum_content_fidelity,
+   inline_content_requirement, transform_json, selection_reason, token_cost);
+   context_health_projection; context_exports (with the actor_ref-or-
+   consent_ref CHECK) and context_export_items (unique export_id+ordinal;
+   provider idempotency uniqueness). Indexes per the plan's minimum list;
+   scope hot dimensions get validated projection columns, not JSON scans.
+3. canonical_json is THE single authoritative byte representation: writes
+   parse+validate against the stella-core types, compute/verify record_hash
+   (core's JCS hasher), and write canonical row + projection columns + link
+   rows in ONE transaction. Reads verify hash on demand. Records are
+   IMMUTABLE: any semantic/status/scope/sharing/enforcement change inserts a
+   new record_id in the same lineage with supersedes_record_id; a repository
+   API that mutates a canonical row must not exist.
+4. Typed repositories in new modules: append/get/list by kind+status+
+   sharing; revision chains; ingestion ledger writes; extraction cursor
+   get/set; idempotent append (same idempotency key + same record_hash =
+   prior receipt; same key + different hash = typed conflict error, matching
+   the lifecycle spec's append semantics); health-projection rebuild fn that
+   reconstructs rows exactly from immutable use/feedback records (used by a
+   later phase, land the seam now).
+5. Tests: migration on the Phase 0 fixture db (transactional, idempotent
+   rerun is a no-op via stored version+content hashes, integrity_check and
+   foreign_key_check pass); hash-verified round trip; immutability enforced;
+   projection columns rebuild exactly from canonical_json (the
+   projection-rebuild witness the plan requires, at least for this task's
+   tables).
+
+Run: cargo test -p stella-context && cargo fmt && cargo clippy -p
+stella-context --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-context): canonical context_records
+schema, repositories, ingestion ledger". Reconcile with landed work.
+'''
+depends_on = ["t01-core-types"]
+claims = [
+  "stella-context/src/lib.rs",
+  "stella-context/src/store.rs",
+  "stella-context/Cargo.toml",
+]
+
+[[tasks]]
+id = "t04-legacy-migration"
+title = "Phase 2b: legacy memory/fact migration, adapters, rule mirrors"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+This is the riskiest slice of the whole effort (plan-header note N2): it
+re-roots storage authority while the live recall pipeline keeps working.
+Read first: AGENTS.md; the build prompt "Storage contract" (its migration
+paragraphs are your exact contract); implementation plan Phase 2 "Migration"
+items 1-10 and the Phase 2 gate; the Phase 0 inventory ADR
+(docs/design/adaptive-context/adr/0000-inventory.md) for the legacy paths.
+
+Deliver, in stella-context (+ the smallest possible stella-cli glue):
+
+1. Migrate every legacy memory row and Memory graph node into canonical
+   context_records: losslessly, as record_kind=memory (episode), preserving
+   public ids in the lineage mapping. NEVER semantically reclassify during
+   migration (no LLM, no heuristics) — later reclassification is a
+   RecordProposal. Explicitly typed legacy facts (context.db edges used as
+   fact assertions) migrate as knowledge:fact records preserving supersession
+   history where the edge close-and-supersede chain expresses it.
+2. Legacy tables become rebuildable projections/compatibility views over the
+   canonical repository: the existing memory table and Memory nodes keep
+   serving the CURRENT recall pipeline byte-compatibly, now derived from
+   canonical rows in the same transaction. Existing MemoryInput/recall APIs
+   become adapters over the canonical repository. The Phase 0 as_of
+   characterization tests must still pass unchanged (or gain the documented
+   adapter mapping the build prompt demands — map as_of to known_at/valid_at
+   only as those tests prove; never guess).
+3. Import existing .stella/rules/*.md as authoritative READ-ONLY mirrors:
+   record_kind=directive rows with source_of_truth_kind=repository_rule_file
+   and source_of_truth_ref = normalized repo path; the lifecycle repository
+   rejects writes to them. If legacy store.db rule rows exist (see the
+   inventory ADR), stop new lifecycle writes there; file-less rows migrate
+   conservatively as imported, repository-applicable but user-shared local
+   directives (no Git changes, no sharing widening).
+4. A projection-rebuild command surface (internal fn + a `stella context
+   rebuild-projections` diagnostic if trivial to wire; otherwise the fn +
+   test) that reproduces graph/index rows byte-for-byte from canonical_json.
+5. Tests = the Phase 2 gate, verbatim: every Phase 0 fixture migrates
+   transactionally; record counts and content checksums reconcile; existing
+   memory/fact recall tests remain green (or have documented semantic
+   replacements); replaying the migration creates no duplicates; SQLite
+   integrity passes; rule mirrors cannot be edited through the repository;
+   projection rebuild reproduces rows exactly.
+
+Run: cargo test -p stella-context -p stella-cli && cargo fmt && cargo clippy
+-p stella-context --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-context): legacy migration to canonical
+records, compatibility adapters, rule mirrors". Reconcile with landed work.
+'''
+depends_on = ["t03-context-schema"]
+claims = [
+  "stella-context/src/lib.rs",
+  "stella-context/src/writeback.rs",
+  "stella-context/src/retrieval.rs",
+]
+
+# ---------------------------------------------------------------------------
+# Phase 3 — temporal queries + CompiledContextFrame
+# ---------------------------------------------------------------------------
+
+[[tasks]]
+id = "t05-temporal-queries"
+title = "Phase 3a: typed temporal query API (known_at / valid_at / ranges)"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Canonical property contract" temporal
+paragraphs; implementation plan Phase 3 "Temporal repository API" (its
+semantics block is normative, copy it into the module doc); lifecycle spec
+7.4-7.5.
+
+Deliver, in stella-context:
+
+1. One typed query implementation over the canonical repository with EXACTLY
+   these semantics: known_at filters local_knowledge_time <= known_at, where
+   local_knowledge_time = observed_at for locally originated records and the
+   MINIMUM context_record_ingestions.received_at for imported records —
+   reject known_at queries with a typed error when durable ingestion history
+   is unavailable rather than silently substituting origin time. valid_at:
+   valid_from <= valid_at < valid_until (null valid_until = open). observed
+   [from,until) filters canonical origin observed_at. valid_overlaps
+   [from,until) uses the half-open overlap rule. Claim-bearing kinds
+   (knowledge, directive, artifact_contract) require non-null valid_from;
+   event-only records are excluded from validity queries unless
+   include_records_without_validity=true. Invalid or contradictory filters
+   are typed errors, never reinterpreted.
+2. Historical reconstruction: restrict records AND lifecycle events to
+   local_knowledge_time <= known_at first, derive effective status
+   (superseded/expired) from only that prefix, then apply validity, then
+   select the maximal applicable revision per lineage via
+   supersedes_record_id. A revision received or created after known_at can
+   never affect the result — test this with an imported-record fixture whose
+   origin observed_at predates its ingestion.
+3. Truth-table tests for boundary instants (from inclusive, until exclusive,
+   null handling under SQLite) and property tests for revision selection.
+   Wire the deprecated ContextQuery.as_of adapter to this API exactly as the
+   Phase 0 characterization tests dictate.
+
+Run: cargo test -p stella-context && cargo fmt && cargo clippy -p
+stella-context --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-context): typed temporal queries and
+historical reconstruction". Reconcile with landed work.
+'''
+depends_on = ["t04-legacy-migration"]
+claims = ["stella-context/src/lib.rs"]
+
+[[tasks]]
+id = "t06-frame-compiler"
+title = "Phase 3b: deterministic CompiledContextFrame + manifest + precedence"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Frame and compaction contract"; implementation
+plan Phase 3 "Frame compiler" and "Precedence" (both normative); lifecycle
+spec sections 9 and 11.
+
+Deliver, in stella-context (new module, e.g. frame_compiler.rs):
+
+1. The twelve-step compilation pipeline from implementation-plan Phase 3:
+   resolve scope without widening; retrieve active temporally-applicable
+   records via the typed temporal API; exclude retracted/archived/expired/
+   suppressed/incompatible-sharing records; apply the CATEGORY-AWARE
+   precedence ladder exactly (authorization + system policy; confirmed
+   organization constraints; authenticated blocking workspace/repository
+   constraints; current-task instructions; selected required contracts;
+   confirmed workspace/repository directives; confirmed user directives;
+   current knowledge; advisory inferred directives; memories; observation
+   summaries and untrusted evidence) — sharing scope is NOT authority;
+   confidence never overrides authority; a preference never overrides a
+   constraint; a memory never overrides current knowledge; at equal
+   authority narrower applicability wins and unresolved workspace/repository
+   conflicts remain explicit conflict records; detect contradictions and
+   supersession; select required constraints and contracts (required items
+   can never be evicted by ranking); rank optional records; allocate a
+   deterministic budget; choose per-item representation and fidelity
+   defaults (full for v1 — compaction is the next phase; the fields exist
+   now); produce the immutable manifest; persist frame + ordered items;
+   emit ContextUse records with use_kind=selected (stable use_trace_id per
+   record/frame/invocation).
+2. frame_hash over the RFC 8785 canonical semantic frame body (reuse core's
+   JCS hasher) with compiled_frame_id, frame_hash, compiled_at omitted;
+   tokenizer_ref declared on every frame (v1: the existing chars/4 estimator,
+   named e.g. "stella-estimate/chars4-v1" — do NOT add a tokenizer
+   dependency); token_cost computed under it for every item.
+3. The manifest records compiler and policy versions, inputs, input_hash,
+   included ids, exclusion reasons, conflicts, provider query refs,
+   transformations, ordering, and section budgets.
+4. Plan-header note N4: the compiler is invoked once per pipeline run at the
+   existing ContextRecallPort seam (a later task wires it); design the API
+   so per-invocation compilation and cached bases can come later without
+   changing the frame schema.
+5. Tests = the Phase 3 gate: identical inputs produce byte-identical
+   semantic frame bodies, ordering, and frame_hash (envelope id/time may
+   differ); known_at vs valid_at historical tests; scope-leakage negative
+   tests at every dimension; conflicts and exclusions inspectable; required
+   items cannot be evicted; existing provider query behavior unchanged.
+
+Run: cargo test -p stella-context && cargo fmt && cargo clippy -p
+stella-context --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-context): deterministic
+CompiledContextFrame compiler with category-aware precedence". Reconcile
+with landed work.
+'''
+depends_on = ["t05-temporal-queries"]
+claims = ["stella-context/src/lib.rs", "stella-context/src/frame_compiler.rs"]
+
+# ---------------------------------------------------------------------------
+# Phase 4 — representations + PromptContext
+# ---------------------------------------------------------------------------
+
+[[tasks]]
+id = "t07-compaction-prompt"
+title = "Phase 4: representations, fidelity, deterministic PromptContext"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Frame and compaction contract"; implementation
+plan Phase 4 (invariants and gate are normative); lifecycle spec section 10.
+
+Deliver:
+
+1. In stella-context: representation full|compact|reference and
+   content_fidelity exact|normalized|summarized|omitted with the exact
+   invariants: full requires canonical inline content; compact requires
+   inline content + transformation identity + inline hash + canonical hash +
+   content_ref + resolve support; reference omits inline content and
+   requires opaque content_ref + canonical hash, and resolution VERIFIES the
+   canonical hash; blocking constraints, guards, ordered procedures, and
+   machine-checkable contract structures never fall below exact fidelity at
+   their point of use; summaries stay linked to canonical records; token
+   counts describe the actual representation under the declared
+   tokenizer_ref. v1 compaction transforms are deterministic (extractive
+   truncation/normalization) — no model calls; record transform_method/
+   implementation/version on every compact item. Persist the full
+   representation lineage columns per item.
+2. In stella-cli (or the crate the repo's prompt assembly lives in): a
+   deterministic PromptContext renderer per lifecycle spec 10.5 — stable
+   citation labels ([d1]/[k1]/[m1]/[a1] style), visibly separated TASK /
+   CONSTRAINTS / DECISIONS / ASSUMPTIONS (always labeled) / MEMORY /
+   CONTRACT / STATE sections, untrusted observations never rendered into an
+   instruction section. The renderer consumes a CompiledContextFrame only —
+   no direct store reads.
+3. Golden prompt fixtures (deterministic byte-for-byte), a compact-vs-full
+   token-count benchmark test proving compact fixtures cost fewer estimated
+   tokens, exact-fidelity byte-equivalence tests, and rehydration tests
+   (compact/reference items trace to canonical hashes). Cached stable-base /
+   invocation-delta optimization is explicitly DEFERRED (plan-header N4) —
+   leave a doc comment, do not implement.
+
+Run: cargo test -p stella-context -p stella-cli && cargo fmt && cargo clippy
+-p stella-context -p stella-cli --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-context): frame representations and
+deterministic PromptContext rendering". Reconcile with landed work.
+'''
+depends_on = ["t06-frame-compiler"]
+claims = [
+  "stella-context/src/frame_compiler.rs",
+  "stella-cli/src/prompt_context.rs",
+]
+
+# ---------------------------------------------------------------------------
+# Phase 5 — evidence + observation harvesting
+# ---------------------------------------------------------------------------
+
+[[tasks]]
+id = "t08-store-cursors"
+title = "Phase 5a: cursored event reads in stella-store"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: AGENTS.md; implementation plan Phase 5 ("Raw operational
+telemetry remains in store.db or the journal") and the extraction_cursors
+ownership note in Phase 2 (stella-context owns cursors; stella-store and the
+journal are READ-ONLY extraction sources).
+
+Deliver, in stella-store: an incremental cursored event read API styled on
+the existing session_events query — return events strictly after an
+(execution_id, seq) cursor in ascending order, bounded by a max-rows
+argument, tolerating undecodable rows the same way session_events does
+(skip + count, never fail). The events table's AUTOINCREMENT execution_id +
+per-execution seq + UNIQUE(execution_id, seq) make this safe. If the
+file-size ratchet pins stella-store/src/lib.rs too tightly, put it in a new
+module. No schema changes; no writes. Unit tests: ordering, boundary
+exactly-after semantics, bound respected, skip counting.
+
+Run: cargo test -p stella-store && cargo fmt && cargo clippy -p stella-store
+--all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-store): cursored incremental event
+reads for context extraction". Reconcile with landed work.
+'''
+depends_on = ["t00-baseline"]
+claims = ["stella-store/src/lib.rs"]
+
+[[tasks]]
+id = "t09-core-extractors"
+title = "Phase 5b: pure extractor contract, normalizers, redaction"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Learning contract"; implementation plan Phase 5
+"Extractor contract" and "Trust and anti-poisoning" (both normative);
+lifecycle spec section 12. stella-core: NO I/O.
+
+Deliver, in stella-core/src/context/ (new submodule):
+
+1. The extractor contract exactly: every extractor has extractor_id and
+   extractor_version and returns source_kind, source_ref, source_hash, a
+   bounded locator or excerpt, observation_kind, occurred_at/occurred_until
+   when known, scope evidence, sensitivity, and confidence components. The
+   idempotency key derives deterministically from extractor identity +
+   source hash + locator + normalized observation kind — replay with the
+   same extractor version creates zero duplicates.
+2. Pure normalizers for the v1 sources: AgentEvent streams (tool failures/
+   recoveries, verification and judge outcomes), journal records, reflection
+   lessons (the .stella/reflections.jsonl shape), explicit user actions
+   (Keep/Edit/Ignore/accept/reject/correct), and git-diff FEATURE structs
+   (the I/O half computes features; you interpret conservatively per
+   implementation-plan Phase 5: follow-up edits are inferred signals unless
+   a deterministic oracle establishes cause; merge/generated/vendor/
+   formatting churn excluded via pure predicates; repetition counted across
+   distinct tasks only).
+3. Anti-poisoning invariants as pure checks + property tests: model prose
+   alone cannot create promotion-eligible evidence; a proposal cannot cite
+   itself or a generated restatement; instructions inside traces/logs/files
+   remain data (no normalizer output ever carries instruction authority);
+   thirty matching events in one task yield one support unit; secret
+   redaction (conservative pattern set, tested both directions) runs before
+   any excerpt is emitted.
+
+Run: cargo test -p stella-core && cargo fmt && cargo clippy -p stella-core
+--all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-core): observation extractor contract,
+normalizers, anti-poisoning invariants". Reconcile with landed work.
+'''
+depends_on = ["t01-core-types"]
+claims = ["stella-core/src/lib.rs"]
+
+[[tasks]]
+id = "t10-cli-harvest"
+title = "Phase 5c: harvest orchestration + context diagnostics commands"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Learning contract"; implementation plan Phase 5
+"CLI diagnostics" and gate; the settings tuple from Phase 0 (t00 landed it).
+Everything below is gated: context.lifecycle.enabled must be true for any of
+it to run, and learning.mode=off disables mining entirely while record_only
+captures observations/evidence/uses/outcomes without any selection or
+promotion (a later task enforces the promotion side).
+
+Deliver, in stella-cli:
+
+1. A harvest orchestrator (new file, e.g. src/context_harvest.rs): read
+   store.db events through the new cursored API, the session journal sidecar
+   when present, and .stella/reflections.jsonl; feed the stella-core
+   normalizers; persist observations and evidence idempotently via the
+   canonical repositories, advancing extraction_cursors per (source,
+   extractor, version). Bounded and best-effort: wall-clock capped, cursor
+   saved on overrun, NEVER fails or blocks the primary task. Wire the
+   incremental pass at the existing post-turn boundary next to
+   reflect_and_record call sites in src/memory.rs.
+2. Diagnostics commands per implementation-plan Phase 5, adapted to the
+   existing CLI hierarchy (new src/context_cmd.rs + Command arm in
+   src/main.rs): `stella context observations` (list, filters, --format
+   table|json), `stella context evidence <record_id>` (record + evidence
+   chain), `stella context harvest [--replay <task_or_journal_id>]`
+   (explicit pass; --replay re-runs a bounded source through the extractors
+   and proves idempotency), `stella context frame <task_or_invocation_id>`
+   (render a stored CompiledContextFrame + manifest).
+3. Tests = the Phase 5 gate: journal replay creates no duplicate evidence or
+   observations; thirty matching events in one task cannot satisfy a
+   three-task threshold; secret fixtures are redacted before storage;
+   prompt-injection fixtures remain non-instructional; harvest failure
+   cannot fail the primary task; git inference is never labeled verified
+   (the git adapter lands next task — assert the label discipline at the
+   normalizer boundary here).
+
+Run: cargo test -p stella-cli && cargo fmt && cargo clippy -p stella-cli
+--all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-cli): bounded observation harvesting +
+stella context diagnostics". Reconcile with landed work.
+'''
+depends_on = ["t04-legacy-migration", "t08-store-cursors", "t09-core-extractors"]
+claims = [
+  "stella-cli/src/main.rs",
+  "stella-cli/src/memory.rs",
+  "stella-cli/src/context_cmd.rs",
+  "stella-cli/src/context_harvest.rs",
+]
+
+[[tasks]]
+id = "t11-git-inference"
+title = "Phase 5d: conservative git-diff evidence adapter"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: implementation plan Phase 5 sources list; lifecycle spec 12.3
+(its safeguards are normative). The pure interpreter for git FEATURES landed
+in stella-core; you build the I/O half.
+
+Deliver, in stella-cli (new file, e.g. src/context_git.rs): compute the
+12.3 signals by comparing the agent's last known state with the accepted
+repository state — working-tree and staged diffs plus commits since the
+per-repo mining cursor: files added by the user after the agent stopped;
+tests repeatedly added with a category of change; files repeatedly renamed
+or reorganized; required asset variants restored; generated output deleted
+before acceptance; final commit shape vs the agent's last patch. Store base
+and head shas in evidence locators. Safeguards enforced here AND at the
+normalizer: only task-related hunks considered; merge/generated/vendor/
+formatting-only churn filtered; every emission is an inferred signal.
+Bounds: byte/file caps + wall-clock budget; cursor = last mined commit sha.
+Spawn git through the workspace's existing non-interactive spawn point
+(stella_fleet::SystemGitCli or the repo tools port — copy the established
+pattern, never a new bare Command). Feature-gated like all harvesting.
+Integrate into the normal harvest pass + a --git flag on `stella context
+harvest`. Tests on a tempdir fixture repo: follow-up edit yields an inferred
+observation; formatting-only commit yields nothing; advanced cursor yields
+nothing new.
+
+Run: cargo test -p stella-cli && cargo fmt && cargo clippy -p stella-cli
+--all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-cli): conservative git-diff evidence
+adapter". Reconcile with landed work.
+'''
+depends_on = ["t10-cli-harvest"]
+claims = [
+  "stella-cli/src/context_git.rs",
+  "stella-cli/src/context_harvest.rs",
+  "stella-cli/src/context_cmd.rs",
+]
+
+# ---------------------------------------------------------------------------
+# Phase 6 — proposals + adaptive governance
+# ---------------------------------------------------------------------------
+
+[[tasks]]
+id = "t12-core-governance"
+title = "Phase 6a: proposal induction, scoring, governance decisions"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Governance contract" (normative, including the
+exact solo-mode Ignore semantics); implementation plan Phase 6; lifecycle
+spec sections 8.9, 8.10, 13. stella-core: NO I/O.
+
+Deliver, in stella-core/src/context/ (new submodules):
+
+1. Proposal induction over normalized observations, reusing the crate's
+   pub(crate) mining helpers (terms/jaccard/cluster_observations/hash8/
+   slugify) and adapting the existing unwired rules::mine_candidates
+   machinery rather than writing a second miner. Proposals target knowledge,
+   directive, or contract_amendment and carry a typed DraftRecordBody +
+   proposed_scope + requested_sharing_scope.
+2. Scoring with SEPARATELY persisted components (supporting observation
+   count, distinct task/episode count, contradiction count, deterministic
+   evidence strength, explicit user feedback, recurrence and recency, user
+   repair cost, future applicability, scope confidence, sensitivity,
+   staleness) plus scoring policy id + version; aggregate confidence must be
+   reproducible from components. Include a citation/efficacy component seam
+   so the legacy `stella memory promote` citation ladder can feed it.
+3. Governance decisions per mode with learning.mode enforcement built in:
+   record_only never selects/activates/confirms/publishes inferred records;
+   advisory permits auto_activated ONLY as user-shared + advisory at the
+   configured thresholds (min_observations, min_distinct_tasks,
+   auto_activate_at_confidence); blocking always requires explicit
+   confirmation; sharing never widens automatically. Solo flows: Keep ->
+   confirmed event; Edit -> superseding user-authored confirmed revision;
+   Ignore after activation -> retracted superseding directive revision +
+   reverted event + dismissed proposal revision + negative induction
+   evidence + configurable re-proposal cooldown, and the ignored directive
+   is immediately unselectable; Ignore before activation -> rejected event,
+   no directive. Team mode decisions produce proposed-repository-directive
+   outcomes for explicit review (publication mechanics are a later task).
+   Workspace publication decisions REQUIRE a durable workspace identity +
+   approver + policy version and are inert without a provider (typed
+   NoWorkspaceProvider outcome). Regulated adds actor/reason/policy-version/
+   evidence requirements. Proposal status transitions (collecting|eligible|
+   dismissed|expired) are new immutable revisions, never in-place updates.
+   review_after aging produces review_due, never stale (staleness needs
+   efficacy or contradiction evidence — a later phase).
+4. Property tests for every Phase 6 gate item that is pure: three distinct
+   tasks -> one eligible proposal; one-task repetition cannot; inferred
+   never blocking; sharing never broadens; Keep/Edit/Ignore event sequences
+   exact and replayable.
+
+Run: cargo test -p stella-core && cargo fmt && cargo clippy -p stella-core
+--all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-core): record proposal induction and
+adaptive governance decisions". Reconcile with landed work.
+'''
+depends_on = ["t09-core-extractors"]
+claims = ["stella-core/src/lib.rs", "stella-core/src/mining.rs", "stella-core/src/rules.rs"]
+
+[[tasks]]
+id = "t13-solo-ladder"
+title = "Phase 6b: solo ladder wiring — proposals, Keep/Edit/Ignore, promotion events"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Governance contract"; implementation plan
+Phase 6 (Solo mode + User interface + gate). Everything gated on
+lifecycle.enabled && learning.mode==advisory for activation; record_only
+still persists proposals without activation.
+
+Deliver, in stella-cli:
+
+1. Induction wiring: after each bounded harvest pass, run core induction
+   over fresh observations; persist proposals (immutable revisions) and
+   promotion events via the canonical repositories; enforce rate limits and
+   cooldowns; auto-activate eligible directive proposals per policy —
+   user-shared + advisory ONLY — appending auto_activated events; emit the
+   AdvisoryNotice event and print the disclosure line at turn end (exact
+   inferred statement, evidence count, distinct task count, confidence,
+   enforcement, sharing scope, effect of each action — the plan's notice
+   contract).
+2. Commands in src/context_cmd.rs (+ main.rs arms): `stella context
+   proposals` (scores with component breakdown), `stella context keep <id>`,
+   `stella context edit <id> --statement <text>` (headless-safe; superseding
+   user-authored confirmed revision), `stella context ignore <id>` (the full
+   retract/revert/dismiss/cooldown semantics from core), `stella context
+   publish <id>` (stub that stops at "explicit publication lands in a later
+   phase" with a typed message — file creation is Phase 8's), `stella
+   context archive <id>` / restore.
+3. Delegate the legacy citation ladder: `stella memory promote` now routes
+   through proposal induction with its citation stats as the efficacy score
+   component and the explicit invocation as user confirmation; preserve the
+   command surface as an alias with a deprecation note; its previous
+   observable outcome (an eligible memory produces a rule file) is preserved
+   via the Phase 8 publication path — until that lands, it produces a
+   confirmed repository-applicable directive and prints where publication
+   will occur. Document this transitional state in the command help.
+4. Tests: end-to-end solo witnesses over fixture observations — three
+   distinct tasks produce exactly one eligible proposal and one notice;
+   auto-activation writes the directive + event chain; Keep/Edit/Ignore
+   produce the exact immutable sequences; a user-shared directive never
+   appears in any git-visible file; record_only mode captures but never
+   activates.
+
+Run: cargo test -p stella-cli && cargo fmt && cargo clippy -p stella-cli
+--all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-cli): solo advisory ladder with
+immutable promotion history". Reconcile with landed work.
+'''
+depends_on = ["t11-git-inference", "t12-core-governance"]
+claims = [
+  "stella-cli/src/main.rs",
+  "stella-cli/src/context_cmd.rs",
+  "stella-cli/src/memory_cmd.rs",
+]
+
+[[tasks]]
+id = "t14-tui-advisory"
+title = "Phase 6c: advisory notices + Keep/Edit/Ignore card in the deck"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: implementation plan Phase 6 "User interface"; the build prompt
+governance section. The deck is a pure-fold ratatui REPL; mirror the
+existing scope-review card (pending_scope_review in stella-tui/src/model.rs,
+the a/t/x bindings in src/ui.rs). The AdvisoryNotice event and the CLI
+ladder actions already landed. BOUNDARY: you own stella-tui plus
+stella-cli/src/command_deck.rs only — call public ladder functions, do not
+edit main.rs or context_cmd.rs.
+
+Deliver:
+
+1. A NON-INTERRUPTING notice surface (net-new — every current affordance is
+   modal): AdvisoryNotice events queue in SessionModel and render as a
+   compact dismissible line at turn boundaries only, never mid-stream,
+   never stealing focus, never pausing the pipeline. The line discloses the
+   statement, distinct-task count, confidence, enforcement, and sharing
+   scope (user rendered as "Personal").
+2. A decision card opened from the notice by keybinding: k=Keep, e=Edit
+   (uses the deck's existing input affordance for the replacement
+   statement), i=Ignore, Esc=dismiss for now (proposal stays eligible;
+   directive stays advisory). Wire decisions through command_deck.rs to the
+   CLI ladder functions exactly once per decision.
+3. Explicit-confirmation card variant (same shape, distinct copy) required
+   before any blocking enforcement or any publication action — never
+   default-yes.
+4. Headless: notices degrade to log lines, decisions unavailable, nothing
+   blocks (mirror ask_user headless discipline).
+5. Pure-fold tests: queue/render/decide/dismiss transitions; mid-turn
+   notices deferred to the boundary; exactly-once dispatch.
+
+Run: cargo test -p stella-tui -p stella-cli && cargo fmt && cargo clippy -p
+stella-tui -p stella-cli --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-tui): advisory notices and
+keep/edit/ignore decision card". Reconcile with landed work.
+'''
+depends_on = ["t13-solo-ladder"]
+claims = [
+  "stella-tui/src/model.rs",
+  "stella-tui/src/ui.rs",
+  "stella-cli/src/command_deck.rs",
+]
+
+# ---------------------------------------------------------------------------
+# Phase 7 — artifact contracts + completion truth
+# ---------------------------------------------------------------------------
+
+[[tasks]]
+id = "t15-contracts-core"
+title = "Phase 7a: contract selection, validation semantics, dual outcome"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Artifact contract and outcome contract"
+(normative, including the command-requirement hardening); implementation
+plan Phase 7; lifecycle spec 8.12-8.14 and 16. stella-core: NO I/O.
+
+Deliver, in stella-core/src/context/ (new submodule):
+
+1. Contract selection decision: explicit user choice first, then scope +
+   validity + authority + triage task-class; plan-header note N6 — there is
+   no intent taxonomy, so applies_when.task_intents matches only explicit
+   intent strings supplied by the caller (document the deferral). Selection
+   binds the exact contract record_id, version, and content hash BEFORE
+   execution.
+2. Requirement evaluation as pure logic over caller-supplied workspace
+   facts: file_exists, directory_exists, glob_min_count (reuse the crate's
+   existing glob module), file_size, markdown_sections, mime_type by
+   extension, image_dimensions ONLY if facts already carry dimensions
+   (callers may not decode images in v1 — document), json_schema evaluation
+   deferred to the I/O task's checker (emit skipped with a named reason
+   here if facts lack a parsed document). Every requirement in the bound
+   contract version must yield exactly one result — duplicates or unknown
+   ids make validation_status=error, and error blocks completion.
+3. Command-requirement hardening exactly per the build prompt: structured
+   argv only (never a shell string type); execution_approval_ref required
+   and resolvable to current-user confirmation or authenticated applicable
+   organization policy; unknown, inferred, unattested-imported, or
+   unresolved contracts are structurally non-executable (typed
+   classification, no execution decision here — I/O and tool policy live
+   outside core). Selecting or exporting a contract never grants
+   permission: encode that as types (an ExecutionEligibility that the I/O
+   layer must still independently gate).
+4. Validator ordering semantics: deterministic before external before
+   semantic; a semantic judge (labeled inferred) can never override a
+   required deterministic failure.
+5. ContractValidation with contract_record_id/version/hash,
+   artifact_manifest_hash, validator_id/version, per-requirement statuses
+   (passed|failed|error|skipped); OutcomeAssessment builders with the
+   independent completion/correctness dimensions and per-dimension
+   assessment levels — property-test that no code path produces a verified
+   level from inferred inputs, and that completion never implies
+   correctness or vice versa.
+
+Run: cargo test -p stella-core && cargo fmt && cargo clippy -p stella-core
+--all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-core): artifact contract selection,
+hardened validation semantics, dual outcome assessment". Reconcile with
+landed work.
+'''
+depends_on = ["t12-core-governance"]
+claims = ["stella-core/src/lib.rs"]
+
+[[tasks]]
+id = "t16-contracts-io"
+title = "Phase 7b: contract storage, workspace validators, validate command"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Artifact contract and outcome contract";
+implementation plan Phase 7; lifecycle spec 8.12. Contracts are canonical
+records (user-shared by default; publication explicit — Phase 8 handles the
+Git-visible export decision per open-decision 3).
+
+Deliver, in stella-cli:
+
+1. Contract surface (new file src/context_contracts.rs + arms in
+   context_cmd.rs/main.rs): `stella context contract add <file>` parsing a
+   TOML or JSON definition into the canonical ArtifactContract record
+   (version bump on changed re-add; typed rejection listing supported
+   requirement kinds when it uses an unimplemented one), `contract list`,
+   `contract show <id>`.
+2. Workspace fact collection: bounded filesystem walk under output_root
+   (file-count and depth caps), paths + sizes + markdown headings + file
+   extensions; image dimensions only via cheap header sniffing if the
+   workspace already has the capability — otherwise those requirements
+   return skipped with a named reason (no new image dependency).
+   json_schema (plan-header N5): implement a bounded structural checker
+   (required properties, type tags, nesting depth cap) with NO new
+   dependency, or add a small vetted crate WITH the AGENTS.md justification
+   — your call, stated in the commit body.
+3. `stella context validate <contract_id> [--root <path>]`: collect facts,
+   evaluate via core against the BOUND contract hash, persist
+   ContractValidation + emit ContractValidationCompleted +
+   artifact_contract_pass/failure observations; idempotent per (contract
+   id, version, task, input content hash). Command-kind requirements: wire
+   through core's ExecutionEligibility AND the existing Stella tool
+   authorization path with artifact-root-contained cwd, sanitized
+   environment, timeout, output cap, and no network — and keep the whole
+   command kind OFF unless the contract resolves an execution_approval_ref
+   (structurally enforced in core; honor it here).
+4. Tests: fixture directories passing and failing (missing file, glob under
+   minimum, missing section); result-set completeness (missing/duplicate
+   requirement -> error -> completion blocked); unresolved approval ref ->
+   command requirement not executed and reported non-executable;
+   re-validation with unchanged inputs stores no duplicate.
+
+Run: cargo test -p stella-cli && cargo fmt && cargo clippy -p stella-cli
+--all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-cli): contract storage, workspace
+validators, stella context validate". Reconcile with landed work.
+'''
+depends_on = ["t13-solo-ladder", "t15-contracts-core"]
+claims = [
+  "stella-cli/src/context_cmd.rs",
+  "stella-cli/src/context_contracts.rs",
+  "stella-cli/src/main.rs",
+]
+
+[[tasks]]
+id = "t17-pipeline-gating"
+title = "Phase 7c: contract-gated completion in the pipeline"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Artifact contract and outcome contract";
+implementation plan Phase 7 "Selection" and "Validation"; the pipeline's
+ports discipline (stella-pipeline/src/ports.rs — all I/O injected).
+
+Deliver:
+
+1. An optional contract port on PipelinePorts (None = feature off, zero
+   behavior change): resolve the explicitly referenced contract during
+   triage, bind its exact record id + version + content hash into the
+   CompiledContextFrame inputs BEFORE execution (emit
+   ArtifactContractSelected), and render the required output shape into the
+   execution context so the worker sees it up front.
+2. Verify/judge integration: run deterministic contract validation before
+   any model judging; a required deterministic failure forces the revise
+   path exactly like failed deterministic verification does today
+   (deterministic evidence outranks the judge — follow the existing
+   Verdict::from_evidence precedence), and the run can never conclude
+   Completed while required checks fail. Validation uses the PRE-EXECUTION
+   bound hash — a worker-modified contract definition invalidates the pass
+   with a named error (reuse the witness tamper-exclusion fingerprint
+   pattern). Emit ContractValidationCompleted and an OutcomeAssessed event
+   whose completion and correctness dimensions are populated independently
+   (correctness stays unknown unless a real oracle spoke).
+3. Wire the port at every PipelinePorts construction site in stella-cli
+   (run/goal glue and src/fleet_cmd.rs), passing None unless
+   lifecycle.enabled and a contract is referenced; fleet workers pass None
+   in v1 (doc comment).
+4. Replay-fixture tests in stella-pipeline/tests: missing required artifact
+   -> revise then not-done with the contract failure in evidence; artifact
+   present -> Completed citing the validation; mid-run contract mutation ->
+   pass invalidated.
+
+Run: cargo test -p stella-pipeline -p stella-cli && cargo fmt && cargo
+clippy -p stella-pipeline -p stella-cli --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-pipeline): contract-gated completion
+with pre-execution hash binding". Reconcile with landed work.
+'''
+depends_on = ["t16-contracts-io"]
+claims = [
+  "stella-pipeline/src/pipeline.rs",
+  "stella-pipeline/src/ports.rs",
+  "stella-pipeline/src/verify.rs",
+  "stella-cli/src/fleet_cmd.rs",
+]
+
+[[tasks]]
+id = "t18-brandkit-witness"
+title = "Phase 7d: brand-kit end-to-end witness"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: implementation plan Phase 7 "Brand-kit witness" (the eight-step
+sequence is normative); lifecycle spec 16.3. TESTS ONLY — if you find a
+genuine bug, apply the minimal fix and flag it prominently in the commit
+body and summary.
+
+Deliver the witness exactly: a user-scoped brand-kit contract requiring the
+editable SVG logo/wordmark/mark, PNG variants (glob_min_count), favicons,
+design tokens matching a schema (use the json_schema checker the contracts
+task landed — or skipped-with-reason if it chose deferral, in which case
+substitute a file_exists so the witness still exercises a failure), brand
+guidelines with required markdown sections, a manifest, and a stable
+directory structure. Sequence: (1) the prompt asks only for a brand kit;
+(2) Stella retrieves the confirmed contract; (3) the first result omits
+logos/wordmark.svg and social/og-image.png; (4) deterministic validation
+fails both; (5) completion is not reported; (6) the failure creates ONE
+idempotent observation (replay proves no duplicate); (7) the repaired
+result passes all requirements with a verified complete outcome;
+(8) a later task retrieves the same contract even though the prompt omits
+the checklist. Build it as replay fixtures + integration tests following
+the idioms the pipeline and cli test suites already use. Also add the
+required-witness-matrix rows from implementation plan section 16 that are
+now testable and untested — audit the matrix, write a mapping comment
+(witness -> test path::name) in the new test file, implement gaps, and mark
+Phase 10 rows deferred.
+
+Run: cargo test --workspace && cargo fmt && cargo clippy --workspace
+--all-targets -- -D warnings.
+Commit via repo_commit: "test(workspace): brand-kit witness + required
+witness matrix audit". Reconcile with landed work.
+'''
+depends_on = ["t17-pipeline-gating"]
+claims = []
+
+# ---------------------------------------------------------------------------
+# Phase 8 — repository publication + team transition
+# ---------------------------------------------------------------------------
+
+[[tasks]]
+id = "t19-publication"
+title = "Phase 8: rule-file mapping, explicit publication, solo-to-team"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Storage contract" + governance publication
+paragraphs; implementation plan Phase 8 (frontmatter list, normative
+file-to-record mapping, and gate); lifecycle spec section 14.
+
+Deliver:
+
+1. In stella-core/src/rules.rs: extend the hand-rolled frontmatter parser to
+   accept the Phase 8 keys (schema_version, record_id, lineage_id,
+   record_kind, record_status, directive_kind, origin,
+   scope.repository_id, sharing_scope, enforcement, confidence,
+   observed_at, valid_from, valid_until, supporting_evidence_ids,
+   record_hash — NO promotion_stage) plus canonical snake_case guard
+   aliases guard_tool/guard_deny_path/guard_deny_command alongside legacy
+   hyphenated keys; emit canonical keys for generated files. The normative
+   mapping: Markdown body -> statement; presentational name/description
+   excluded from the ContextRecord and its record_hash; record_hash is the
+   canonical semantic record hash (not a file hash); source-file hash
+   stored separately in context.db. Witness: existing legacy files parse
+   byte-identically (fails if aliases removed).
+2. In stella-cli: explicit publication — `stella context publish <id>`
+   creates the .stella/rules/<slug>.md file from a CONFIRMED directive as a
+   new repository-shared revision + published PromotionEvent linking source
+   and result records, and updates the read-only mirror. File creation,
+   staging, committing, and pushing are separate authorities: this command
+   only writes the file and prints the suggested next Git steps — it never
+   stages or commits. Drift handling: a manual semantic edit that no longer
+   matches record_hash is validated into a NEW immutable revision on next
+   load, never a mutation.
+3. Solo-to-team transition per Phase 8: multiple recent Git identities are
+   a SIGNAL — `stella context governance` shows the detection and asks
+   before changing mode (headless: prints, changes nothing); user-shared
+   records stay private; repository-applicable proposals are listed for
+   explicit publication; owner routing only when maintainers/code owners
+   resolve. Wire `stella memory promote`'s transitional path (from the solo
+   ladder task) to this real publication flow.
+4. Tests = the Phase 8 gate: legacy rule files load unchanged; generated
+   rules round-trip through the current loader and guard engine; personal
+   evidence never enters Git; adding a collaborator requires no migration;
+   repository mutation never occurs merely because a proposal is eligible.
+
+Run: cargo test -p stella-core -p stella-cli && cargo fmt && cargo clippy
+-p stella-core -p stella-cli --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-cli): explicit rule publication and
+solo-to-team transition". Reconcile with landed work.
+'''
+depends_on = ["t16-contracts-io"]
+claims = [
+  "stella-core/src/rules.rs",
+  "stella-cli/src/context_cmd.rs",
+  "stella-cli/src/rules.rs",
+]
+
+# ---------------------------------------------------------------------------
+# Phase 9 — efficacy, staleness, pruning, Observatory
+# ---------------------------------------------------------------------------
+
+[[tasks]]
+id = "t20-efficacy-pruning"
+title = "Phase 9a: context-use lineage, efficacy projections, reversible pruning"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: the build prompt "Context-use and pruning contract";
+implementation plan Phase 9 (policy thresholds and gate are normative);
+lifecycle spec 8.15 and 15.
+
+Deliver:
+
+1. Complete the use lineage: the frame compiler already emits selected;
+   add rendered (when PromptContext actually includes the item) and cited
+   (when the response/citation path references it) ContextUse events, all
+   sharing one stable use_trace_id per record/frame/invocation.
+   ContextUseFeedback records reference the exact context_use_id + trace
+   id, with evaluation method, evaluator, real-opportunity flag, and
+   attribution confidence. v1 evaluation methods are deterministic only:
+   explicit user Keep/Ignore/correction on a cited directive, contract
+   pass/fail bound to a selected contract, witness/verification outcomes.
+   A failed task must not mark every selected record unhelpful (enforce:
+   feedback requires opportunity + method).
+2. Health projections rebuilt exactly from immutable events (the rebuild fn
+   landed with the schema — finish and wire it): opportunity/selected/
+   rendered/cited/evaluated/helpful/not_helpful/neutral counts, last-use
+   timestamps, review_after, selection_health
+   (healthy|review_due|stale|suppressed).
+3. Reversible pruning per the exact Phase 9 policy: suppression eligibility
+   only when >= 5 evaluated uses with real opportunity AND >= 80 percent
+   attributable not_helpful AND attribution confidence meets threshold AND
+   a simple interval test rejects noise; first action selection_health=
+   stale + exclusion from automatic selection + a user notice (reuse the
+   advisory notice surface); archive only after a grace period, as a new
+   archived revision. NEVER auto-suppress blocking, critical, organization,
+   pinned, or user-confirmed directives. `stella context health` and
+   `stella context restore <id>` commands.
+4. Tests = the Phase 9 gate: aggregates rebuild exactly from immutable
+   records; negative attribution requires opportunity and method; stale
+   records remain inspectable and restorable; suppressed records excluded
+   from automatic retrieval; protected directives never auto-archived.
+
+Run: cargo test -p stella-context -p stella-cli && cargo fmt && cargo
+clippy -p stella-context -p stella-cli --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-context): context-use lineage,
+efficacy projections, reversible pruning". Reconcile with landed work.
+'''
+depends_on = ["t07-compaction-prompt", "t14-tui-advisory", "t19-publication"]
+claims = [
+  "stella-context/src/frame_compiler.rs",
+  "stella-cli/src/context_cmd.rs",
+  "stella-cli/src/prompt_context.rs",
+]
+
+[[tasks]]
+id = "t21-observatory"
+title = "Phase 9b: Observatory context lifecycle views"
+prompt = '''
+You are one task in a fleet implementing Stella's Adaptive Context Lifecycle.
+Read first: implementation plan Phase 9 "Observatory". The Observatory
+(stella-observatory) is loopback-only, read-only, GET-only, hand-rolled
+HTTP, one embedded page with ZERO external references (a test enforces it).
+It does not read context.db today; every new open is SQLITE_OPEN_READ_ONLY
+and a missing/pre-migration db is an empty state, never an error.
+
+Deliver: read-only routes + embedded page sections for the Phase 9 list —
+frame lineage (per-invocation selections, exclusions, conflicts,
+representations); evidence -> observation -> proposal -> promoted record
+lineage; context use and efficacy (health projection with immutable-event
+drill-down); stale/review-due/expiring records; contract selection and
+validation results; scope and sharing transitions (promotion events).
+Follow the existing db.rs route/handler idioms and page style. Tests: route
+handlers against a fixture context.db; empty-state behavior; the
+zero-external-reference page test stays green.
+
+Run: cargo test -p stella-observatory && cargo fmt && cargo clippy -p
+stella-observatory --all-targets -- -D warnings.
+Commit via repo_commit: "feat(stella-observatory): context lifecycle
+views". Reconcile with landed work.
+'''
+depends_on = ["t20-efficacy-pruning"]
+claims = [
+  "stella-observatory/src/lib.rs",
+  "stella-observatory/src/db.rs",
+]
+
+# ---------------------------------------------------------------------------
+# Docs + final gate
+# ---------------------------------------------------------------------------
+
+[[tasks]]
+id = "t22-docs"
+title = "User docs, ADR completion, AGENTS.md updates"
+prompt = '''
+You are the documentation task of a fleet that implemented Phases 0-9 of
+Stella's Adaptive Context Lifecycle. Read the spec bundle in
+docs/design/adaptive-context/ and the ACTUAL landed command surfaces (the
+context_cmd/context_contracts modules) — document what exists; where code
+and spec differ, the code is right and the delta belongs in the ADR series.
+
+Deliver:
+
+1. stella-docs user docs (Fumadocs .mdx + meta.json registration):
+   an adaptive-context concepts page (the six semantic families and their
+   authority boundaries; the solo ladder; contracts; frames and
+   PromptContext; privacy defaults — local-first, user-shared by default,
+   publication explicit; the lifecycle/learning/governance settings tuple);
+   commands/context.mdx (full `stella context` surface with examples);
+   updates to commands/memory.mdx (promote delegation), configuration/
+   settings.mdx (the context section), and the context-engine page (frame
+   compilation and the recall seam).
+2. Complete the ADR series in docs/design/adaptive-context/adr/ with any
+   decisions individual tasks recorded in commit bodies (JCS strategy,
+   json_schema checker choice, tokenizer_ref naming, deferred items:
+   cached base/delta frames, intent taxonomy, workspace provider, Phase 10
+   CGEP adapter).
+3. AGENTS.md: extend the .stella table (context lifecycle records in
+   context.db, .stella/context-snapshots/), note the settings tuple, and
+   correct the external-protocol row: the protocol is Context Graph
+   Exchange Protocol (repo context-graph-protocol, renamed from
+   opencontextprotocol); Stella still depends on the pre-rename
+   ocp-types/ocp-host coordinates at a pinned rev, and repointing is a
+   Phase 10 prerequisite. Do NOT touch the context-graph-protocol
+   repository itself — its work has a separate handoff prompt.
+
+Verify the docs build if the JS toolchain is available; otherwise state so.
+Commit via repo_commit: "docs(adaptive-context): user docs, ADR completion,
+AGENTS.md updates". Reconcile with landed work.
+'''
+depends_on = ["t18-brandkit-witness", "t19-publication", "t21-observatory"]
+claims = ["AGENTS.md"]
+
+[[tasks]]
+id = "t23-gate"
+title = "Final gate: make gate green + verification artifact"
+prompt = '''
+You are the final task of a fleet that implemented Phases 0-9 of Stella's
+Adaptive Context Lifecycle. Everything is committed in your tree. Leave the
+workspace releasable.
+
+1. Run the repo gate exactly as CI does: make gate (cargo fmt --check +
+   file-size ratchet + cargo clippy --workspace --all-targets -- -D
+   warnings + cargo test --workspace). Fix ALL fallout with minimal diffs
+   (formatting, lints, ratchet splits, cross-crate breaks the per-crate
+   runs missed). Re-run until green. No allow-attributes without a
+   justifying comment.
+2. Re-verify the master invariant at workspace level: with no `context`
+   settings section, behavior is unchanged — run the tests asserting it
+   and name them.
+3. Audit the implementation plan's section 16 required witness matrix one
+   final time: every row either maps to a passing test (name it) or is
+   explicitly deferred with the phase that owns it (Phase 10 rows).
+4. Write verifications/adaptive-context/SUMMARY.md (the repo's PR-evidence
+   convention): gate output tail; the witness matrix with statuses; the
+   implementation plan's section 19 completion criteria as a checklist,
+   each marked met (with proving test/command) or deferred; feature flags
+   and defaults; risks needing maintainer decisions.
+5. Commit via repo_commit: "chore(workspace): green gate +
+   adaptive-context verification artifact".
+
+Your final summary must state plainly: gate green or not, which completion
+criteria are met, which witnesses pass, and anything a human must review
+before merging.
+'''
+depends_on = ["t11-git-inference", "t18-brandkit-witness", "t22-docs"]
+claims = []

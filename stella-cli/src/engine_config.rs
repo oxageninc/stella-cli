@@ -82,6 +82,15 @@ pub fn parse_model_spec(raw: &str, is_provider: &dyn Fn(&str) -> bool) -> Option
 /// phantom slug `zai/openrouter/openrouter/auto`). Unseeded pins
 /// (openrouter, local, settings-defined) keep verbatim semantics — their
 /// slug space is open, so the catalog has no veto.
+///
+/// An unseeded pin still gets ONE shape arbitration the catalog can't
+/// provide: a string that starts with the pin's own `provider/` prefix and
+/// whose residue is itself vendor-namespaced is the qualified flat form,
+/// not a verbatim wire slug — a pinned `openrouter` over
+/// `openrouter/openrouter/auto` sends the wire slug `openrouter/auto`, not
+/// the doubled form OpenRouter 400s on. A bare residue keeps verbatim
+/// semantics (`openrouter/auto` under the same pin IS the wire slug —
+/// stripping it would send the unserved `auto`).
 pub fn model_spec_for(
     engine: &AgentEngineConfig,
     kind: EngineAgentKind,
@@ -104,6 +113,20 @@ pub fn model_spec_for(
                 && let Some(spec) = parse_model_spec(model, is_provider)
             {
                 return Some(spec);
+            }
+            // Unseeded shape arbitration (see the doc comment): the pin's
+            // own `provider/` prefix over a still-namespaced residue is the
+            // TUI's qualified flat form — strip exactly one prefix.
+            if !pin_seeded
+                && let Some(rest) = model
+                    .strip_prefix(provider)
+                    .and_then(|m| m.strip_prefix('/'))
+                && rest.contains('/')
+            {
+                return Some(ModelSpec {
+                    provider: provider.to_string(),
+                    model: rest.to_string(),
+                });
             }
             Some(ModelSpec {
                 provider: provider.to_string(),
@@ -638,6 +661,41 @@ mod tests {
         let spec = model_spec_for(&engine, EngineAgentKind::Judge, &is_builtin).unwrap();
         assert_eq!(spec.provider, "openrouter");
         assert_eq!(spec.model, "openai/gpt-5.5");
+    }
+
+    #[test]
+    fn unseeded_pin_strips_its_own_qualified_prefix_but_keeps_verbatim_wire_slugs() {
+        // The TUI-save shape for an UNSEEDED provider: pin plus a flat
+        // `provider/slug` spec naming the pin itself. Verbatim routing sent
+        // the doubled `openrouter/openrouter/auto` to the wire, which
+        // OpenRouter 400s on — the qualified reading must win.
+        let engine = engine_from_json(
+            r#"{"default_model": "openrouter/openrouter/auto",
+                "agents": {"default": {"provider": "openrouter"}}}"#,
+        );
+        let spec = model_spec_for(&engine, EngineAgentKind::Default, &is_builtin).unwrap();
+        assert_eq!(spec.provider, "openrouter");
+        assert_eq!(spec.model, "openrouter/auto");
+
+        // Same shape over a routed vendor slug (a synced-catalog picker row).
+        let engine = engine_from_json(
+            r#"{"default_model": "openrouter/anthropic/claude-sonnet-5",
+                "agents": {"default": {"provider": "openrouter"}}}"#,
+        );
+        let spec = model_spec_for(&engine, EngineAgentKind::Default, &is_builtin).unwrap();
+        assert_eq!(spec.provider, "openrouter");
+        assert_eq!(spec.model, "anthropic/claude-sonnet-5");
+
+        // But a BARE residue keeps verbatim semantics: `openrouter/auto` IS
+        // the wire slug (OpenRouter's own vendor namespace) — stripping it
+        // would send the unserved `auto`.
+        let engine = engine_from_json(
+            r#"{"default_model": "openrouter/auto",
+                "agents": {"default": {"provider": "openrouter"}}}"#,
+        );
+        let spec = model_spec_for(&engine, EngineAgentKind::Default, &is_builtin).unwrap();
+        assert_eq!(spec.provider, "openrouter");
+        assert_eq!(spec.model, "openrouter/auto");
     }
 
     #[test]
