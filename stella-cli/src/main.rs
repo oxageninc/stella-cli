@@ -91,9 +91,36 @@ pub enum OutputFormat {
     about = "A fast, BYOK, model-agnostic terminal coding agent"
 )]
 struct Cli {
+    #[command(flatten)]
+    globals: GlobalArgs,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Session-wide flags shared by every subcommand — model routing,
+/// credentials, output shape, spend limit, UI toggles.
+///
+/// Every field here MUST carry `global = true`. clap accepts a plain
+/// root-level flag only *before* the subcommand token, so a non-global
+/// field in this struct is silently unreachable in the position users
+/// naturally type it (`stella fleet … --budget 5` dies with "unexpected
+/// argument"). `global = true` registers the flag with every subcommand,
+/// making both positions valid. The invariant is machine-enforced by
+/// `every_root_flag_is_global` in main_tests.rs — a new field without the
+/// attribute fails the suite, not a user's shell.
+///
+/// The names here are reserved CLI-wide: a subcommand flag reusing one
+/// does not shadow cleanly — clap propagates the global's value slot into
+/// every subcommand, and the id collision panics at match time in debug
+/// builds and misbinds in release. `no_subcommand_flag_reuses_a_global_name`
+/// in main_tests.rs enforces uniqueness (it is why `connect linear` pastes
+/// a key via `--paste-key`, not `--api-key`).
+#[derive(clap::Args)]
+struct GlobalArgs {
     /// Override the worker model for this invocation: provider/model_id
     /// (e.g. zai/glm-5.2, anthropic/claude-fable-5, openai/gpt-5.5)
-    #[arg(long, env = "STELLA_MODEL")]
+    #[arg(long, global = true, env = "STELLA_MODEL")]
     model: Option<String>,
 
     /// API key for the selected provider, highest-precedence step of the
@@ -101,42 +128,45 @@ struct Cli {
     /// interactive prompt). Prefer an env var or
     /// ~/.config/stella/credentials.toml for anything long-lived — a flag
     /// value is visible in shell history and `ps`.
-    #[arg(long)]
+    #[arg(long, global = true)]
     api_key: Option<String>,
 
     /// Base URL override. Required with --model local/<model> to point at a
     /// local OpenAI-compatible server (Ollama, vLLM, LM Studio, llama.cpp
     /// server — e.g. http://localhost:11434/v1); optional for every other
     /// provider to route through a proxy.
-    #[arg(long, env = "STELLA_BASE_URL")]
+    #[arg(long, global = true, env = "STELLA_BASE_URL")]
     base_url: Option<String>,
 
     /// Output format: text (interactive), json (one final object), or
     /// stream-json (one line per agent event)
-    #[arg(long, env = "STELLA_OUTPUT_FORMAT", value_enum, default_value = "text")]
+    #[arg(
+        long,
+        global = true,
+        env = "STELLA_OUTPUT_FORMAT",
+        value_enum,
+        default_value = "text"
+    )]
     output_format: OutputFormat,
 
     /// Hard USD spend limit for the whole run/session — enforced mode
     /// : work aborts cleanly (never mid-tool) once
     /// total spend exceeds this. Omit to meter spend for the cost summary
     /// without ever blocking (observed mode).
-    #[arg(long, env = "STELLA_BUDGET", value_parser = parse_budget)]
+    #[arg(long, global = true, env = "STELLA_BUDGET", value_parser = parse_budget)]
     budget: Option<f64>,
 
     /// Use the plain line-based REPL for chat instead of the Command Deck
     /// (the tabbed TUI). The deck also steps aside automatically when stdin
     /// or stdout is not a terminal. Env: STELLA_PLAIN=1.
-    #[arg(long)]
+    #[arg(long, global = true)]
     plain: bool,
 
     /// Freeze all deck animation (the run progress bar's shimmer/pulse and the
     /// caret blink) to a static frame — for CI and asciinema-style recordings.
     /// Also forced on by STELLA_NO_ANIM or NO_COLOR.
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_anim: bool,
-
-    #[command(subcommand)]
-    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -403,9 +433,11 @@ pub enum ConnectCmd {
     /// Connect Linear via browser OAuth (needs STELLA_LINEAR_CLIENT_ID) or a
     /// personal API key
     Linear {
-        /// Paste a personal API key even when an OAuth app is configured
+        /// Paste a personal API key even when an OAuth app is configured.
+        /// (Named to stay clear of the session-wide `--api-key`, which is
+        /// the model-provider credential — a different secret entirely.)
         #[arg(long)]
-        api_key: bool,
+        paste_key: bool,
     },
     /// Show stored connections, their accounts, and credential precedence
     Status,
@@ -949,7 +981,7 @@ fn main() -> ExitCode {
 
     // Value-free confirmation (names only), gated on STELLA_ENV_DEBUG + a TTY +
     // a human output format so it never pollutes json/stream-json.
-    env_files::announce(&loaded_env, cli.output_format);
+    env_files::announce(&loaded_env, cli.globals.output_format);
 
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -1026,7 +1058,17 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Some(Command::Connect { cmd }) => {
             // Tracker OAuth talks only to the tracker the user is connecting
-            // — no provider or API key required.
+            // — no provider or API key required. A `--api-key` here is
+            // almost always muscle memory from when `connect linear` had a
+            // flag by that name (now `--paste-key`): say so instead of
+            // silently running the OAuth path.
+            if cli.globals.api_key.is_some() {
+                eprintln!(
+                    "⚠ --api-key is the model-provider credential and is unused by \
+                     `stella connect`; to paste a Linear personal API key, use \
+                     `stella connect linear --paste-key`"
+                );
+            }
             return connect_cmd::run(cmd);
         }
         Some(Command::Observe { port, open }) => {
@@ -1064,18 +1106,18 @@ fn run(cli: Cli) -> Result<(), String> {
     // failure downgrades rather than aborting.
     if let Some(Command::Init) = cli.command {
         return rt()?.block_on(agent::run_init(
-            cli.model.as_deref(),
-            cli.api_key.as_deref(),
-            cli.base_url.as_deref(),
-            cli.no_anim,
+            cli.globals.model.as_deref(),
+            cli.globals.api_key.as_deref(),
+            cli.globals.base_url.as_deref(),
+            cli.globals.no_anim,
         ));
     }
 
     // Run/Chat/Config need a resolved config (which requires an API key).
     let cfg = config::Config::load(
-        cli.model.as_deref(),
-        cli.api_key.as_deref(),
-        cli.base_url.as_deref(),
+        cli.globals.model.as_deref(),
+        cli.globals.api_key.as_deref(),
+        cli.globals.base_url.as_deref(),
     )?;
 
     // Correctness pass over the resolved settings — model-slug problems (an
@@ -1095,14 +1137,19 @@ fn run(cli: Cli) -> Result<(), String> {
             rt()?.block_on(agent::run_one_shot(
                 &cfg,
                 &prompt,
-                cli.budget,
-                cli.output_format,
+                cli.globals.budget,
+                cli.globals.output_format,
                 !no_pipeline,
                 test_command.as_deref(),
             ))?;
         }
         Command::Goal { goal, no_pipeline } => {
-            rt()?.block_on(agent::run_goal_cmd(&cfg, &goal, cli.budget, !no_pipeline))?;
+            rt()?.block_on(agent::run_goal_cmd(
+                &cfg,
+                &goal,
+                cli.globals.budget,
+                !no_pipeline,
+            ))?;
         }
         Command::Fleet {
             tasks,
@@ -1118,7 +1165,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 plan.as_deref(),
                 base_ref.as_deref(),
                 max_concurrency,
-                cli.budget,
+                cli.globals.budget,
                 watch,
                 !no_pipeline,
             ))?;
@@ -1133,21 +1180,21 @@ fn run(cli: Cli) -> Result<(), String> {
                  code, commit and push the fix, then re-check. The goal is met only when the \
                  latest CI run for `{target}` has completed with every check successful."
             );
-            rt()?.block_on(agent::run_goal_cmd(&cfg, &goal, cli.budget, true))?;
+            rt()?.block_on(agent::run_goal_cmd(&cfg, &goal, cli.globals.budget, true))?;
         }
         Command::Chat => {
             // The Command Deck (tabbed TUI) is the default chat surface on a
             // real terminal; `--plain` / STELLA_PLAIN=1 / a non-TTY stream
             // falls back to the line-based REPL.
-            if use_deck(cli.plain) {
+            if use_deck(cli.globals.plain) {
                 rt()?.block_on(command_deck::run_deck_session(
                     &cfg,
-                    cli.budget,
-                    cli.no_anim,
+                    cli.globals.budget,
+                    cli.globals.no_anim,
                     None,
                 ))?;
             } else {
-                rt()?.block_on(agent::run_interactive(&cfg, cli.budget))?;
+                rt()?.block_on(agent::run_interactive(&cfg, cli.globals.budget))?;
             }
         }
         Command::Resume { id, list } => {
@@ -1155,7 +1202,7 @@ fn run(cli: Cli) -> Result<(), String> {
             // actual reopen, which is a full deck session (durable state is
             // a deck feature — the plain REPL has no session to restore).
             debug_assert!(!list, "handled before provider resolution");
-            if !use_deck(cli.plain) {
+            if !use_deck(cli.globals.plain) {
                 return Err(
                     "`stella resume` reopens a Command Deck session and needs a real \
                      terminal (it cannot combine with --plain / STELLA_PLAIN / a piped \
@@ -1169,8 +1216,8 @@ fn run(cli: Cli) -> Result<(), String> {
             };
             rt()?.block_on(command_deck::run_deck_session(
                 &cfg,
-                cli.budget,
-                cli.no_anim,
+                cli.globals.budget,
+                cli.globals.no_anim,
                 Some(request),
             ))?;
         }
@@ -1197,3 +1244,7 @@ fn run(cli: Cli) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "main_tests.rs"]
+mod main_tests;
