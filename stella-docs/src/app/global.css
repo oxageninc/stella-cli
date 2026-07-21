@@ -2,21 +2,23 @@
  * Stella CLI docs — styles.
  *
  * Brand system: "stardust gold on black". High-contrast bumblebee identity —
- * a warm near-black Ground with soft-but-bright golds and a stardust white.
+ * a cool carbon near-black Ground with sharp lemon-golds and a stardust white.
+ * The yellows sit at ~52–54° hue (lemon, not amber) and the blacks carry a
+ * cool blue-gray hint instead of the old brown cast — bumblebee, not tree bark.
  * The chevron+cells terminal mark (docs/brand/) rides a gold stardust gradient
- * over the black Ground in dark mode and a warm cream surface in light mode.
+ * over the black Ground in dark mode and a cool cream surface in light mode.
  * Fumadocs' neutral tokens are re-tinted here so the whole site reads as
  * Stella-gold rather than shadcn-neutral.
  *
  * Palette:
- *   Gold #FFD24A · Amber #F5A623 · Honey #FFF0B8 · Gold-deep #866400
- *   Ground #0A0A08 · Card #14120B · Stardust white #FBF8EE · Cream #FFFDF7
- *   Gradient: #FFF0B8 → #FFD24A (46%) → #F5A623
+ *   Gold #ffe81a · Brass #e3c010 · Honey #fef7b0 · Gold-deep #806e00
+ *   Ground #090a0d · Card #13151a · Stardust white #faf9f0 · Cream #fdfdf7
+ *   Gradient: #fef7b0 → #ffe81a (46%) → #e3c010
  *
- * Contrast rule: bright gold (#FFD24A) is the accent for the black Ground and
+ * Contrast rule: bright gold (#ffe81a) is the accent for the black Ground and
  * for non-text surfaces (the mark, borders, hero glints, button *fills*). Gold
  * text on a light surface is the classic WCAG trap, so for link/active/button
- * *text* on the cream surface we drop to a deep bronze-gold (#866400) that
+ * *text* on the cream surface we drop to a deep gold (#806e00) that
  * clears AA at body size. Dark mode keeps the bright gold, which clears AA on
  * Ground with room to spare. Button fills invert to a dark Ground label — the
  * bumblebee move — for maximum contrast in both modes.
@@ -41,12 +43,12 @@
 
 :root {
   /* Raw stardust-gold scale — reference these for decorative gold anywhere. */
-  --stella-gold: #ffd24a; /* bright bumblebee gold — dark-mode accent + fills */
-  --stella-amber: #f5a623; /* rich amber — icons, prompt, diagrams; legible on both grounds */
-  --stella-honey: #fff0b8; /* pale champagne stardust — gradient highlight */
-  --stella-gold-deep: #866400; /* AA-legible bronze-gold for text on Cream */
-  --stella-ground: #0a0a08; /* warm near-black Ground */
-  --stella-white: #fbf8ee; /* soft warm stardust white */
+  --stella-gold: #ffe81a; /* bright bumblebee lemon-gold — dark-mode accent + fills */
+  --stella-amber: #e3c010; /* cool brass (keeps the legacy `amber` name) — icons, prompt, diagrams */
+  --stella-honey: #fef7b0; /* pale lemon stardust — gradient highlight */
+  --stella-gold-deep: #806e00; /* AA-legible deep gold for text on Cream */
+  --stella-ground: #090a0d; /* cool carbon near-black Ground */
+  --stella-white: #faf9f0; /* cool stardust white */
   --stella-gradient: linear-gradient(
     135deg,
     var(--stella-honey) 0%,
@@ -64,41 +66,41 @@
   --stella-azure-deep: var(--stella-gold-deep);
   --stella-ice: var(--stella-white);
 
-  /* Light mode — warm cream ground, deep bronze-gold functional accent. */
-  --color-fd-background: #fffdf7;
-  --color-fd-foreground: #17140c;
-  --color-fd-muted: #faf3de;
-  --color-fd-muted-foreground: #6b6141;
-  --color-fd-card: #fffefb;
-  --color-fd-card-foreground: #17140c;
-  --color-fd-popover: #fffefb;
-  --color-fd-popover-foreground: #17140c;
-  --color-fd-border: #ece0be;
-  --color-fd-accent: #faf3de;
-  --color-fd-accent-foreground: #0a0a08;
+  /* Light mode — cool cream ground, deep gold functional accent. */
+  --color-fd-background: #fdfdf7;
+  --color-fd-foreground: #14161a;
+  --color-fd-muted: #f7f6e3;
+  --color-fd-muted-foreground: #666547;
+  --color-fd-card: #fefefb;
+  --color-fd-card-foreground: #14161a;
+  --color-fd-popover: #fefefb;
+  --color-fd-popover-foreground: #14161a;
+  --color-fd-border: #e8e6c4;
+  --color-fd-accent: #f7f6e3;
+  --color-fd-accent-foreground: #090a0d;
   --color-fd-primary: var(--stella-gold-deep);
-  --color-fd-primary-foreground: #fffdf7;
-  --color-fd-secondary: #faf3de;
-  --color-fd-secondary-foreground: #0a0a08;
-  --color-fd-ring: #b07d00; /* deep gold — clears 3:1 focus-ring contrast on Cream */
+  --color-fd-primary-foreground: #fdfdf7;
+  --color-fd-secondary: #f7f6e3;
+  --color-fd-secondary-foreground: #090a0d;
+  --color-fd-ring: #a28f00; /* deep gold — clears 3:1 focus-ring contrast on Cream */
 }
 
 .dark {
-  /* Dark mode — near-black Ground, bright bumblebee gold accent. */
+  /* Dark mode — carbon near-black Ground, bright bumblebee gold accent. */
   --color-fd-background: var(--stella-ground);
   --color-fd-foreground: var(--stella-white);
-  --color-fd-muted: #16130b;
-  --color-fd-muted-foreground: #c3b892;
-  --color-fd-card: #14120b;
+  --color-fd-muted: #14161b;
+  --color-fd-muted-foreground: #bfbc97;
+  --color-fd-card: #13151a;
   --color-fd-card-foreground: var(--stella-white);
-  --color-fd-popover: #14120b;
+  --color-fd-popover: #13151a;
   --color-fd-popover-foreground: var(--stella-white);
-  --color-fd-border: #3a3116; /* warm gold hairline — enough presence to define panels on black */
-  --color-fd-accent: #201a0e; /* hover/selected — lifted above Card for feedback */
+  --color-fd-border: #343312; /* dim cool-gold hairline — enough presence to define panels on black */
+  --color-fd-accent: #1a1c22; /* hover/selected — lifted above Card for feedback */
   --color-fd-accent-foreground: var(--stella-white);
   --color-fd-primary: var(--stella-gold);
   --color-fd-primary-foreground: var(--stella-ground);
-  --color-fd-secondary: #14120b;
+  --color-fd-secondary: #13151a;
   --color-fd-secondary-foreground: var(--stella-white);
   --color-fd-ring: var(--stella-gold);
 }
