@@ -41,7 +41,7 @@ not any individual property — constitutes the moat.
 3. [Property I: Ports, not concretions — the adapter boundary](#3-property-i-ports-not-concretions--the-adapter-boundary)
 4. [Property II: No I/O in the engine — decision logic is pure](#4-property-ii-no-io-in-the-engine--decision-logic-is-pure)
 5. [Property III: The witness-test contract — verified done](#5-property-iii-the-witness-test-contract--verified-done)
-6. [Property IV: BYOK + no phone-home — the trust perimeter](#6-property-iv-byok--no-phone-home--the-trust-perimeter)
+6. [Property IV: BYOK + zero telemetry egress by default — the trust perimeter](#6-property-iv-byok--zero-telemetry-egress-by-default--the-trust-perimeter)
 7. [Property V: Prompt-cache-native memory — the cost discipline](#7-property-v-prompt-cache-native-memory--the-cost-discipline)
 8. [Property VI: Budget enforcement at safe boundaries](#8-property-vi-budget-enforcement-at-safe-boundaries)
 9. [Property VII: The Open Context Protocol — an open standard](#9-property-vii-the-open-context-protocol--an-open-standard)
@@ -92,7 +92,7 @@ We identify seven such properties in Stella's design.
 | I | Ports, not concretions | The engine (`stella-core`) never imports a provider SDK, filesystem API, or terminal library | Crate-level dependency boundary; `Provider` trait (`stella-protocol`) and `ToolExecutor` trait (`stella-core::ports`) |
 | II | No I/O in the engine | All decision logic is synchronous functions over owned data | Architectural discipline; property-tested in `stella-core` |
 | III | Witness-test contract | A task is done only when a test fails on old code and passes on new | `verify_done` tool (`stella-tools::verify`) |
-| IV | BYOK + no phone-home | The only outbound network traffic is to the user's chosen provider; all telemetry is local | Architectural invariant; local SQLite (`stella-store`) |
+| IV | BYOK + zero telemetry egress by default | Community/default telemetry is local; only an explicitly enrolled Oxagen Enterprise managed deployment may send a signed-policy-authorized, content-free operational rollup | Architectural invariant; local SQLite (`stella-store`) plus the [managed enrollment boundary](../../stella-docs/content/docs/telemetry/index.mdx#oxagen-enterprise-managed-export) |
 | V | Prompt-cache-native memory | Lessons load into a byte-stable system prompt prefix at ~0.1x input price | `build_system_prompt` (`stella-cli::agent`); L-E8 cache discipline |
 | VI | Budget at safe boundaries | The budget guard consults only between model calls, never interrupts a tool | `run_turn` budget check (`stella-core::driver`); property-tested |
 | VII | Open Context Protocol | Retrieval is a typed, budgeted, provenance-carrying, consent-gated, conformance-verified protocol | `ocp-types`, `ocp-host`, `ocp-conformance` |
@@ -267,7 +267,7 @@ standard.
 
 ---
 
-## 6. Property IV: BYOK + no phone-home — the trust perimeter
+## 6. Property IV: BYOK + zero telemetry egress by default — the trust perimeter
 
 ### The invariant
 
@@ -276,12 +276,15 @@ Two architectural constraints, enforced together:
 1. **BYOK (Bring Your Own Key):** Stella auto-detects the provider from
    whichever API keys the user has set. No account, no sign-up, no vendor
    lock-in. Nine providers plus any local server.
-2. **No phone-home:** The only outbound network traffic Stella produces is to
-   the model provider the user chose. No telemetry, no update checks, no
-   "anonymous" analytics. Events are recorded, best-effort, to a local SQLite
-   file (`.stella/store.db`) — the store is never a dependency of a turn: a
-   session runs even when it can't be opened, and an individual event write
-   that fails degrades the local record rather than the run.
+2. **Zero telemetry egress by default:** Community/default Stella sends no
+   telemetry, update checks, or "anonymous" analytics. Events are recorded,
+   best-effort, to a local SQLite file (`.stella/private/store.db`) — the store
+   is never a dependency of a turn: a session runs even when it can't be
+   opened, and an individual event write that fails degrades the local record
+   rather than the run. The sole telemetry-egress exception is an
+   [explicitly enrolled Oxagen Enterprise managed deployment](../../stella-docs/content/docs/telemetry/index.mdx#oxagen-enterprise-managed-export):
+   a current signed org policy may authorize one minimal content-free
+   operational rollup to one exact allowlisted HTTPS sink.
 
 ### Why it is hard to copy
 
@@ -293,10 +296,12 @@ Their business model requires:
 - Vendor lock-in (to keep users on the platform).
 - Account-based access (to enforce subscription tiers).
 
-Stella's no-phone-home and BYOK constraints are incompatible with this business
-model. A commercial agent *cannot* adopt them without abandoning its revenue
-model. This makes the trust perimeter **structurally defensible**: no
-commercial competitor can match it without ceasing to be commercial.
+Stella's Community/default no-telemetry-egress and BYOK constraints are
+incompatible with this business model. A commercial agent *cannot* adopt the
+default without abandoning telemetry-funded product assumptions. Oxagen
+Enterprise preserves the boundary by requiring explicit managed enrollment,
+signed process-free authority, a closed content-free schema, and one exact
+sink rather than turning analytics on silently.
 
 The enforcement is architectural, not policy-based. The `stella-core` engine
 has no network code. Outbound HTTP is confined to a small, enumerable set of
@@ -305,20 +310,24 @@ crates, and every call targets an endpoint the user chose or configured:
 plus the MCP registry when you run `stella mcp search`), `stella-tools` (your
 issue tracker — GitHub or Linear — only when you invoke the issue tools), and
 `stella-media` (your image/video provider, only when you invoke the media
-tools). There is no telemetry SDK, no analytics endpoint, and no update checker.
-A code audit can verify this in minutes — `grep -rl reqwest` names every crate
-above and no others.
+tools), and `stella-cli` only for the signed Oxagen Enterprise managed
+operational sink described above. Community/default builds activate no
+telemetry client or analytics endpoint, and there is no update checker.
 
 ### The specific advantage
 
 For enterprise adoption, the trust perimeter is not a feature — it is a
-**gate**. Security and compliance teams reject tools that phone home, and the
-rejection is often not negotiable. Stella passes the gate by design. Agents
-that require cloud connectivity, even optionally, do not.
+**gate**. Community/default Stella satisfies a zero-telemetry-egress policy by
+design. Organizations that deliberately permit operational egress can instead
+audit and enroll the signed Oxagen Enterprise boundary rather than accepting
+ambient analytics.
 
-For individual developers, the trust perimeter means **your code stays on your
-machine.** The telemetry file is local SQLite — query it, delete it, back it
-up, share it. Nobody sees it unless you choose to share it.
+For individual developers using Community/default Stella, the trust perimeter
+means **your telemetry stays on your machine.** The telemetry file is local
+SQLite — query it, delete it, back it up, share it. Managed Enterprise
+enrollment can export only the documented content-free operational fields,
+never code, prompts, paths, tool payloads, reasoning, errors, memories, or
+local identifiers.
 
 ---
 
@@ -499,10 +508,12 @@ are mutually reinforcing:
   the budget guard ensures the agent doesn't spend unboundedly trying. Together,
   they define "done" as both *verified* and *bounded*.
 
-- **BYOK + no phone-home (IV) + OCP (VII)** define a trust perimeter. BYOK
-  means the user controls the model; no-phone-home means the user controls the
-  data; OCP means the user controls the context sources. The trust perimeter
-  is not one property but three, each closing a gap the others don't address.
+- **BYOK + zero telemetry egress by default (IV) + OCP (VII)** define a trust
+  perimeter. BYOK means the user controls the model; Community/default local
+  telemetry plus the explicit signed Enterprise exception makes operational
+  egress inspectable and governed; OCP means the user controls the context
+  sources. The trust perimeter is not one property but three, each closing a
+  gap the others don't address.
 
 - **Prompt-cache-native memory (V) + budget (VI)** define a cost discipline.
   Memory is structured for cache locality (0.1x input price); budget is
@@ -527,8 +538,10 @@ Stella on:
 
 - **BYOK**: Claude Code is locked to Anthropic models. Stella supports nine
   providers plus local.
-- **No phone-home**: Claude Code is a client of Anthropic's platform; usage is
-  metered server-side. Stella's telemetry is local SQLite.
+- **Zero telemetry egress by default**: Claude Code is a client of Anthropic's
+  platform; usage is metered server-side. Stella Community/default telemetry is
+  local SQLite; signed Oxagen Enterprise enrollment is the sole governed
+  operational exception.
 - **Ports**: Claude Code's engine is not separable from its provider
   integration. Stella's engine is SDK-free.
 - **Witness-test**: Claude Code does not have a verify_done-equivalent. It
@@ -548,8 +561,9 @@ feature (tree-sitter-based). It is Stella's closest open-source peer.
 
 - **Shared**: Both are open-source, BYOK, terminal-based.
 - **Stella's unique advantages**: Witness-test contract, budget enforcement
-  at safe boundaries, no-phone-home (Aider has optional analytics), the
-  Open Context Protocol, and goal-mode with evidence-gathering judge.
+  at safe boundaries, zero Community/default telemetry egress (Aider has
+  optional analytics), the governed Oxagen Enterprise exception, the Open
+  Context Protocol, and goal-mode with evidence-gathering judge.
 - **Aider's unique advantages**: Mature git-integration workflow (edit,
   commit, undo), broader language support in repo-map, larger community.
 
@@ -565,7 +579,10 @@ cannot match Stella on:
 
 - **BYOK**: Cursor and Windsurf route through their own backend (or a
   metered BYOK path). Stella is pure BYOK.
-- **No phone-home**: Both are cloud-connected products. Stella is local-only.
+- **Zero telemetry egress by default**: Both are cloud-connected products.
+  Stella Community/default telemetry stays local; an explicitly enrolled
+  Oxagen Enterprise seat has only the signed, content-free operational
+  exception documented above.
 - **Ports and I/O purity**: Both embed provider integration in the agent loop.
   Stella's engine is SDK-free and property-testable.
 - **Witness-test, budget, OCP**: Neither has these properties.
@@ -582,8 +599,8 @@ A rigorous analysis must consider what could erode Stella's position:
 
 1. **Model convergence.** If a single model becomes so dominant that
    model-agnosticism stops mattering, BYOK loses its edge. *Mitigation:*
-   Stella's other properties (no phone-home, witness-test, budget, OCP) do
-   not depend on model diversity.
+   Stella's other properties (zero telemetry egress by default, witness-test,
+   budget, OCP) do not depend on model diversity.
 
 2. **OCP non-adoption.** If the ecosystem does not build OCP providers, the
    protocol's network effects don't materialize, and OCP becomes an internal
@@ -610,13 +627,14 @@ A rigorous analysis must consider what could erode Stella's position:
 
 Stella's defensible technology position is not a feature list. It is a set of
 **architectural invariants** — ports not concretions, no I/O in the engine,
-witness-test definition of done, BYOK with no phone-home, prompt-cache-native
-memory, budget enforcement at safe boundaries, and the Open Context
-Protocol — each grounded in primary research, each expensive to replicate, and
-each mutually reinforcing. A competitor who copies one property gets a fraction
-of the benefit; a competitor who copies all seven must rebuild the
-architecture from scratch. The combination, not any individual property, is
-the moat.
+witness-test definition of done, BYOK with zero Community/default telemetry
+egress and one explicit signed Oxagen Enterprise operational exception,
+prompt-cache-native memory, budget enforcement at safe boundaries, and the Open
+Context Protocol — each grounded in primary research, each expensive to
+replicate, and each mutually reinforcing. A competitor who copies one property
+gets a fraction of the benefit; a competitor who copies all seven must rebuild
+the architecture from scratch. The combination, not any individual property,
+is the moat.
 
 The field manual (Anderson, 2026) articulates the theory: "the next leap in
 AI coding isn't a bigger model, it's a better system around the model." Stella

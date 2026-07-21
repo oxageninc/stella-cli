@@ -17,6 +17,8 @@ use crate::file_touch::{
     normalize_workspace_path,
 };
 
+mod process_tools;
+
 /// One tool the agent can call. Input arrives as the model-produced JSON;
 /// output is always a typed `ToolOutput` (never a bare string).
 #[async_trait]
@@ -85,10 +87,8 @@ pub struct ToolRegistry {
     /// after every `save_exploration`; drives the once-per-session
     /// "this area is already mapped" hints on search-tool results.
     exploration_coverage: std::sync::Mutex<ExplorationCoverage>,
-    /// The session's extension hook bus, once a host attaches one
-    /// ([`ToolRegistry::attach_bus`]). Every emission is `None`-guarded, so
-    /// a bus-less registry behaves exactly as it did before hooks existed.
     bus: std::sync::RwLock<Option<HookBus>>,
+    process_free: bool,
 }
 
 /// Path-coverage of fresh exploration maps plus the hint dedup set.
@@ -137,32 +137,28 @@ pub struct StorageIndex {
     session: Vec<stella_graph::storage::RelationEntry>,
 }
 
-/// Host-decided feature switches for registry construction. `Default` is
-/// the SECURE posture — no `bash`: arbitrary shell execution is opt-in via
-/// settings (`tools.bash: "on"` in any scope), never ambient. Every
-/// construction path (CLI session drivers, fleet workers, tests) threads a
-/// value through explicitly; there is no global.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct RegistryOptions {
-    /// Register the `bash` shell tool. Off by default everywhere: when off
-    /// the model never sees the schema, and calling `bash` anyway returns
-    /// the standard unknown-tool error.
     pub bash: bool,
-    /// Register the web family (`web_fetch`, `web_extract_assets`,
-    /// `web_download`, and `web_search` when a BYOK search key is present).
-    /// Off by default everywhere — network egress is opt-in exactly like
-    /// the shell (settings `tools.web: "on"`).
     pub web: bool,
+    pub media_spend_gate: Option<Arc<dyn stella_media::MediaSpendGate>>,
+    pub media_operation_ids: Option<Arc<dyn crate::media::MediaOperationIdSource>>,
+    pub media_operation_journal: Option<Arc<dyn stella_media::MediaOperationJournal>>,
+    pub media_requires_host_approval: bool,
+    pub media_host_data_isolation: Option<crate::media::HostDataIsolation>,
 }
 
 impl ToolRegistry {
-    /// Construct with auto-detected optional backends (issue tracker, media
-    /// provider). Prefer [`ToolRegistry::new_detected`] from async contexts —
-    /// this synchronous form probes `gh` inline, blocking the calling thread.
+    /// Construct with auto-detected optional backends.
     pub fn new(root: PathBuf, options: RegistryOptions) -> Self {
+        let issue_backend = if crate::media::process_free(options.media_host_data_isolation) {
+            None
+        } else {
+            crate::issues::detect_issue_backend()
+        };
         Self::with_backends_and_options(
             root,
-            crate::issues::detect_issue_backend(),
+            issue_backend,
             crate::media::detect_media_backend(),
             options,
         )
@@ -172,9 +168,14 @@ impl ToolRegistry {
     /// routed through the blocking pool (#64) — the constructor every async
     /// session driver uses.
     pub async fn new_detected(root: PathBuf, options: RegistryOptions) -> Self {
+        let issue_backend = if crate::media::process_free(options.media_host_data_isolation) {
+            None
+        } else {
+            crate::issues::detect_issue_backend_async().await
+        };
         Self::with_backends_and_options(
             root,
-            crate::issues::detect_issue_backend_async().await,
+            issue_backend,
             crate::media::detect_media_backend(),
             options,
         )
@@ -213,12 +214,19 @@ impl ToolRegistry {
         media_backend: Option<crate::media::MediaBackend>,
         options: RegistryOptions,
     ) -> Self {
+        let process_free = crate::media::process_free(options.media_host_data_isolation);
+        let media_host_context = options
+            .media_spend_gate
+            .clone()
+            .zip(options.media_operation_ids.clone())
+            .zip(options.media_operation_journal.clone())
+            .zip(options.media_host_data_isolation)
+            .filter(|_| options.media_requires_host_approval && process_free)
+            .map(|(((gate, ids), journal), _)| (gate, ids, journal));
         let citations: crate::memory::CitationLedger = Arc::default();
         let mcp_usage: stella_core::mcp_usage::McpUsageLedger = Arc::default();
         let task_board: crate::tasks::TaskBoardHandle = Arc::default();
         let spawn_queue: crate::tasks::SpawnQueue = Arc::default();
-        let processes: crate::process::ProcessTableHandle = Arc::default();
-        let repo_backend: Arc<dyn crate::repo::RepoBackend> = Arc::new(crate::repo::GitCli);
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         let mut entries: Vec<Arc<dyn Tool>> = vec![
             Arc::new(crate::read::ReadFile::default()),
@@ -228,54 +236,32 @@ impl ToolRegistry {
             // Search results carry a code-map footer; a symbol-shaped grep
             // pattern additionally carries the graph_query pointer, decided
             // per-call from the pattern (crate::code_map::is_symbol_shaped).
-            Arc::new(crate::grep::Grep::with_code_map()),
-            Arc::new(crate::glob::Glob::with_code_map()),
-            Arc::new(crate::gather::GatherContext),
-            Arc::new(crate::exploration::Explorations),
-            Arc::new(crate::exploration::SaveExploration),
             Arc::new(crate::memory::SaveMemory),
             Arc::new(crate::memory::CiteMemory(citations.clone())),
-            Arc::new(crate::verify::VerifyDone),
-            Arc::new(crate::project::BuildProject),
-            Arc::new(crate::project::RunTests),
-            Arc::new(crate::project::RunLint),
-            Arc::new(crate::project::FormatCode),
             Arc::new(crate::scripts::ListScripts),
-            Arc::new(crate::scripts::RunScript),
-            // The process group shares one table; it lives exactly as long
-            // as the registry and its Drop reaps anything still running.
-            Arc::new(crate::process::StartProcess(processes.clone())),
-            Arc::new(crate::process::ReadOutput(processes.clone())),
-            Arc::new(crate::process::SendStdin(processes.clone())),
-            Arc::new(crate::process::StopProcess(processes)),
-            // Vendor-neutral repository tools over the RepoBackend port.
-            Arc::new(crate::repo::RepoStatusTool(repo_backend.clone())),
-            Arc::new(crate::repo::RepoCommit(repo_backend.clone())),
-            Arc::new(crate::repo::RepoPush(repo_backend.clone())),
-            Arc::new(crate::repo::RepoPull(repo_backend.clone())),
-            Arc::new(crate::repo::RepoRollback(repo_backend)),
-            Arc::new(crate::ci::CiStatus),
-            Arc::new(crate::screenshot::Screenshot),
             Arc::new(crate::tasks::TaskCreate(task_board.clone())),
             Arc::new(crate::tasks::TaskList(task_board.clone())),
             Arc::new(crate::tasks::TaskStart(task_board.clone())),
             Arc::new(crate::tasks::TaskComplete(task_board.clone())),
             Arc::new(crate::tasks::TaskCancel(task_board.clone())),
-            Arc::new(crate::tasks::TaskAssign(
-                task_board.clone(),
-                spawn_queue.clone(),
-            )),
             // SVG generation is client-side (the model authors the SVG, the
             // pipeline validates/sanitizes) — no provider key needed, so
             // unlike image/video it is always registered.
             Arc::new(crate::media::GenerateSvg),
         ];
-        // `bash` is OPT-IN, never ambient: registered only when the host
-        // enabled it (settings `tools.bash: "on"`). Absent, the model never
-        // sees the schema and a call is the standard unknown-tool error —
-        // policy enforced at the tool boundary, not by prompt discipline.
-        if options.bash {
-            entries.push(Arc::new(crate::bash::Bash));
+        // `grep`, `glob`, and exploration staleness checks also launch fixed
+        // child processes, so the isolation mode keeps this omission literal.
+        if !process_free {
+            entries.push(Arc::new(crate::gather::GatherContext));
+            entries.push(Arc::new(crate::grep::Grep::with_code_map()));
+            entries.push(Arc::new(crate::glob::Glob::with_code_map()));
+            entries.push(Arc::new(crate::exploration::Explorations));
+            entries.push(Arc::new(crate::exploration::SaveExploration));
+            entries.extend(process_tools::builtins(
+                options.bash,
+                task_board.clone(),
+                spawn_queue.clone(),
+            ));
         }
         // The web family is OPT-IN like bash (`tools.web: "on"`): a fetched
         // page is untrusted input AND an uncontrolled egress channel, so
@@ -292,25 +278,43 @@ impl ToolRegistry {
                 entries.push(Arc::new(crate::web::WebSearch(search)));
             }
         }
-        // The code-graph query tool exists only when `stella init` has built
-        // an index — same conditional-registration discipline as the issue
-        // tools: no index, no dead schema entry.
-        if crate::graph::graph_available(&root) {
+        // Resolver errors advertise the tool so invocation exposes them.
+        if !matches!(crate::graph::graph_available(&root), Ok(false)) {
             entries.push(Arc::new(crate::graph::CodeGraphQuery));
         }
-        // Media generation exists only when an image-capable provider key is
-        // configured — BYOK end to end. The async video pair additionally
-        // needs the key family to have a video adapter.
         if let Some(media) = media_backend {
-            entries.push(Arc::new(crate::media::GenerateImage(media.image)));
+            entries.push(match &media_host_context {
+                Some((gate, ids, journal)) => {
+                    Arc::new(crate::media::GenerateImage::with_host_context(
+                        media.image,
+                        gate.clone(),
+                        ids.clone(),
+                        journal.clone(),
+                    )) as Arc<dyn Tool>
+                }
+                None => Arc::new(crate::media::GenerateImage::new(media.image)),
+            });
             if let Some(video) = media.video {
-                entries.push(Arc::new(crate::media::GenerateVideo(video.clone())));
-                entries.push(Arc::new(crate::media::PollVideo(video)));
+                entries.push(match &media_host_context {
+                    Some((gate, ids, journal)) => {
+                        Arc::new(crate::media::GenerateVideo::with_host_context(
+                            video.clone(),
+                            gate.clone(),
+                            ids.clone(),
+                            journal.clone(),
+                        )) as Arc<dyn Tool>
+                    }
+                    None => Arc::new(crate::media::GenerateVideo::new(video.clone())),
+                });
+                entries.push(match &media_host_context {
+                    Some((_, _, journal)) => Arc::new(
+                        crate::media::PollVideo::with_operation_journal(video, journal.clone()),
+                    ) as Arc<dyn Tool>,
+                    None => Arc::new(crate::media::PollVideo::new(video)),
+                });
             }
         }
-        // Issue tools exist only when a tracker is configured — no dead
-        // schema entries burning tokens, no surface that errors on use.
-        if let Some(backend) = issue_backend {
+        if let Some(backend) = issue_backend.filter(|_| !process_free) {
             let backend = Arc::new(backend);
             entries.push(Arc::new(crate::issues::CreateIssue(backend.clone())));
             entries.push(Arc::new(crate::issues::UpdateIssue(backend.clone())));
@@ -325,7 +329,11 @@ impl ToolRegistry {
             let name = tool.schema().name;
             tools.insert(name, tool);
         }
-        let exploration_coverage = std::sync::Mutex::new(ExplorationCoverage::rebuild(&root));
+        let exploration_coverage = std::sync::Mutex::new(if process_free {
+            ExplorationCoverage::default()
+        } else {
+            ExplorationCoverage::rebuild(&root)
+        });
         Self {
             tools,
             late_tools: std::sync::RwLock::new(HashMap::new()),
@@ -339,7 +347,12 @@ impl ToolRegistry {
             storage_index: std::sync::Mutex::new(StorageIndex::default()),
             exploration_coverage,
             bus: std::sync::RwLock::new(None),
+            process_free,
         }
+    }
+
+    pub fn is_process_free(&self) -> bool {
+        self.process_free
     }
 
     /// Attach the session's extension hook bus. From this point every tool
@@ -365,24 +378,20 @@ impl ToolRegistry {
         self.bus.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// Enable the `graph_query` tool once the code-graph index has been built
-    /// and it isn't already registered. Idempotent, cheap, and safe to
-    /// call every turn. Lets a background session-start build (or a mid-session
-    /// `/init`) expose `graph_query` to
-    /// subsequent turns without rebuilding the whole registry (and its MCP
-    /// wrapper) — the overlay is shared through every `&ToolRegistry` /
-    /// `Arc<ToolRegistry>` reference the session already holds.
-    pub fn enable_code_graph_if_available(&self, root: &std::path::Path) {
-        if !crate::graph::graph_available(root) {
-            return;
+    /// Enable `graph_query` after a background build or mid-session `/init`;
+    /// the shared overlay avoids rebuilding the registry and its MCP wrapper.
+    pub fn enable_code_graph_if_available(&self, root: &std::path::Path) -> Result<(), String> {
+        if !crate::graph::graph_available(root)? {
+            return Ok(());
         }
         let tool: Arc<dyn Tool> = Arc::new(crate::graph::CodeGraphQuery);
         let name = tool.schema().name;
         if self.tools.contains_key(&name) {
-            return; // already registered at construction
+            return Ok(()); // already registered at construction
         }
         let mut late = self.late_tools.write().unwrap_or_else(|p| p.into_inner());
         late.entry(name).or_insert(tool);
+        Ok(())
     }
 
     /// All tool schemas, for advertising to the model — primary tools plus any
@@ -529,7 +538,10 @@ impl ToolRegistry {
                     .as_deref()
                     .map(|content| extractor.extract(path, content))
                     .unwrap_or_default();
-                let snapshot = self.storage_snapshot();
+                let snapshot = match self.storage_snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(message) => return ToolOutput::Error { message },
+                };
                 let manifest_layer = crate::schema_gate::manifest_layer_for(&self.root, path);
                 let intent = input.get("storage_intent").and_then(|v| v.as_str());
                 match crate::schema_gate::check(&crate::schema_gate::GateRequest {
@@ -857,13 +869,9 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// The live storage map for the gate: the persisted index + manifest,
-    /// re-read per gated write (so a mid-session `stella init` or manifest
-    /// edit is seen immediately), merged with the host-seeded baseline and
-    /// the objects created by earlier writes this session (covers the
-    /// watcher's re-index lag).
-    fn storage_snapshot(&self) -> stella_graph::StorageSnapshot {
-        let mut snapshot = stella_graph::load_storage_snapshot(&self.root);
+    /// Fresh persisted storage map merged with the session overlay.
+    fn storage_snapshot(&self) -> Result<stella_graph::StorageSnapshot, String> {
+        let mut snapshot = crate::graph::load_storage_snapshot(&self.root)?;
         let index = self.storage_index.lock().unwrap_or_else(|p| p.into_inner());
         for rel in index.baseline.relations.iter().chain(index.session.iter()) {
             if let Some(existing) = snapshot
@@ -887,7 +895,7 @@ impl ToolRegistry {
                 snapshot.relations.push(rel.clone());
             }
         }
-        snapshot
+        Ok(snapshot)
     }
 
     /// Record what a landed write created: grow the session overlay, and —
@@ -1259,6 +1267,10 @@ impl ToolExecutor for ToolRegistry {
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "registry/private_state_tests.rs"]
+mod private_state_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1266,7 +1278,7 @@ mod tests {
     use crate::issues::IssueBackend;
 
     /// A registry rooted in a fresh empty tempdir. Rooting tests at a shared
-    /// path like `/tmp` is not hermetic: a stray `.stella/codegraph.db` left
+    /// path like `/tmp` is not hermetic: a stray `.stella/private/codegraph.db` left
     /// there by a real session conditionally registers `graph_query` and
     /// skews every tool-set assertion. The `TempDir` is returned so the root
     /// outlives the registry.
@@ -1513,6 +1525,11 @@ mod tests {
         // And the default options value IS the off posture.
         assert!(!RegistryOptions::default().bash);
         assert!(!RegistryOptions::default().web);
+        assert!(
+            RegistryOptions::default()
+                .media_host_data_isolation
+                .is_none()
+        );
     }
 
     /// Witness: the explicit opt-in registers `bash` — schema advertised
@@ -1527,6 +1544,7 @@ mod tests {
             RegistryOptions {
                 bash: true,
                 web: false,
+                ..Default::default()
             },
         );
         assert!(reg.schemas().iter().any(|s| s.name == "bash"));
@@ -1572,6 +1590,7 @@ mod tests {
             RegistryOptions {
                 bash: false,
                 web: true,
+                ..Default::default()
             },
         );
         let schemas = reg.schemas();
@@ -1701,18 +1720,18 @@ mod tests {
             |r: &ToolRegistry| r.schemas().iter().any(|s| s.name == "graph_query");
 
         assert!(!has_graph_query(&reg), "no index → not advertised");
-        reg.enable_code_graph_if_available(&root); // no index yet: a no-op
+        reg.enable_code_graph_if_available(&root).unwrap(); // no index yet: a no-op
         assert!(!has_graph_query(&reg));
 
         // Build a minimal index, exactly what `stella init` does.
         std::fs::write(root.join("lib.rs"), "pub fn f() {}\n").unwrap();
-        let db = root.join(".stella").join("codegraph.db");
+        let db = crate::graph::graph_db_path(&root);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let graph = stella_graph::CodeGraph::open(&root, &db).unwrap();
         graph.index_all().unwrap();
         graph.shutdown();
 
-        reg.enable_code_graph_if_available(&root);
+        reg.enable_code_graph_if_available(&root).unwrap();
         assert!(has_graph_query(&reg), "index built → now advertised");
         // And it actually dispatches through the overlay.
         let out = reg
@@ -2537,6 +2556,7 @@ mod tests {
             RegistryOptions {
                 bash: true,
                 web: false,
+                ..Default::default()
             },
         );
         let bus = HookBus::new("sess");

@@ -125,11 +125,36 @@ fn config_debug_never_leaks_the_api_key() {
         engine_settings: None,
         tools_bash: false,
         tools_web: false,
+        authority: crate::settings::AuthorityPolicy::default(),
         credential_source: Some(stella_model::credential::CredentialSource::EnvVar),
     };
     let dbg = format!("{cfg:?}");
     assert!(!dbg.contains(secret), "Config Debug leaked the key: {dbg}");
     assert!(dbg.contains("redacted"));
+}
+
+#[test]
+fn resolved_config_carries_the_authority_computed_during_settings_load() {
+    let authority = crate::settings::AuthorityPolicy {
+        project_prompts_allowed: true,
+        project_custom_tools_allowed: false,
+        bash_allowed: false,
+        web_allowed: true,
+        media_requires_host_approval: true,
+    };
+    let mut settings = crate::settings::Settings::default();
+    settings.authority_policy = authority;
+
+    let cfg = Config::load_with_settings(
+        Some("local/test-model"),
+        None,
+        Some("http://localhost:11434/v1"),
+        &settings,
+        std::path::PathBuf::from("/tmp/ws"),
+    )
+    .unwrap();
+
+    assert_eq!(cfg.authority, authority);
 }
 
 /// Helper: a Settings value parsed from JSON, as the scope-merge would

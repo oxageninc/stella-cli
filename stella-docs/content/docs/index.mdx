@@ -13,8 +13,9 @@ description: Stella is a fast, bring-your-own-key, model-agnostic terminal codin
 > — [Mac Anderson](https://github.com/macanderson)
 
 **Stella** is a fast, model-agnostic coding agent that lives in your terminal. It is
-**bring-your-own-key (BYOK)**: there is no account and no sign-up — Stella runs on the
-provider credentials you already have, and everything it records stays on your machine.
+**bring-your-own-key (BYOK)**: Community/default use has no account and no sign-up —
+Stella runs on the provider credentials you already have, records locally, and has zero
+telemetry egress.
 
 ```bash
 export ANTHROPIC_API_KEY=your_key_here
@@ -35,7 +36,9 @@ stella run "add a --json flag to the export command and update the tests"
   in [`settings.json`](/docs/configuration/settings), merged across a project →
   org-managed → user hierarchy.
 - **Local-first telemetry.** Token usage, cost, and per-step metering land in a local
-  SQLite store (`.stella/store.db`) on your disk. Nothing is sent anywhere.
+  SQLite store (`.stella/private/store.db`) on your disk. Community/default sends none
+  of it anywhere. Explicitly enrolled Oxagen Enterprise managed mode may export only a
+  minimal content-free operational rollup from a process-free eligible path.
 
 ## How it fits together
 
@@ -76,8 +79,8 @@ ends on a verified outcome rather than the worker's own say-so.
   tree with cooperative claims, or per-task worktree isolation on demand.
 - **[Agent Tools](/docs/agent-tools)** — the built-in toolbelt, skills, MCP servers,
   custom commands, hooks, and permissions.
-- **[Telemetry &amp; Usage Analytics](/docs/telemetry)** — local-only metering, the
-  dashboard, budgets, and the files-touched ledger.
+- **[Telemetry &amp; Usage Analytics](/docs/telemetry)** — local metering, the
+  dashboard, budgets, files touched, and the governed Enterprise export boundary.
 
 **How it works**
 
@@ -103,6 +106,8 @@ ends on a verified outcome rather than the worker's own say-so.
 - **[Donate](/docs/donate)** — keep independent, local-first tooling alive.
 
 <Callout type="info">
-  Stella is BYOK — it never proxies your traffic through a hosted service. Your keys call
-  your provider directly, and your telemetry stays local.
+  Stella is BYOK — it never proxies model traffic through a hosted service. Your keys
+  call your provider directly. Community/default telemetry stays local; only an
+  explicitly enrolled Oxagen Enterprise seat can send the documented minimal
+  operational envelope to its exact allowlisted HTTPS sink.
 </Callout>

@@ -395,12 +395,14 @@ fn describe_diagnostic(diag: &stella_core::extensions::ExtensionDiagnostic) -> S
 
 /// The `.stella`-side directories one kind is loaded from, lowest precedence
 /// first (user-global, then workspace — workspace wins, like skills).
-fn load_dirs(workspace_root: &Path, kind: ExtensionKind) -> Vec<PathBuf> {
+fn load_dirs(workspace_root: &Path, kind: ExtensionKind, include_workspace: bool) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(config_root) = user_config_root() {
         dirs.push(config_root.join(kind.dir_name()));
     }
-    dirs.push(workspace_root.join(".stella").join(kind.dir_name()));
+    if include_workspace {
+        dirs.push(workspace_root.join(".stella").join(kind.dir_name()));
+    }
     dirs
 }
 
@@ -455,19 +457,27 @@ pub enum Invocation<'a> {
 }
 
 impl CustomExtensions {
-    /// Load every custom definition visible from `workspace_root`
-    /// (user-global + workspace `.stella` directories, workspace wins).
-    pub fn load(workspace_root: &Path) -> Self {
+    /// Load user-global definitions plus project definitions permitted by the
+    /// session's immutable authority snapshot.
+    pub fn load_with_authority(
+        workspace_root: &Path,
+        authority: &crate::settings::AuthorityPolicy,
+    ) -> Self {
+        Self::load_with_workspace_extensions(workspace_root, authority.project_prompts_allowed)
+    }
+
+    fn load_with_workspace_extensions(workspace_root: &Path, include_workspace: bool) -> Self {
         let mut problems = Vec::new();
         let commands = load_commands_from(
-            &load_dirs(workspace_root, ExtensionKind::Commands),
+            &load_dirs(workspace_root, ExtensionKind::Commands, include_workspace),
             &mut problems,
         );
         let agents = load_agents_from(
-            &load_dirs(workspace_root, ExtensionKind::Agents),
+            &load_dirs(workspace_root, ExtensionKind::Agents, include_workspace),
             &mut problems,
         );
-        let loaded_skills = crate::memory::load_workspace_skills_with_diagnostics(workspace_root);
+        let loaded_skills =
+            crate::memory::load_workspace_skills_with_authority(workspace_root, include_workspace);
         for diag in &loaded_skills.diagnostics {
             let why = match diag.problem {
                 stella_core::skills::SkillProblem::MissingName => "no usable name",
@@ -860,6 +870,74 @@ mod tests {
         let agents = load_agents_from(&[agent_dir], &mut problems);
         assert_eq!(agents.len(), 1, "flat .md files parse as agents");
         assert_eq!(agents[0].name, "reviewer");
+    }
+
+    #[test]
+    fn untrusted_project_extensions_are_excluded_while_user_extensions_remain() {
+        let _env = crate::test_env::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let workspace = tmp.path().join("workspace");
+        write(
+            &home.join(".config/stella/commands/user.md"),
+            "---\ndescription: user command\n---\nUSER_COMMAND_BODY",
+        );
+        write(
+            &workspace.join(".stella/commands/project.md"),
+            "---\ndescription: project command\n---\nPROJECT_COMMAND_BODY",
+        );
+        write(
+            &home.join(".config/stella/agents/user.md"),
+            "---\nname: user-agent\ndescription: user agent\n---\nUSER_AGENT_BODY",
+        );
+        write(
+            &workspace.join(".stella/agents/project.md"),
+            "---\nname: project-agent\ndescription: project agent\n---\nPROJECT_AGENT_BODY",
+        );
+        // SAFETY: serialized behind the binary-wide environment lock.
+        let previous_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let custom = CustomExtensions::load_with_authority(
+            &workspace,
+            &crate::settings::AuthorityPolicy::default(),
+        );
+        let trusted = CustomExtensions::load_with_authority(
+            &workspace,
+            &crate::settings::AuthorityPolicy {
+                project_prompts_allowed: true,
+                ..crate::settings::AuthorityPolicy::default()
+            },
+        );
+
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("HOME", previous) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let names: Vec<&str> = custom
+            .commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["user"], "loaded commands: {names:?}");
+        let trusted_names: Vec<&str> = trusted
+            .commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(trusted_names, vec!["user", "project"]);
+        let agent_names: Vec<&str> = custom
+            .agents
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect();
+        assert_eq!(agent_names, vec!["user-agent"]);
+        let trusted_agent_names: Vec<&str> = trusted
+            .agents
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect();
+        assert_eq!(trusted_agent_names, vec!["user-agent", "project-agent"]);
     }
 
     #[test]

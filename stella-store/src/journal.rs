@@ -148,18 +148,18 @@ pub struct SessionJournal {
 impl SessionJournal {
     /// Open (creating the sidecar dir and file as needed) for appending.
     pub fn open(dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| StoreError(format!("cannot create {}: {e}", dir.display())))?;
+        crate::ensure_private_dir(dir)?;
         let path = dir.join(JOURNAL_FILE);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| StoreError(format!("cannot open {}: {e}", path.display())))?;
+        let mut options = OpenOptions::new();
+        // Read is required for the torn-tail recovery probe below; append
+        // alone yields a write-only descriptor whose final byte cannot be
+        // inspected.
+        options.read(true).create(true).append(true);
+        let mut file = crate::open_private_file(&path, options)?;
         // Heal a torn tail before appending: without the terminator, the
         // first record written after recovery would fuse into the very line
         // the interruption tore, corrupting BOTH.
-        if unterminated_tail(&path) {
+        if unterminated_tail(&mut file) {
             file.write_all(b"\n")
                 .map_err(|e| StoreError(format!("cannot heal {}: {e}", path.display())))?;
         }
@@ -269,11 +269,8 @@ impl Drop for SessionJournal {
 
 /// Whether the journal's last byte is NOT a newline — the signature of a
 /// write an interruption tore mid-line. Missing/empty/unreadable → false.
-fn unterminated_tail(path: &Path) -> bool {
+fn unterminated_tail(f: &mut File) -> bool {
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let Ok(mut f) = File::open(path) else {
-        return false;
-    };
     let Ok(len) = f.seek(SeekFrom::End(0)) else {
         return false;
     };
@@ -291,7 +288,7 @@ fn unterminated_tail(path: &Path) -> bool {
 /// does not parse — the torn tail of an interrupted write, or a record from
 /// a newer version — is skipped: one bad line never hides the session.
 pub fn read_journal(dir: &Path) -> Vec<JournalRecord> {
-    let Ok(text) = std::fs::read_to_string(dir.join(JOURNAL_FILE)) else {
+    let Ok(text) = crate::read_private_to_string(&dir.join(JOURNAL_FILE)) else {
         return Vec::new();
     };
     text.lines()
@@ -306,7 +303,7 @@ pub fn write_history(dir: &Path, messages: &[CompletionMessage]) -> Result<()> {
 
 /// Load the LLM conversation snapshot; `None` when absent or unreadable.
 pub fn read_history(dir: &Path) -> Option<Vec<CompletionMessage>> {
-    let text = std::fs::read_to_string(dir.join(HISTORY_FILE)).ok()?;
+    let text = crate::read_private_to_string(&dir.join(HISTORY_FILE)).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -317,7 +314,7 @@ pub fn write_queue(dir: &Path, queue: &[String]) -> Result<()> {
 
 /// Load the pending prompt backlog; empty when absent or unreadable.
 pub fn read_queue(dir: &Path) -> Vec<String> {
-    std::fs::read_to_string(dir.join(QUEUE_FILE))
+    crate::read_private_to_string(&dir.join(QUEUE_FILE))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
@@ -333,21 +330,11 @@ pub fn has_state(dir: &Path) -> bool {
 /// temp+rename is not enough here — an unfsynced rename can surface an empty
 /// file after a crash, and these snapshots ARE the conversation.
 fn write_snapshot<T: Serialize + ?Sized>(dir: &Path, name: &str, value: &T) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| StoreError(format!("cannot create {}: {e}", dir.display())))?;
+    crate::ensure_private_dir(dir)?;
     let json = serde_json::to_string(value)
         .map_err(|e| StoreError(format!("cannot serialize {name}: {e}")))?;
     let path = dir.join(name);
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    let mut file = File::create(&tmp)
-        .map_err(|e| StoreError(format!("cannot create {}: {e}", tmp.display())))?;
-    file.write_all(json.as_bytes())
-        .map_err(|e| StoreError(format!("cannot write {}: {e}", tmp.display())))?;
-    file.sync_data()
-        .map_err(|e| StoreError(format!("cannot fsync {}: {e}", tmp.display())))?;
-    drop(file);
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| StoreError(format!("cannot replace {}: {e}", path.display())))
+    crate::write_private_atomic(&path, json.as_bytes(), true)
 }
 
 /// Scan a journal for the prompts an interruption cut short: every
@@ -415,6 +402,27 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_sidecar_directory_and_file_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sidecar");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        drop(SessionJournal::open(&dir).unwrap());
+        let mode = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join(JOURNAL_FILE)), 0o600);
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

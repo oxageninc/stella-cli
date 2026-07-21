@@ -3,7 +3,7 @@ title: stella fleet
 description: Fan a batch of tasks out to a fleet of worker agents in one shared tree, coordinated by cooperative file claims.
 ---
 
-Run many tasks in parallel in **one shared working tree**, coordinated by cooperative file claims and wave-scheduled by dependency. A task gets its own git worktree only when a plan file opts it in with `isolation = "isolated"`. Every attempt, commit, and dollar is recorded in `.stella/fleet.db`, and any isolated worktrees and their `fleet/<slug>-<hash>` branches are left in place for review.
+Run many tasks in parallel in **one shared working tree**, coordinated by cooperative file claims and wave-scheduled by dependency. A task gets its own git worktree only when a plan file opts it in with `isolation = "isolated"`. Every attempt, commit, and dollar is recorded in `.stella/private/fleet.db`, and any isolated worktrees and their `fleet/<slug>-<hash>` branches are left in place for review.
 
 ## Synopsis
 
@@ -13,7 +13,7 @@ stella fleet <task>... [--plan <FILE>] [--max-concurrency <N>] [--base-ref <ref>
 
 ## What it does
 
-Each task prompt becomes an independent task running **in the shared repository root**. Workers coordinate through cooperative file claims — paths declared upfront in a plan (`claims`) plus claim-on-first-write at the tool layer — so a conflict surfaces in under a second at write time with the rival named, and commits interleave on one branch with no merge-back. A task a plan file opts into `isolation = "isolated"` instead gets a dedicated git worktree under `.stella/worktrees/<slug>` — branched from the current `HEAD` (or `--base-ref`), pinned to a SHA at start, onto a `fleet/<slug>-<hash>` branch (the hash suffix keeps re-runs from colliding with branches you kept). Tasks dispatch in dependency-ordered waves, running up to `--max-concurrency` at once within a wave. Each worker is a full engine run through the [staged pipeline](/docs/inference-pipeline) by default. Progress, attempts, commits, and cost are persisted to `.stella/fleet.db` and surface on the [Observatory dashboard](/docs/telemetry/dashboard)'s Fleet runs card.
+Each task prompt becomes an independent task running **in the shared repository root**. Workers coordinate through cooperative file claims — paths declared upfront in a plan (`claims`) plus claim-on-first-write at the tool layer — so a conflict surfaces in under a second at write time with the rival named, and commits interleave on one branch with no merge-back. A task a plan file opts into `isolation = "isolated"` instead gets a dedicated git worktree under `.stella/worktrees/<slug>` — branched from the current `HEAD` (or `--base-ref`), pinned to a SHA at start, onto a `fleet/<slug>-<hash>` branch (the hash suffix keeps re-runs from colliding with branches you kept). Tasks dispatch in dependency-ordered waves, running up to `--max-concurrency` at once within a wave. Each worker is a full engine run through the [staged pipeline](/docs/inference-pipeline) by default. Progress, attempts, commits, and cost are persisted to `.stella/private/fleet.db` and surface on the [Observatory dashboard](/docs/telemetry/dashboard)'s Fleet runs card.
 
 Isolated worktrees and fleet branches are **not** cleaned up automatically: they stay on disk so you can inspect, test, and merge each result yourself. A failed task is never retried automatically, and its dependents end the run as `skipped`.
 

@@ -11,6 +11,7 @@
 //! the persistence and the load-then-poll flow.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +31,47 @@ pub struct JobStore {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct JobsFile {
     #[serde(default)]
-    jobs: Vec<MediaJob>,
+    jobs: Vec<PersistedMediaJob>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedMediaJob {
+    artifact_id: String,
+    provider_id: String,
+    provider_job_id: String,
+    kind: stella_protocol::MediaKind,
+    model: String,
+    estimated_cost_usd: f64,
+    submitted_at: u64,
+}
+
+impl From<&MediaJob> for PersistedMediaJob {
+    fn from(job: &MediaJob) -> Self {
+        Self {
+            artifact_id: job.artifact_id.clone(),
+            provider_id: job.provider_id.clone(),
+            provider_job_id: job.provider_job_id.clone(),
+            kind: job.kind,
+            model: job.model.clone(),
+            estimated_cost_usd: job.estimated_cost_usd,
+            submitted_at: job.submitted_at,
+        }
+    }
+}
+
+impl From<PersistedMediaJob> for MediaJob {
+    fn from(job: PersistedMediaJob) -> Self {
+        Self {
+            label: job.artifact_id.clone(),
+            artifact_id: job.artifact_id,
+            provider_id: job.provider_id,
+            provider_job_id: job.provider_job_id,
+            kind: job.kind,
+            model: job.model,
+            estimated_cost_usd: job.estimated_cost_usd,
+            submitted_at: job.submitted_at,
+        }
+    }
 }
 
 impl JobStore {
@@ -45,15 +86,16 @@ impl JobStore {
 
     /// Record (or replace, keyed by `provider_job_id`) a submitted job.
     pub fn record(&self, job: &MediaJob) -> Result<(), MediaError> {
+        let _lock = self.mutation_lock()?;
         let mut file = self.load()?;
         if let Some(existing) = file
             .jobs
             .iter_mut()
             .find(|j| j.provider_job_id == job.provider_job_id)
         {
-            *existing = job.clone();
+            *existing = job.into();
         } else {
-            file.jobs.push(job.clone());
+            file.jobs.push(job.into());
         }
         self.store(&file)
     }
@@ -64,17 +106,19 @@ impl JobStore {
         Ok(file
             .jobs
             .into_iter()
-            .find(|j| j.provider_job_id == provider_job_id))
+            .find(|j| j.provider_job_id == provider_job_id)
+            .map(Into::into))
     }
 
     /// All persisted in-flight jobs.
     pub fn list(&self) -> Result<Vec<MediaJob>, MediaError> {
-        Ok(self.load()?.jobs)
+        Ok(self.load()?.jobs.into_iter().map(Into::into).collect())
     }
 
     /// Forget a job (call after it reaches a terminal state and any artifact
     /// has been persisted).
     pub fn remove(&self, provider_job_id: &str) -> Result<(), MediaError> {
+        let _lock = self.mutation_lock()?;
         let mut file = self.load()?;
         let before = file.jobs.len();
         file.jobs.retain(|j| j.provider_job_id != provider_job_id);
@@ -105,13 +149,12 @@ impl JobStore {
         }
         let body = serde_json::to_string_pretty(file)
             .map_err(|e| MediaError::Artifact(format!("cannot serialize job store: {e}")))?;
-        // Pid-unique temp name (same convention as the session registry's
-        // sidecars): a fixed `.tmp` path lets two concurrent processes
-        // clobber each other's staged write — losing a paid job record, the
-        // exact orphan this module exists to prevent.
-        let tmp = self
-            .path
-            .with_extension(format!("json.tmp.{}", std::process::id()));
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        let tmp = self.path.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::write(&tmp, body).map_err(|e| {
             MediaError::Artifact(format!(
                 "cannot write temp job store {}: {e}",
@@ -125,6 +168,31 @@ impl JobStore {
             ))
         })?;
         Ok(())
+    }
+
+    fn mutation_lock(&self) -> Result<std::fs::File, MediaError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                MediaError::Artifact(format!("cannot create job store dir: {error}"))
+            })?;
+        }
+        let path = self.path.with_extension("json.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| {
+                MediaError::Artifact(format!(
+                    "cannot open job store lock {}: {error}",
+                    path.display()
+                ))
+            })?;
+        file.lock().map_err(|error| {
+            MediaError::Artifact(format!("cannot lock job store {}: {error}", path.display()))
+        })?;
+        Ok(file)
     }
 }
 
@@ -202,6 +270,43 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_distinct_records_and_removes_preserve_every_update() {
+        let dir = TempDir::new().unwrap();
+        let store = JobStore::open(dir.path());
+        for id in ["remove-a", "remove-b"] {
+            store.record(&sample_job(id)).unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let mut workers = Vec::new();
+        for (record, remove) in [
+            ("record-a", "remove-a"),
+            ("record-b", "remove-b"),
+            ("record-c", "missing-a"),
+            ("record-d", "missing-b"),
+        ] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.record(&sample_job(record)).unwrap();
+                store.remove(remove).unwrap();
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let mut ids: Vec<_> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|job| job.provider_job_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["record-a", "record-b", "record-c", "record-d"]);
+    }
+
+    #[test]
     fn survives_a_reopen_persistence_across_process_restart() {
         let dir = TempDir::new().unwrap();
         {
@@ -214,6 +319,9 @@ mod tests {
             reopened.get("job-1").unwrap().unwrap().provider_job_id,
             "job-1"
         );
+        let journal = std::fs::read_to_string(dir.path().join(JOBS_NAME)).unwrap();
+        assert!(!journal.contains("\"label\""));
+        assert!(!journal.contains("teaser"));
     }
 
     #[test]

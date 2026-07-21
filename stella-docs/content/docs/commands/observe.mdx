@@ -1,9 +1,12 @@
 ---
 title: stella observe
-description: Serve the Observatory — your local telemetry as a web dashboard, loopback-only.
+description: Serve the Observatory — the canonical local telemetry dashboard, always loopback-only.
 ---
 
-Serve the **Observatory**: a read-only web dashboard over the local telemetry in `.stella/store.db` and `.stella/fleet.db`. Nothing leaves your machine — the server binds to `127.0.0.1` only.
+Serve the **Observatory**: a read-only web dashboard over the local telemetry in
+`.stella/private/store.db` and `.stella/private/fleet.db`. The Observatory itself never
+exports data and binds to `127.0.0.1` only. This remains true if a separately enrolled
+Enterprise adapter is allowed to derive its minimal operational rollup.
 
 ## Synopsis
 
@@ -13,7 +16,10 @@ stella observe [--port <N>] [--open]
 
 ## What it does
 
-`stella observe` starts a local HTTP server (default port `7787`) and serves the embedded dashboard — no separate install, no build step, no network egress. It reads the same SQLite stores every Stella command writes, so it works on any workspace that has run Stella at least once, and it needs no API key.
+`stella observe` starts a local HTTP server (default port `7787`) and serves the embedded
+dashboard — no separate install, no build step, and no Observatory egress. It reads the
+same SQLite stores every Stella command writes, so it works on any workspace that has
+run Stella at least once, and it needs no API key.
 
 The dashboard's tabs cover the overview, executions (with per-run drill-down), the code graph, skills, MCP traffic, memory, self-improvement, and resolved config, plus model spend panels, fleet runs, and a timeframe selector for the charts. See [the Observatory dashboard](/docs/telemetry/dashboard) for a tour of what each tab shows.
 

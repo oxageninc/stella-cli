@@ -36,7 +36,7 @@ code path in the workspace.
   at index time (no `just --list`, no `npm run`, no corepack trigger).
   Detection cost is a handful of file reads — cheap enough to recompute per
   CLI invocation and per `list_scripts` call, so there is **no cache file,
-  no database, no watcher**. (The code graph needs `.stella/codegraph.db`
+  no database, no watcher**. (The code graph needs `.stella/private/codegraph.db`
   because tree-sitter over the tree is expensive; manifest parsing is not.
   Nothing persisted means nothing to go stale or be lost.)
 - **Byte-stable output.** Canonical verbs render in the fixed order
@@ -60,7 +60,7 @@ code path in the workspace.
   `stella-tools/src/registry.rs:479`), so settings-driven policy can deny or
   require approval per command.
 - **No new telemetry tables.** `run_script` invocations ride the existing
-  `events` → `tool_calls` projection in `.stella/store.db`. No `store.db`
+  `events` → `tool_calls` projection in `.stella/private/store.db`. No `store.db`
   migration slot is consumed.
 
 ## Detection semantics

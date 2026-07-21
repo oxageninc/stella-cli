@@ -166,11 +166,11 @@ system.
 
 Stella already uses:
 
-- .stella/context.db for the context plane;
-- .stella/store.db for execution and telemetry;
-- .stella/codegraph.db for the source-code graph;
+- .stella/private/context.db for the context plane;
+- .stella/private/store.db for execution and telemetry;
+- .stella/private/codegraph.db for the source-code graph;
 - .stella/rules/*.md for repository-authored durable rules;
-- .stella/reflections.jsonl for a loose mining log.
+- .stella/private/reflections.jsonl for a loose mining log.
 
 The new design must preserve those boundaries.
 
@@ -181,7 +181,7 @@ duplicate parsing and enforcement semantics, and drift between two Git-backed
 sources.
 
 Draft observations, candidates, feedback, evidence, and private directives live
-in .stella/context.db. Published repository rules are materialized to
+in .stella/private/context.db. Published repository rules are materialized to
 .stella/rules/*.md and mirrored into the context graph for retrieval. The file
 remains the source of truth for published repository steering.
 
@@ -905,7 +905,7 @@ Stella should extract observations from:
 
 - stella-protocol AgentEvent streams;
 - .stella session journal JSONL and replay records;
-- .stella/reflections.jsonl;
+- .stella/private/reflections.jsonl;
 - tool calls, failures, retries, and recovery actions;
 - verification and witness-test results;
 - judge evidence;
@@ -1290,7 +1290,7 @@ retrieval alone. Memory reminds the model; the contract verifies the result.
 
 ### 15.1 Context database
 
-Add normalized lifecycle tables to .stella/context.db and mirror only
+Add normalized lifecycle tables to .stella/private/context.db and mirror only
 retrievable summaries into the existing node and edge graph.
 
 Recommended canonical tables:
@@ -1399,7 +1399,7 @@ provider registry. Add record-type diversity and instruction-capability labels.
 
 Own workspace integration:
 
-- mount .stella/context.db;
+- mount .stella/private/context.db;
 - extract from journal, store, reflections, and Git;
 - run incremental observation harvesting after safe task boundaries;
 - expose context status, list, explain, keep, edit, ignore, share, archive, and
@@ -1868,7 +1868,7 @@ Recommended defaults for the open decisions are:
 
 Implement the adaptive context lifecycle as a Stella feature using the context
 graph as its durable substrate. Keep repository rule publication in the
-existing .stella/rules/*.md path, local learning in .stella/context.db, and
+existing .stella/rules/*.md path, local learning in .stella/private/context.db, and
 governance in .stella/settings.json.
 
 Do not block Stella on protocol expansion. Once the local lifecycle is proven,

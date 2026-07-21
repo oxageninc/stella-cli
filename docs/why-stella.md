@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/engine-zero--I%2FO%20core-FFAC26?style=flat-square" alt="Zero-I/O core">
   <img src="https://img.shields.io/badge/providers-9%20%2B%20local-FFAC26?style=flat-square" alt="9 providers + local">
-  <img src="https://img.shields.io/badge/telemetry-local--only-FFAC26?style=flat-square" alt="Local-only telemetry">
+  <img src="https://img.shields.io/badge/community%20telemetry-local--only-FFAC26?style=flat-square" alt="Community telemetry is local-only">
   <img src="https://img.shields.io/badge/rust-1.90%2B-FFAC26?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.90+">
 </p>
 
@@ -59,7 +59,7 @@ plane.
 | Property | How it works |
 |---|---|
 | **BYOK, model-agnostic** | Nine hosted providers (Anthropic, OpenAI, Gemini, xAI, DeepSeek, Z.ai, OpenRouter, Vertex, Bedrock) plus **any** OpenAI-compatible local server (Ollama, vLLM, LM Studio, llama.cpp). No account, no gateway. Pin per run with `--model provider/id`. |
-| **No phone-home** | The only network traffic Stella emits goes to the provider *you* chose. Executions, the full event stream, per-call token/cost telemetry, and a `[C·R·U·D] path` files-touched ledger land in a local `.stella/store.db` you can open with any SQLite client — and the store is never a dependency of a turn. |
+| **Zero telemetry egress by default** | Community/default Stella sends no telemetry anywhere. Executions, the full event stream, per-call token/cost telemetry, and a `[C·R·U·D] path` files-touched ledger land in a local `.stella/private/store.db` you can open with any SQLite client — and the store is never a dependency of a turn. The sole exception is an [explicitly enrolled Oxagen Enterprise managed deployment](../stella-docs/content/docs/telemetry/index.mdx#oxagen-enterprise-managed-export): a current signed policy may authorize one minimal content-free operational rollup to one exact allowlisted HTTPS sink. |
 | **Budget you can trust** | `--budget <usd>` aborts cleanly **between** steps, never mid-tool, so a cap can't corrupt a half-written edit. |
 | **Bounded blast radius** | File tools are workspace-root-pinned; the `bash` tool is **off by default** (settings `tools.bash: "on"` to opt in — the default surface is enumerable argv, no shell); an opt-in `bash` sandbox (Seatbelt / bubblewrap) contains prompt-injection damage and **fails closed**; a cloned repo's own hooks never auto-execute (`STELLA_PROJECT_HOOKS=1` to opt in). |
 
@@ -78,9 +78,11 @@ dives: [`hooks.md`](design/hooks.md), [`file-touch-telemetry.md`](design/file-to
 ## What it optimizes for
 
 Provable, reproducible progress over flashy autonomy. If you want an agent whose
-every decision is a synchronous function you can test, whose telemetry never
-leaves your disk, whose budget is a hard boundary, and whose "done" is a fact
-you can re-run — Stella is built for you.
+every decision is a synchronous function you can test, whose Community/default
+telemetry never leaves your disk, whose budget is a hard boundary, and whose
+"done" is a fact you can re-run — Stella is built for you. An explicitly
+enrolled Oxagen Enterprise managed deployment has the single signed operational
+egress exception documented above.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/macanderson/stella/main/install.sh | sh

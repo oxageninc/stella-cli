@@ -223,6 +223,7 @@ impl Tool for StartProcess {
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         cmd.current_dir(root);
+        crate::exec::scrub_sensitive_env(&mut cmd);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -576,6 +577,38 @@ mod tests {
         match out {
             ToolOutput::Error { message } => assert!(message.contains("argv"), "{message}"),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_process_cannot_inherit_registered_host_credentials() {
+        let secret_name = "STELLA_TEST_PROCESS_VERIFY_SECRET";
+        let token_name = "STELLA_TEST_PROCESS_BEARER";
+        crate::exec::register_sensitive_env_names([secret_name, token_name]);
+        unsafe {
+            std::env::set_var(secret_name, "process-verification-secret");
+            std::env::set_var(token_name, "process-bearer-secret");
+        }
+        let (table, root) = tools();
+        let handle = start(&table, &root, &["env"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let output = ReadOutput(table)
+            .execute(&serde_json::json!({"handle": handle}), &root)
+            .await;
+        unsafe {
+            std::env::remove_var(secret_name);
+            std::env::remove_var(token_name);
+        }
+        let ToolOutput::Ok { content } = output else {
+            panic!("cannot read process output: {output:?}");
+        };
+        for forbidden in [
+            secret_name,
+            token_name,
+            "process-verification-secret",
+            "process-bearer-secret",
+        ] {
+            assert!(!content.contains(forbidden), "credential leaked: {content}");
         }
     }
 

@@ -128,6 +128,7 @@ impl Engine<'_> {
         events: &UnboundedSender<AgentEvent>,
         goal_config: &GoalConfig,
     ) -> GoalOutcome {
+        let starting_cost_usd = budget.session_spent_usd();
         messages.push(CompletionMessage::user(format!(
             "GOAL: {goal}\n\nWork toward this goal. An independent judge will assess the \
              result after each working round from the transcript evidence; keep your work \
@@ -138,11 +139,11 @@ impl Engine<'_> {
             budget.begin_turn();
             match self.run_turn(messages, budget, events).await {
                 TurnOutcome::Completed { .. } => {}
-                TurnOutcome::Aborted { reason } => {
+                TurnOutcome::Aborted { reason, .. } => {
                     return GoalOutcome::Unmet {
                         rounds: round,
                         reason: format!("working turn aborted: {reason}"),
-                        cost_usd: budget.session_spent_usd(),
+                        cost_usd: budget.session_spent_usd() - starting_cost_usd,
                     };
                 }
             }
@@ -163,7 +164,7 @@ impl Engine<'_> {
                     return GoalOutcome::Unmet {
                         rounds: round,
                         reason: format!("judge unavailable: {reason}"),
-                        cost_usd: budget.session_spent_usd(),
+                        cost_usd: budget.session_spent_usd() - starting_cost_usd,
                     };
                 }
             };
@@ -183,7 +184,7 @@ impl Engine<'_> {
                 return GoalOutcome::Met {
                     rounds: round,
                     verdict: verdict.reasoning,
-                    cost_usd: budget.session_spent_usd(),
+                    cost_usd: budget.session_spent_usd() - starting_cost_usd,
                 };
             }
 
@@ -204,7 +205,7 @@ impl Engine<'_> {
                 "round cap ({}) reached without a passing verdict",
                 goal_config.max_rounds
             ),
-            cost_usd: budget.session_spent_usd(),
+            cost_usd: budget.session_spent_usd() - starting_cost_usd,
         }
     }
 
@@ -269,7 +270,7 @@ impl Engine<'_> {
                 });
                 Ok((verdict, cost_usd))
             }
-            TurnOutcome::Aborted { reason } => Err(reason),
+            TurnOutcome::Aborted { reason, .. } => Err(reason),
         }
     }
 }
@@ -717,6 +718,41 @@ mod tests {
             other => panic!("expected Unmet, got {other:?}"),
         }
         assert!((budget.session_spent_usd() - 0.05).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn goal_outcome_cost_is_delta_from_the_guard_entry() {
+        let worker = ScriptedProvider::new(vec![Ok(text_result("done", 0.01))]);
+        let judge = ScriptedProvider::new(vec![Ok(text_result(
+            r#"{"met": true, "reasoning": "verified", "feedback": ""}"#,
+            0.001,
+        ))]);
+        let tools = NoTools;
+        let engine = Engine::with_sleeper(&worker, &tools, EngineConfig::default(), &NoSleep);
+        let mut messages = vec![CompletionMessage::system("sys")];
+        let mut budget = BudgetGuard::new(BudgetMode::Observed, None, None);
+        budget.reseed_session_spend(0.75);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = engine
+            .run_goal(
+                &judge,
+                "goal",
+                &mut messages,
+                &mut budget,
+                &tx,
+                &GoalConfig::default(),
+            )
+            .await;
+
+        match outcome {
+            GoalOutcome::Met { cost_usd, .. } => assert!(
+                (cost_usd - 0.011).abs() < 1e-9,
+                "pre-existing session spend is not part of this goal: {cost_usd}"
+            ),
+            other => panic!("expected Met, got {other:?}"),
+        }
+        assert!((budget.session_spent_usd() - 0.761).abs() < 1e-9);
     }
 
     #[test]

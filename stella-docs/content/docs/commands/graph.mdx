@@ -3,7 +3,7 @@ title: stella graph
 description: Query the code graph built by stella init — definitions, references, imports, importers, and neighbors.
 ---
 
-Ask the code graph structural questions about your workspace: where a symbol is defined, who references it, what a file imports, who imports it, or a file's immediate neighborhood. It is fully offline — it reads `.stella/codegraph.db` and needs no API key.
+Ask the code graph structural questions about your workspace: where a symbol is defined, who references it, what a file imports, who imports it, or a file's immediate neighborhood. It is fully offline — it reads `.stella/private/codegraph.db` and needs no API key.
 
 ## Synopsis
 
@@ -13,7 +13,7 @@ stella graph <op> <target>
 
 ## What it does
 
-`stella graph` reads the code-graph index that [`stella init`](/docs/commands/init) builds at `<workspace>/.stella/codegraph.db`. Because it only reads that local index, it makes no model calls and needs no provider credential — it is instant and works on a plane.
+`stella graph` reads the code-graph index that [`stella init`](/docs/commands/init) builds at `<workspace>/.stella/private/codegraph.db`. Because it only reads that local index, it makes no model calls and needs no provider credential — it is instant and works on a plane.
 
 `<op>` is one of five operations, and `<target>` is interpreted according to the operation:
 
@@ -26,7 +26,7 @@ stella graph <op> <target>
 | `neighbors` | a workspace-relative file path | What is this file's immediate graph neighborhood? |
 
 <Callout type="info">
-Run [`stella init`](/docs/commands/init) first. The graph is only as current as the last `init` — if you have moved or renamed a lot of code since, re-run `init` to rebuild `.stella/codegraph.db`.
+Run [`stella init`](/docs/commands/init) first. The graph is only as current as the last `init` — if you have moved or renamed a lot of code since, re-run `init` to rebuild `.stella/private/codegraph.db`.
 </Callout>
 
 ## Examples

@@ -454,7 +454,7 @@ written (nothing downstream breaks); the storage tables are the richer model
 layered beside them. `graph_nodes`/`graph_edges` in `stella-store` remain
 reserved and untouched — this feature does not adopt dead scaffolding.
 
-Rebuild invariant: `rm .stella/codegraph.db` followed by a mount reproduces
+Rebuild invariant: `rm .stella/private/codegraph.db` followed by a mount reproduces
 the structural index byte-for-byte from source + manifest. Anything that
 would fail that test belongs in the manifest instead.
 

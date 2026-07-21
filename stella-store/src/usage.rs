@@ -1,7 +1,7 @@
 //! `usage.db` — the **user-tier** telemetry aggregate, one database per
 //! developer (not per project), living under the OS data dir (e.g.
 //! `~/.local/share/stella/usage.db`). It is a *derived* store: every project's
-//! `.stella/store.db` is the source of truth, and each finished turn is rolled
+//! `.stella/private/store.db` is the source of truth, and each finished turn is rolled
 //! up here so a future cross-project dashboard can answer "how do I actually
 //! use Stella, across all my repos?" without opening every project database.
 //!
@@ -17,7 +17,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, params};
 
-use crate::{Result, StoreError};
+use crate::Result;
 
 /// The user-tier stella data dir (usage rollup, session registry,
 /// notifications). `STELLA_DATA_DIR` overrides; otherwise the platform data
@@ -162,9 +162,9 @@ impl UsageStore {
     /// Open (creating parent dirs + schema) at an explicit path.
     pub fn open_at(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| StoreError(e.to_string()))?;
+            crate::ensure_private_dir(parent)?;
         }
-        Self::init(Connection::open(path)?)
+        Self::init(crate::open_private_sqlite(path)?)
     }
 
     /// In-memory aggregate — tests and ephemeral runs.
@@ -409,5 +409,47 @@ mod tests {
         unsafe {
             std::env::remove_var("STELLA_DATA_DIR");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_store_repairs_private_dir_and_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let private = tmp.path().join("stella-data");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let db = private.join("usage.db");
+
+        drop(UsageStore::open_at(&db).unwrap());
+        let mode = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&private), 0o700);
+        assert_eq!(mode(&db), 0o600);
+
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o666)).unwrap();
+        drop(UsageStore::open_at(&db).unwrap());
+        assert_eq!(mode(&db), 0o600, "existing private DB is repaired");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_store_rejects_a_symlink_database() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let private = tmp.path().join("stella-data");
+        std::fs::create_dir_all(&private).unwrap();
+        let target = tmp.path().join("outside.db");
+        std::fs::write(&target, b"outside").unwrap();
+        symlink(&target, private.join("usage.db")).unwrap();
+        assert!(UsageStore::open_at(&private.join("usage.db")).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside");
     }
 }

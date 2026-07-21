@@ -270,10 +270,10 @@ pub fn rules_files(workspace_root: &Path) -> Value {
     json!(markdown_cards(&workspace_root.join(".stella/rules"), 400))
 }
 
-/// Distilled lessons from `.stella/reflections.jsonl` — one object per line,
+/// Distilled lessons from `.stella/private/reflections.jsonl` — one object per line,
 /// `{lesson, domains, occurred_at}`. Unparseable lines are skipped.
 pub fn lessons(workspace_root: &Path) -> Value {
-    let path = workspace_root.join(".stella/reflections.jsonl");
+    let path = workspace_root.join(".stella/private/reflections.jsonl");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return json!([]);
     };
@@ -427,7 +427,7 @@ pub fn config(workspace_root: &Path) -> Value {
     ];
     let dot = workspace_root.join(".stella");
     let store_path = |name: &str| {
-        let p = dot.join(name);
+        let p = dot.join("private").join(name);
         json!({ "path": p.display().to_string(), "exists": p.exists() })
     };
     let usage = crate::global::usage_db_path();

@@ -13,7 +13,7 @@ stella stats [--format <table|json|csv>] [--provider <id>]
 
 ## What it does
 
-`stella stats` reads `<workspace>/.stella/store.db` — the embedded SQLite store every run writes to — and aggregates it per provider/model: total tokens, total cost, and how often work resolved. It makes no network calls and needs no API key; it only reads local telemetry.
+`stella stats` reads `<workspace>/.stella/private/store.db` — the embedded SQLite store every run writes to — and aggregates it per provider/model: total tokens, total cost, and how often work resolved. It makes no network calls and needs no API key; it only reads local telemetry.
 
 ## Flags
 
