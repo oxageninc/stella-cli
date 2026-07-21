@@ -183,6 +183,19 @@ struct ZaiRequest<'a> {
     /// reject.
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<ZaiUsageInclude>,
+    /// OpenRouter's request-root automatic prompt-caching switch
+    /// (`{"type": "ephemeral"}`): the gateway places a cache breakpoint at
+    /// the last cacheable block and advances it as the conversation grows.
+    /// Anthropic models routed through OpenRouter get NO prompt caching
+    /// without it — their cache is explicit opt-in, unlike the implicit
+    /// OpenAI/Gemini/DeepSeek caches — so every agent turn re-billed the
+    /// full growing prefix at the uncached input rate and pinned the
+    /// cache-hit stat at zero. Providers with implicit caches ignore the
+    /// field (OpenRouter normalizes it per upstream), so it is sent on
+    /// every OpenRouter request; no other Chat Completions server speaks
+    /// it, so any other identity keeps it off the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<ZaiCacheControl>,
 }
 
 /// GLM's request-level thinking object: `{"type": "enabled"}` /
@@ -252,6 +265,16 @@ fn openrouter_reasoning(
 #[derive(Serialize)]
 struct ZaiUsageInclude {
     include: bool,
+}
+
+/// OpenRouter's cache-control object, `{"type": "ephemeral"}` — the 5-minute
+/// default TTL. The 1-hour variant costs 2x input on writes (vs 1.25x) and
+/// only pays off for sessions idle between turns, which an agent loop never
+/// is.
+#[derive(Serialize)]
+struct ZaiCacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -568,6 +591,13 @@ struct ZaiUsage {
 struct ZaiPromptTokensDetails {
     #[serde(default)]
     cached_tokens: u64,
+    /// OpenRouter-only sibling of `cached_tokens`: tokens WRITTEN to the
+    /// upstream's prompt cache by this call (Anthropic bills them at 1.25x
+    /// input). Absent on every other OpenAI-compatible endpoint, where
+    /// `serde(default)` keeps it 0 — matching the normalized envelope's
+    /// "0 when never reported" contract.
+    #[serde(default)]
+    cache_write_tokens: u64,
 }
 
 fn to_zai_messages(messages: &[CompletionMessage]) -> Vec<ZaiMessage> {
@@ -706,6 +736,8 @@ impl ZaiProvider {
             usage: self
                 .usage_accounting
                 .then_some(ZaiUsageInclude { include: true }),
+            cache_control: (self.id == "openrouter")
+                .then_some(ZaiCacheControl { kind: "ephemeral" }),
         };
 
         let mut request = self
@@ -871,10 +903,9 @@ async fn aggregate_zai_stream(
             if let Some(u) = parsed.usage {
                 usage.input_tokens = u.prompt_tokens;
                 usage.output_tokens = u.completion_tokens;
-                usage.cached_input_tokens = u
-                    .prompt_tokens_details
-                    .map(|d| d.cached_tokens)
-                    .unwrap_or(0);
+                let details = u.prompt_tokens_details.unwrap_or_default();
+                usage.cached_input_tokens = details.cached_tokens;
+                usage.cache_write_tokens = details.cache_write_tokens;
                 if u.cost.is_some() {
                     reported_cost_usd = u.cost;
                 }
@@ -1943,9 +1974,81 @@ mod tests {
             "seed",
             "thinking",
             "reasoning",
+            "cache_control",
         ] {
             assert!(!body.contains(key), "unexpected `{key}` in: {body}");
         }
+    }
+
+    /// Anthropic models routed through OpenRouter have explicit opt-in
+    /// caching: without a `cache_control` breakpoint the gateway never
+    /// caches a byte, so every agent turn re-bills its full growing prefix
+    /// at the uncached input rate (the "CACHE 0%" defect). The root-level
+    /// object opts in and lets OpenRouter advance the breakpoint per turn.
+    #[tokio::test]
+    async fn openrouter_identity_sends_root_level_cache_control() {
+        let server = MockServer::start().await;
+        mock_ok(&server).await;
+
+        let provider = ZaiProvider::new(ApiKey::new("sk-or-test"), "anthropic/claude-sonnet-5")
+            .with_base_url(server.uri())
+            .with_identity("openrouter", "OpenRouter");
+        provider
+            .complete(CompletionRequest {
+                messages: vec![CompletionMessage::user("hi")],
+                max_output_tokens: None,
+                temperature: None,
+                effort: None,
+                tools: vec![],
+                reasoning: None,
+                params: None,
+            })
+            .await
+            .expect("should succeed");
+
+        let body = first_request_body(&server).await;
+        assert!(
+            body.contains("\"cache_control\":{\"type\":\"ephemeral\"}"),
+            "{body}"
+        );
+    }
+
+    /// Cache writes surfaced by OpenRouter usage accounting
+    /// (`prompt_tokens_details.cache_write_tokens`) land on the normalized
+    /// envelope's `cache_write_tokens` — dropping them hid the 1.25x-billed
+    /// write volume from the engine's cache telemetry.
+    #[tokio::test]
+    async fn complete_surfaces_cache_write_tokens() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":500,\"prompt_tokens_details\":{\"cached_tokens\":200,\"cache_write_tokens\":600}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = ZaiProvider::new(ApiKey::new("sk-or-test"), "anthropic/claude-sonnet-5")
+            .with_base_url(server.uri())
+            .with_identity("openrouter", "OpenRouter");
+        let result = provider
+            .complete(CompletionRequest {
+                messages: vec![CompletionMessage::user("hi")],
+                max_output_tokens: None,
+                temperature: None,
+                effort: None,
+                tools: vec![],
+                reasoning: None,
+                params: None,
+            })
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.usage.cached_input_tokens, 200);
+        assert_eq!(result.usage.cache_write_tokens, 600);
     }
 
     #[tokio::test]
@@ -2059,5 +2162,7 @@ mod tests {
         let body = first_request_body(&server).await;
         assert!(!body.contains("thinking"), "{body}");
         assert!(!body.contains("reasoning"), "{body}");
+        // cache_control is OpenRouter-only, same 400 risk as the fields above.
+        assert!(!body.contains("cache_control"), "{body}");
     }
 }
