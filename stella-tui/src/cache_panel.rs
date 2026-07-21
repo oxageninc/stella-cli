@@ -172,4 +172,217 @@ mod tests {
         assert_eq!(fmt_warmth(Some(252)), "4:12");
         assert_eq!(fmt_warmth(Some(9)), "0:09"); // zero-padded seconds
     }
+
+    // ── Statline integration tests ──────────────────────────────────────────
+    //
+    // These render a full frame through `deck_render::render_status_bar` to
+    // check the CACHE / SAVED / WARMTH cells land in the deck's Running and
+    // Complete states — the deck's snapshot-test idiom (assert on a rendered
+    // `Buffer`'s flattened text, same pattern as `deck_render`'s own statline
+    // tests). Kept here rather than in `deck_render.rs`'s test module purely
+    // to stay under that file's size ratchet; `render_status_bar` is
+    // `pub(crate)` for exactly this reason.
+
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use stella_protocol::{AgentEvent, StageKind};
+
+    use crate::deck_render::render_status_bar;
+    use crate::deck_ui::DeckUi;
+    use crate::envelope::{AgentMeta, Inbound};
+
+    /// Flatten a rendered `Buffer` to one string, styling stripped — content
+    /// is what these tests assert on, never raw ANSI.
+    fn buffer_text(buf: &Buffer) -> String {
+        let area = *buf.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A running "lead" agent, `now_ms` seeded — the minimal fixture these
+    /// cache-panel assertions need (no queue: unlike `deck_render`'s own
+    /// `running_model_with_queue`, nothing here touches the composer queue).
+    fn running_model() -> WorkspaceModel {
+        let mut m = WorkspaceModel::new();
+        m.now_ms = 1_000;
+        m.apply_inbound(&Inbound::Register(AgentMeta::new("lead", "goal", 0)));
+        m.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Stage {
+                name: StageKind::Execute,
+            },
+        });
+        m
+    }
+
+    /// One committed model call, carrying `input`/`cached` usage — the fold
+    /// that feeds the CACHE cell. `step_usage` writes nothing to the cache;
+    /// `step_usage_full` also sets the write volume.
+    fn step_usage(input: u64, cached: u64) -> AgentEvent {
+        step_usage_full(input, cached, 0)
+    }
+
+    fn step_usage_full(input: u64, cached: u64, write: u64) -> AgentEvent {
+        AgentEvent::StepUsage {
+            step: 1,
+            model: "glm".into(),
+            input_tokens: input,
+            output_tokens: 0,
+            cached_input_tokens: cached,
+            cache_write_tokens: write,
+            estimated_input_tokens: 0,
+            cost_usd: 0.0,
+            duration_ms: 1,
+            retries: 0,
+            tool_calls: 0,
+        }
+    }
+
+    /// The running model plus one metered step with the given cache usage.
+    fn model_with_cache(input: u64, cached: u64) -> WorkspaceModel {
+        let mut m = running_model();
+        m.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: step_usage(input, cached),
+        });
+        m
+    }
+
+    #[test]
+    fn statline_cache_box_shows_hit_rate_and_compact_token_counts() {
+        // 105.3M cache-read over 211.4M input → 50% (rounded), compact `M`s.
+        let model = model_with_cache(211_400_000, 105_300_000);
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("CACHE"), "cache label present:\n{text}");
+        assert!(
+            text.contains("50% (105.3M rd · 0 wr)"),
+            "cache hit rate + compact read/write volumes:\n{text}"
+        );
+    }
+
+    #[test]
+    fn statline_cache_box_sits_after_spend_and_before_engine() {
+        let model = model_with_cache(1_000, 500);
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        let pos = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?}:\n{text}"))
+        };
+        assert!(pos("SPEND") < pos("CACHE"), "CACHE after SPEND:\n{text}");
+        assert!(pos("CACHE") < pos("ENGINE"), "CACHE before ENGINE:\n{text}");
+        assert!(
+            pos("ENGINE") < pos("PIPELINE"),
+            "PIPELINE after ENGINE:\n{text}"
+        );
+    }
+
+    #[test]
+    fn statline_cache_box_renders_zero_and_full_hit_rates() {
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+
+        // 0%: input metered, nothing served from cache.
+        let cold = model_with_cache(1_000, 0);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&cold, &ui, area, &mut buf);
+        assert!(
+            buffer_text(&buf).contains("0% (0 rd · 0 wr)"),
+            "cold cache reads 0%:\n{}",
+            buffer_text(&buf)
+        );
+
+        // 100%: every input token was a cache hit.
+        let warm = model_with_cache(1_000, 1_000);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&warm, &ui, area, &mut buf);
+        assert!(
+            buffer_text(&buf).contains("100% (1.0K rd · 0 wr)"),
+            "fully warm cache reads 100%:\n{}",
+            buffer_text(&buf)
+        );
+    }
+
+    #[test]
+    fn statline_cache_box_is_a_dash_before_any_usage() {
+        // No StepUsage metered yet → the CACHE cell shows the no-data dash and
+        // never divides by zero (the render below must not panic).
+        let model = running_model();
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("CACHE"), "cache label still present:\n{text}");
+        assert!(
+            !text.contains(" wr)"),
+            "no read/write volumes before any usage:\n{text}"
+        );
+    }
+
+    #[test]
+    fn statline_cache_panel_shows_savings_and_warmth_running_and_complete() {
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 240, 2);
+        let render = |m: &WorkspaceModel| {
+            let mut buf = Buffer::empty(area);
+            render_status_bar(m, &ui, area, &mut buf);
+            buffer_text(&buf)
+        };
+        let fold = |m: &mut WorkspaceModel, event| {
+            m.apply_inbound(&Inbound::Event {
+                agent: "lead".into(),
+                event,
+            });
+        };
+
+        // Running: 150K of 200K input served from cache, 40K written; derived
+        // economics say $0.42 saved on a 5-min-TTL provider; 120s idle since,
+        // so 180s of warmth ("3:00") remains.
+        let mut m = running_model();
+        fold(&mut m, step_usage_full(200_000, 150_000, 40_000));
+        m.apply_inbound(&Inbound::CacheInsight {
+            agent: "lead".into(),
+            savings_usd_delta: 0.42,
+            ttl_secs: 300,
+        });
+        m.now_ms += 120_000;
+        let running = render(&m);
+        for needle in [
+            "75% (150.0K rd · 40.0K wr)",
+            "SAVED",
+            "$0.42",
+            "WARMTH",
+            "3:00",
+        ] {
+            assert!(running.contains(needle), "missing {needle:?}:\n{running}");
+        }
+
+        // Complete: the turn ends; the cache panel stays populated.
+        fold(
+            &mut m,
+            AgentEvent::Complete {
+                model: "claude".into(),
+                cost_usd: 0.05,
+            },
+        );
+        let complete = render(&m);
+        assert!(
+            complete.contains("75% (150.0K rd · 40.0K wr)") && complete.contains("$0.42"),
+            "cache panel persists in Complete:\n{complete}"
+        );
+    }
 }
