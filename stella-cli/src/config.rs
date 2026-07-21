@@ -1172,6 +1172,23 @@ mod tests {
         assert_eq!(ids.len(), before, "duplicate provider id in PROVIDERS");
     }
 
+    /// Every seeded provider must declare its prompt-cache posture in
+    /// stella-model's parity matrix — the guard born from OpenRouter
+    /// silently running Claude with zero caching. A new provider cannot
+    /// land without stating how caching is engaged and naming the witness
+    /// test that proves it.
+    #[test]
+    fn every_seeded_provider_declares_a_cache_posture() {
+        for provider in PROVIDERS.iter().chain(std::iter::once(&LOCAL_PROVIDER)) {
+            assert!(
+                stella_model::provider_parity::cache_posture(provider.id).is_some(),
+                "provider `{}` has no row in stella-model/src/provider_parity.rs — \
+                 add its CachePosture (with a witness test) in this PR",
+                provider.id
+            );
+        }
+    }
+
     #[test]
     fn alias_env_var_resolves_when_the_primary_is_unset() {
         // Synthetic provider with unique var names so parallel tests can't

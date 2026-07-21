@@ -348,10 +348,9 @@ mod tests {
         // With no explicit `provider`, `openai/nope` splits to the OpenAI
         // catalog and is correctly flagged (the string carries its own
         // routing).
-        let engine: AgentEngineConfig = serde_json::from_str(
-            r#"{ "agents": { "judge": { "model": "openai/nope" } } }"#,
-        )
-        .unwrap();
+        let engine: AgentEngineConfig =
+            serde_json::from_str(r#"{ "agents": { "judge": { "model": "openai/nope" } } }"#)
+                .unwrap();
         let issues = check_engine_settings(&engine, &is_seed_provider);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert_eq!(issues[0].location, "agents.judge.model");

@@ -169,7 +169,7 @@ mod tests {
         let server = MockServer::start().await;
         let sse_body = concat!(
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi from Vertex\"}]}}],",
-            "\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":4}}\n\n",
+            "\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":4,\"cachedContentTokenCount\":3}}\n\n",
         );
         Mock::given(method("POST"))
             .and(path(
@@ -206,6 +206,10 @@ mod tests {
         assert_eq!(result.text, "Hi from Vertex");
         assert_eq!(result.usage.input_tokens, 7);
         assert_eq!(result.usage.output_tokens, 4);
+        // Vertex shares the gemini aggregator: implicit-cache hits reported
+        // as `cachedContentTokenCount` must reach the normalized envelope
+        // here too, or Vertex runs bill cached tokens at the full rate.
+        assert_eq!(result.usage.cached_input_tokens, 3);
     }
 
     #[tokio::test]
