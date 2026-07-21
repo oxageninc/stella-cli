@@ -148,10 +148,11 @@ async fn run_pipeline_one_shot(
     let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let renderer = spawn_renderer(rx, format, execution.clone(), cfg.provider.id.to_string());
 
-    // Role wiring from `agent_engine_config`: per-role model pins (triage/
-    // judge), their adapters, and per-role request overrides. Notices are
-    // stderr diagnostics — stdout may be machine-readable JSON.
-    let wiring = resolve_engine_wiring(cfg, &model_ref);
+    // Role wiring from `agent_engine_config`: per-role model pins (worker/
+    // triage/judge), their adapters, and per-role request overrides. Notices
+    // are stderr diagnostics — stdout may be machine-readable JSON.
+    let configured = crate::config::discover_configured_providers();
+    let wiring = resolve_engine_wiring(cfg, &model_ref, &configured);
     for notice in &wiring.notices {
         eprintln!("  ! {notice}");
     }
@@ -209,8 +210,12 @@ async fn run_pipeline_one_shot(
             } else {
                 PipelineApprovalCapability::Unavailable
             };
-        let mut pipeline_config =
-            pipeline_config_for_approval_capability(cfg, approval_capability, test_command);
+        let mut pipeline_config = pipeline_config_for_approval_capability(
+            cfg,
+            &wiring.worker_model,
+            approval_capability,
+            test_command,
+        );
         pipeline_config.role_overrides = wiring.role_overrides.clone();
 
         let stdio_gate = StdioApprovalGate;
@@ -319,7 +324,7 @@ async fn run_pipeline_one_shot(
                 "(files changed this turn: {changed})"
             )));
         }
-        let report = m
+        let mut report = m
             .reflect_and_record(
                 &*provider,
                 &cfg.model_id,
@@ -332,6 +337,7 @@ async fn run_pipeline_one_shot(
                 remaining_budget(&budget),
             )
             .await;
+        settle_reflection_budget(&mut report, &mut budget);
         surface_reflection(&report, format);
         reflection_report = report;
     }
@@ -694,7 +700,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             } else if turn_warrants_reflection(&messages[turn_start..])
                 && let Some(m) = &mut memory
             {
-                let report = m
+                let mut report = m
                     .reflect_and_record(
                         &*provider,
                         &cfg.model_id,
@@ -704,6 +710,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                         remaining_budget(&budget),
                     )
                     .await;
+                settle_reflection_budget(&mut report, &mut budget);
                 surface_reflection(&report, OutputFormat::Text);
             }
             continue;
@@ -772,7 +779,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         } else if turn_warrants_reflection(&messages[turn_start..])
             && let Some(m) = &mut memory
         {
-            let report = m
+            let mut report = m
                 .reflect_and_record(
                     &*provider,
                     &cfg.model_id,
@@ -782,6 +789,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                     remaining_budget(&budget),
                 )
                 .await;
+            settle_reflection_budget(&mut report, &mut budget);
             surface_reflection(&report, OutputFormat::Text);
         }
     }
@@ -914,7 +922,6 @@ fn reflection_json(report: &ReflectionReport) -> serde_json::Value {
         "events": report.events,
     })
 }
-
 /// Build the workspace code-graph index into `.stella/private/codegraph.db` (the
 /// `stella-graph` tree-sitter indexer). This is the data side of `init`: the
 /// domain taxonomy tags graph nodes/edges, and the index makes the symbols +
@@ -972,6 +979,7 @@ fn index_workspace_graph_blocking(
             .unwrap_or(stats.files_parsed + stats.files_skipped_unchanged),
         files_parsed: stats.files_parsed,
         files_unchanged: stats.files_skipped_unchanged,
+        files_skipped_generated: stats.files_skipped_generated,
     };
     graph.shutdown();
     Ok(summary)
@@ -984,13 +992,22 @@ struct GraphSummary {
     total_files: usize,
     files_parsed: usize,
     files_unchanged: usize,
+    /// Files this pass excluded as generated/minified (issue #272:
+    /// `.gitattributes` `linguist-generated=true`, `*.min.*`, or the
+    /// minified-content heuristic — see `stella_graph::generated`). Reported
+    /// separately from `total_files` so the exclusion is visible, not just
+    /// silently absent from the count.
+    files_skipped_generated: usize,
 }
 
 /// The `✓ code graph: N symbols, M imports…` summary line, shared by `stella
 /// init` and the session auto-builder so both surfaces read identically.
 /// Reports index totals; the parenthetical is this pass's parse/skip split.
+/// When this pass excluded any generated/minified files, an explicit
+/// "skipped N generated files" clause makes that visible rather than letting
+/// them silently vanish from the file count (issue #272).
 fn format_graph_stats(summary: &GraphSummary) -> String {
-    format!(
+    let base = format!(
         "✓ code graph: {} symbols, {} imports across {} file{} ({} re-parsed, {} unchanged this pass)",
         summary.total_symbols,
         summary.total_imports,
@@ -998,6 +1015,18 @@ fn format_graph_stats(summary: &GraphSummary) -> String {
         if summary.total_files == 1 { "" } else { "s" },
         summary.files_parsed,
         summary.files_unchanged,
+    );
+    if summary.files_skipped_generated == 0 {
+        return base;
+    }
+    format!(
+        "{base} — skipped {} generated file{}",
+        summary.files_skipped_generated,
+        if summary.files_skipped_generated == 1 {
+            ""
+        } else {
+            "s"
+        }
     )
 }
 
@@ -1739,6 +1768,29 @@ pub(crate) fn remaining_budget(guard: &BudgetGuard) -> Option<f64> {
         .map(|limit| (limit - guard.spent_usd()).max(0.0))
 }
 
+pub(crate) fn settle_reflection_budget(report: &mut ReflectionReport, guard: &mut BudgetGuard) {
+    let had_accounting = report.events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::StepUsage { .. }
+                | AgentEvent::UsageIncomplete { .. }
+                | AgentEvent::BudgetTick { .. }
+        )
+    });
+    report
+        .events
+        .retain(|event| !matches!(event, AgentEvent::BudgetTick { .. }));
+    if report.cost_usd > 0.0 {
+        let _ = guard.record_spend(report.cost_usd);
+    }
+    if had_accounting {
+        report.events.push(AgentEvent::BudgetTick {
+            spent_usd: guard.spent_usd(),
+            limit_usd: guard.turn_limit_usd(),
+            mode: guard.mode(),
+        });
+    }
+}
 /// Open the workspace SQLite store (`.stella/private/store.db`). Persistence is
 /// observability, not a work dependency: a store that won't open warns once
 /// and the session runs on without it — never a startup failure.

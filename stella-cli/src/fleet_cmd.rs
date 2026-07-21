@@ -534,8 +534,9 @@ async fn run_task(
         };
         let model_ref = stella_protocol::ModelRef::new(cfg.provider.id, cfg.model_id.clone());
         // Role wiring from `agent_engine_config` — fleet workers honor the
-        // same triage/judge pins and per-role overrides as `stella run`.
-        let wiring = agent::resolve_engine_wiring(&cfg, &model_ref);
+        // same worker/triage/judge pins and per-role overrides as `stella run`.
+        let configured = crate::config::discover_configured_providers();
+        let wiring = agent::resolve_engine_wiring(&cfg, &model_ref, &configured);
         for notice in &wiring.notices {
             eprintln!("  ! {notice}");
         }
@@ -576,7 +577,7 @@ async fn run_task(
             steering: None,
         };
         let config = PipelineConfig {
-            engine: agent::pipeline_engine_config_for(&cfg),
+            engine: agent::pipeline_engine_config_for(&cfg, &wiring.worker_model),
             role_overrides: wiring.role_overrides.clone(),
             headless: true,
             headless_bypass_scope_review: agent::HEADLESS_SCOPE_REVIEW_BYPASS,

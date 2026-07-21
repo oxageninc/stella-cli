@@ -193,7 +193,6 @@ fn event_rejects_unfinished_or_unbounded_rollups() {
         StellaOperationalEventV1::from_finalized_rollup(&context(), &incomplete).is_err(),
         "unknown paid-call accounting must never enter the closed export schema"
     );
-
     let invalid = OperationalEventContext::new(
         "enroll 01",
         "org_01",

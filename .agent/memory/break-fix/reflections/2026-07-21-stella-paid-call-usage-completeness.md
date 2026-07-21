@@ -9,3 +9,5 @@ The most useful regression shape combined exact-once cancellation at the cost-se
 A follow-up inventory found four standalone CLI dispatches outside the engine and pipeline chokepoints. The reusable boundary is an I/O-free core accounting primitive; CLI adapters own execution persistence and closeout, while exact settled cost crosses both success and structured error paths so over-budget output is never applied before its paid call is recorded.
 
 Independent review exposed three secondary seams: engine overflow summarization was also a paid role, multi-attempt callers must decrement one cumulative operation budget, and persisting a private usage channel is insufficient when machine/deck consumers enumerate the public event stream. A must-use reflection report now carries the full envelope and cost to every surface.
+
+Standalone sub-call events cannot be forwarded verbatim into a caller-scoped stream: their budget guard starts at zero and uses the caller's remaining limit. The caller must record the settled sub-call cost, discard the operation-relative tick, and emit one cumulative caller/session tick so HUD state and future admission checks stay monotonic.

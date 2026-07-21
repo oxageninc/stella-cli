@@ -43,6 +43,7 @@
 
 mod error;
 mod frames;
+mod generated;
 mod graph;
 mod import;
 mod lang;

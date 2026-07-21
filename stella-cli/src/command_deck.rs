@@ -101,7 +101,7 @@ use crate::interactive::{AskUserIo, FREE_TEXT_LABEL, InteractiveToolSet, SkillRe
 
 mod authoring;
 mod forwarder;
-use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
+use crate::memory::{SessionMemory, inject_recall_block};
 use crate::runtime::{SystemClock, TokioSleeper};
 use crate::subsession::{self, SubSessions, SupervisorMsg};
 use authoring::handle_agent_create;
@@ -436,6 +436,22 @@ pub async fn run_deck_session(
     // re-checked every boot, so it never journals.
     if let Some(report) = custom.problems_report() {
         let _ = deck_tx.send(chrome_note(report));
+    }
+    // Honest degradation (#266): a user who pinned a reasoning effort for the
+    // lead but chose a provider whose adapter has no reasoning control gets a
+    // one-line notice instead of a silently-dropped setting. Keyed on the
+    // explicit settings pin for the lead (Default kind), never the
+    // auto-resolved effort — session chrome, re-checked every boot, never
+    // journaled.
+    if let Some(notice) = crate::engine_config::unsupported_effort_notice(
+        cfg.provider.id,
+        cfg.provider.display_name,
+        cfg.engine_settings
+            .as_ref()
+            .and_then(|e| e.agent(crate::settings::EngineAgentKind::Default))
+            .and_then(|a| a.effort),
+    ) {
+        let _ = deck_tx.send(chrome_note(notice));
     }
     // An idle lead is waiting on the human, not queued behind a supervisor
     // (sent after the problems report — a Text event folds to `Running`).
@@ -1571,37 +1587,21 @@ pub async fn run_deck_session(
                         });
                     }
                 }
-                agent::record_turn_episode(
-                    &memory,
+                authoring::record_and_reflect_turn(
+                    &mut memory,
                     &prompt,
                     &outcome,
                     &registry,
                     files_before,
                     started_unix,
-                    &messages[reflect_start..],
+                    &messages,
+                    reflect_start,
+                    &*provider,
+                    cfg,
+                    &mut budget,
+                    &in_tx,
                 )
                 .await;
-                if outcome.is_ok()
-                    && turn_warrants_reflection(&messages[reflect_start..])
-                    && let Some(m) = &mut memory
-                {
-                    let report = m
-                        .reflect_and_record(
-                            &*provider,
-                            &cfg.model_id,
-                            &messages,
-                            true,
-                            true,
-                            agent::remaining_budget(&budget),
-                        )
-                        .await;
-                    authoring::forward_reflection_events(&in_tx, report);
-                }
-                // Registry + inbox: the turn settled, so the session now
-                // waits on the user (Needs Input, machine-wide). Failed work
-                // always lands a persist-until-read notification; successful
-                // work does too when it ran long enough that the user has
-                // plausibly looked away.
                 session_exit = if outcome.is_err() {
                     stella_store::SessionStatus::Error
                 } else {
@@ -4357,10 +4357,11 @@ async fn run_lead_pipeline_turn(
         };
 
         let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
-        // Role wiring from `agent_engine_config`: triage/judge pins + their
-        // adapters + per-role request overrides. Notices land in the
+        // Role wiring from `agent_engine_config`: worker/triage/judge pins +
+        // their adapters + per-role request overrides. Notices land in the
         // transcript — stderr is invisible under the alternate screen.
-        let wiring = agent::resolve_engine_wiring(cfg, &model_ref);
+        let configured = crate::config::discover_configured_providers();
+        let wiring = agent::resolve_engine_wiring(cfg, &model_ref, &configured);
         for notice in &wiring.notices {
             let _ = tx.send(AgentEvent::Text {
                 delta: format!("! {notice}\n"),
@@ -4404,7 +4405,7 @@ async fn run_lead_pipeline_turn(
             steering: Some(steering),
         };
         let config = PipelineConfig {
-            engine: agent::pipeline_engine_config_for(cfg),
+            engine: agent::pipeline_engine_config_for(cfg, &wiring.worker_model),
             role_overrides: wiring.role_overrides.clone(),
             headless: true,
             headless_bypass_scope_review: agent::HEADLESS_SCOPE_REVIEW_BYPASS,

@@ -133,7 +133,7 @@ pub(crate) async fn run_raw_one_shot(
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
-        let report = m
+        let mut report = m
             .reflect_and_record(
                 &*provider,
                 &cfg.model_id,
@@ -143,6 +143,7 @@ pub(crate) async fn run_raw_one_shot(
                 crate::agent::remaining_budget(&budget),
             )
             .await;
+        settle_reflection_budget(&mut report, &mut budget);
         surface_reflection(&report, format);
     }
     if let Some(set) = &mcp {
@@ -291,7 +292,7 @@ pub async fn run_goal_cmd(
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
-        let report = m
+        let mut report = m
             .reflect_and_record(
                 &*provider,
                 &cfg.model_id,
@@ -301,6 +302,7 @@ pub async fn run_goal_cmd(
                 crate::agent::remaining_budget(&budget),
             )
             .await;
+        settle_reflection_budget(&mut report, &mut budget);
         surface_reflection(&report, OutputFormat::Text);
     }
     if let Some(set) = &mcp {
@@ -494,7 +496,8 @@ async fn run_goal_pipeline_turn(
 
     // Role wiring from `agent_engine_config` — the pinned/auto judge (when
     // configured) also serves as the goal loop's round judge below.
-    let wiring = resolve_engine_wiring(cfg, &model_ref);
+    let configured = crate::config::discover_configured_providers();
+    let wiring = resolve_engine_wiring(cfg, &model_ref, &configured);
     for notice in &wiring.notices {
         eprintln!("  ! {notice}");
     }
@@ -591,7 +594,7 @@ async fn run_goal_pipeline_turn(
         for round in 1..=goal_config.max_rounds {
             budget.begin_turn();
             let pipeline_config = PipelineConfig {
-                engine: pipeline_engine_config_for(cfg),
+                engine: pipeline_engine_config_for(cfg, &wiring.worker_model),
                 role_overrides: wiring.role_overrides.clone(),
                 headless: true,
                 headless_bypass_scope_review: HEADLESS_SCOPE_REVIEW_BYPASS,

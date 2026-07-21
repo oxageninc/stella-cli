@@ -27,6 +27,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use crate::error::GraphError;
+use crate::generated::{self, GeneratedFilter};
 use crate::import::{self, ImportKind};
 use crate::lang::Language;
 use crate::manifest::StorageManifest;
@@ -97,6 +98,11 @@ pub struct IndexStats {
     pub files_parsed: usize,
     pub files_skipped_unchanged: usize,
     pub files_skipped_binary: usize,
+    /// Files excluded as generated/minified (`crate::generated::is_excluded`)
+    /// — `.gitattributes` `linguist-generated=true`, the `*.min.*` filename
+    /// convention, or the minified-content heuristic. Surfaced by `stella
+    /// init` as "skipped N generated files" (issue #272).
+    pub files_skipped_generated: usize,
     pub files_unreadable: usize,
     pub parse_failures: usize,
     pub files_pruned: usize,
@@ -152,17 +158,27 @@ pub(crate) fn index_tree(
 ) -> Result<IndexStats, GraphError> {
     let files = walk_indexable(root);
     let mut stats = IndexStats::default();
-    // Manifest layer mapping is loaded once per pass; a malformed manifest
-    // degrades to the implicit layer, never aborts the batch (L-L1).
+    // Manifest layer mapping and the generated-file filter are each loaded
+    // once per pass; a malformed manifest or absent `.gitattributes` degrades
+    // to the implicit layer / no-op filter, never aborts the batch (L-L1).
     let manifest = StorageManifest::load(root).ok().flatten();
+    let generated_filter = GeneratedFilter::load(root);
     let tx = conn.transaction()?;
 
     let mut current: HashSet<String> = HashSet::with_capacity(files.len());
     for abs in &files {
         current.insert(rel_path(root, abs));
-        index_one(&tx, root, grammars, manifest.as_ref(), abs, &mut stats)?;
+        index_one(
+            &tx,
+            root,
+            grammars,
+            manifest.as_ref(),
+            &generated_filter,
+            abs,
+            &mut stats,
+        )?;
     }
-    stats.files_pruned = prune_missing(&tx, &current)?;
+    stats.files_pruned += prune_missing(&tx, &current)?;
 
     tx.commit()?;
     Ok(stats)
@@ -179,13 +195,22 @@ pub(crate) fn apply_changes(
 ) -> Result<IndexStats, GraphError> {
     let mut stats = IndexStats::default();
     let manifest = StorageManifest::load(root).ok().flatten();
+    let generated_filter = GeneratedFilter::load(root);
     let tx = conn.transaction()?;
     for abs in changed {
         if Language::from_path(abs).is_none() && !storage::indexes_without_language(abs) {
             continue;
         }
         if abs.is_file() {
-            index_one(&tx, root, grammars, manifest.as_ref(), abs, &mut stats)?;
+            index_one(
+                &tx,
+                root,
+                grammars,
+                manifest.as_ref(),
+                &generated_filter,
+                abs,
+                &mut stats,
+            )?;
         } else {
             let rel = rel_path(root, abs);
             stats.files_pruned +=
@@ -204,6 +229,7 @@ fn index_one(
     root: &Path,
     grammars: &Grammars,
     manifest: Option<&StorageManifest>,
+    generated_filter: &GeneratedFilter,
     abs: &Path,
     stats: &mut IndexStats,
 ) -> Result<(), GraphError> {
@@ -217,6 +243,21 @@ fn index_one(
             return Ok(());
         }
     };
+
+    // Generated/minified exclusion (issue #272) runs **before** the
+    // byte-compat skip below, on purpose: a file already sitting in an index
+    // built before this filter existed would otherwise never be re-evaluated
+    // (its bytes have not changed, so the skip would keep hiding it forever).
+    // Deleting any pre-existing row here retroactively cleans that case out
+    // on the very next index pass — the same row removal `prune_missing`
+    // does for a file that vanished from disk.
+    if generated::is_excluded(generated_filter, &rel, &content) {
+        stats.files_skipped_generated += 1;
+        stats.files_pruned +=
+            tx.execute("DELETE FROM code_graph_files WHERE path = ?1", params![rel])?;
+        return Ok(());
+    }
+
     let sha = sha256_hex(&content);
 
     // Byte-compat skip (L-C2): identical content is never re-parsed.
@@ -997,5 +1038,85 @@ mod tests {
         // The pruned file's symbols are gone (CASCADE).
         assert!(definitions(&conn, "gone").unwrap().is_empty());
         assert!(!definitions(&conn, "keep").unwrap().is_empty());
+    }
+
+    /// Issue #272: a minified bundle (one giant line, well past the byte
+    /// floor) never persists a row, while an ordinary file alongside it
+    /// indexes normally.
+    #[test]
+    fn minified_content_is_skipped_and_not_persisted() {
+        let ws = tempdir().unwrap();
+        let dbdir = tempdir().unwrap();
+        let root = canon(&ws);
+        let db = dbdir.path().join("context.db");
+        let long_line = "function bigOne(){return 1;}".repeat(200);
+        fs::write(root.join("bundle.js"), format!("{long_line}\n")).unwrap();
+        fs::write(root.join("real.js"), "function real() { return 2; }\n").unwrap();
+        let grammars = Grammars::load().unwrap();
+        let mut conn = open(&db).unwrap();
+
+        let stats = index_tree(&mut conn, &root, &grammars).unwrap();
+        assert_eq!(stats.files_skipped_generated, 1, "{stats:?}");
+        assert_eq!(
+            file_count(&conn).unwrap(),
+            1,
+            "only the real file is indexed"
+        );
+        assert!(definitions(&conn, "bigOne").unwrap().is_empty());
+        assert!(!definitions(&conn, "real").unwrap().is_empty());
+    }
+
+    /// The `*.min.*` filename convention is enough on its own — no minified
+    /// content shape required.
+    #[test]
+    fn min_dot_filename_convention_is_skipped_regardless_of_content_shape() {
+        let ws = tempdir().unwrap();
+        let dbdir = tempdir().unwrap();
+        let root = canon(&ws);
+        let db = dbdir.path().join("context.db");
+        fs::write(root.join("app.min.js"), "function tiny() {}\n").unwrap();
+        let grammars = Grammars::load().unwrap();
+        let mut conn = open(&db).unwrap();
+
+        let stats = index_tree(&mut conn, &root, &grammars).unwrap();
+        assert_eq!(stats.files_skipped_generated, 1);
+        assert!(definitions(&conn, "tiny").unwrap().is_empty());
+    }
+
+    /// Issue #272's retroactive-cleanup requirement: a file indexed normally
+    /// under an older version, then later declared `linguist-generated=true`
+    /// with its bytes completely unchanged, must still be pruned on the very
+    /// next pass — proving the exclusion check runs ahead of (and overrides)
+    /// the byte-compat skip rather than being hidden behind it forever.
+    #[test]
+    fn a_file_marked_generated_after_the_fact_is_pruned_even_with_unchanged_bytes() {
+        let ws = tempdir().unwrap();
+        let dbdir = tempdir().unwrap();
+        let root = canon(&ws);
+        let db = dbdir.path().join("context.db");
+        fs::write(root.join("legacy.js"), "function legacyThing() {}\n").unwrap();
+        let grammars = Grammars::load().unwrap();
+        let mut conn = open(&db).unwrap();
+
+        index_tree(&mut conn, &root, &grammars).unwrap();
+        assert!(
+            !definitions(&conn, "legacyThing").unwrap().is_empty(),
+            "indexed normally before any .gitattributes rule exists"
+        );
+
+        // Mark it generated without touching its bytes at all.
+        fs::write(
+            root.join(".gitattributes"),
+            "legacy.js linguist-generated=true\n",
+        )
+        .unwrap();
+        let stats = index_tree(&mut conn, &root, &grammars).unwrap();
+
+        assert_eq!(stats.files_skipped_generated, 1);
+        assert!(
+            definitions(&conn, "legacyThing").unwrap().is_empty(),
+            "a stale pre-fix row must be retroactively pruned, not hidden behind the byte-compat skip"
+        );
+        assert_eq!(file_count(&conn).unwrap(), 0);
     }
 }

@@ -438,8 +438,10 @@ async fn untrusted_project_custom_tools_are_absent_from_the_runtime_surface() {
 fn non_tty_text_output_is_headless_without_losing_text_rendering() {
     let cfg = cfg_for("zai");
     let format = OutputFormat::Text;
+    let worker_model = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
     let non_tty = pipeline_config_for_approval_capability(
         &cfg,
+        &worker_model,
         PipelineApprovalCapability::Unavailable,
         None,
     );
@@ -453,8 +455,12 @@ fn non_tty_text_output_is_headless_without_losing_text_rendering() {
     );
     assert_eq!(format, OutputFormat::Text, "rendering remains text");
 
-    let interactive =
-        pipeline_config_for_approval_capability(&cfg, PipelineApprovalCapability::Stdio, None);
+    let interactive = pipeline_config_for_approval_capability(
+        &cfg,
+        &worker_model,
+        PipelineApprovalCapability::Stdio,
+        None,
+    );
     assert!(
         !interactive.headless,
         "an explicit interactive approval host retains scope review"
@@ -744,5 +750,292 @@ fn reflection_json_preserves_full_paid_call_envelope_and_cost() {
     assert_eq!(value["events"][0]["complete"], true);
 }
 
+#[test]
+fn reflection_budget_tick_is_rebased_to_the_caller_session() {
+    let mut guard = BudgetGuard::new(BudgetMode::Enforced, Some(1.0), None);
+    let _ = guard.record_spend(0.8);
+    let mut report = ReflectionReport {
+        recorded: 0,
+        model_error: None,
+        cost_usd: 0.02,
+        events: vec![AgentEvent::BudgetTick {
+            spent_usd: 0.02,
+            limit_usd: Some(0.2),
+            mode: BudgetMode::Enforced,
+        }],
+    };
+
+    settle_reflection_budget(&mut report, &mut guard);
+
+    assert!((guard.spent_usd() - 0.82).abs() < f64::EPSILON);
+    let ticks = report
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::BudgetTick {
+                spent_usd,
+                limit_usd,
+                ..
+            } => Some((*spent_usd, *limit_usd)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ticks.len(), 1);
+    assert!((ticks[0].0 - 0.82).abs() < f64::EPSILON);
+    assert_eq!(ticks[0].1, Some(1.0));
+}
+
 #[path = "agent_tests/usage_completeness.rs"]
 mod usage_completeness;
+
+/// A `Config` selecting `provider_id` at its default model, carrying
+/// `engine_settings` — the `agent_engine_config` variant of [`cfg_for`] for
+/// `resolve_engine_wiring` tests.
+fn cfg_with_engine(provider_id: &str, engine_settings_json: &str) -> Config {
+    let mut cfg = cfg_for(provider_id);
+    cfg.engine_settings =
+        Some(serde_json::from_str(engine_settings_json).expect("valid agent_engine_config json"));
+    cfg
+}
+
+#[test]
+fn pipeline_worker_model_is_inert_without_the_fix_but_routes_with_it() {
+    // Issue #276: `pipeline_worker_model` (and `agents.worker.*`) must
+    // actually change what `Role::Worker` resolves to — previously the
+    // worker always rode `worker_ref` (the session default), no matter what
+    // this setting said.
+    let cfg = cfg_with_engine(
+        "zai", // session default: zai/glm-5.2
+        r#"{ "pipeline_worker_model": "anthropic/claude-fable-5" }"#,
+    );
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+    let configured = vec![configured_provider("zai"), configured_provider("anthropic")];
+
+    let wiring = resolve_engine_wiring(&cfg, &model_ref, &configured);
+
+    let overridden = ModelRef::new("anthropic", "claude-fable-5");
+    assert_eq!(
+        wiring.worker_model, overridden,
+        "the wiring's own worker_model must reflect the pipeline_worker_model override"
+    );
+    assert_eq!(
+        wiring.pins.get(Role::Worker),
+        Some(&overridden),
+        "Role::Worker must be pinned to the configured worker model"
+    );
+    assert_eq!(
+        wiring.pins.get(Role::Plan),
+        Some(&overridden),
+        "Role::Plan shares the worker's tier and must follow the override too, or plan/witness \
+         turns would silently keep running on the session default"
+    );
+    assert!(
+        wiring
+            .extra_providers
+            .iter()
+            .any(|(model_ref, _)| *model_ref == overridden),
+        "an adapter for the overridden worker model must be built"
+    );
+
+    // The full round trip through the actual router (what `resolve_provider`
+    // in `stella-pipeline` calls) must resolve BOTH roles to the override,
+    // not just the raw pin table.
+    let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
+    let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
+    assert_eq!(
+        router.resolve(Role::Worker).unwrap().model_ref,
+        overridden,
+        "the router must actually route worker turns to the override"
+    );
+    assert_eq!(
+        router.resolve(Role::Plan).unwrap().model_ref,
+        overridden,
+        "the router must actually route plan turns to the override"
+    );
+}
+
+/// Issue #272: `stella init`'s summary line must surface generated/minified
+/// exclusion count, not let excluded files silently vanish from the totals.
+/// Tested on the pure builder/output functions, never a live TTY.
+#[test]
+fn format_graph_stats_reports_generated_skip_count_when_nonzero() {
+    let summary = GraphSummary {
+        total_symbols: 12,
+        total_imports: 4,
+        total_files: 3,
+        files_parsed: 2,
+        files_unchanged: 1,
+        files_skipped_generated: 5,
+    };
+    let line = format_graph_stats(&summary);
+    assert!(
+        line.contains("skipped 5 generated files"),
+        "line should surface the skip count: {line}"
+    );
+    assert!(line.contains("12 symbols"), "{line}");
+}
+
+#[test]
+fn format_graph_stats_omits_the_skip_clause_when_nothing_was_skipped() {
+    let summary = GraphSummary {
+        total_symbols: 1,
+        total_imports: 0,
+        total_files: 1,
+        files_parsed: 1,
+        files_unchanged: 0,
+        files_skipped_generated: 0,
+    };
+    let line = format_graph_stats(&summary);
+    assert!(
+        !line.contains("skipped"),
+        "no skip clause when nothing was excluded: {line}"
+    );
+}
+
+#[test]
+fn worker_model_unset_falls_back_to_the_session_default() {
+    // No `pipeline_worker_model`/`agents.worker.*` configured at all: the
+    // worker must behave exactly as before this fix — riding the session
+    // default, no pin, no extra adapter.
+    let cfg = cfg_with_engine(
+        "zai",
+        r#"{ "pipeline_judge_model": "anthropic/claude-fable-5" }"#,
+    );
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+    let configured = vec![configured_provider("zai"), configured_provider("anthropic")];
+
+    let wiring = resolve_engine_wiring(&cfg, &model_ref, &configured);
+
+    assert_eq!(
+        wiring.worker_model, model_ref,
+        "with no worker override, worker_model falls back to the session default"
+    );
+    assert!(
+        wiring.pins.get(Role::Worker).is_none(),
+        "no worker pin is recorded when unconfigured"
+    );
+    assert!(
+        wiring.pins.get(Role::Plan).is_none(),
+        "no plan pin is recorded when unconfigured"
+    );
+}
+
+#[test]
+fn worker_model_with_no_resolvable_credential_falls_back_and_notices() {
+    // The configured worker provider has no credential available: the
+    // override must degrade to the session default (soft failure), with a
+    // human-readable notice — never a hard error, matching triage/judge's
+    // existing posture. An explicit `agents.worker.provider` pin (rather
+    // than a flat-key `provider/slug` string) is what exercises this path:
+    // an unconfigured provider named only inside a flat-key string is not
+    // even recognized as a provider prefix (`model_spec_for`'s `is_provider`
+    // gate), so it never reaches `pin_role`'s credential lookup at all.
+    let cfg = cfg_with_engine(
+        "zai",
+        r#"{ "agents": { "worker": { "provider": "anthropic" } } }"#,
+    );
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+    let configured = vec![configured_provider("zai")]; // anthropic NOT configured
+
+    let wiring = resolve_engine_wiring(&cfg, &model_ref, &configured);
+
+    assert_eq!(
+        wiring.worker_model, model_ref,
+        "an unroutable worker override must fall back to the session default"
+    );
+    assert!(wiring.pins.get(Role::Worker).is_none());
+    assert!(
+        wiring
+            .notices
+            .iter()
+            .any(|n| n.contains("worker") && n.contains("anthropic")),
+        "a skipped worker override must be reported: {:?}",
+        wiring.notices
+    );
+}
+
+#[test]
+fn worker_override_equal_to_the_session_default_still_pins_without_a_duplicate_adapter() {
+    // Configuring the worker to the SAME model the session already defaults
+    // to must not build a redundant second adapter (mirrors the existing
+    // triage/judge "same instance" optimization) — but the pin is still
+    // recorded, matching that established behavior.
+    let cfg = cfg_with_engine("zai", r#"{ "pipeline_worker_model": "zai/glm-5.2" }"#);
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+    let configured = vec![configured_provider("zai")];
+
+    let wiring = resolve_engine_wiring(&cfg, &model_ref, &configured);
+
+    assert_eq!(wiring.worker_model, model_ref);
+    assert_eq!(wiring.pins.get(Role::Worker), Some(&model_ref));
+    assert!(
+        wiring.extra_providers.is_empty(),
+        "no extra adapter is needed when the override equals the session default"
+    );
+}
+
+#[test]
+fn worker_override_shifts_the_judges_cross_family_comparison() {
+    // Issue #276's router-correctness corollary: once the worker is
+    // overridden, auto-mode judge selection (and the router's own unpinned-
+    // judge cross-family fallback) must compare against the model the
+    // worker ACTUALLY resolves to, not the stale session default — else a
+    // judge could silently collapse to the same family as the real worker.
+    let cfg = cfg_with_engine(
+        "zai",
+        r#"{ "pipeline_worker_model": "anthropic/claude-fable-5",
+             "auto_mode": "on",
+             "allowed_models": ["anthropic/claude-fable-5", "zai/glm-5.2"] }"#,
+    );
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+    let configured = vec![configured_provider("zai"), configured_provider("anthropic")];
+
+    let wiring = resolve_engine_wiring(&cfg, &model_ref, &configured);
+
+    // The worker now runs on Anthropic; auto-mode must pick the cross-family
+    // candidate (zai) as judge, not Anthropic again (which the STALE
+    // "worker family = zai" comparison would have wrongly treated as
+    // cross-family).
+    assert_eq!(
+        wiring.pins.get(Role::Judge),
+        Some(&ModelRef::new("zai", "glm-5.2")),
+        "auto-mode judge selection must be cross-family from the OVERRIDDEN worker, not the \
+         session default"
+    );
+}
+
+#[test]
+fn format_graph_stats_uses_singular_file_for_a_count_of_one() {
+    let summary = GraphSummary {
+        total_symbols: 0,
+        total_imports: 0,
+        total_files: 0,
+        files_parsed: 0,
+        files_unchanged: 0,
+        files_skipped_generated: 1,
+    };
+    let line = format_graph_stats(&summary);
+    assert!(line.contains("skipped 1 generated file"), "{line}");
+    assert!(
+        !line.contains("generated files"),
+        "singular, not plural, for a count of one: {line}"
+    );
+}
+
+/// End-to-end through the real builder `stella init` calls
+/// ([`index_workspace_graph_blocking`]): a `*.min.*` file sitting at the
+/// workspace root (no denied directory involved) must be excluded and
+/// counted, while an ordinary file alongside it indexes normally.
+#[test]
+fn index_workspace_graph_blocking_reports_generated_skips_end_to_end() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("app.min.js"), "function refresh(){}\n").unwrap();
+    std::fs::write(ws.path().join("main.rs"), "pub fn run() {}\n").unwrap();
+
+    let summary = index_workspace_graph_blocking(ws.path()).expect("index build succeeds");
+    assert_eq!(summary.total_files, 1, "the minified file is never indexed");
+    assert_eq!(summary.files_skipped_generated, 1);
+
+    let line = format_graph_stats(&summary);
+    assert!(line.contains("skipped 1 generated file"), "{line}");
+}

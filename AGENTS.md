@@ -129,18 +129,30 @@ regardless of how good the feature is:
    and `stella-cli/src/memory.rs` for the L-E8 discipline).
 
 8. **Provider feature parity is declared, not assumed.** Providers diverge
-   in sneaky ways (Anthropic's prompt cache is explicit opt-in; DeepSeek
-   spells its cache-hit telemetry differently; only OpenRouter speaks the
-   normalized `reasoning` object). Any per-provider feature divergence is
-   recorded as a matrix in `stella-model/src/provider_parity.rs`, where each
-   provider id declares its posture and names the **witness test** proving
-   it on the wire. Tests enforce the matrix from both sides: `stella-cli`'s
-   config tests fail if a seeded provider lacks a row, and `stella-model`'s
-   parity tests fail if a row's witness test no longer exists. Adding a
-   provider — or a new divergent feature axis — means updating the matrix
-   in the same PR. Born from a real defect: OpenRouter ran Claude models
-   with ZERO prompt caching for months because nothing enforced the cache
-   axis.
+   in sneaky ways, and this is guarded on **two axes** today in
+   `stella-model/src/provider_parity.rs`:
+   - **`CachePosture`** — how the prompt cache is engaged/observed
+     (Anthropic's cache is explicit opt-in; DeepSeek spells its cache-hit
+     telemetry differently; OpenRouter needs a request-root `cache_control`
+     plus a sticky `session_id`).
+   - **`ReasoningPosture`** — how reasoning/thinking is controlled on the
+     wire (`Controllable`/`FixedOn`/`FixedOff`/`Unsupported`). Only Z.ai
+     (`thinking`), OpenRouter (`reasoning`), Anthropic/Gemini/Vertex
+     (thinking budget / `thinkingLevel`), OpenAI and now xAI
+     (`reasoning[_]effort`) honor a pinned effort; the shared adapter drops
+     it for `Unsupported` providers (bedrock/deepseek/local) — and a pinned
+     effort against one surfaces a one-line boot notice, never a silent drop.
+
+   Each provider id declares a posture on **every** axis and, for a
+   controllable/opt-in/implicit posture, names the **witness test** proving
+   it on the wire. Tests enforce each matrix from both sides: `stella-cli`'s
+   config tests fail if a seeded provider lacks a row on either axis, and
+   `stella-model`'s parity tests fail if a row's witness test no longer
+   exists. Adding a provider — or a new divergent feature axis — means
+   updating the matrix in the same PR. Born from a real defect: OpenRouter
+   ran Claude models with ZERO prompt caching for months because nothing
+   enforced the cache axis; the reasoning axis was added after the same
+   silent-drop shape recurred for pinned `effort`.
 
 ---
 
