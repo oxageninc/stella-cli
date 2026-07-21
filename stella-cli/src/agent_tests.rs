@@ -300,6 +300,7 @@ fn cfg_for(provider_id: &str) -> Config {
         engine_settings: None,
         tools_bash: false,
         tools_web: false,
+        credential_source: None,
     }
 }
 

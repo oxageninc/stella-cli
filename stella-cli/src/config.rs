@@ -234,7 +234,7 @@ fn leak(s: &str) -> &'static str {
 /// The env var a config-defined provider reads its credential from when the
 /// entry doesn't name one: `<ID>_API_KEY`, uppercased, with anything outside
 /// `[A-Za-z0-9]` folded to `_` (`my-gateway` → `MY_GATEWAY_API_KEY`).
-fn derived_env_var(id: &str) -> String {
+pub(crate) fn derived_env_var(id: &str) -> String {
     let mut var: String = id
         .chars()
         .map(|c| {
@@ -255,7 +255,7 @@ fn derived_env_var(id: &str) -> String {
 /// `ANTHROPIC_API_KEY` keeps working). `dialect` on a built-in override is
 /// ignored — a built-in's dialect is fixed by its adapter — and the catalog
 /// check stays on (`seeded` is untouched).
-fn effective_builtin(
+pub(crate) fn effective_builtin(
     provider: &ProviderConfig,
     settings: &crate::settings::Settings,
 ) -> ProviderConfig {
@@ -287,7 +287,7 @@ fn effective_builtin(
 /// `dialect` defaults to OpenAI-compatible; the model catalog check is off
 /// (`seeded: false`) because the user's endpoint, not our seed data, is the
 /// authority on which models exist.
-fn custom_provider(
+pub(crate) fn custom_provider(
     id: &str,
     entry: &crate::settings::ProviderSettings,
 ) -> Result<ProviderConfig, String> {
@@ -384,6 +384,13 @@ pub struct Config {
     /// Same threading as `tools_bash` — the default tool surface has no
     /// network egress.
     pub tools_web: bool,
+    /// Which step in the credential chain produced `api_key` — `stella
+    /// config` displays this next to the redacted key preview so the
+    /// command can never disagree with what actually resolved it. `None`
+    /// only for the `local` provider's placeholder bearer token when no
+    /// real credential (flag/env) was involved — not a resolved secret, so
+    /// there is no source to report.
+    pub credential_source: Option<stella_model::credential::CredentialSource>,
 }
 
 impl Config {
@@ -554,16 +561,28 @@ impl Config {
                      --base-url http://localhost:11434/v1)"
                         .to_string()
                 })?;
-                let api_key = api_key_override
-                    .map(str::to_string)
-                    .or_else(|| {
-                        env::var(LOCAL_PROVIDER.env_var)
-                            .ok()
-                            .filter(|v| !v.is_empty())
-                    })
+                // Track WHERE the local key came from (if anywhere real) so
+                // `stella config` reports it accurately — the "local"
+                // fallback below is a placeholder bearer token, not a
+                // resolved credential, so it gets no source.
+                let (api_key, credential_source) = if let Some(flag) = api_key_override {
+                    (
+                        flag.to_string(),
+                        Some(stella_model::credential::CredentialSource::CliFlag),
+                    )
+                } else if let Some(env_value) = env::var(LOCAL_PROVIDER.env_var)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                {
+                    (
+                        env_value,
+                        Some(stella_model::credential::CredentialSource::EnvVar),
+                    )
+                } else {
                     // Most local servers ignore auth; OpenAI-compatible
                     // clients still send *something* as the bearer token.
-                    .unwrap_or_else(|| "local".to_string());
+                    ("local".to_string(), None)
+                };
                 return Ok(Self {
                     provider: LOCAL_PROVIDER.clone(),
                     model_id,
@@ -574,6 +593,7 @@ impl Config {
                     engine_settings: None,
                     tools_bash: false,
                     tools_web: false,
+                    credential_source,
                 });
             }
 
@@ -766,6 +786,7 @@ impl Config {
             engine_settings: None,
             tools_bash: false,
             tools_web: false,
+            credential_source: Some(source),
         })
     }
 
@@ -773,12 +794,20 @@ impl Config {
     /// depends only on `PROVIDERS` and the ambient environment, never on
     /// `self`, so it delegates to the static [`Config::print_available_models`]
     /// — one renderer backs both the `/models` REPL command and the top-level
-    /// `stella models` subcommand, and they can never drift apart.
+    /// `stella models` subcommand, and they can never drift apart. The REPL
+    /// call site has no startup `Loaded` record handy, so its source labels
+    /// degrade to the generic `env:VAR` form rather than a specific dotenv
+    /// filename — see `credential_status::label_for`.
     pub fn print_models(&self) {
-        Self::print_available_models();
+        Self::print_available_models(None);
     }
 
-    pub fn print_config(&self) {
+    /// `loaded_env` is the startup dotenv-load record (main's
+    /// `env_files::maybe_load` result) — pass `Some` so the API Key line can
+    /// name the exact `.env*` file a key came from, and so the "Env files"
+    /// line (always shown, unconditionally — unlike `STELLA_ENV_DEBUG`) can
+    /// list which files/names were loaded.
+    pub fn print_config(&self, loaded_env: Option<&crate::env_files::Loaded>) {
         println!(
             "{}\n",
             "Stella — Current Configuration".bright_cyan().bold()
@@ -792,22 +821,52 @@ impl Config {
             self.provider.id.bright_magenta(),
             self.model_id.bright_white()
         );
-        println!("  API Key:    {}", self.api_key.redacted_preview().dimmed());
+        let source = self
+            .credential_source
+            .map(|s| crate::credential_status::label_for(&self.provider, s, loaded_env))
+            .unwrap_or_else(|| "n/a (local placeholder)".to_string());
+        println!(
+            "  API Key:    {} {}",
+            self.api_key.redacted_preview().dimmed(),
+            format!("({source})").dimmed()
+        );
         println!("  Base URL:   {}", self.effective_base_url().dimmed());
         println!("  Workspace:  {}", self.workspace_root.display());
         println!("  Dialect:    {}", self.provider.dialect.label());
+        if let Some(summary) = loaded_env.and_then(crate::credential_status::env_files_summary) {
+            println!("  Env files:  {}", summary.dimmed());
+        }
     }
 }
 
 impl Config {
+    /// The credentials file to check provider status against, degrading to
+    /// an empty in-memory one (rather than aborting the whole listing) on a
+    /// read/parse failure — the listing commands must still show the
+    /// built-ins even when `~/.config/stella/credentials.toml` is malformed.
+    /// Returns the degradation warning line, if any, alongside the file.
+    fn credentials_file_for_listing() -> (CredentialsFile, Option<String>) {
+        match CredentialsFile::load_default() {
+            Ok(f) => (f, None),
+            Err(e) => (
+                CredentialsFile::empty(),
+                Some(format!(
+                    "~/.config/stella/credentials.toml could not be read: {e}"
+                )),
+            ),
+        }
+    }
+
     /// The provider/model table as plain text (no ANSI): the built-in
     /// providers with their key status, then any config-defined providers
     /// from `.stella/settings.json` — the same two sections the ANSI
     /// `print_available_models` renders, so `/models` in the deck lists
     /// exactly what `stella models` does. The Command Deck renders this into
     /// the transcript; stdout printing would corrupt the alternate screen, so
-    /// the deck needs a string, not a print.
-    pub fn available_models_plain() -> String {
+    /// the deck needs a string, not a print. `loaded_env`: see
+    /// [`Config::print_config`]'s doc — `None` at call sites that don't have
+    /// the startup dotenv record handy (the deck, the REPL fallback).
+    pub fn available_models_plain(loaded_env: Option<&crate::env_files::Loaded>) -> String {
         // Surface a settings load/parse failure rather than silently reporting
         // built-in defaults (which would hide a malformed config and wrong key
         // status), then continue with defaults so the listing still renders.
@@ -818,27 +877,33 @@ impl Config {
             Ok(s) => (s, None),
             Err(e) => (crate::settings::Settings::default(), Some(e)),
         };
+        let (credentials_file, credentials_error) = Self::credentials_file_for_listing();
         let mut lines = vec!["Available providers & models:".to_string()];
         if let Some(e) = &load_error {
             lines.push(format!("  ! settings could not be read: {e}"));
         }
+        if let Some(e) = &credentials_error {
+            lines.push(format!("  ! {e}"));
+        }
         for p in PROVIDERS {
             let p = effective_builtin(p, &settings);
-            let settings_key = settings
-                .providers
-                .get(p.id)
-                .and_then(|e| e.api_key.as_deref())
-                .is_some_and(|k| !k.is_empty());
-            let has_key = settings_key
-                || std::iter::once(&p.env_var)
-                    .chain(p.env_var_aliases)
-                    .any(|var| env::var(var).map(|v| !v.is_empty()).unwrap_or(false));
+            let settings_key = crate::credential_status::settings_literal_key(&p, &settings);
+            let status = crate::credential_status::status_for(
+                &p,
+                settings_key.as_deref(),
+                &credentials_file,
+                loaded_env,
+            );
             lines.push(format!(
-                "  {} {}/{}  {}",
-                if has_key { "✓" } else { "✗" },
+                "  {} {}/{}  {}{}",
+                if status.configured { "✓" } else { "✗" },
                 p.id,
                 p.default_model,
                 p.display_name,
+                status
+                    .source_label
+                    .map(|s| format!("  [{s}]"))
+                    .unwrap_or_default(),
             ));
         }
         // Config-defined (non-built-in) providers, mirroring the ANSI table.
@@ -861,18 +926,16 @@ impl Config {
                 lines.push("Config-defined providers (settings.json):".to_string());
                 printed_header = true;
             }
-            // Key status must consider the provider's env var (settable via
-            // `api_key_env` or the derived default), not only the settings
-            // literal — otherwise a provider keyed through the environment
-            // wrongly shows ✗ (matching the built-in branch above).
-            let settings_key = entry.api_key.as_deref().is_some_and(|k| !k.is_empty());
-            let has_key = settings_key
-                || std::iter::once(&p.env_var)
-                    .chain(p.env_var_aliases)
-                    .any(|var| env::var(var).map(|v| !v.is_empty()).unwrap_or(false));
+            let settings_key = entry.api_key.clone();
+            let status = crate::credential_status::status_for(
+                &p,
+                settings_key.as_deref(),
+                &credentials_file,
+                loaded_env,
+            );
             lines.push(format!(
-                "  {} {}/{}  {}",
-                if has_key { "✓" } else { "✗" },
+                "  {} {}/{}  {}{}",
+                if status.configured { "✓" } else { "✗" },
                 p.id,
                 if p.default_model.is_empty() {
                     "<model>"
@@ -880,6 +943,10 @@ impl Config {
                     p.default_model
                 },
                 p.display_name,
+                status
+                    .source_label
+                    .map(|s| format!("  [{s}]"))
+                    .unwrap_or_default(),
             ));
         }
         lines.push("Pin one with --model provider/model_id on the next launch.".to_string());
@@ -888,10 +955,11 @@ impl Config {
 
     /// Print all available providers/models without needing a resolved
     /// config: the built-in table (with any settings.json overrides
-    /// applied), then the config-defined providers. A malformed settings
-    /// file degrades to a warning here — a listing command should still
-    /// list the built-ins.
-    pub fn print_available_models() {
+    /// applied), then the config-defined providers. A malformed settings or
+    /// credentials file degrades to a warning here — a listing command
+    /// should still list the built-ins. `loaded_env`: see
+    /// [`Config::print_config`]'s doc.
+    pub fn print_available_models(loaded_env: Option<&crate::env_files::Loaded>) {
         let settings = match env::current_dir()
             .map_err(|e| e.to_string())
             .and_then(|ws| crate::settings::Settings::load(&ws))
@@ -902,35 +970,45 @@ impl Config {
                 crate::settings::Settings::default()
             }
         };
+        let (credentials_file, credentials_error) = Self::credentials_file_for_listing();
+        if let Some(e) = &credentials_error {
+            eprintln!("  {} {e}", "warning:".yellow());
+        }
         println!(
             "{}\n",
             "Stella — Available Providers & Models".bright_cyan().bold()
         );
-        let key_status = |p: &ProviderConfig, settings_key: bool| {
-            let has_key = settings_key
-                || std::iter::once(&p.env_var)
-                    .chain(p.env_var_aliases)
-                    .any(|var| env::var(var).map(|v| !v.is_empty()).unwrap_or(false));
-            if has_key {
+        let key_status = |status: &crate::credential_status::CredentialStatus| {
+            if status.configured {
                 "✓ configured".green()
             } else {
                 "✗ no key".dimmed()
             }
         };
+        let source_suffix = |status: &crate::credential_status::CredentialStatus| {
+            status
+                .source_label
+                .as_ref()
+                .map(|s| format!(" ({s})").dimmed().to_string())
+                .unwrap_or_default()
+        };
         for p in PROVIDERS {
             let p = effective_builtin(p, &settings);
-            let settings_key = settings
-                .providers
-                .get(p.id)
-                .and_then(|e| e.api_key.as_deref())
-                .is_some_and(|k| !k.is_empty());
+            let settings_key = crate::credential_status::settings_literal_key(&p, &settings);
+            let status = crate::credential_status::status_for(
+                &p,
+                settings_key.as_deref(),
+                &credentials_file,
+                loaded_env,
+            );
             println!(
-                "  {} {}/{}  {}  [{}]",
-                key_status(&p, settings_key),
+                "  {} {}/{}  {}  [{}]{}",
+                key_status(&status),
                 p.id.bright_magenta(),
                 p.default_model.bright_white(),
                 p.display_name,
                 p.base_url.dimmed(),
+                source_suffix(&status),
             );
         }
         let mut printed_header = false;
@@ -949,10 +1027,16 @@ impl Config {
                 println!("\n  {}", "Config-defined providers (settings.json):".bold());
                 printed_header = true;
             }
-            let settings_key = entry.api_key.as_deref().is_some_and(|k| !k.is_empty());
+            let settings_key = entry.api_key.clone();
+            let status = crate::credential_status::status_for(
+                &p,
+                settings_key.as_deref(),
+                &credentials_file,
+                loaded_env,
+            );
             println!(
-                "  {} {}/{}  {}  [{}] ({})",
-                key_status(&p, settings_key),
+                "  {} {}/{}  {}  [{}] ({}){}",
+                key_status(&status),
                 p.id.bright_magenta(),
                 if p.default_model.is_empty() {
                     "<model>"
@@ -963,6 +1047,7 @@ impl Config {
                 p.display_name,
                 p.base_url.dimmed(),
                 p.dialect.label().dimmed(),
+                source_suffix(&status),
             );
         }
         println!("\n  Use --model provider/model_id to pin a specific model.");
@@ -981,8 +1066,16 @@ impl Config {
 /// exactly env-var precedence — after the primary var, before the settings
 /// literal. A settings `api_key` outranks the credentials file because it
 /// is explicit, scope-merged configuration; the credentials file is the
-/// store interactive prompts write into.
-fn resolve_provider_key(
+/// store interactive prompts write into. The returned `CredentialSource`
+/// distinguishes the two file-shaped stores (`SettingsJson` for the
+/// settings.json literal, `ConfigFile` for a real credentials.toml hit) so
+/// callers displaying the source (`stella models`/`stella config`/`stella
+/// auth list`) never conflate them. This is the SAME resolution `Config`
+/// itself uses — `discover_configured_providers` and the "is this provider
+/// configured" status shown by `stella models`/`stella config` both call
+/// through here, so status can never disagree with what `stella run` would
+/// actually do.
+pub(crate) fn resolve_provider_key(
     provider: &ProviderConfig,
     api_key_override: Option<&str>,
     settings_key: Option<&str>,
@@ -1012,7 +1105,7 @@ fn resolve_provider_key(
                 }
             }
             if let Some(settings_key) = settings_key.filter(|k| !k.is_empty()) {
-                return Ok((ApiKey::new(settings_key), CredentialSource::ConfigFile));
+                return Ok((ApiKey::new(settings_key), CredentialSource::SettingsJson));
             }
             Ok((key, source))
         }
@@ -1027,7 +1120,7 @@ fn resolve_provider_key(
                 }
             }
             if let Some(settings_key) = settings_key.filter(|k| !k.is_empty()) {
-                return Ok((ApiKey::new(settings_key), CredentialSource::ConfigFile));
+                return Ok((ApiKey::new(settings_key), CredentialSource::SettingsJson));
             }
             // Nothing anywhere — rerun the full chain with the caller's
             // interactivity so the prompt step can fire when allowed.

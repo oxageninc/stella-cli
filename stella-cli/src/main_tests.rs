@@ -7,7 +7,7 @@
 
 use clap::{CommandFactory, Parser};
 
-use super::{Cli, Command, ConnectCmd, OutputFormat};
+use super::{AuthCmd, Cli, Command, ConnectCmd, OutputFormat};
 
 /// clap's own consistency audit (conflicting ids, broken defaults,
 /// mis-typed value parsers) — panics on the first violation. Runs the same
@@ -167,4 +167,69 @@ fn connect_linear_paste_key_parses() {
         }) => assert!(!paste_key),
         _ => panic!("expected `connect linear`"),
     }
+}
+
+/// `stella auth set <provider> --key <k>` parses, and the global `--api-key`
+/// (a different secret — the model-provider credential) still parses
+/// independently on the same command line, same shape as `connect linear`.
+#[test]
+fn auth_set_key_parses_and_stays_independent_of_the_global_api_key() {
+    let cli = Cli::try_parse_from([
+        "stella",
+        "auth",
+        "set",
+        "zai",
+        "--key",
+        "sk-stored",
+        "--api-key",
+        "sk-model",
+    ])
+    .expect("`auth set <provider> --key <k>` must parse alongside the global --api-key");
+    assert_eq!(cli.globals.api_key.as_deref(), Some("sk-model"));
+    match cli.command {
+        Some(Command::Auth {
+            cmd:
+                AuthCmd::Set {
+                    provider,
+                    key,
+                    stdin,
+                },
+        }) => {
+            assert_eq!(provider, "zai");
+            assert_eq!(key.as_deref(), Some("sk-stored"));
+            assert!(!stdin);
+        }
+        _ => panic!("expected `auth set`"),
+    }
+}
+
+/// `--key` and `--stdin` are mutually exclusive — a user meaning to pipe a
+/// secret in via `--stdin` must not silently also accept a (likely absent)
+/// `--key` value.
+#[test]
+fn auth_set_rejects_key_and_stdin_together() {
+    // `Cli` derives no `Debug` (it carries the model API key), so match
+    // rather than `expect_err`/`unwrap_err` (both require `T: Debug`).
+    match Cli::try_parse_from(["stella", "auth", "set", "zai", "--key", "sk-x", "--stdin"]) {
+        Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict),
+        Ok(_) => panic!("--key and --stdin must conflict"),
+    }
+}
+
+#[test]
+fn auth_remove_and_list_parse() {
+    let cli = Cli::try_parse_from(["stella", "auth", "remove", "zai"])
+        .expect("`auth remove <provider>` must parse");
+    match cli.command {
+        Some(Command::Auth {
+            cmd: AuthCmd::Remove { provider },
+        }) => assert_eq!(provider, "zai"),
+        _ => panic!("expected `auth remove`"),
+    }
+
+    let cli = Cli::try_parse_from(["stella", "auth", "list"]).expect("`auth list` must parse");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Auth { cmd: AuthCmd::List })
+    ));
 }

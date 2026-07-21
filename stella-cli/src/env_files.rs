@@ -50,11 +50,24 @@ use crate::OutputFormat;
 pub struct Loaded {
     pub files: Vec<PathBuf>,
     pub names: Vec<String>,
+    /// Which specific file each loaded variable name came from — lets a
+    /// display surface (`stella config`) attribute e.g. `OPENROUTER_API_KEY`
+    /// to `.env.local` by name, rather than only "loaded from a dotenv file"
+    /// in aggregate.
+    pub name_files: std::collections::BTreeMap<String, PathBuf>,
 }
 
 impl Loaded {
     fn is_empty(&self) -> bool {
         self.names.is_empty()
+    }
+
+    /// The dotenv file that contributed `name`, if any — `None` when `name`
+    /// resolves some other way (a real shell export, a CLI flag, a
+    /// credentials store, …) or wasn't loaded from a project `.env*` file at
+    /// all.
+    pub fn file_for(&self, name: &str) -> Option<&Path> {
+        self.name_files.get(name).map(PathBuf::as_path)
     }
 }
 
@@ -78,17 +91,23 @@ pub fn maybe_load() -> Loaded {
 
     let mut names = Vec::new();
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut name_files = std::collections::BTreeMap::new();
     for (key, value, path) in plan {
         // SAFETY: called only from `main` during single-threaded process
         // startup, before the tokio runtime or any worker threads exist — no
         // concurrent `getenv`/`setenv` can race this write.
         unsafe { std::env::set_var(&key, &value) };
+        name_files.insert(key.clone(), path.clone());
         names.push(key);
         if !files.contains(&path) {
             files.push(path);
         }
     }
-    Loaded { files, names }
+    Loaded {
+        files,
+        names,
+        name_files,
+    }
 }
 
 /// The ordered list of assignments a load would apply, given a predicate for
@@ -372,5 +391,23 @@ mod tests {
         write(home, ".env", "HOME_LEVEL=nope\n");
         // Running *in* $HOME must not load `~/.env`.
         assert_eq!(find_base(home, Some(home)), None);
+    }
+
+    // ---- Loaded::file_for (stella config's "which file, which name") ----
+
+    #[test]
+    fn file_for_attributes_a_loaded_name_to_its_source_file_and_nothing_else() {
+        let local = PathBuf::from("/proj/.env.local");
+        let loaded = Loaded {
+            files: vec![local.clone()],
+            names: vec!["OPENROUTER_API_KEY".to_string()],
+            name_files: [("OPENROUTER_API_KEY".to_string(), local.clone())]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(loaded.file_for("OPENROUTER_API_KEY"), Some(local.as_path()));
+        // A name that was never loaded from a dotenv file (a real shell
+        // export, say) must not be attributed to one.
+        assert_eq!(loaded.file_for("ANTHROPIC_API_KEY"), None);
     }
 }

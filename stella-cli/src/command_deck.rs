@@ -3941,7 +3941,7 @@ async fn run_deck_command(
             });
         }
         "/models" => {
-            say(Config::available_models_plain());
+            say(Config::available_models_plain(None));
         }
         "/pipeline" => {
             *pipeline_on = !*pipeline_on;
@@ -4040,7 +4040,7 @@ async fn run_deck_command(
                             say(format!("refresh failed: {e}"));
                         }
                     }
-                    ModelsCommand::List => say(Config::available_models_plain()),
+                    ModelsCommand::List => say(Config::available_models_plain(None)),
                     ModelsCommand::Usage(word) => say(format!(
                         "`/models {word}` — unknown subcommand; try `/models` or `/models list` \
                          (the listing) or `/models refresh [--force]` (re-sync the catalog)"

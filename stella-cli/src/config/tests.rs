@@ -104,6 +104,7 @@ fn config_debug_never_leaks_the_api_key() {
         engine_settings: None,
         tools_bash: false,
         tools_web: false,
+        credential_source: Some(stella_model::credential::CredentialSource::EnvVar),
     };
     let dbg = format!("{cfg:?}");
     assert!(!dbg.contains(secret), "Config Debug leaked the key: {dbg}");
@@ -334,7 +335,7 @@ fn a_bare_slug_matches_a_custom_providers_default_model() {
 #[test]
 fn discovery_style_resolution_accepts_the_settings_literal_key() {
     // resolve_provider_key with a settings literal and nothing else:
-    // resolves non-interactively as ConfigFile — this is what puts
+    // resolves non-interactively as SettingsJson — this is what puts
     // config-defined providers into auto-detection and judge discovery.
     let provider = ProviderConfig {
         id: "settings-key-test",
@@ -356,7 +357,45 @@ fn discovery_style_resolution_accepts_the_settings_literal_key() {
     assert_eq!(key.reveal(), "sk-settings");
     assert_eq!(
         source,
-        stella_model::credential::CredentialSource::ConfigFile
+        stella_model::credential::CredentialSource::SettingsJson
+    );
+}
+
+/// Issue #249's source-display requirement: a settings.json literal and a
+/// real credentials.toml entry are two DIFFERENT stores, and a caller
+/// showing "where did this come from" must be able to tell them apart. On
+/// origin/main both cases reported the same `CredentialSource::ConfigFile`,
+/// which is what let `stella config` conflate "declared in settings.json"
+/// with "stored in credentials.toml". This constructs a provider with BOTH
+/// present (the settings literal must win per the documented precedence)
+/// and asserts the resolved source is the settings-specific variant, not
+/// the file one — the file's differing value proves which one actually won.
+#[test]
+fn settings_json_literal_is_reported_distinctly_from_a_real_credentials_toml_entry() {
+    let provider = ProviderConfig {
+        id: "settings-vs-file-test",
+        env_var: "STELLA_TEST_SETTINGS_VS_FILE_UNSET",
+        env_var_aliases: &[],
+        display_name: "Settings vs File Test",
+        default_model: "m",
+        base_url: "https://x.example/v1",
+        dialect: Dialect::OpenaiCompatible,
+        seeded: false,
+    };
+    let mut file = CredentialsFile::load(std::env::temp_dir().join(format!(
+        "stella-test-settings-vs-file-credentials-{}.toml",
+        std::process::id()
+    )))
+    .unwrap();
+    file.set("settings-vs-file-test", "sk-from-credentials-file");
+
+    let (key, source) =
+        resolve_provider_key(&provider, None, Some("sk-from-settings-json"), &file, false).unwrap();
+    assert_eq!(key.reveal(), "sk-from-settings-json");
+    assert_eq!(
+        source,
+        stella_model::credential::CredentialSource::SettingsJson,
+        "a settings.json literal must be reported as SettingsJson, distinct from ConfigFile"
     );
 }
 

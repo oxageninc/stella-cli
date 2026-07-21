@@ -20,11 +20,13 @@
 mod agent;
 mod agents_installed;
 mod attachments;
+mod auth_cmd;
 mod candidate_ws;
 mod claims;
 mod command_deck;
 mod config;
 mod connect_cmd;
+mod credential_status;
 mod discovery;
 mod domains;
 mod engine_config;
@@ -382,8 +384,53 @@ enum Command {
     /// Show current configuration
     Config,
 
+    /// Manage BYOK provider keys stored in
+    /// ~/.config/stella/credentials.toml (set/remove/list) — keys resolved
+    /// via an env var or settings.json still take precedence per the normal
+    /// chain; `stella models`/`stella config` show which source actually
+    /// wins. Never prints a secret value; needs no model API key itself.
+    Auth {
+        #[command(subcommand)]
+        cmd: AuthCmd,
+    },
+
     /// Print the version and exit
     Version,
+}
+
+/// `stella auth` subcommands — the whole `~/.config/stella/credentials.toml`
+/// management surface. Deliberately small: a handful of BYOK keys, not a
+/// config language (mirrors `CredentialsFile`'s own doc intent).
+#[derive(Subcommand)]
+pub enum AuthCmd {
+    /// Store (or replace) a provider's API key in credentials.toml.
+    Set {
+        /// Provider id (a built-in like `zai`/`anthropic`/`openai`, or a
+        /// settings.json-defined custom provider id)
+        provider: String,
+
+        /// Pass the key directly on the command line. WARNING: this value
+        /// becomes visible in shell history and `ps` output — prefer
+        /// --stdin, or omit both flags for an interactive masked prompt.
+        #[arg(long, conflicts_with = "stdin")]
+        key: Option<String>,
+
+        /// Read the key from stdin (one line, trimmed) instead of a flag or
+        /// an interactive prompt — for scripts, e.g. `printf '%s' "$KEY" | \
+        /// stella auth set zai --stdin`.
+        #[arg(long)]
+        stdin: bool,
+    },
+
+    /// Remove a provider's stored key from credentials.toml.
+    Remove {
+        /// Provider id
+        provider: String,
+    },
+
+    /// List providers with a key stored in credentials.toml (redacted
+    /// preview + resolution source).
+    List,
 }
 
 /// `stella models` subcommands — the model-catalog surface. A bare
@@ -983,7 +1030,7 @@ fn main() -> ExitCode {
     // a human output format so it never pollutes json/stream-json.
     env_files::announce(&loaded_env, cli.globals.output_format);
 
-    match run(cli) {
+    match run(cli, &loaded_env) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{} {}", "stella:".red().bold(), e);
@@ -992,13 +1039,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), String> {
+fn run(cli: Cli, loaded_env: &env_files::Loaded) -> Result<(), String> {
     // Models and Version don't need a configured provider/key.
     match &cli.command {
         Some(Command::Models { cmd }) => {
             return match cmd {
                 None => {
-                    config::Config::print_available_models();
+                    config::Config::print_available_models(Some(loaded_env));
                     model_catalog::print_catalog_status();
                     Ok(())
                 }
@@ -1070,6 +1117,13 @@ fn run(cli: Cli) -> Result<(), String> {
                 );
             }
             return connect_cmd::run(cmd);
+        }
+        Some(Command::Auth { cmd }) => {
+            // Reads/writes ~/.config/stella/credentials.toml directly — no
+            // provider needs to already resolve (this is often how the
+            // FIRST key gets configured), so this short-circuits before
+            // `Config::load` like `Connect`/`Mcp` do.
+            return auth_cmd::run(cmd);
         }
         Some(Command::Observe { port, open }) => {
             // Loopback-only dashboard over local telemetry — no provider or
@@ -1233,13 +1287,14 @@ fn run(cli: Cli) -> Result<(), String> {
         | Command::Memory { .. }
         | Command::Mcp { .. }
         | Command::Connect { .. }
+        | Command::Auth { .. }
         | Command::Observe { .. }
         | Command::Models { .. }
         | Command::Version => {
             unreachable!("handled before provider resolution")
         }
         Command::Config => {
-            cfg.print_config();
+            cfg.print_config(Some(loaded_env));
         }
     }
     Ok(())

@@ -510,7 +510,10 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             continue;
         }
         if input == "/config" {
-            cfg.print_config();
+            // The REPL fallback has no startup dotenv-load record handy —
+            // the source label just degrades to the generic `env:VAR` form
+            // (see `Config::print_config`'s doc).
+            cfg.print_config(None);
             continue;
         }
         if input == "/help" {
