@@ -1,8 +1,10 @@
 //! The orchestrator: the staged turn flow that sits
 //! *above* `stella-core::Engine`. It sequences evaluate → enhance → route →
 //! witness → execute → verify → judge → revise over the injected ports,
-//! emitting a `Stage` event at every boundary and exactly one terminal
-//! `Complete`.
+//! emitting a `Stage` event at every boundary and owning terminal
+//! success-or-failure signaling for outcome-producing runs (`Complete` or a
+//! non-retryable `Error`). Hard infrastructure failures return out of band as
+//! [`PipelineRunError`].
 //!
 //! Everything here is I/O sequencing; every *decision* it makes is delegated
 //! to a pure function in a sibling module (`triage`, `plan`, `scope`,
@@ -15,11 +17,14 @@
 //! `stella-core::Engine::run_turn` emits its own `Stage { Execute }`, a
 //! terminal `Stage { Complete }`, and a `Complete` — correct for *one turn*,
 //! but a multi-step plan or a revise loop runs several turns. The pipeline is
-//! the **single authority** for stage boundaries and the one terminal
-//! `Complete`: it gives each `run_turn` a private channel, then forwards every
-//! event to the consumer *except* the engine's `Stage`/`Complete` (which would
-//! otherwise falsely signal "done" after step one). This mirrors the
-//! one-emission-point discipline of L-E1/L-T5.
+//! the **single authority** for stage boundaries and the terminal event on an
+//! outcome-producing run: it gives each `run_turn` a private channel, then
+//! forwards every event to the consumer *except* the engine's
+//! `Stage`/`Complete` (which would otherwise falsely signal "done" after step
+//! one). The pipeline emits `Complete` for success or a non-retryable `Error`
+//! for terminal failure; hard [`PipelineRunError`] exits remain typed return
+//! values for the caller to close out. This mirrors the one-emission-point
+//! discipline of L-E1/L-T5.
 //!
 //! # Cache discipline (L-E8)
 //!
@@ -1739,8 +1744,8 @@ impl<'a> Pipeline<'a> {
             while let Some(event) = rx.recv().await {
                 let forward = match &event {
                     // The pipeline is the sole authority for stage boundaries
-                    // and the terminal Complete — drop the engine's per-turn
-                    // copies.
+                    // and the terminal event of an outcome-producing run —
+                    // drop the engine's per-turn copies.
                     AgentEvent::Stage { .. } | AgentEvent::Complete { .. } => false,
                     AgentEvent::FileChange { kind, .. } => {
                         // Reads ride the same event for the files panel but

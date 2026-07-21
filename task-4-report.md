@@ -134,3 +134,46 @@ in a second strict RED/GREEN pass without rewriting the original commit.
 - `cargo test -p stella-protocol`: 42 passed.
 - Workspace clippy with `-D warnings`, formatting, file-size ratchet, and diff
   whitespace checks passed.
+
+## Speculative-settlement follow-up
+
+The final review found one remaining cancellation window: a provider could
+finish a billed `complete_observed` call while a speculative read remained
+blocked, but the engine joined both futures before recording the cost. Dropping
+the turn in that interval discarded the successful provider result and left
+the caller-owned ledger at zero.
+
+### Final RED/GREEN evidence
+
+- `cancellation_after_billed_completion_before_speculation_finishes_keeps_the_cost`
+  deterministically failed RED with a `$0` session ledger after the provider
+  returned a `$0.25` result and the turn was cancelled while the speculative
+  read stayed blocked.
+- A first settlement-channel prototype remained RED because cancellation
+  could win before the outer receiver was repolled. It was discarded rather
+  than papering over the race.
+- The retry attempt now returns the successful completion together with its
+  still-live speculation future. `run_model_call` records that result in the
+  borrowed `BudgetGuard` synchronously, with no await point, and only then
+  awaits speculative work. The later bookkeeping path consumes the carried
+  `BudgetOutcome` and cannot charge again.
+- `a_normal_completion_charges_the_budget_exactly_once` pins the non-cancelled
+  path and confirms the ledger receives one, and only one, charge.
+- The pipeline event-ownership documentation now names both terminal event
+  outcomes: success is `Complete`; terminal status failure is a non-retryable
+  `Error`. Hard infrastructure failures remain typed `PipelineRunError`
+  returns for caller closeout.
+
+### Final verification
+
+- `cargo test -p stella-core`: 320 passed.
+- `cargo test -p stella-cli`: 326 passed, including all command-deck and
+  subsession tests.
+- `cargo test -p stella-pipeline`: 114 unit tests and 4 replay tests passed.
+- `cargo test -p stella-fleet`: 69 passed.
+- `cargo test -p stella-serve`: 2 unit, 3 bridge, and 2 HTTP tests passed; the
+  HTTP tests required permission to bind a local loopback port.
+- Workspace clippy with `-D warnings`, formatting, file-size ratchet, and diff
+  whitespace checks passed.
+
+No push was performed.
