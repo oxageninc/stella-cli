@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(not(test))]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -20,8 +22,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use stella_store::enterprise_telemetry::{
-    EnqueueOutcome, EnterpriseTelemetrySpool, ManagedModelDimension, OperationalEventContext,
-    OperationalIdentity, SpoolLimits, SpoolStatus, StellaOperationalEventV1,
+    EnqueueOutcome, EnterpriseExportSkipReason, EnterpriseTelemetrySpool, ManagedModelDimension,
+    OperationalEventContext, OperationalIdentity, SpoolLimits, SpoolStatus,
+    StellaOperationalEventV1,
 };
 #[cfg(test)]
 use stella_store::usage::ExecutionRollupRow;
@@ -30,6 +33,7 @@ use crate::TelemetryCmd;
 
 const ENROLLMENT_SCHEMA: &str = "stella.enterprise.telemetry.enrollment.v1";
 const MAX_POLICY_ENTRIES: usize = 16;
+const MAX_IDENTIFIER_BYTES: usize = 128;
 const MAX_ENV_REF_BYTES: usize = 128;
 const MAX_SECRET_BYTES: usize = 4 * 1024;
 const MAX_BEARER_BYTES: usize = 8 * 1024;
@@ -41,8 +45,37 @@ const COMPLETED_LEDGER_RETENTION_ROWS: usize = 2_048;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const LEASE_MS: i64 = 30_000;
-static PROCESS_FREE_AUTHORITY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+const AUTHORITY_COMMUNITY: u8 = 0;
+const AUTHORITY_PROCESS_FREE: u8 = 1;
+const AUTHORITY_FAILED_CLOSED: u8 = 2;
+#[cfg(not(test))]
+static PROCESS_FREE_AUTHORITY: AtomicU8 = AtomicU8::new(AUTHORITY_COMMUNITY);
+#[cfg(test)]
+std::thread_local! {
+    static PROCESS_FREE_AUTHORITY: std::cell::Cell<u8> = const {
+        std::cell::Cell::new(AUTHORITY_COMMUNITY)
+    };
+}
+
+#[cfg(not(test))]
+fn load_process_free_authority() -> u8 {
+    PROCESS_FREE_AUTHORITY.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+fn load_process_free_authority() -> u8 {
+    PROCESS_FREE_AUTHORITY.get()
+}
+
+#[cfg(not(test))]
+fn store_process_free_authority(value: u8) {
+    PROCESS_FREE_AUTHORITY.store(value, Ordering::Release);
+}
+
+#[cfg(test)]
+fn store_process_free_authority(value: u8) {
+    PROCESS_FREE_AUTHORITY.set(value);
+}
 
 const PRIVILEGED_ENV_NAMES: &[&str] = &[
     "STELLA_MANAGED_SETTINGS",
@@ -176,10 +209,33 @@ pub(crate) fn canonical_enrollment_bytes(value: &Value) -> Result<Vec<u8>, Strin
     Ok(bytes)
 }
 
+#[derive(Clone)]
+struct VerifiedIdentifier(String);
+
+impl VerifiedIdentifier {
+    fn parse(value: &str) -> Result<Self, String> {
+        let valid = !value.is_empty()
+            && value.len() <= MAX_IDENTIFIER_BYTES
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            });
+        if !valid {
+            return Err(format!(
+                "enterprise telemetry identifier must be 1..={MAX_IDENTIFIER_BYTES} ASCII bytes from [A-Za-z0-9._:-]"
+            ));
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 pub(crate) struct VerifiedEnrollment {
-    enrollment_id: String,
-    organization_id: String,
-    workspace_id: String,
+    enrollment_id: VerifiedIdentifier,
+    organization_id: VerifiedIdentifier,
+    workspace_id: VerifiedIdentifier,
     model_catalog: Vec<ManagedModelDimension>,
     endpoint: Url,
     credential_env: String,
@@ -195,9 +251,9 @@ impl VerifiedEnrollment {
         export_nonce: &str,
     ) -> Result<OperationalEventContext, String> {
         OperationalEventContext::new(
-            self.enrollment_id.clone(),
-            self.organization_id.clone(),
-            self.workspace_id.clone(),
+            self.enrollment_id.as_str().to_owned(),
+            self.organization_id.as_str().to_owned(),
+            self.workspace_id.as_str().to_owned(),
             identity,
             export_nonce,
             self.model_catalog.clone(),
@@ -211,8 +267,19 @@ impl VerifiedEnrollment {
     }
 }
 
+/// Whether signed managed authority has displaced Community authority.
+/// Failed proof remains restricted here even though execution is denied.
 pub(crate) fn process_free_authority_active() -> bool {
-    PROCESS_FREE_AUTHORITY.load(Ordering::Acquire)
+    load_process_free_authority() != AUTHORITY_COMMUNITY
+}
+
+fn process_free_authority_proven() -> bool {
+    load_process_free_authority() == AUTHORITY_PROCESS_FREE
+}
+
+#[cfg(test)]
+pub(crate) fn reset_process_free_authority_for_test() {
+    store_process_free_authority(AUTHORITY_COMMUNITY);
 }
 
 /// Every production constructor that can assemble an agent execution surface.
@@ -256,7 +323,14 @@ impl ExecutionSurface {
 }
 
 pub(crate) fn authorize_execution_surface(surface: ExecutionSurface) -> Result<(), String> {
-    authorize_execution_surface_with(surface, process_free_authority_active())
+    match load_process_free_authority() {
+        AUTHORITY_FAILED_CLOSED => Err(format!(
+            "enterprise telemetry process-free authority activation failed closed before `{}` execution surface",
+            surface.as_str()
+        )),
+        AUTHORITY_PROCESS_FREE => authorize_execution_surface_with(surface, true),
+        _ => authorize_execution_surface_with(surface, false),
+    }
 }
 
 pub(crate) fn authorize_one_shot(use_pipeline: bool) -> Result<(), String> {
@@ -280,9 +354,31 @@ pub(crate) fn authorize_execution_surface_with(
     Ok(())
 }
 
-fn activate_process_free_authority(enrollment: &VerifiedEnrollment) {
-    PROCESS_FREE_AUTHORITY.store(true, Ordering::Release);
+fn activate_process_free_authority(
+    enrollment: &VerifiedEnrollment,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    activate_process_free_authority_with(enrollment, || prove_process_free_surface(workspace_root))
+}
+
+pub(crate) fn activate_process_free_authority_with<F>(
+    enrollment: &VerifiedEnrollment,
+    prove: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     register_verified_credentials(enrollment);
+    if process_free_authority_proven() {
+        return Ok(());
+    }
+    // Once signed managed authority exists, community/full-authority fallback
+    // is no longer safe. Keep every execution surface denied until the
+    // concrete registry proof succeeds.
+    store_process_free_authority(AUTHORITY_FAILED_CLOSED);
+    prove()?;
+    store_process_free_authority(AUTHORITY_PROCESS_FREE);
+    Ok(())
 }
 
 fn register_verified_credentials(enrollment: &VerifiedEnrollment) {
@@ -497,15 +593,21 @@ pub(crate) fn verify_managed_enrollment(
     mac.verify_slice(&signature)
         .map_err(|_| "enterprise telemetry enrollment signature mismatch".to_string())?;
 
+    // Keep only identifiers which already satisfy the wire boundary. No
+    // enrollment, ledger, identity, or spool mutation may precede this check.
+    let enrollment_id = VerifiedIdentifier::parse(&claims.enrollment_id)?;
+    let organization_id = VerifiedIdentifier::parse(&claims.organization_id)?;
+    let workspace_id = VerifiedIdentifier::parse(&claims.workspace_id)?;
+
     let mut sink = Sha256::new();
     sink.update(b"stella.enterprise.telemetry.sink.v1");
     for value in [
         claims.schema.as_str(),
         claims.issuer.as_str(),
         claims.audience.as_str(),
-        claims.enrollment_id.as_str(),
-        claims.organization_id.as_str(),
-        claims.workspace_id.as_str(),
+        enrollment_id.as_str(),
+        organization_id.as_str(),
+        workspace_id.as_str(),
         claims.endpoint.as_str(),
     ] {
         let len = u32::try_from(value.len()).map_err(|_| "telemetry sink field too large")?;
@@ -520,9 +622,9 @@ pub(crate) fn verify_managed_enrollment(
             .collect::<String>()
     );
     Ok(VerifiedEnrollment {
-        enrollment_id: claims.enrollment_id.clone(),
-        organization_id: claims.organization_id.clone(),
-        workspace_id: claims.workspace_id.clone(),
+        enrollment_id,
+        organization_id,
+        workspace_id,
         model_catalog: claims.model_catalog.clone(),
         endpoint,
         credential_env: claims.credential_env.clone(),
@@ -746,7 +848,7 @@ where
         return Ok(None);
     };
     let enrollment = verify_managed_enrollment(managed, now_unix_s)?;
-    prove_process_free_surface(workspace_root)?;
+    activate_process_free_authority(&enrollment, workspace_root)?;
     let spool_path = host_spool_path(workspace_root)?;
     let store = stella_store::Store::open(workspace_root).map_err(|error| error.to_string())?;
     store
@@ -755,7 +857,6 @@ where
     let identity = operational_identity(&store, &spool_path)?;
     let spool = EnterpriseTelemetrySpool::open_at(&spool_path, SpoolLimits::default())
         .map_err(|error| error.to_string())?;
-    register_verified_credentials(&enrollment);
     let sender = build_sender()?;
     let runtime = EnterpriseTelemetryRuntime {
         enrollment,
@@ -776,13 +877,36 @@ where
             .execution_rollup(pending.execution_id, workspace_root)
             .map_err(|error| error.to_string())?
         else {
+            store
+                .mark_enterprise_export_skipped(
+                    &runtime.enrollment.sink_fingerprint,
+                    pending.execution_id,
+                    EnterpriseExportSkipReason::MissingRollup,
+                )
+                .map_err(|error| error.to_string())?;
             continue;
         };
-        let context = runtime
-            .enrollment
-            .context(runtime.identity.clone(), &pending.export_nonce)?;
-        let event = StellaOperationalEventV1::from_finalized_rollup(&context, &rollup)
-            .map_err(|error| error.to_string())?;
+        let event = match project_backfill_event(
+            &runtime.enrollment,
+            runtime.identity.clone(),
+            &pending.export_nonce,
+            &rollup,
+        ) {
+            Ok(event) => event,
+            Err(reason) => {
+                // Legacy rows predate the closed nonce/rollup boundary. Mark
+                // malformed candidates skipped so they cannot pin the first
+                // page forever or prevent later valid work from advancing.
+                store
+                    .mark_enterprise_export_skipped(
+                        &runtime.enrollment.sink_fingerprint,
+                        pending.execution_id,
+                        reason,
+                    )
+                    .map_err(|error| error.to_string())?;
+                continue;
+            }
+        };
         match runtime
             .spool
             .enqueue(
@@ -808,6 +932,19 @@ where
         )
         .map_err(|error| error.to_string())?;
     Ok(Some(runtime))
+}
+
+fn project_backfill_event(
+    enrollment: &VerifiedEnrollment,
+    identity: OperationalIdentity,
+    export_nonce: &str,
+    rollup: &stella_store::usage::ExecutionRollupRow,
+) -> Result<StellaOperationalEventV1, EnterpriseExportSkipReason> {
+    let context = enrollment
+        .context(identity, export_nonce)
+        .map_err(|_| EnterpriseExportSkipReason::MalformedNonce)?;
+    StellaOperationalEventV1::from_finalized_rollup(&context, rollup)
+        .map_err(|_| EnterpriseExportSkipReason::MalformedRollup)
 }
 
 fn operational_identity(
@@ -982,6 +1119,7 @@ fn enrolled_spool(
         return Ok(None);
     };
     let enrollment = verify_managed_enrollment(managed, now_unix_s)?;
+    activate_process_free_authority(&enrollment, workspace_root)?;
     let path = host_spool_path(workspace_root)?;
     let spool = EnterpriseTelemetrySpool::open_at(&path, SpoolLimits::default())
         .map_err(|error| error.to_string())?;
@@ -1005,14 +1143,22 @@ pub(crate) fn run_command(command: TelemetryCmd) -> Result<(), String> {
             let status = spool
                 .status_for_sink(&enrollment.sink_fingerprint)
                 .map_err(|error| error.to_string())?;
+            let ledger = stella_store::Store::open(&workspace)
+                .map_err(|error| error.to_string())?
+                .enterprise_export_ledger_status(&enrollment.sink_fingerprint)
+                .map_err(|error| error.to_string())?;
             println!(
-                "enterprise telemetry: enrolled; pending={} ({} bytes); stranded={} ({} bytes); quarantine={} ({} metadata bytes); physical={} bytes; dropped={}; corrupt_dropped={}; rollover_discarded={}",
+                "enterprise telemetry: enrolled; pending={} ({} bytes); stranded={} ({} bytes); quarantine={} ({} metadata bytes); ledger_skipped={} (missing_rollup={} malformed_nonce={} malformed_rollup={}); physical={} bytes; dropped={}; corrupt_dropped={}; rollover_discarded={}",
                 status.pending_rows,
                 status.pending_payload_bytes,
                 status.stranded_rows,
                 status.stranded_payload_bytes,
                 status.quarantine_diagnostic_rows,
                 status.quarantine_diagnostic_bytes,
+                ledger.skipped_rows,
+                ledger.missing_rollup_rows,
+                ledger.malformed_nonce_rows,
+                ledger.malformed_rollup_rows,
                 status.physical_bytes,
                 status.dropped_rows,
                 status.corrupt_dropped_rows,
@@ -1075,6 +1221,7 @@ pub(crate) fn enqueue_finalized_execution(
         return Ok(FinalizationEnqueueOutcome::Disabled);
     };
     let enrollment = verify_managed_enrollment(managed, now_s)?;
+    activate_process_free_authority(&enrollment, workspace)?;
     // Durable intent precedes every host-spool filesystem operation.
     let Some(export_nonce) = store
         .mark_enterprise_export_pending(&enrollment.sink_fingerprint, execution_id)
@@ -1135,26 +1282,31 @@ pub(crate) fn start_best_effort_flush() {
             return;
         }
     };
-    if let Err(error) = prove_process_free_surface(&workspace) {
-        eprintln!("warning: enterprise telemetry enrollment is inactive: {error}");
+    if let Err(error) = activate_process_free_authority(&enrollment, &workspace) {
+        eprintln!("warning: enterprise telemetry authority failed closed: {error}");
         return;
     }
     if let Err(error) = host_spool_path(&workspace) {
-        eprintln!("warning: enterprise telemetry enrollment is inactive: {error}");
+        eprintln!(
+            "warning: enterprise telemetry delivery is unavailable; process-free authority remains active: {error}"
+        );
         return;
     }
     let store = match stella_store::Store::open(&workspace) {
         Ok(store) => store,
         Err(error) => {
-            eprintln!("warning: enterprise telemetry enrollment is inactive: {error}");
+            eprintln!(
+                "warning: enterprise telemetry delivery is unavailable; process-free authority remains active: {error}"
+            );
             return;
         }
     };
     if let Err(error) = store.begin_enterprise_enrollment(&enrollment.sink_fingerprint) {
-        eprintln!("warning: enterprise telemetry enrollment is inactive: {error}");
+        eprintln!(
+            "warning: enterprise telemetry delivery is unavailable; process-free authority remains active: {error}"
+        );
         return;
     }
-    activate_process_free_authority(&enrollment);
     std::thread::spawn(move || {
         let Ok((now_s, _)) = unix_time() else {
             return;

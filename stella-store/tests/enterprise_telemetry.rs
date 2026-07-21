@@ -1,8 +1,8 @@
 use stella_protocol::AgentEvent;
 use stella_store::enterprise_telemetry::{
-    ClaimedOperationalEvent, EnqueueOutcome, EnterpriseTelemetrySpool, ManagedModelDimension,
-    OperationalEventContext, OperationalIdentity, SpoolLimits, StellaOperationalEventV1,
-    load_or_create_installation_uuid,
+    ClaimedOperationalEvent, EnqueueOutcome, EnterpriseExportSkipReason, EnterpriseTelemetrySpool,
+    ManagedModelDimension, OperationalEventContext, OperationalIdentity, SpoolLimits,
+    StellaOperationalEventV1, load_or_create_installation_uuid,
 };
 use stella_store::usage::ExecutionRollupRow;
 use stella_store::{FileTouchRow, Store, StoreError, TelemetryRow};
@@ -1087,6 +1087,102 @@ fn export_ledger_backfills_only_post_enrollment_pending_executions() {
 }
 
 #[test]
+fn skipped_export_is_durable_distinct_from_spooled_and_never_reenters_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store = stella_store::Store::open(&workspace).unwrap();
+    store.begin_enterprise_enrollment(SINK_A).unwrap();
+    let execution = store
+        .begin_execution("run", "legacy", "anthropic", "model")
+        .unwrap();
+    store.finish_execution(execution, "completed", 0.0).unwrap();
+    store
+        .mark_enterprise_export_pending(SINK_A, execution)
+        .unwrap()
+        .unwrap();
+    store
+        .mark_enterprise_export_skipped(
+            SINK_A,
+            execution,
+            EnterpriseExportSkipReason::MalformedNonce,
+        )
+        .unwrap();
+    assert!(
+        store
+            .pending_enterprise_export_page(SINK_A, None, 256)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .mark_enterprise_export_pending(SINK_A, execution)
+            .unwrap()
+            .is_none(),
+        "a skipped legacy row must never be represented as a retryable pending export"
+    );
+    let status = store.enterprise_export_ledger_status(SINK_A).unwrap();
+    assert_eq!(status.skipped_rows, 1);
+    assert_eq!(status.malformed_nonce_rows, 1);
+    assert_eq!(status.malformed_rollup_rows, 0);
+    assert_eq!(status.missing_rollup_rows, 0);
+
+    drop(store);
+    let path = stella_store::workspace_private_sqlite_path(&workspace, "store.db").unwrap();
+    let inspect = rusqlite::Connection::open(&path).unwrap();
+    let pending_ledger_rows: i64 = inspect
+        .query_row(
+            "SELECT COUNT(*) FROM enterprise_export_ledger
+             WHERE sink_fingerprint = ?1 AND execution_id = ?2",
+            rusqlite::params![SINK_A, execution],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let skip_reason: String = inspect
+        .query_row(
+            "SELECT reason FROM enterprise_export_skips
+             WHERE sink_fingerprint = ?1 AND execution_id = ?2",
+            rusqlite::params![SINK_A, execution],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending_ledger_rows, 0);
+    assert_eq!(skip_reason, "malformed_nonce");
+    drop(inspect);
+    let reopened = stella_store::Store::open(&workspace).unwrap();
+    assert_eq!(
+        reopened.enterprise_export_ledger_status(SINK_A).unwrap(),
+        status
+    );
+}
+
+#[test]
+fn negative_export_skip_counters_fail_closed_instead_of_reporting_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store = Store::open(&workspace).unwrap();
+    store.begin_enterprise_enrollment(SINK_A).unwrap();
+    drop(store);
+
+    let path = stella_store::workspace_private_sqlite_path(&workspace, "store.db").unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "UPDATE enterprise_export_enrollment SET skipped_rows = -1
+         WHERE sink_fingerprint = ?1",
+        rusqlite::params![SINK_A],
+    )
+    .unwrap();
+    drop(raw);
+
+    let reopened = Store::open(&workspace).unwrap();
+    assert!(
+        reopened.enterprise_export_ledger_status(SINK_A).is_err(),
+        "corrupt aggregate counters must not be silently reported as zero"
+    );
+}
+
+#[test]
 fn pending_export_backfill_is_hard_paged_across_a_ten_thousand_row_outage() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -1200,10 +1296,36 @@ fn legacy_export_nonce_migration_is_resumable_and_startup_bounded() {
         }
     }
     tx.commit().unwrap();
+    let ledger_rootpage_before: i64 = raw
+        .query_row(
+            "SELECT rootpage FROM sqlite_master
+             WHERE type = 'table' AND name = 'enterprise_export_ledger'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     drop(raw);
 
     drop(Store::open(&workspace).unwrap());
     let inspect = rusqlite::Connection::open(&path).unwrap();
+    let ledger_rootpage_after: i64 = inspect
+        .query_row(
+            "SELECT rootpage FROM sqlite_master
+             WHERE type = 'table' AND name = 'enterprise_export_ledger'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let preserved_rows: i64 = inspect
+        .query_row("SELECT COUNT(*) FROM enterprise_export_ledger", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        ledger_rootpage_after, ledger_rootpage_before,
+        "first open must not rebuild or copy the legacy export ledger"
+    );
+    assert_eq!(preserved_rows, LEGACY_ROWS);
     let (migrated, batches, complete): (i64, i64, i64) = inspect
         .query_row(
             "SELECT migrated_rows, batches_completed, is_complete

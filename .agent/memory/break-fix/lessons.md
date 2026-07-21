@@ -1,0 +1,1 @@
+- [2026-07-21] A failed authority proof must remain restricted for tool, hook, and configuration construction as well as deny execution; never encode failed-closed as the same boolean value as Community mode. (source: reflections/2026-07-21-stella-enterprise-authority-final-review.md, agent: break-fix)

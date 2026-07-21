@@ -13,6 +13,34 @@ pub(super) fn migrate_store_export_schema(conn: &mut Connection) -> Result<()> {
              ADD COLUMN compacted_through_execution_id INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    for (column, ddl) in [
+        (
+            "skipped_rows",
+            "ALTER TABLE enterprise_export_enrollment ADD COLUMN skipped_rows INTEGER NOT NULL DEFAULT 0;",
+        ),
+        (
+            "skipped_missing_rollup_rows",
+            "ALTER TABLE enterprise_export_enrollment ADD COLUMN skipped_missing_rollup_rows INTEGER NOT NULL DEFAULT 0;",
+        ),
+        (
+            "skipped_malformed_nonce_rows",
+            "ALTER TABLE enterprise_export_enrollment ADD COLUMN skipped_malformed_nonce_rows INTEGER NOT NULL DEFAULT 0;",
+        ),
+        (
+            "skipped_malformed_rollup_rows",
+            "ALTER TABLE enterprise_export_enrollment ADD COLUMN skipped_malformed_rollup_rows INTEGER NOT NULL DEFAULT 0;",
+        ),
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('enterprise_export_enrollment')
+             WHERE name = ?1)",
+            params![column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(ddl)?;
+        }
+    }
     let has_export_nonce: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('enterprise_export_ledger')
          WHERE name = 'export_nonce')",

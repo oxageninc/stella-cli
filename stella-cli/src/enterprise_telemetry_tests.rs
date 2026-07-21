@@ -11,15 +11,32 @@ use stella_store::enterprise_telemetry::StellaOperationalEventV1;
 use stella_store::usage::ExecutionRollupRow;
 
 use crate::enterprise_telemetry::{
-    BatchSender, ExecutionSurface, StartupAuthoritySnapshot, authorize_execution_surface_with,
-    build_runtime_from_managed, canonical_enrollment_bytes, host_spool_path,
-    prove_process_free_surface, validate_response_status, verify_managed_enrollment,
+    BatchSender, ExecutionSurface, StartupAuthoritySnapshot, activate_process_free_authority_with,
+    authorize_execution_surface, authorize_execution_surface_with, build_runtime_from_managed,
+    canonical_enrollment_bytes, host_spool_path, process_free_authority_active,
+    prove_process_free_surface, reset_process_free_authority_for_test, validate_response_status,
+    verify_managed_enrollment,
 };
 use crate::settings::Settings;
 use crate::{Cli, Command, TelemetryCmd};
 use clap::Parser;
 
 struct EnvRestore(Vec<(String, Option<std::ffi::OsString>)>);
+
+struct AuthorityReset;
+
+impl AuthorityReset {
+    fn new() -> Self {
+        reset_process_free_authority_for_test();
+        Self
+    }
+}
+
+impl Drop for AuthorityReset {
+    fn drop(&mut self) {
+        reset_process_free_authority_for_test();
+    }
+}
 
 impl EnvRestore {
     fn capture(names: &[&str]) -> Self {
@@ -467,6 +484,259 @@ fn invalid_enrollment_cannot_register_arbitrary_scrub_names() {
     });
     assert!(verify_managed_enrollment(&invalid, 1_700_000_001).is_err());
     assert!(!stella_tools::exec::is_sensitive_env_name(arbitrary));
+}
+
+#[test]
+fn proof_activation_failure_scrubs_credentials_and_fails_every_execution_surface_closed() {
+    let _env = crate::test_env::lock();
+    let _authority = AuthorityReset::new();
+    let names = ["STELLA_TEST_VERIFY_SECRET", "STELLA_TEST_TELEMETRY_TOKEN"];
+    let _restore = EnvRestore::capture(&names);
+    unsafe {
+        std::env::set_var(
+            "STELLA_TEST_VERIFY_SECRET",
+            "0123456789abcdef0123456789abcdef",
+        );
+        std::env::set_var("STELLA_TEST_TELEMETRY_TOKEN", "separate-bearer-token");
+    }
+    let managed = signed_managed(
+        "STELLA_TEST_VERIFY_SECRET",
+        b"0123456789abcdef0123456789abcdef",
+        valid_claims(),
+    );
+    let enrollment = verify_managed_enrollment(&managed, 1_700_000_001).unwrap();
+
+    let error = activate_process_free_authority_with(&enrollment, || {
+        Err("simulated registry proof failure".into())
+    })
+    .unwrap_err();
+    assert!(error.contains("simulated registry proof failure"));
+    assert!(
+        process_free_authority_active(),
+        "failed-closed authority must keep process-free restrictions armed"
+    );
+    for name in names {
+        assert!(
+            stella_tools::exec::is_sensitive_env_name(name),
+            "verified credential was not scrub-registered: {name}"
+        );
+    }
+    for surface in ExecutionSurface::ALL {
+        let error = authorize_execution_surface(surface).unwrap_err();
+        assert!(error.contains("failed closed"), "{surface:?}: {error}");
+    }
+}
+
+#[test]
+fn post_verification_setup_errors_never_restore_full_execution_authority() {
+    let _env = crate::test_env::lock();
+    let _authority = AuthorityReset::new();
+    let names = [
+        "STELLA_DATA_DIR",
+        "STELLA_TEST_VERIFY_SECRET",
+        "STELLA_TEST_TELEMETRY_TOKEN",
+    ];
+    let _restore = EnvRestore::capture(&names);
+    unsafe {
+        std::env::set_var(
+            "STELLA_TEST_VERIFY_SECRET",
+            "0123456789abcdef0123456789abcdef",
+        );
+        std::env::set_var("STELLA_TEST_TELEMETRY_TOKEN", "separate-bearer-token");
+    }
+    let managed = signed_managed(
+        "STELLA_TEST_VERIFY_SECRET",
+        b"0123456789abcdef0123456789abcdef",
+        valid_claims(),
+    );
+
+    for seam in [
+        "host_spool_path",
+        "store_open",
+        "identity",
+        "spool_open",
+        "sender",
+    ] {
+        reset_process_free_authority_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let data = dir.path().join("host-data");
+        std::fs::create_dir_all(&workspace).unwrap();
+        unsafe { std::env::set_var("STELLA_DATA_DIR", &data) };
+        match seam {
+            "host_spool_path" => unsafe {
+                std::env::set_var("STELLA_DATA_DIR", workspace.join("model-visible"));
+            },
+            "store_open" => {
+                std::fs::create_dir_all(workspace.join(".stella")).unwrap();
+                std::fs::write(workspace.join(".stella/private"), b"not a directory").unwrap();
+            }
+            "identity" => {
+                std::fs::create_dir_all(&data).unwrap();
+                std::fs::write(data.join("installation-id"), b"malformed-legacy-id").unwrap();
+            }
+            "spool_open" => {
+                std::fs::create_dir_all(data.join("enterprise-telemetry.db")).unwrap();
+            }
+            "sender" => {}
+            _ => unreachable!(),
+        }
+        let result = build_runtime_from_managed(Some(&managed), &workspace, 1_700_000_001, || {
+            if seam == "sender" {
+                Err("simulated sender construction failure".into())
+            } else {
+                Ok(Arc::new(Sender {
+                    attempts: AtomicUsize::new(0),
+                    fail: Mutex::new(false),
+                }) as Arc<dyn BatchSender>)
+            }
+        });
+        assert!(result.is_err(), "seam unexpectedly succeeded: {seam}");
+        assert!(
+            process_free_authority_active(),
+            "authority downgraded after {seam}"
+        );
+        assert!(
+            authorize_execution_surface(ExecutionSurface::PipelineOneShot).is_err(),
+            "full execution authority returned after {seam}"
+        );
+        for name in &names[1..] {
+            assert!(
+                stella_tools::exec::is_sensitive_env_name(name),
+                "credential scrub registration was lost after {seam}: {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn managed_identifiers_are_bounded_before_any_store_or_ledger_mutation() {
+    let _env = crate::test_env::lock();
+    let _authority = AuthorityReset::new();
+    let names = [
+        "STELLA_DATA_DIR",
+        "STELLA_TEST_VERIFY_SECRET",
+        "STELLA_TEST_TELEMETRY_TOKEN",
+    ];
+    let _restore = EnvRestore::capture(&names);
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let data = dir.path().join("host-data");
+    std::fs::create_dir_all(&workspace).unwrap();
+    unsafe {
+        std::env::set_var("STELLA_DATA_DIR", &data);
+        std::env::set_var(
+            "STELLA_TEST_VERIFY_SECRET",
+            "0123456789abcdef0123456789abcdef",
+        );
+        std::env::set_var("STELLA_TEST_TELEMETRY_TOKEN", "separate-bearer-token");
+    }
+    let too_long: &'static str = Box::leak("x".repeat(129).into_boxed_str());
+    let managed = signed_managed(
+        "STELLA_TEST_VERIFY_SECRET",
+        b"0123456789abcdef0123456789abcdef",
+        TestClaims {
+            organization_id: too_long,
+            ..valid_claims()
+        },
+    );
+    let sender_builds = AtomicUsize::new(0);
+
+    assert!(
+        build_runtime_from_managed(Some(&managed), &workspace, 1_700_000_001, || {
+            sender_builds.fetch_add(1, Ordering::SeqCst);
+            unreachable!("invalid managed identifiers must fail before sender construction")
+        })
+        .is_err()
+    );
+    assert_eq!(sender_builds.load(Ordering::SeqCst), 0);
+    assert!(!workspace.join(".stella/private/store.db").exists());
+    assert!(!data.exists());
+}
+
+#[test]
+fn malformed_legacy_pending_rows_are_skipped_without_blocking_later_valid_rows() {
+    let _env = crate::test_env::lock();
+    let _authority = AuthorityReset::new();
+    let names = [
+        "STELLA_DATA_DIR",
+        "STELLA_TEST_VERIFY_SECRET",
+        "STELLA_TEST_TELEMETRY_TOKEN",
+    ];
+    let _restore = EnvRestore::capture(&names);
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let data = dir.path().join("host-data");
+    std::fs::create_dir_all(&workspace).unwrap();
+    unsafe {
+        std::env::set_var("STELLA_DATA_DIR", &data);
+        std::env::set_var(
+            "STELLA_TEST_VERIFY_SECRET",
+            "0123456789abcdef0123456789abcdef",
+        );
+        std::env::set_var("STELLA_TEST_TELEMETRY_TOKEN", "separate-bearer-token");
+    }
+    let managed = signed_managed(
+        "STELLA_TEST_VERIFY_SECRET",
+        b"0123456789abcdef0123456789abcdef",
+        valid_claims(),
+    );
+    let enrollment = verify_managed_enrollment(&managed, 1_700_000_001).unwrap();
+    let store = stella_store::Store::open(&workspace).unwrap();
+    store
+        .begin_enterprise_enrollment(enrollment.sink_fingerprint())
+        .unwrap();
+    let malformed = store
+        .begin_execution("run", "malformed", "anthropic", "anthropic/claude-sonnet-4")
+        .unwrap();
+    store.finish_execution(malformed, "completed", 0.0).unwrap();
+    store
+        .mark_enterprise_export_pending(enrollment.sink_fingerprint(), malformed)
+        .unwrap()
+        .unwrap();
+    let valid = store
+        .begin_execution("run", "valid", "anthropic", "anthropic/claude-sonnet-4")
+        .unwrap();
+    store.finish_execution(valid, "completed", 0.0).unwrap();
+    store
+        .mark_enterprise_export_pending(enrollment.sink_fingerprint(), valid)
+        .unwrap()
+        .unwrap();
+    drop(store);
+    let path = stella_store::workspace_private_sqlite_path(&workspace, "store.db").unwrap();
+    let raw = rusqlite::Connection::open(path).unwrap();
+    raw.execute(
+        "UPDATE enterprise_export_ledger SET export_nonce = 'malformed' WHERE execution_id = ?1",
+        rusqlite::params![malformed],
+    )
+    .unwrap();
+    drop(raw);
+
+    let sender = Arc::new(Sender {
+        attempts: AtomicUsize::new(0),
+        fail: Mutex::new(false),
+    });
+    let runtime = build_runtime_from_managed(Some(&managed), &workspace, 1_700_000_001, || {
+        Ok(sender as Arc<dyn BatchSender>)
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(runtime.status().unwrap().pending_rows, 1);
+    let reopened = stella_store::Store::open(&workspace).unwrap();
+    let status = reopened
+        .enterprise_export_ledger_status(enrollment.sink_fingerprint())
+        .unwrap();
+    assert_eq!(status.skipped_rows, 1);
+    assert_eq!(status.malformed_nonce_rows, 1);
+    assert_eq!(status.malformed_rollup_rows, 0);
+    assert_eq!(status.missing_rollup_rows, 0);
+    assert!(
+        reopened
+            .pending_enterprise_export_page(enrollment.sink_fingerprint(), None, 256)
+            .unwrap()
+            .is_empty(),
+        "malformed first row must be skipped and later valid row spooled"
+    );
 }
 
 #[test]

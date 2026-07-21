@@ -15,7 +15,8 @@ sink-scoped claims/acks/retries, leases, jittered retry backoff, hard row/byte
 capacity, sink-local oldest-unleased eviction, and durable
 drop/corruption/rollover counters.
 `stella telemetry status` reports payload and physical SQLite/WAL/SHM health,
-including the bounded quarantine sample's row and metadata-byte footprint;
+including the bounded quarantine sample's row and metadata-byte footprint plus
+durable categorized legacy-ledger skip counters;
 `flush` performs one explicit bounded delivery, and `rollover-discard` is the
 only path that discards rows stranded by sink rotation.
 
@@ -77,6 +78,10 @@ part of the design contract.
   50,000-row histories resume without an unbounded vector or transaction. A
   mark or bounded pending-page read transactionally repairs any empty legacy
   nonce beyond that startup budget before runtime event construction.
+- Malformed legacy pending candidates move atomically from the retry ledger into
+  a distinct durable skip table with a closed content-free reason category.
+  Aggregate counters survive bounded completed-row compaction; a skipped row
+  never masquerades as a successful spool enqueue or re-enters pending work.
 
 ## TDD evidence
 
@@ -124,9 +129,11 @@ redirect helper. Focused regressions then established and closed these cases:
   claimant from creating an already-expired lease. Delivery reads a fresh retry
   clock, retry horizon is at most 375 seconds, and malformed rows quarantine
   before lease while later valid rows continue;
-- the 50,257-row legacy-ledger witness is GREEN: each startup migrates exactly
-  four committed 256-row batches, progress resumes from durable version/cursor
-  state, and completion preserves every row with a distinct nonce;
+- the 50,257-row legacy-ledger witness is GREEN: first open preserves the
+  ledger's SQLite root page instead of rebuilding or copying it, each startup
+  migrates exactly four committed 256-row batches, progress resumes from
+  durable version/cursor state, and completion preserves every row with a
+  distinct nonce;
 - the repeated-corruption witness is GREEN: the aggregate count reaches 8,000,
   diagnostics stay at 128 rows and under 32 KiB even with a 100 KiB corrupt
   identifier, and WAL/journal limits bound physical growth; and
@@ -153,25 +160,36 @@ redirect helper. Focused regressions then established and closed these cases:
 
 ## Verification
 
-- `cargo test -p stella-store`: 87 unit and 29 enterprise telemetry integration
+- `cargo test -p stella-store`: 87 unit and 31 enterprise telemetry integration
   tests passed.
 - `cargo test -p stella-tools`: 335 unit tests passed; 1 existing sandbox test
   remained ignored; 4 media replay tests passed. The 6 tracker and 8 web
   localhost integration tests passed outside the restricted network sandbox.
-- `cargo test -p stella-cli`: 372 tests passed, including the project-dotenv
+- `cargo test -p stella-cli`: 381 tests passed, including the project-dotenv
   provenance and credential non-disclosure witnesses.
 - `cargo clippy -p stella-store -p stella-tools -p stella-cli --all-targets --
   -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
-- `make sizes`: all 305 tracked Rust files passed the ratchet.
+- `make sizes`: all 307 tracked Rust files passed the ratchet.
 - `git diff --check`: passed.
-- The required documentation search confirmed that existing absolute
-  no-phone-home claims need the precise managed-enrollment exception. Those
-  user-facing edits remain owned by Task 8; this task updated the authoritative
-  design prose for non-blocking shutdown semantics.
+- The final public-claim audit qualifies Community/default zero telemetry
+  egress with the explicit signed Oxagen Enterprise managed exception and a
+  link to its governed boundary, including the strict air-gapped guide.
 
-## Handoff
+## Final-review remediation
 
-Task 8 must replace absolute public no-phone-home wording with the exact
-contract: no community/default enterprise telemetry egress, plus an explicit,
-signed, managed-only enterprise operational exception.
+- C1: credential scrub names are registered immediately after signature
+  verification. Authority enters a failed-closed state before the concrete
+  process-free registry proof and becomes active before host path, local store,
+  enrollment ledger, identity, spool, sender, or backfill setup. Proof failure
+  blocks every execution surface; later delivery/storage failure cannot restore
+  full authority.
+- I6: `VerifiedEnrollment` now stores bounded validated identifiers before any
+  store or ledger mutation. Malformed legacy pending candidates enter a
+  distinct durable skip table with closed reason counters; later valid rows in
+  the same bounded page continue to the spool. The legacy ledger is never
+  rebuilt or copied during first-open migration.
+- I8: all assigned public privacy claims now state the Community/default
+  zero-egress contract and link the sole explicit signed Oxagen Enterprise
+  operational exception. Fully air-gapped instructions explicitly require no
+  managed enrollment and loopback-only configured endpoints.
