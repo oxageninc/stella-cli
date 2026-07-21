@@ -3245,6 +3245,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "stella-serve"
+version = "0.4.47"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "stella-core",
+ "stella-protocol",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "stella-store"
 version = "0.4.47"
 dependencies = [
