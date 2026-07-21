@@ -42,18 +42,26 @@ This has to exist and be writable before the first release:
    (Homebrew maps the tap `macanderson/tap` → repo `homebrew-tap`). It can
    start empty; the release job commits `Formula/stella.rb` into it.
 
-2. **Create a push token.** A GitHub token with **contents: write** on the tap
-   repo — a fine-grained PAT scoped to `macanderson/homebrew-tap`, or a classic
-   PAT with `repo`. The default `GITHUB_TOKEN` can't push to another repo, so a
-   dedicated one is required.
+2. **Create write access, either way** (the release job tries the deploy key
+   first, falling back to the token — see `.github/workflows/release.yml`'s
+   `homebrew` job):
+   - **SSH deploy key (what's actually configured today)** — generate a
+     dedicated keypair, add the public half as a **write-enabled deploy key**
+     on `macanderson/homebrew-tap` (repo Settings → Deploy keys), and the
+     private half as the `HOMEBREW_TAP_DEPLOY_KEY` secret below. Scoped to
+     exactly that one repo, unlike a PAT.
+   - **PAT (fallback)** — a GitHub token with **contents: write** on the tap
+     repo — a fine-grained PAT scoped to `macanderson/homebrew-tap`, or a
+     classic PAT with `repo`. The default `GITHUB_TOKEN` can't push to
+     another repo, so a dedicated one is required either way.
 
 3. **Add it as a secret** on **this** repo (`macanderson/stella`):
    Settings → Secrets and variables → Actions → New repository secret →
-   name `HOMEBREW_TAP_TOKEN`, value the token from step 2.
+   name `HOMEBREW_TAP_DEPLOY_KEY` (deploy key) or `HOMEBREW_TAP_TOKEN` (PAT).
 
 The prebuilt tarballs, checksums, and the `curl | sh` installer are published
 to this repo's GitHub Releases and need no extra secrets — only the Homebrew
-tap push does. If `HOMEBREW_TAP_TOKEN` is absent, the release still succeeds and
+tap push does. If neither secret is set, the release still succeeds and
 the `homebrew` job skips with a warning.
 
 ## Cut a release

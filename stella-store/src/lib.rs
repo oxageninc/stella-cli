@@ -609,7 +609,11 @@ impl Store {
             // newer schema added.
             return Err(StoreError(format!(
                 "store.db is at schema version {version}, but this build only \
-                 knows {SCHEMA_VERSION} — refusing to open it with older code"
+                 knows {SCHEMA_VERSION} — your stella binary is out of date, not \
+                 the workspace. Upgrade with `brew upgrade stella`, re-run \
+                 install.sh, or grab a newer build from \
+                 https://github.com/macanderson/stella/releases, then reopen \
+                 this workspace."
             )));
         }
         if version == 0 && !any_store_table_exists(&conn)? {
@@ -3491,9 +3495,23 @@ mod tests {
             Ok(_) => panic!("a newer-versioned file must refuse to open"),
             Err(e) => e,
         };
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("schema version"),
+            msg.contains("schema version"),
             "downgrade must refuse, not silently write into a newer shape: {err}"
+        );
+        // The real cause is a stale binary, not a corrupt workspace — the
+        // message must name that and point at an upgrade path, not just
+        // refuse (#252).
+        assert!(
+            msg.contains("out of date"),
+            "message must name the stale binary as the cause, not just refuse: {err}"
+        );
+        assert!(
+            msg.contains("brew upgrade stella")
+                && msg.contains("install.sh")
+                && msg.contains("github.com/macanderson/stella/releases"),
+            "message must name every supported upgrade path: {err}"
         );
         std::fs::remove_dir_all(&root).ok();
     }
