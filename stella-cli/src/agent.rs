@@ -492,8 +492,21 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         if input == "/exit" || input == "/quit" || input == "exit" {
             break;
         }
-        if input == "/models" {
+        if input == "/models" || input == "/models list" {
             cfg.print_models();
+            continue;
+        }
+        // `/models refresh` is handled model-free: when the configured model
+        // itself is broken, the catalog re-sync is part of digging out —
+        // routing it into a model turn would fail on the very error being
+        // fixed. (Changing a model happens in the deck's SETTINGS tab, via
+        // `--model`, or by editing settings.json — not through a command.)
+        if input == "/models refresh" || input == "/models refresh --force" {
+            println!();
+            if let Err(e) = crate::model_catalog::run_refresh(input.ends_with("--force")).await {
+                println!("  {} refresh failed: {e}", "✗".red());
+            }
+            println!();
             continue;
         }
         if input == "/config" {
@@ -2115,7 +2128,7 @@ fn print_help() {
     println!("  {}\n", "Stella Commands".bright_cyan().bold());
     println!("  {}  Send a prompt to the agent", "type message".dimmed());
     println!(
-        "  {}       List configured providers and models",
+        "  {}       List configured providers and models (`/models refresh` re-syncs the catalog)",
         "/models".bright_magenta()
     );
     println!(

@@ -914,26 +914,29 @@ async fn refresh_with_store(
 /// `stella models refresh [--force]`: the master list, then every
 /// configured provider's own live `/models` listing.
 pub async fn run_refresh(force: bool) -> Result<(), String> {
+    println!("{}\n", "Stella — Model Catalog Refresh".yellow().bold());
+    run_refresh_emit(force, &mut |line| println!("{line}")).await
+}
+
+/// [`run_refresh`] with the output routed through `emit` — the seam the
+/// deck's `/models refresh` uses: its transcript renders from events, so
+/// printing to stdout (which the alternate screen owns) is never an
+/// option. Lines are plain text (the ✓/– glyphs carry the state).
+pub async fn run_refresh_emit(force: bool, emit: &mut dyn FnMut(String)) -> Result<(), String> {
     let store = store_for_command()?;
     ensure_seed_floor(&store);
-    println!("{}\n", "Stella — Model Catalog Refresh".yellow().bold());
     let (not_modified, providers, counts) = refresh_with_store(&store, force).await?;
     if not_modified {
-        println!(
-            "  {} master list (models.dev) unchanged (ETag match) — already current",
-            "✓".green()
-        );
+        emit("  ✓ master list (models.dev) unchanged (ETag match) — already current".to_string());
     } else {
-        println!(
-            "  {} master list (models.dev): {} models across {} providers",
-            "✓".green(),
-            counts.models_seen,
-            providers
-        );
-        println!(
+        emit(format!(
+            "  ✓ master list (models.dev): {} models across {} providers",
+            counts.models_seen, providers
+        ));
+        emit(format!(
             "    {} new model cards, {} new pricing versions, {} new aliases",
             counts.cards_added, counts.versions_added, counts.aliases_added
-        );
+        ));
     }
 
     // Live listings, straight from each configured provider's own API —
@@ -945,22 +948,22 @@ pub async fn run_refresh(force: bool) -> Result<(), String> {
         }
         let id = configured.config.id;
         match refresh_native_provider(&store, &configured).await {
-            Ok((seen, counts)) => println!(
-                "  {} {id}: {seen} models live from the provider ({} new cards)",
-                "✓".green(),
+            Ok((seen, counts)) => emit(format!(
+                "  ✓ {id}: {seen} models live from the provider ({} new cards)",
                 counts.cards_added
-            ),
-            Err(e) => println!("  {} {id}: {e}", "–".yellow()),
+            )),
+            Err(e) => emit(format!("  – {id}: {e}")),
         }
     }
 
     let (cards, versions, aliases) = store.counts().map_err(|e| e.to_string())?;
-    println!(
+    emit(format!(
         "\n  catalog now holds {cards} model cards, {versions} pricing versions, {aliases} aliases"
-    );
-    println!(
+    ));
+    emit(
         "  Model slugs validate against this catalog; it re-syncs automatically once a day \
          while a provider credential is configured."
+            .to_string(),
     );
     Ok(())
 }

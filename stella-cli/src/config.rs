@@ -1386,6 +1386,36 @@ mod tests {
     }
 
     #[test]
+    fn an_openrouter_pin_over_the_tui_qualified_default_does_not_double_the_wire_slug() {
+        // Regression: the pin naming the qualified spec's OWN provider —
+        // `agents.default.provider: "openrouter"` plus the TUI-written
+        // `default_model: "openrouter/openrouter/auto"`. OpenRouter is
+        // unseeded, so the catalog arbitration that saves a stale seeded
+        // pin never ran, verbatim routing kept the doubled slug, and every
+        // call died on `openrouter/openrouter/auto is not a valid model ID`
+        // (HTTP 400). The wire slug must come out de-qualified.
+        let settings = settings_from(
+            r#"{
+                "providers": {"openrouter": {"api_key": "sk-or-test"}},
+                "agent_engine_config": {
+                    "default_model": "openrouter/openrouter/auto",
+                    "agents": {"default": {"provider": "openrouter"}}
+                }
+            }"#,
+        );
+        let cfg = Config::load_with_settings(
+            None,
+            None,
+            None,
+            &settings,
+            std::path::PathBuf::from("/tmp/ws"),
+        )
+        .expect("the pinned qualified default must resolve");
+        assert_eq!(cfg.provider.id, "openrouter");
+        assert_eq!(cfg.model_id, "openrouter/auto");
+    }
+
+    #[test]
     fn env_var_outranks_the_settings_literal_key() {
         // Chain order: env var above settings.json api_key. Unique var name
         // so parallel tests can't race on shared env state.

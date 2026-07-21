@@ -331,7 +331,7 @@ pub fn ingest_config(ui: &mut DeckUi, state: &EngineConfigState, status: &Option
     e.busy = false;
 }
 
-// ── focusers (`e` on the SETTINGS tab, and `/model-*`) ─────────────────────
+// ── focusers (`e` on the SETTINGS tab) ─────────────────────────────────────
 
 /// Focus the engine panel (switching to the SETTINGS tab if needed) on
 /// the GLOBAL tab, and ask the driver to re-read the settings chain so the
@@ -346,23 +346,6 @@ pub fn focus_panel(ui: &mut DeckUi) -> DeckAction {
     e.edit = None;
     e.picker = None;
     e.busy = true;
-    DeckAction::Send(WorkspaceInput::EngineConfigRefresh)
-}
-
-/// `/model-<agent>`: jump to the SETTINGS tab, focus the panel on that
-/// agent's tab with the model picker already up — the one-keystroke "change
-/// this agent's model" path.
-pub fn open_with_picker(ui: &mut DeckUi, role: EngineRole) -> DeckAction {
-    ui.set_tab(DeckTab::Settings);
-    let e = &mut ui.engine;
-    e.focused = true;
-    e.tab = EngineTab::Agent(role);
-    // Row 0 is the model row (AgentField::ALL[0]) — where the picker's ⏎
-    // will land its slug.
-    e.row = 0;
-    e.edit = None;
-    e.busy = true;
-    open_picker(e, role);
     DeckAction::Send(WorkspaceInput::EngineConfigRefresh)
 }
 
@@ -1234,7 +1217,6 @@ fn tail_chars(s: &str, max_chars: usize) -> String {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
-    use crate::composer::SlashCommand;
     use crate::deck::WorkspaceModel;
     use crate::deck_ui::{DeckAction, DeckUi, handle_deck_key, ingest_inbound};
     use crate::envelope::Inbound;
@@ -1373,26 +1355,6 @@ mod tests {
         // Esc hands the keyboard back to the tab.
         handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
         assert!(!ui.engine.focused, "esc hands the keyboard back to the tab");
-    }
-
-    #[test]
-    fn slash_model_worker_opens_the_settings_tab_with_the_picker() {
-        let model = WorkspaceModel::new();
-        let mut ui = ready_ui();
-        ui.slash_commands = vec![SlashCommand::new("/model-worker", "pick the worker model")];
-        for c in "/model-worker".chars() {
-            handle_deck_key(ch(c), &model, &mut ui);
-        }
-        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
-        assert_eq!(
-            action,
-            DeckAction::Send(WorkspaceInput::EngineConfigRefresh)
-        );
-        assert_eq!(ui.tab, DeckTab::Settings, "jumps to the SETTINGS tab");
-        assert!(ui.engine.focused);
-        assert_eq!(ui.engine.tab, EngineTab::Agent(EngineRole::Worker));
-        assert_eq!(ui.engine.row, 0, "the model row is preselected");
-        assert!(ui.engine.picker.is_some(), "the picker is already open");
     }
 
     #[test]

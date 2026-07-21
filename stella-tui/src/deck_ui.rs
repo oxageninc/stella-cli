@@ -29,7 +29,7 @@ use crate::composer::{
 };
 use crate::deck::{DeckTab, WorkspaceModel};
 use crate::envelope::{
-    AgentControl, AgentId, AgentScope, AgentStatus, EngineRole, EntityField, EntityHit, Inbound,
+    AgentControl, AgentId, AgentScope, AgentStatus, EntityField, EntityHit, Inbound,
     InstalledAgentEntry, IssueAction, IssueRow, Secret, SkillOp, SkillScope, SkillSearchHit,
     SkillsView, SplashCue, WorkspaceInput,
 };
@@ -1628,16 +1628,6 @@ fn handle_slash_key(key: KeyEvent, matches: &[String], ui: &mut DeckUi) -> Optio
             "/sessions" => open_sessions_overlay(ui),
             "/context" => open_context_overlay(ui),
             "/inbox" => open_inbox_overlay(ui),
-            // The ENGINE panel: deck-local view state over a driver-owned
-            // settings snapshot. The old `/engine` popup is gone — the panel
-            // is the full-width body of the SETTINGS tab, and the four
-            // `/model-<agent>` commands jump straight there with that agent's
-            // model picker already open. Intercepted here so these never get
-            // submitted as prompts.
-            "/model-default" => crate::views::engine::open_with_picker(ui, EngineRole::Default),
-            "/model-worker" => crate::views::engine::open_with_picker(ui, EngineRole::Worker),
-            "/model-judge" => crate::views::engine::open_with_picker(ui, EngineRole::Judge),
-            "/model-triage" => crate::views::engine::open_with_picker(ui, EngineRole::Triage),
             // `/mcp-search` jumps straight into the MCP tab's registry
             // search — THE way to begin looking for a server from anywhere
             // (the old `/`-on-the-MCP-tab trigger collided with the command
