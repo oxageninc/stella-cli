@@ -615,6 +615,29 @@ fn conflict_paths_from_stderr(stderr: &str, changes: &[AdoptedChange]) -> Vec<St
 mod tests {
     use super::*;
 
+    #[test]
+    fn candidate_port_keeps_the_exact_host_operation_journal() {
+        let journal: Arc<dyn stella_media::MediaOperationJournal> = Arc::new(
+            stella_media::SqliteMediaOperationJournal::open_in_memory(Default::default()).unwrap(),
+        );
+        let options = RegistryOptions {
+            media_operation_journal: Some(journal.clone()),
+            ..Default::default()
+        };
+
+        let port = GitCandidateWorkspaces::new(
+            PathBuf::from("unused"),
+            options,
+            Vec::new(),
+            crate::rules::ResolvedRules::default(),
+        );
+
+        assert!(Arc::ptr_eq(
+            &journal,
+            port.options.media_operation_journal.as_ref().unwrap()
+        ));
+    }
+
     /// Run `git <args>` in `root` with hook-exported `GIT_*` vars scrubbed
     /// (the verify_done test discipline — without it, running the suite from
     /// inside a git hook re-targets every command at the HOST repo) and

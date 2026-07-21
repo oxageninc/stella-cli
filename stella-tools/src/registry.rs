@@ -137,26 +137,18 @@ pub struct StorageIndex {
     session: Vec<stella_graph::storage::RelationEntry>,
 }
 
-/// Host-decided registry switches. `Default` is secure; every construction
-/// path threads a value explicitly, with no global fallback.
 #[derive(Clone, Default)]
 pub struct RegistryOptions {
-    /// Register `bash`; off by default, so the model never sees its schema.
     pub bash: bool,
-    /// Register the web family; off by default, so egress is always opt-in.
     pub web: bool,
-    /// Host-owned media gate; `None` resolves to deny.
     pub media_spend_gate: Option<Arc<dyn stella_media::MediaSpendGate>>,
-    /// Host-owned retry-stable identity; required for an approving media gate.
     pub media_operation_ids: Option<Arc<dyn crate::media::MediaOperationIdSource>>,
-    /// Managed ceiling; `false` denies even when a host gate would approve.
+    pub media_operation_journal: Option<Arc<dyn stella_media::MediaOperationJournal>>,
     pub media_requires_host_approval: bool,
 }
 
 impl ToolRegistry {
-    /// Construct with auto-detected optional backends (issue tracker, media
-    /// provider). Prefer [`ToolRegistry::new_detected`] from async contexts —
-    /// this synchronous form probes `gh` inline, blocking the calling thread.
+    /// Construct with auto-detected optional backends.
     pub fn new(root: PathBuf, options: RegistryOptions) -> Self {
         Self::with_backends_and_options(
             root,
@@ -215,6 +207,8 @@ impl ToolRegistry {
             .media_spend_gate
             .clone()
             .zip(options.media_operation_ids.clone())
+            .zip(options.media_operation_journal.clone())
+            .map(|((gate, ids), journal)| (gate, ids, journal))
             .filter(|_| options.media_requires_host_approval);
         let citations: crate::memory::CitationLedger = Arc::default();
         let mcp_usage: stella_core::mcp_usage::McpUsageLedger = Arc::default();
@@ -301,32 +295,38 @@ impl ToolRegistry {
         if crate::graph::graph_available(&root) {
             entries.push(Arc::new(crate::graph::CodeGraphQuery));
         }
-        // Media generation exists only when an image-capable provider key is
-        // configured — BYOK end to end. The async video pair additionally
-        // needs the key family to have a video adapter.
         if let Some(media) = media_backend {
             entries.push(match &media_host_context {
-                Some((gate, ids)) => Arc::new(crate::media::GenerateImage::with_host_context(
-                    media.image,
-                    gate.clone(),
-                    ids.clone(),
-                )) as Arc<dyn Tool>,
+                Some((gate, ids, journal)) => {
+                    Arc::new(crate::media::GenerateImage::with_host_context(
+                        media.image,
+                        gate.clone(),
+                        ids.clone(),
+                        journal.clone(),
+                    )) as Arc<dyn Tool>
+                }
                 None => Arc::new(crate::media::GenerateImage::new(media.image)),
             });
             if let Some(video) = media.video {
                 entries.push(match &media_host_context {
-                    Some((gate, ids)) => Arc::new(crate::media::GenerateVideo::with_host_context(
-                        video.clone(),
-                        gate.clone(),
-                        ids.clone(),
-                    )) as Arc<dyn Tool>,
+                    Some((gate, ids, journal)) => {
+                        Arc::new(crate::media::GenerateVideo::with_host_context(
+                            video.clone(),
+                            gate.clone(),
+                            ids.clone(),
+                            journal.clone(),
+                        )) as Arc<dyn Tool>
+                    }
                     None => Arc::new(crate::media::GenerateVideo::new(video.clone())),
                 });
-                entries.push(Arc::new(crate::media::PollVideo(video)));
+                entries.push(match &media_host_context {
+                    Some((_, _, journal)) => Arc::new(
+                        crate::media::PollVideo::with_operation_journal(video, journal.clone()),
+                    ) as Arc<dyn Tool>,
+                    None => Arc::new(crate::media::PollVideo::new(video)),
+                });
             }
         }
-        // Issue tools exist only when a tracker is configured — no dead
-        // schema entries burning tokens, no surface that errors on use.
         if let Some(backend) = issue_backend {
             let backend = Arc::new(backend);
             entries.push(Arc::new(crate::issues::CreateIssue(backend.clone())));

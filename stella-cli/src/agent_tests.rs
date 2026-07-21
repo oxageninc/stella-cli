@@ -492,7 +492,12 @@ async fn candidate_rules_reuse_the_parent_snapshot_after_source_removal() {
         prompt.contains("Original session guard.  [enforced]"),
         "prompt rendering diverged from the parent rule snapshot: {prompt}"
     );
-    let ws_ports = workspace_ports(root.path().to_path_buf(), &cfg, parent_rules.clone());
+    let ws_ports = workspace_ports(
+        root.path().to_path_buf(),
+        &cfg,
+        stella_tools::RegistryOptions::default(),
+        parent_rules.clone(),
+    );
     let candidate = ws_ports.candidate_workspaces.create().await.unwrap();
     let output = candidate
         .tools()

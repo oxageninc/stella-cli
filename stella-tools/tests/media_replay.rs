@@ -6,17 +6,37 @@ use std::sync::{
 use async_trait::async_trait;
 use stella_media::{
     CostDecision, ImageRequest, MediaArtifact, MediaCapabilities, MediaError, MediaJob,
-    MediaJobStatus, MediaKind, MediaProvider, MediaSpendGate, MediaSpendRequest, VideoRequest,
+    MediaJobStatus, MediaKind, MediaOperationClaim, MediaOperationJournal, MediaOperationRetention,
+    MediaProvider, MediaSpendGate, MediaSpendRequest, SqliteMediaOperationJournal, VideoRequest,
 };
-use stella_tools::media::{GenerateImage, MediaOperationIdSource};
+use stella_tools::media::{
+    GenerateImage, HostMediaOperation, MediaBackend, MediaOperationIdSource,
+};
 use stella_tools::registry::Tool;
+use stella_tools::{RegistryOptions, ToolRegistry};
 
-struct SameHostOperation;
+struct SameHostOperation {
+    expires_at: u64,
+}
 
 impl MediaOperationIdSource for SameHostOperation {
-    fn operation_id(&self) -> String {
-        "host-concurrent-retry".into()
+    fn operation_id(&self) -> HostMediaOperation {
+        HostMediaOperation {
+            opaque_id: "host-concurrent-retry".into(),
+            expires_at: self.expires_at,
+        }
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn journal(path: &std::path::Path) -> Arc<dyn MediaOperationJournal> {
+    Arc::new(SqliteMediaOperationJournal::open(path, MediaOperationRetention::default()).unwrap())
 }
 
 struct CountingGate(AtomicUsize);
@@ -73,10 +93,14 @@ async fn concurrent_same_id_claims_authorize_and_submit_once() {
     let dir = tempfile::tempdir().unwrap();
     let gate = Arc::new(CountingGate(AtomicUsize::new(0)));
     let provider = Arc::new(SlowImageProvider(AtomicUsize::new(0)));
+    let operation_journal = journal(&dir.path().join("host-data/media-operations.db"));
     let tool = GenerateImage::with_host_context(
         provider.clone(),
         gate.clone(),
-        Arc::new(SameHostOperation),
+        Arc::new(SameHostOperation {
+            expires_at: unix_now() + 3600,
+        }),
+        operation_journal,
     );
     let input = serde_json::json!({"prompt": "same"});
 
@@ -90,5 +114,106 @@ async fn concurrent_same_id_claims_authorize_and_submit_once() {
     assert_eq!(
         usize::from(first.is_error()) + usize::from(second.is_error()),
         1
+    );
+}
+
+#[tokio::test]
+async fn different_roots_with_one_host_journal_submit_once() {
+    let first_root = tempfile::tempdir().unwrap();
+    let second_root = tempfile::tempdir().unwrap();
+    let host_data = tempfile::tempdir().unwrap();
+    let gate = Arc::new(CountingGate(AtomicUsize::new(0)));
+    let provider = Arc::new(SlowImageProvider(AtomicUsize::new(0)));
+    let operation_journal = journal(&host_data.path().join("media-operations.db"));
+    let options = RegistryOptions {
+        media_requires_host_approval: true,
+        media_spend_gate: Some(gate.clone()),
+        media_operation_ids: Some(Arc::new(SameHostOperation {
+            expires_at: unix_now() + 3600,
+        })),
+        media_operation_journal: Some(operation_journal),
+        ..Default::default()
+    };
+    let backend = || MediaBackend {
+        image: provider.clone(),
+        video: None,
+    };
+    let first = ToolRegistry::with_backends_and_options(
+        first_root.path().to_path_buf(),
+        None,
+        Some(backend()),
+        options.clone(),
+    );
+    let second = ToolRegistry::with_backends_and_options(
+        second_root.path().to_path_buf(),
+        None,
+        Some(backend()),
+        options,
+    );
+    let input = serde_json::json!({"prompt": "same"});
+
+    let (first_out, second_out) = tokio::join!(
+        first.execute("generate_image", &input),
+        second.execute("generate_image", &input)
+    );
+
+    assert_eq!(gate.0.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        usize::from(first_out.is_error()) + usize::from(second_out.is_error()),
+        1
+    );
+}
+
+#[tokio::test]
+async fn workspace_tools_cannot_modify_or_delete_host_journal() {
+    let workspace = tempfile::tempdir().unwrap();
+    let host_data = tempfile::tempdir().unwrap();
+    let journal_path = host_data.path().join("media-operations.db");
+    let operation_journal = journal(&journal_path);
+    let expires_at = unix_now() + 3600;
+    assert_eq!(
+        operation_journal
+            .claim(
+                "host-owned-key",
+                MediaKind::Image,
+                "concurrent-test",
+                expires_at,
+            )
+            .unwrap(),
+        MediaOperationClaim::New
+    );
+    let registry = ToolRegistry::new(workspace.path().to_path_buf(), RegistryOptions::default());
+    let path = journal_path.to_string_lossy();
+
+    let write = registry
+        .execute(
+            "write_file",
+            &serde_json::json!({"path": path, "content": "reset"}),
+        )
+        .await;
+    let delete = registry
+        .execute("delete_file", &serde_json::json!({"path": path}))
+        .await;
+
+    assert!(
+        write.is_error(),
+        "workspace write escaped its root: {write:?}"
+    );
+    assert!(
+        delete.is_error(),
+        "workspace delete escaped its root: {delete:?}"
+    );
+    assert!(journal_path.exists());
+    assert_eq!(
+        operation_journal
+            .claim(
+                "host-owned-key",
+                MediaKind::Image,
+                "concurrent-test",
+                expires_at,
+            )
+            .unwrap(),
+        MediaOperationClaim::Existing(stella_media::MediaOperationState::Pending)
     );
 }

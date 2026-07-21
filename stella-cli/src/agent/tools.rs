@@ -118,6 +118,7 @@ pub(crate) struct WorkspacePorts {
 pub(crate) fn workspace_ports(
     root: std::path::PathBuf,
     cfg: &Config,
+    registry_options: stella_tools::RegistryOptions,
     active_rules: crate::rules::ResolvedRules,
 ) -> WorkspacePorts {
     // The candidate registry mirrors the session's custom tool surface —
@@ -136,7 +137,7 @@ pub(crate) fn workspace_ports(
         command_runner: ShellCommandRunner { root: root.clone() },
         candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces::new(
             root,
-            registry_options(cfg),
+            registry_options,
             custom_tools,
             active_rules,
         ),
@@ -247,12 +248,35 @@ fn truncate_tail(s: &str, max_bytes: usize) -> String {
 /// interactive, deck, sub-session workers, fleet workers) builds its
 /// registry through this, so no path can quietly re-enable the shell.
 pub(crate) fn registry_options(cfg: &Config) -> stella_tools::RegistryOptions {
+    let media_operation_journal = host_media_operation_journal(&cfg.workspace_root);
     stella_tools::RegistryOptions {
         bash: cfg.tools_bash,
         web: cfg.tools_web,
         media_requires_host_approval: cfg.authority.media_requires_host_approval,
+        media_operation_journal,
         ..Default::default()
     }
+}
+
+fn host_media_operation_journal(
+    workspace_root: &std::path::Path,
+) -> Option<Arc<dyn stella_media::MediaOperationJournal>> {
+    let workspace_root = workspace_root.canonicalize().ok()?;
+    let data_dir = std::path::absolute(stella_store::usage::data_dir()).ok()?;
+    if data_dir.starts_with(&workspace_root) {
+        return None;
+    }
+    std::fs::create_dir_all(&data_dir).ok()?;
+    let data_dir = data_dir.canonicalize().ok()?;
+    if data_dir.starts_with(workspace_root) {
+        return None;
+    }
+    stella_media::SqliteMediaOperationJournal::open(
+        data_dir.join("media-operations.db"),
+        Default::default(),
+    )
+    .ok()
+    .map(|journal| Arc::new(journal) as Arc<dyn stella_media::MediaOperationJournal>)
 }
 
 #[cfg(test)]
@@ -271,8 +295,15 @@ mod tests {
     struct FixedOperationId(&'static str);
 
     impl stella_tools::media::MediaOperationIdSource for FixedOperationId {
-        fn operation_id(&self) -> String {
-            self.0.to_string()
+        fn operation_id(&self) -> stella_tools::media::HostMediaOperation {
+            stella_tools::media::HostMediaOperation {
+                opaque_id: self.0.to_string(),
+                expires_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600,
+            }
         }
     }
 
@@ -283,6 +314,50 @@ mod tests {
         async fn authorize(&self, _request: &MediaSpendRequest) -> CostDecision {
             self.0.fetch_add(1, Ordering::SeqCst);
             CostDecision::Approve
+        }
+    }
+
+    #[test]
+    fn host_journal_rejects_workspace_paths_symlinks_and_dot_fallback() {
+        let _env = crate::test_env::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let saved: Vec<_> = ["STELLA_DATA_DIR", "HOME", "XDG_DATA_HOME", "APPDATA"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+
+        unsafe { std::env::set_var("STELLA_DATA_DIR", workspace.join(".stella")) };
+        assert!(host_media_operation_journal(&workspace).is_none());
+
+        #[cfg(unix)]
+        {
+            let link = outside.join("linked-data");
+            std::os::unix::fs::symlink(&workspace, &link).unwrap();
+            unsafe { std::env::set_var("STELLA_DATA_DIR", link) };
+            assert!(host_media_operation_journal(&workspace).is_none());
+        }
+
+        std::env::set_current_dir(&workspace).unwrap();
+        unsafe {
+            for name in ["STELLA_DATA_DIR", "HOME", "XDG_DATA_HOME", "APPDATA"] {
+                std::env::remove_var(name);
+            }
+        }
+        assert!(host_media_operation_journal(&workspace).is_none());
+
+        std::env::set_current_dir(original_dir).unwrap();
+        unsafe {
+            for (name, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
         }
     }
 
@@ -328,14 +403,24 @@ mod tests {
         workspace: &std::path::Path,
         home: &std::path::Path,
         managed: &std::path::Path,
-    ) -> (crate::settings::Settings, Config) {
+    ) -> (
+        crate::settings::Settings,
+        Config,
+        stella_tools::RegistryOptions,
+    ) {
         let _env = crate::test_env::lock();
         let original_dir = std::env::current_dir().unwrap();
         let original_home = std::env::var_os("HOME");
         let original_managed = std::env::var_os("STELLA_MANAGED_SETTINGS");
+        let original_data = std::env::var_os("STELLA_DATA_DIR");
+        let data_dir = home.join(format!(
+            "data-{}",
+            workspace.file_name().unwrap().to_string_lossy()
+        ));
         unsafe {
             std::env::set_var("HOME", home);
             std::env::set_var("STELLA_MANAGED_SETTINGS", managed);
+            std::env::set_var("STELLA_DATA_DIR", &data_dir);
         }
         std::env::set_current_dir(workspace).unwrap();
         let settings = crate::settings::Settings::load(workspace);
@@ -344,6 +429,7 @@ mod tests {
             Some("test-key"),
             Some("http://localhost:11434/v1"),
         );
+        let options = registry_options(cfg.as_ref().unwrap());
         std::env::set_current_dir(original_dir).unwrap();
         unsafe {
             match original_home {
@@ -354,8 +440,14 @@ mod tests {
                 Some(value) => std::env::set_var("STELLA_MANAGED_SETTINGS", value),
                 None => std::env::remove_var("STELLA_MANAGED_SETTINGS"),
             }
+            match original_data {
+                Some(value) => std::env::set_var("STELLA_DATA_DIR", value),
+                None => std::env::remove_var("STELLA_DATA_DIR"),
+            }
         }
-        (settings.unwrap(), cfg.unwrap())
+        assert!(data_dir.join("media-operations.db").exists());
+        assert!(!data_dir.starts_with(workspace));
+        (settings.unwrap(), cfg.unwrap(), options)
     }
 
     #[tokio::test]
@@ -382,10 +474,10 @@ mod tests {
             let managed = dir.path().join(format!("managed-{name}.json"));
             std::fs::create_dir_all(&workspace).unwrap();
             std::fs::write(&managed, authority_json).unwrap();
-            let (settings, cfg) = load_managed_config(&workspace, &home, &managed);
+            let (settings, cfg, mut options) = load_managed_config(&workspace, &home, &managed);
             let gate = Arc::new(CountingGate(AtomicUsize::new(0)));
             let provider = Arc::new(CountingImageProvider(AtomicUsize::new(0)));
-            let mut options = registry_options(&cfg);
+            assert!(options.media_operation_journal.is_some());
             options.media_spend_gate = Some(gate.clone());
             options.media_operation_ids = Some(Arc::new(FixedOperationId("host-managed-test")));
             let registry = stella_tools::ToolRegistry::with_backends_and_options(

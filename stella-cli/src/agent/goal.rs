@@ -16,11 +16,12 @@ pub(crate) async fn run_raw_one_shot(
     format: OutputFormat,
 ) -> Result<(), String> {
     let provider = build_provider(cfg)?;
+    let registry_options = registry_options(cfg);
     // Concrete `Arc<ToolRegistry>` (not `Arc<dyn ToolExecutor>`) so the
     // files-touched ledger is reachable after the turn — the trait object
     // hides it. It still coerces to `&dyn ToolExecutor` for the engine.
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root);
     let active_rules =
@@ -175,8 +176,9 @@ pub async fn run_goal_cmd(
     use_pipeline: bool,
 ) -> Result<(), String> {
     let provider = build_provider(cfg)?;
+    let registry_options = registry_options(cfg);
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root);
     let active_rules =
@@ -238,6 +240,7 @@ pub async fn run_goal_cmd(
             &store,
             goal,
             Some(presence.id()),
+            registry_options.clone(),
             active_rules.clone(),
         )
         .await
@@ -451,6 +454,7 @@ async fn run_goal_pipeline_turn(
     store: &Option<Arc<Store>>,
     goal: &str,
     session: Option<&str>,
+    registry_options: stella_tools::RegistryOptions,
     active_rules: crate::rules::ResolvedRules,
 ) -> Result<(), String> {
     let turn_start = Instant::now();
@@ -527,7 +531,12 @@ async fn run_goal_pipeline_turn(
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
-        let ws_ports = workspace_ports(cfg.workspace_root.clone(), cfg, active_rules.clone());
+        let ws_ports = workspace_ports(
+            cfg.workspace_root.clone(),
+            cfg,
+            registry_options,
+            active_rules.clone(),
+        );
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = &no_recall;
         let hook_runner = ShellHookRunner;

@@ -19,6 +19,7 @@ reqwest.workspace = true
 roxmltree.workspace = true
 base64.workspace = true
 sha2.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

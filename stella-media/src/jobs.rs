@@ -32,8 +32,6 @@ pub struct JobStore {
 struct JobsFile {
     #[serde(default)]
     jobs: Vec<PersistedMediaJob>,
-    #[serde(default)]
-    operations: Vec<MediaOperation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -76,34 +74,6 @@ impl From<PersistedMediaJob> for MediaJob {
     }
 }
 
-/// Durable, content-free state for one host-identified paid submission.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MediaOperation {
-    pub operation_id: String,
-    pub kind: stella_protocol::MediaKind,
-    pub provider_id: String,
-    pub state: MediaOperationState,
-}
-
-/// The replay-relevant state of a paid media operation. Only opaque handles
-/// are retained; prompts and labels never enter this journal.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-pub enum MediaOperationState {
-    Pending,
-    ImageCompleted {
-        artifact_path: String,
-    },
-    VideoSubmitted {
-        provider_job_id: String,
-    },
-    VideoCompleted {
-        provider_job_id: String,
-        artifact_path: String,
-    },
-}
-
 impl JobStore {
     /// Open a job store whose `jobs.json` lives inside `artifacts_root`. The
     /// root is not created here — the [`crate::artifact::ArtifactStore`] owns
@@ -116,7 +86,7 @@ impl JobStore {
 
     /// Record (or replace, keyed by `provider_job_id`) a submitted job.
     pub fn record(&self, job: &MediaJob) -> Result<(), MediaError> {
-        let _lock = self.lock()?;
+        let _lock = self.mutation_lock()?;
         let mut file = self.load()?;
         if let Some(existing) = file
             .jobs
@@ -128,119 +98,6 @@ impl JobStore {
             file.jobs.push(job.into());
         }
         self.store(&file)
-    }
-
-    /// Durably claim an operation before approval or provider submission.
-    /// Returns its prior state when the host retries an existing identifier.
-    pub fn claim_operation(
-        &self,
-        operation_id: &str,
-        kind: stella_protocol::MediaKind,
-        provider_id: &str,
-    ) -> Result<Option<MediaOperationState>, MediaError> {
-        let _lock = self.lock()?;
-        let mut file = self.load()?;
-        if let Some(existing) = file
-            .operations
-            .iter()
-            .find(|operation| operation.operation_id == operation_id)
-        {
-            if existing.kind != kind || existing.provider_id != provider_id {
-                return Err(MediaError::Artifact(format!(
-                    "operation `{operation_id}` has conflicting media identity"
-                )));
-            }
-            return Ok(Some(existing.state.clone()));
-        }
-        file.operations.push(MediaOperation {
-            operation_id: operation_id.to_string(),
-            kind,
-            provider_id: provider_id.to_string(),
-            state: MediaOperationState::Pending,
-        });
-        self.store(&file)?;
-        Ok(None)
-    }
-
-    /// Mark an image operation complete with its content-free artifact handle.
-    pub fn complete_image_operation(
-        &self,
-        operation_id: &str,
-        artifact_path: &str,
-    ) -> Result<(), MediaError> {
-        let _lock = self.lock()?;
-        let mut file = self.load()?;
-        operation_mut(&mut file, operation_id)?.state = MediaOperationState::ImageCompleted {
-            artifact_path: artifact_path.to_string(),
-        };
-        self.store(&file)
-    }
-
-    /// Atomically retain a submitted video handle and complete its operation.
-    pub fn complete_video_operation(
-        &self,
-        operation_id: &str,
-        job: &MediaJob,
-    ) -> Result<(), MediaError> {
-        let _lock = self.lock()?;
-        let mut file = self.load()?;
-        operation_mut(&mut file, operation_id)?.state = MediaOperationState::VideoSubmitted {
-            provider_job_id: job.provider_job_id.clone(),
-        };
-        if let Some(existing) = file
-            .jobs
-            .iter_mut()
-            .find(|candidate| candidate.provider_job_id == job.provider_job_id)
-        {
-            *existing = job.into();
-        } else {
-            file.jobs.push(job.into());
-        }
-        self.store(&file)
-    }
-
-    /// Atomically retain a completed replay handle and remove its poll row.
-    pub fn complete_video_job(
-        &self,
-        provider_job_id: &str,
-        artifact_path: &str,
-    ) -> Result<(), MediaError> {
-        let _lock = self.lock()?;
-        let mut file = self.load()?;
-        let operation = file.operations.iter_mut().find(|operation| {
-            matches!(
-                &operation.state,
-                MediaOperationState::VideoSubmitted { provider_job_id: id }
-                    if id == provider_job_id
-            )
-        });
-        let Some(operation) = operation else {
-            return Err(MediaError::Artifact(format!(
-                "no operation owns video job `{provider_job_id}`"
-            )));
-        };
-        operation.state = MediaOperationState::VideoCompleted {
-            provider_job_id: provider_job_id.to_string(),
-            artifact_path: artifact_path.to_string(),
-        };
-        file.jobs
-            .retain(|job| job.provider_job_id != provider_job_id);
-        self.store(&file)
-    }
-
-    /// Release a pending claim after the host explicitly denies submission.
-    pub fn cancel_operation(&self, operation_id: &str) -> Result<(), MediaError> {
-        let _lock = self.lock()?;
-        let mut file = self.load()?;
-        let before = file.operations.len();
-        file.operations.retain(|operation| {
-            operation.operation_id != operation_id
-                || operation.state != MediaOperationState::Pending
-        });
-        if file.operations.len() != before {
-            self.store(&file)?;
-        }
-        Ok(())
     }
 
     /// Look up a persisted job by the provider's job id.
@@ -261,7 +118,7 @@ impl JobStore {
     /// Forget a job (call after it reaches a terminal state and any artifact
     /// has been persisted).
     pub fn remove(&self, provider_job_id: &str) -> Result<(), MediaError> {
-        let _lock = self.lock()?;
+        let _lock = self.mutation_lock()?;
         let mut file = self.load()?;
         let before = file.jobs.len();
         file.jobs.retain(|j| j.provider_job_id != provider_job_id);
@@ -285,32 +142,6 @@ impl JobStore {
         }
     }
 
-    fn lock(&self) -> Result<JobStoreLock, MediaError> {
-        let lock_path = self.path.with_extension("json.lock");
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| MediaError::Artifact(format!("cannot create job store dir: {e}")))?;
-        }
-        for _ in 0..50 {
-            match std::fs::create_dir(&lock_path) {
-                Ok(()) => return Ok(JobStoreLock(lock_path)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                Err(error) => {
-                    return Err(MediaError::Artifact(format!(
-                        "cannot lock job store {}: {error}",
-                        self.path.display()
-                    )));
-                }
-            }
-        }
-        Err(MediaError::Artifact(format!(
-            "job store {} remains locked; reconciliation_required",
-            self.path.display()
-        )))
-    }
-
     fn store(&self, file: &JobsFile) -> Result<(), MediaError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
@@ -318,8 +149,6 @@ impl JobStore {
         }
         let body = serde_json::to_string_pretty(file)
             .map_err(|e| MediaError::Artifact(format!("cannot serialize job store: {e}")))?;
-        // Process + write-unique temp name: a fixed `.tmp` path lets
-        // concurrent tasks clobber staged writes and lose a paid job record.
         static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
         let tmp = self.path.with_extension(format!(
             "json.tmp.{}.{}",
@@ -340,24 +169,31 @@ impl JobStore {
         })?;
         Ok(())
     }
-}
 
-struct JobStoreLock(PathBuf);
-
-impl Drop for JobStoreLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.0);
+    fn mutation_lock(&self) -> Result<std::fs::File, MediaError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                MediaError::Artifact(format!("cannot create job store dir: {error}"))
+            })?;
+        }
+        let path = self.path.with_extension("json.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| {
+                MediaError::Artifact(format!(
+                    "cannot open job store lock {}: {error}",
+                    path.display()
+                ))
+            })?;
+        file.lock().map_err(|error| {
+            MediaError::Artifact(format!("cannot lock job store {}: {error}", path.display()))
+        })?;
+        Ok(file)
     }
-}
-
-fn operation_mut<'a>(
-    file: &'a mut JobsFile,
-    operation_id: &str,
-) -> Result<&'a mut MediaOperation, MediaError> {
-    file.operations
-        .iter_mut()
-        .find(|operation| operation.operation_id == operation_id)
-        .ok_or_else(|| MediaError::Artifact(format!("unknown operation `{operation_id}`")))
 }
 
 /// Reconcile a persisted job **live** against its provider (L-V3). This is
@@ -434,6 +270,43 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_distinct_records_and_removes_preserve_every_update() {
+        let dir = TempDir::new().unwrap();
+        let store = JobStore::open(dir.path());
+        for id in ["remove-a", "remove-b"] {
+            store.record(&sample_job(id)).unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let mut workers = Vec::new();
+        for (record, remove) in [
+            ("record-a", "remove-a"),
+            ("record-b", "remove-b"),
+            ("record-c", "missing-a"),
+            ("record-d", "missing-b"),
+        ] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.record(&sample_job(record)).unwrap();
+                store.remove(remove).unwrap();
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let mut ids: Vec<_> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|job| job.provider_job_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["record-a", "record-b", "record-c", "record-d"]);
+    }
+
+    #[test]
     fn survives_a_reopen_persistence_across_process_restart() {
         let dir = TempDir::new().unwrap();
         {
@@ -446,76 +319,9 @@ mod tests {
             reopened.get("job-1").unwrap().unwrap().provider_job_id,
             "job-1"
         );
-    }
-
-    #[test]
-    fn operation_claim_and_completion_survive_reopen_without_content() {
-        let dir = TempDir::new().unwrap();
-        let store = JobStore::open(dir.path());
-        assert_eq!(
-            store
-                .claim_operation("mop_image", MediaKind::Image, "zai")
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            JobStore::open(dir.path())
-                .claim_operation("mop_image", MediaKind::Image, "zai")
-                .unwrap(),
-            Some(MediaOperationState::Pending)
-        );
-        store
-            .complete_image_operation("mop_image", "med_image.png")
-            .unwrap();
-        assert_eq!(
-            JobStore::open(dir.path())
-                .claim_operation("mop_image", MediaKind::Image, "zai")
-                .unwrap(),
-            Some(MediaOperationState::ImageCompleted {
-                artifact_path: "med_image.png".into()
-            })
-        );
-        let journal = std::fs::read_to_string(dir.path().join(JOBS_NAME)).unwrap();
-        assert!(!journal.contains("\"prompt\""));
-        assert!(!journal.contains("\"label\""));
-    }
-
-    #[test]
-    fn video_operation_and_poll_handle_commit_together() {
-        let dir = TempDir::new().unwrap();
-        let store = JobStore::open(dir.path());
-        store
-            .claim_operation("mop_video", MediaKind::Video, "zai")
-            .unwrap();
-        let job = sample_job("job-1");
-        store.complete_video_operation("mop_video", &job).unwrap();
-        let reopened = JobStore::open(dir.path());
-        let persisted = reopened.get("job-1").unwrap().unwrap();
-        assert_eq!(persisted.provider_job_id, job.provider_job_id);
-        assert_eq!(persisted.label, job.artifact_id);
         let journal = std::fs::read_to_string(dir.path().join(JOBS_NAME)).unwrap();
         assert!(!journal.contains("\"label\""));
         assert!(!journal.contains("teaser"));
-        assert_eq!(
-            reopened
-                .claim_operation("mop_video", MediaKind::Video, "zai")
-                .unwrap(),
-            Some(MediaOperationState::VideoSubmitted {
-                provider_job_id: "job-1".into()
-            })
-        );
-
-        reopened.complete_video_job("job-1", "med_abc.mp4").unwrap();
-        assert!(reopened.get("job-1").unwrap().is_none());
-        assert_eq!(
-            reopened
-                .claim_operation("mop_video", MediaKind::Video, "zai")
-                .unwrap(),
-            Some(MediaOperationState::VideoCompleted {
-                provider_job_id: "job-1".into(),
-                artifact_path: "med_abc.mp4".into(),
-            })
-        );
     }
 
     #[test]

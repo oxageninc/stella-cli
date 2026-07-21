@@ -91,16 +91,13 @@ async fn run_pipeline_one_shot(
 ) -> Result<(), String> {
     let provider = build_provider(cfg)?;
     let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
-
+    let registry_options = registry_options(cfg);
     let registry: Arc<ToolRegistry> = Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root);
     let active_rules =
         crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
-    // Auto-build + live-refresh the code graph in the background so the
-    // pipeline's localize step can reach for `graph_query` once it is ready.
-    // Status goes to stderr — stdout may be machine-readable JSON.
     let (_session_graph, _graph_build) = spawn_session_graph(
         &cfg.workspace_root,
         registry.clone(),
@@ -176,13 +173,16 @@ async fn run_pipeline_one_shot(
             default_ask_io(format == OutputFormat::Text),
         )
         .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
-        // Outermost: the discovery layer (tool_search/skill_search/mcp_search)
-        // must see the complete advertised catalog below it.
         let tools =
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
                 .with_project_prompts_allowed(cfg.authority.project_prompts_allowed);
 
-        let ws_ports = workspace_ports(cfg.workspace_root.clone(), cfg, active_rules.clone());
+        let ws_ports = workspace_ports(
+            cfg.workspace_root.clone(),
+            cfg,
+            registry_options,
+            active_rules.clone(),
+        );
 
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);

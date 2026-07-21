@@ -260,8 +260,9 @@ pub async fn run_deck_session(
     // MCP connect is NOT here: it can block up to 10s per server, so it runs
     // after the deck task spawns, narrated as transcript events (#98).
     let provider = agent::build_provider(cfg)?;
+    let registry_options = agent::registry_options(cfg);
     let registry: Arc<ToolRegistry> = Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), agent::registry_options(cfg)).await,
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
     agent::populate_schema_index(&registry, &cfg.workspace_root);
     let active_rules =
@@ -627,7 +628,7 @@ pub async fn run_deck_session(
     let mut pending_create: Option<(String, AgentScope)> = None;
     // Sub-session bookkeeping: live-worker slots, and `task_assign` requests
     // waiting for one (drained oldest-first as workers end).
-    let mut subs = SubSessions::new();
+    let mut subs = SubSessions::with_registry_options(registry_options.clone());
     let mut pending_spawns: VecDeque<stella_core::tasks::SpawnRequest> = VecDeque::new();
     // Lanes whose Restart arrived while the worker was still live: stop
     // first, respawn on its Ended.
@@ -1194,6 +1195,7 @@ pub async fn run_deck_session(
                         &mut budget,
                         cfg,
                         &active_rules,
+                        &registry_options,
                         execution.clone(),
                         &in_tx,
                         &ask_io,
@@ -4236,6 +4238,7 @@ async fn run_lead_pipeline_turn(
     budget: &mut BudgetGuard,
     cfg: &Config,
     active_rules: &crate::rules::ResolvedRules,
+    registry_options: &stella_tools::RegistryOptions,
     execution: Option<(Arc<Store>, i64)>,
     in_tx: &UnboundedSender<Inbound>,
     ask_io: &DeckAskUserIo,
@@ -4300,8 +4303,12 @@ async fn run_lead_pipeline_turn(
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
-        let ws_ports =
-            agent::workspace_ports(cfg.workspace_root.clone(), cfg, active_rules.clone());
+        let ws_ports = agent::workspace_ports(
+            cfg.workspace_root.clone(),
+            cfg,
+            registry_options.clone(),
+            active_rules.clone(),
+        );
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = match memory {
             Some(m) => m,
