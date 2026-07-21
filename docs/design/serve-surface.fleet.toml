@@ -1,0 +1,216 @@
+# Stella serve surface — fleet plan
+# Source: docs/design/serve-surface.md (2026-07-20). Builds the headless engine
+# service (Option B of oxagen ADR-033) so Oxagen drives the Rust core over HTTP/SSE.
+#
+# Run from the stella repo root, on a FEATURE BRANCH (shared-tree commits land on
+# the current branch):
+#   git checkout feat/serve-engine
+#   stella fleet --plan docs/design/serve-surface.fleet.toml --max-concurrency 4 --budget <N>
+# Per-child budget = --budget / --max-concurrency. No resume: re-running re-dispatches
+# every task; prompts tell workers to reconcile with already-landed work.
+#
+# EVERY task must leave `make gate` green (fmt --check + file-size ratchet +
+# clippy -D warnings + cargo test --workspace). New .rs files are capped at 1500
+# lines by the ratchet — split modules. Library code returns typed, named errors;
+# no .unwrap()/.expect() on runtime data. Behavior changes ship a witness test
+# (fails on old code, passes on new). Pure refactors say so in the commit.
+#
+# Phase order: 0 -> 1 -> 2 -> (3 tasks run parallel from their deps) -> 4 verify.
+# Tasks sharing a claimed file are dependency-ordered (claims are exact-string
+# locks; a conflict at dispatch is a PERMANENT failure and dependents are skipped).
+
+# ───────────────────────── Phase 0 — make the wiring reusable ─────────────────────────
+
+[[tasks]]
+id = "p0-runtime-lib"
+title = "Extract stella-cli engine wiring into a reusable stella-runtime crate"
+claims = ["stella-runtime/Cargo.toml", "stella-runtime/src/lib.rs", "stella-runtime/src/builder.rs", "Cargo.toml"]
+prompt = '''
+You are one worker in a fleet preparing Stella to run as a headless engine service for Oxagen. Read docs/design/serve-surface.md first — it is the design of record. Reconcile with already-landed work: read every file you touch before editing.
+
+Problem (from the sweep): stella-cli is bin-only (no [lib]); its engine wiring — build_provider / ToolRegistry::new_detected / open_store / connect_mcp / build_system_prompt / build_budget_guard / the tool-set stack / workspace_ports — is duplicated across run_pipeline_one_shot (agent.rs:85), run_goal_cmd, command_deck.rs, and fleet_cmd.rs. Nothing is callable from another crate. This is Step 0.
+
+Your task:
+1. Create a new workspace crate `stella-runtime` (add to root Cargo.toml [workspace] members, alphabetized near the other stella-* crates; version.workspace = true etc. like siblings).
+2. Extract the canonical construction sequence from stella-cli/src/agent.rs (steps 1–19 documented in serve-surface.md and in agent.rs) into ONE builder API, e.g. `RuntimeBuilder::new(config).build() -> SessionRuntime` returning the assembled provider + tool registry + store + mcp toolset + system prompt + budget + ports. Take workspace_root, provider config, and settings as EXPLICIT inputs (Config::load_with_settings is the clean seam) — do NOT read process env or current_dir inside the builder. Vertex/Bedrock/ZAI secondary config that build_provider_parts currently reads from std::env must become explicit builder inputs.
+3. Re-point stella-cli's existing drivers at stella-runtime so the CLI is a thin consumer — NO behavior change to the CLI (this is the correctness bar: `stella run`, `goal`, `fleet`, `chat` behave identically). Keep TTY-coupled pieces (spawn_renderer text arm, command_deck, stdin REPL) in stella-cli; only the pure wiring moves.
+4. The builder must be usable with N different workspace_root values in one process (fleet already proves this is safe below Config::load).
+
+Verify: `cargo build --workspace`, `make lint`, and run the CLI smoke path (`cargo run -p stella-cli -- models`). This is a refactor — no witness needed, but state that in the commit and confirm existing tests still pass (`cargo test -p stella-cli`). When done, COMMIT all work via repo_commit with a descriptive conventional-commit message (scope: stella-runtime). Uncommitted work is lost.
+'''
+
+# ───────────────────────── Phase 1 — step-scoped engine facade ─────────────────────────
+
+[[tasks]]
+id = "p1-engine-facade"
+title = "stella-engine facade with run_step + serializable checkpoint"
+depends_on = ["p0-runtime-lib"]
+claims = ["stella-engine/Cargo.toml", "stella-engine/src/lib.rs", "stella-engine/src/turn_state.rs", "stella-engine/src/checkpoint.rs"]
+prompt = '''
+You are one worker in a fleet preparing Stella as a headless engine service for Oxagen. Read docs/design/serve-surface.md and stella-core/src/driver.rs first. Reconcile with already-landed work (stella-runtime now exists).
+
+Problem: Engine::run_turn (stella-core/src/driver.rs:329) owns the whole `for step in 0..max_steps` loop. Oxagen's durable runner needs to checkpoint and cancel BETWEEN committed steps from outside. The phase functions inside run_turn are already separate — this is extraction, not redesign.
+
+Your task — create a new workspace crate `stella-engine` (add to root Cargo.toml members):
+1. `TurnState` — owns the mutable per-turn state that currently lives as locals in run_turn: the message history, BudgetGuard, the calibration map handle, step index, and any oracle/pipeline state needed to resume. It must be constructible fresh (`Engine::new_turn(spec, None)`) or from a checkpoint (`Engine::new_turn(spec, Some(checkpoint))`).
+2. `Engine::run_step(&self, state: &mut TurnState) -> Result<StepOutcome, EngineError>` — runs exactly ONE committed step (the body of the run_turn loop: pause-gate → steering drain → compaction → loop-detect → budget check → model call with retry → dispatch), emits the same AgentEvents run_turn emits into the state's event sender, and returns StepOutcome { Continue | Done { text, cost_usd } | Aborted { reason } }. Do NOT change run_turn's observable behavior — ideally re-implement run_turn as a loop over run_step so there is ONE code path (delete the duplication).
+3. `Checkpoint` — a serde-serializable snapshot: (messages_digest or messages, budget_state, oracle_state, calibration_state, event seq). Round-trips byte-for-byte (add a round-trip test, per the serde-first invariant).
+4. Keep stella-core I/O-free — stella-engine may depend on stella-core + stella-protocol + stella-pipeline; it must NOT add I/O to the engine core.
+
+Verify: witness test that drives new_turn → run_step until Done over a mock Provider + mock ToolExecutor, and a second test proving new_turn(spec, Some(checkpoint)) resumes at the right step with identical downstream events. `make gate` green. COMMIT via repo_commit (scope: stella-engine). Uncommitted work is lost.
+'''
+
+[[tasks]]
+id = "p1-cancellation"
+title = "Cancellation token through run_step; retire dead ProviderError::Cancelled path"
+depends_on = ["p1-engine-facade"]
+claims = ["stella-engine/src/lib.rs", "stella-core/src/driver.rs"]
+prompt = '''
+You are one worker in a fleet preparing Stella as a headless engine service. Read docs/design/serve-surface.md §"Upstream Stella work items" (item 6) and stella-core/src/driver.rs. stella-engine's run_step now exists — build on it; reconcile with landed work (this task shares stella-engine/src/lib.rs and driver.rs with the facade task, which is already merged).
+
+Today hard-cancel is host-side future-drop only; ProviderError::Cancelled exists but is never produced. Add a first-class cancellation token so a host can stop a turn at a safe boundary AND document the hard-drop semantics.
+
+Your task:
+1. Thread a cancellation signal (a cheap clonable token, e.g. a shared AtomicBool or a tokio watch/CancellationToken already reachable via the sync feature) into TurnState / run_step. Checked at the SAME safe boundary as soft-stop and budget (step top, never mid-tool). On cancel, close any open tool_use with synthetic error tool_results (mirror the budget-overshoot discipline at driver.rs ~807-825) so reused history stays valid, emit the appropriate Aborted event, and return StepOutcome::Aborted { reason }.
+2. Distinguish soft-stop (keep completed steps) from cancel (stop now) in the reason so the host can render correctly.
+3. Either produce ProviderError::Cancelled on the real path or delete it as dead — do not leave a lying variant. Chase the rename through comments/docs.
+4. Document hard-drop (future-drop) semantics in the run_step doc comment: what state is lost, why soft-cancel is preferred.
+
+Verify: witness test that a mid-turn cancel returns Aborted at a step boundary with valid tool_use/tool_result pairing and no mid-tool interruption. `make gate` green. COMMIT via repo_commit (scope: stella-engine/stella-core). Uncommitted work is lost.
+'''
+
+# ───────────────────────── Phase 2 — the serve sidecar ─────────────────────────
+
+[[tasks]]
+id = "p2-serve-skeleton"
+title = "stella-serve crate: HTTP/SSE server, session manager, thread-per-session"
+depends_on = ["p1-engine-facade"]
+claims = ["stella-serve/Cargo.toml", "stella-serve/src/main.rs", "stella-serve/src/server.rs", "stella-serve/src/session.rs", "stella-serve/src/http.rs"]
+prompt = '''
+You are one worker in a fleet building Stella's headless engine service for Oxagen. Read docs/design/serve-surface.md (whole doc) and study stella-observatory/src/lib.rs — it is the in-repo HTTP precedent (hand-rolled HTTP/1.1 over tokio::net::TcpListener, pure `respond` function, DNS-rebinding Host guard, per-connection tokio::spawn). Reconcile with landed work (stella-runtime + stella-engine exist).
+
+Build a new workspace crate `stella-serve` (add to root Cargo.toml members) — a long-lived, multi-session engine server. Follow Observatory idioms; do NOT add axum/hyper (respect "no new deps casually" — the Observatory proves a hand-rolled server is the house style). If you believe a framework is justified, put ONE sentence of justification in the commit body per the dependency rule.
+
+Endpoints (see serve-surface.md "Architecture"):
+- POST /v1/sessions            → create a Session (id, workspace_root, provider cfg via stella-runtime builder); returns id.
+- POST /v1/sessions/:id/turn   → drive a turn via stella-engine run_step loop; returns a run id.
+- GET  /v1/sessions/:id/events → SSE stream of AgentEvent JSON, each with monotonic seq; resumable via ?after=<seq>.
+- POST /v1/sessions/:id/{steer,pause,cancel} → map to TurnSteering / TurnGate / cancellation.
+- DELETE /v1/sessions/:id       → tear down thread + runtime + stores.
+- GET /healthz /readyz.
+
+Critical: the engine turn future is `!Send` (fleet_cmd.rs:375-405). Each session MUST run on its OWN std::thread with a current-thread tokio runtime, bridged to the async accept/SSE side by Send channels/oneshots — copy EngineWorker's pattern in stella-cli/src/fleet_cmd.rs. Do NOT tokio::spawn the engine future on the multi-thread runtime.
+
+Auth + bind: bearer-token auth (token from an explicit config arg, NOT ambient); reuse the Observatory's Host-header loopback/DNS-rebinding guard but allow a configurable bind address (127.0.0.1 for local, 0.0.0.0 inside a container). Graceful shutdown: SIGTERM drains in-flight turns to the next step boundary (soft-stop) then exits. Do NOT use stella-store or shell hooks server-side.
+
+Leave the reverse-RPC ports (tool-result/approval) and RemoteProvider/RemoteToolExecutor to the dependent task p2-remote-ports — expose the seams (a pluggable ToolExecutor/Provider on the Session) but a first cut may wire the local ports so the crate compiles and an integration test can drive an echo turn.
+
+Verify: integration test that creates a session, drives a turn against a mock Provider, and asserts the AgentEvent SSE stream (including resume from ?after=). Split files to stay under the 1500-line ratchet. `make gate` green. COMMIT via repo_commit (scope: stella-serve). Uncommitted work is lost.
+'''
+
+[[tasks]]
+id = "p2-remote-ports"
+title = "Remote ports + reverse tool-call/approval RPC over the wire"
+depends_on = ["p2-serve-skeleton"]
+claims = ["stella-serve/src/server.rs", "stella-serve/src/session.rs", "stella-serve/src/remote_ports.rs"]
+prompt = '''
+You are one worker in a fleet building Stella's engine service for Oxagen. Read docs/design/serve-surface.md §"Wire protocol" and §"Containment posture". stella-serve now exists with a session manager and SSE — build on it; reconcile with landed work (this shares server.rs/session.rs with p2-serve-skeleton, already merged).
+
+The sovereignty rule: server-side, the engine must NOT execute tools or call models with ambient authority. Every model call and tool call is remoted back to the host (Oxagen), which runs kernel.invoke(). Implement the reverse-RPC transport:
+
+1. RemoteToolExecutor (implements stella_core::ports::ToolExecutor): execute(name, input) emits a tool_start AgentEvent carrying a fresh call_id, then AWAITS a per-call_id oneshot. Add POST /v1/sessions/:id/tool-result { call_id, output } that resolves the matching oneshot with a ToolResult/ToolOutput. schemas() returns the schemas the host advertised at session-create (host sends the materialized tool schemas, incl. read_only flags, so partitioned concurrency still works).
+2. RemoteApprovalGate (implements the pipeline ApprovalGate): a scope_review/ask_user AgentEvent carrying an id; POST /v1/sessions/:id/approval { id, decision } resolves it. Headless with no bypass and no host decision = the named ScopeReviewRequiredHeadless error, never silent auto-approve.
+3. RemoteProvider (implements stella_protocol::Provider): complete_observed forwards text_delta/tool_call_streamed as AgentEvents so the browser gets token streaming; the actual model call is delegated to the host via the same reverse-RPC (the host owns @oxagen/ai). Classify HTTP/stream errors into Stella's ProviderError taxonomy AT the adapter (Transport/RateLimited/Auth/Malformed/Terminal) — never re-derived downstream.
+4. `--tools remote` mode (default for server): the local shell/web/process tool surface is NOT registered server-side; all execution goes through RemoteToolExecutor. Confirm build_project/run_tests/verify_done/run_script are absent from the remote registry (the sweep found these bypass tools.bash:off).
+
+Wire correlation must be robust to concurrent in-flight calls in one turn (partitioned read-only groups can have several tool_starts pending). Use call_id-keyed maps guarded per-session.
+
+Verify: integration test — drive a turn where the engine requests two read-only tool calls concurrently + one mutating call; assert the host receives the tool_start events, POSTs results by call_id, and the turn completes with correct ordering. Test the ScopeReviewRequiredHeadless path. `make gate` green. COMMIT via repo_commit (scope: stella-serve). Uncommitted work is lost.
+'''
+
+# ───────────────────────── Phase 3 — parallel enablers (independent files) ─────────────────────────
+
+[[tasks]]
+id = "p3-agentevent-codegen"
+title = "Serde-stable AgentEvent -> TS/JSON-Schema codegen + validate_stream CI gate"
+depends_on = ["p1-engine-facade"]
+claims = ["stella-protocol/src/schema_export.rs", "stella-protocol/Cargo.toml", "scripts/export-agentevent-schema.sh"]
+prompt = '''
+You are one worker in a fleet preparing Stella as Oxagen's engine. Read docs/design/serve-surface.md §"Wire protocol" and stella-protocol/src/event.rs. Reconcile with landed work.
+
+Oxagen must consume typed AgentEvents (ADR-033 §6 item 3). Produce a codegen path from the serde-stable AgentEvent enum to a shared schema:
+1. Add a schema-export path in stella-protocol (a schemars derive + an export binary/test, OR ts-rs) that emits JSON Schema (and/or TS types) for AgentEvent and every payload type it references. Gate it behind a feature or a small bin target so it does not bloat the default build. Keep the additive-only, byte-stable serde contract intact — do not change any wire tags/field names.
+2. Add scripts/export-agentevent-schema.sh that regenerates the schema into a committed artifact (e.g. docs/wire/agentevent.schema.json) so drift is reviewable.
+3. Wire stella_protocol replay `validate_stream` (stage-ordering, tool pairing, single terminal Complete, monotonic budget) as a test/CI-runnable conformance check over a recorded fixture stream, so the host and CLI streams are validated against the same rules.
+
+Verify: the exported schema round-trips a fixture AgentEvent stream; validate_stream passes on a good fixture and fails on a corrupted one (out-of-order stage, double Complete). `make gate` green. COMMIT via repo_commit (scope: stella-protocol). Uncommitted work is lost.
+'''
+
+[[tasks]]
+id = "p3-provider-observed"
+title = "complete_observed overrides for OpenAI/Gemini/Vertex/Bedrock (uniform token streaming)"
+depends_on = ["p0-runtime-lib"]
+claims = ["stella-model/src/openai.rs", "stella-model/src/gemini.rs", "stella-model/src/vertex.rs", "stella-model/src/bedrock.rs"]
+prompt = '''
+You are one worker in a fleet preparing Stella as Oxagen's engine service. Read docs/design/serve-surface.md §"Wire protocol" and stella-model/src/provider.rs + anthropic.rs (the reference that already implements complete_observed). Reconcile with landed work.
+
+Problem (from the model sweep): Anthropic and all OpenAI-compatible (zai.rs) adapters override complete_observed and emit text_delta / tool_call_streamed mid-stream. OpenAI (openai.rs), Gemini (gemini.rs), Vertex (vertex.rs), and Bedrock (bedrock.rs) do NOT — they stream internally but return only the aggregated result, so a browser re-stream through them sees one final chunk. Bedrock's Converse is non-streaming; handle it honestly (emit the final text as one delta, documented).
+
+Your task: add complete_observed overrides to openai.rs, gemini.rs, and vertex.rs that call observer.text_delta(...) and observer.tool_call_streamed(...) at their existing SSE delta-parse sites (they already loop the stream — this is small, scoped additions, not a rewrite). For bedrock.rs, implement complete_observed to emit the assembled text as a single terminal delta with a doc comment explaining Converse is non-streaming. Do NOT change token accounting or cost — only add the observer emissions. Preserve error classification.
+
+Verify: extend the existing wiremock-based adapter tests to assert complete_observed emits ordered text_delta fragments (mirror the zai.rs test `complete_observed_streams_content_deltas`). `make gate` green. Note: these four files are all in stella-model and edited by one task to avoid claim conflicts. COMMIT via repo_commit (scope: stella-model). Uncommitted work is lost.
+'''
+
+[[tasks]]
+id = "p3-bus-lifecycle"
+title = "Host-emitted bus lifecycle events (emit_named helpers)"
+depends_on = ["p1-engine-facade"]
+claims = ["stella-core/src/bus.rs"]
+prompt = '''
+You are one worker in a fleet preparing Stella as Oxagen's engine. Read docs/design/serve-surface.md §"Upstream Stella work items" (item 5) and stella-core/src/bus.rs. Reconcile with landed work.
+
+Problem (ADR-033 §6 item 4, and the sweep): the hook bus is only emitted from the tool registry today; there is no general lifecycle host, so session/model/tool lifecycle events cannot be observed. The serve sidecar (and Oxagen's plugin policy surface) needs to attach observers to session-start/model-call/step lifecycle.
+
+Your task:
+1. Add blessed `emit_named` helper(s) on HookBus so a host can emit the session/model/step lifecycle events from the general catalog (names::*) without hand-constructing HookEvent envelopes — keeping payload hygiene (secret scan, sensitive-path detection, sanitized observer payloads) intact.
+2. Ensure the catalog (names) covers the lifecycle points a host needs: session.start/end, model.call.start/end, step.start/end (add names if missing, additive only). Keep the blocking allowlist (the 9 interceptable names) UNCHANGED — lifecycle events are observer-only, never blocking.
+3. Keep fail-closed for blocking policy and isolation for observers (a panicking observer must not break the turn; note release profile is panic=abort so observers must return Err, not panic).
+
+Verify: unit test that emit_named delivers a lifecycle event to a registered observer with a sanitized payload, and that a secret in the payload is redacted / a secret-scan event fires. `make gate` green. COMMIT via repo_commit (scope: stella-core). Uncommitted work is lost.
+'''
+
+[[tasks]]
+id = "p3-tools-isolation"
+title = "Per-session isolation of stella-tools process-global state"
+depends_on = ["p0-runtime-lib"]
+claims = ["stella-tools/src/web.rs", "stella-tools/src/sandbox.rs", "stella-tools/src/media.rs"]
+prompt = '''
+You are one worker in a fleet preparing Stella as a headless multi-session engine service. Read docs/design/serve-surface.md §"Containment posture" and the relevant stella-tools files. Reconcile with landed work.
+
+Problem (from the tools sweep): server mode runs one engine process per trust boundary, but several tool knobs are read from process-global std::env and cannot be per-session: STELLA_BASH_SANDBOX (sandbox.rs), STELLA_WEB_AUTH_FILE + web auth config (web.rs), BRAVE_API_KEY/TAVILY_API_KEY (web.rs), media provider keys (media.rs via detect_media_backend in stella-tools/src/media.rs). For the serve sidecar these are delegated to the host (RemoteToolExecutor), but the CLI still needs them — so make them INJECTABLE without breaking the CLI.
+
+Your task:
+1. Add explicit-config constructors alongside the env-reading paths: web auth, search keys, sandbox mode, and the media backend must all be constructible from passed-in values (a config struct), falling back to the env-reading path ONLY when the CLI wiring opts in. Do NOT delete the env path — the CLI relies on it; add an injection seam next to it (mirror how the model adapters already take ApiKey as a constructor arg while the CLI does env detection).
+2. detect_media_backend(): add a per-request variant that takes injected keys instead of reading ZAI_API_KEY/OPENAI_API_KEY from std::env.
+3. Document that in server (`--tools remote`) mode none of these run locally.
+
+Verify: unit test constructing each surface from explicit config with NO env set. `make gate` green. COMMIT via repo_commit (scope: stella-tools). Uncommitted work is lost.
+'''
+
+# ───────────────────────── Phase 4 — end-to-end verification ─────────────────────────
+
+[[tasks]]
+id = "p4-e2e-verify"
+title = "End-to-end serve integration test + Dockerfile + serve-surface docs"
+depends_on = ["p2-remote-ports", "p3-agentevent-codegen"]
+claims = ["stella-serve/tests/e2e.rs", "packaging/docker/Dockerfile.serve", "docs/design/serve-surface.md"]
+prompt = '''
+You are the verification worker in a fleet that built Stella's headless engine service for Oxagen. Read docs/design/serve-surface.md. Reconcile with all landed work (stella-runtime, stella-engine, stella-serve with remote ports, codegen).
+
+Your task:
+1. Write stella-serve/tests/e2e.rs — a full round trip against a REAL stella-serve instance bound to an ephemeral port: create session → open the events SSE → POST a turn → act as the HOST: receive tool_start events, POST tool-result by call_id, resolve one scope-review approval → assert the turn reaches a single terminal Complete, the AgentEvent stream validates via validate_stream, and a mid-turn cancel returns Aborted at a step boundary. Use a mock model via the reverse Provider RPC (no real API key).
+2. Add packaging/docker/Dockerfile.serve — a multi-stage build (rust:1.97 builder honoring rust-toolchain.toml → distroless/debian-slim runtime) that builds `stella-serve` in --release and runs it binding 0.0.0.0:$PORT with a bearer token from env. This is the image Oxagen's infra deploys (its docker-compose service + Modal/container target reference it). Include a HEALTHCHECK hitting /healthz.
+3. Update docs/design/serve-surface.md "Build decomposition" to reflect what actually shipped (mark items done, note any deviations).
+
+Verify: `cargo test -p stella-serve` green; `docker build -f packaging/docker/Dockerfile.serve .` succeeds if a docker daemon is available (else document the exact build command). `make gate` green. COMMIT via repo_commit (scope: stella-serve/packaging). Uncommitted work is lost.
+'''

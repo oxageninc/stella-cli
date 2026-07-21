@@ -103,22 +103,22 @@ async fn complete_reassembles_a_large_multi_fragment_tool_call() {
     let chars: Vec<char> = full_input_json.chars().collect();
     let mut body = String::from(
         "event: message_start\n\
-         data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":40,\"output_tokens\":0}}}\n\n\
-         event: content_block_start\n\
-         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"write_file\"}}\n\n",
+             data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":40,\"output_tokens\":0}}}\n\n\
+             event: content_block_start\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"write_file\"}}\n\n",
     );
     for piece in chars.chunks(29) {
         let frag: String = piece.iter().collect();
         let escaped = serde_json::to_string(&frag).unwrap();
         body.push_str("event: content_block_delta\n");
         body.push_str(&format!(
-            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{escaped}}}}}\n\n"
-        ));
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{escaped}}}}}\n\n"
+            ));
     }
     body.push_str(
-        "event: message_delta\n\
-         data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":0,\"output_tokens\":15}}\n\n",
-    );
+            "event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":0,\"output_tokens\":15}}\n\n",
+        );
 
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -910,7 +910,7 @@ async fn complete_observed_announces_a_tool_call_at_its_block_stop() {
     assert_eq!(
         announced[0], result.tool_calls[0],
         "an announced call must be identical to its committed twin — \
-         harvest matches by exact equality"
+             harvest matches by exact equality"
     );
     assert_eq!(
         announced[0].input,

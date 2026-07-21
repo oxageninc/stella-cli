@@ -8,6 +8,7 @@ stella-core/src/bus.rs 1671
 stella-core/src/driver.rs 3149
 stella-core/src/rules.rs 1606
 stella-core/src/skills.rs 1518
+stella-model/src/zai.rs 2063
 stella-pipeline/src/pipeline.rs 1938
 stella-pipeline/src/pipeline/tests.rs 1524
 stella-store/src/lib.rs 3904
