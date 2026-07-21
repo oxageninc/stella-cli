@@ -409,6 +409,22 @@ pub async fn run_deck_session(
     if let Some(report) = custom.problems_report() {
         let _ = deck_tx.send(chrome_note(report));
     }
+    // Honest degradation (#266): a user who pinned a reasoning effort for the
+    // lead but chose a provider whose adapter has no reasoning control gets a
+    // one-line notice instead of a silently-dropped setting. Keyed on the
+    // explicit settings pin for the lead (Default kind), never the
+    // auto-resolved effort — session chrome, re-checked every boot, never
+    // journaled.
+    if let Some(notice) = crate::engine_config::unsupported_effort_notice(
+        cfg.provider.id,
+        cfg.provider.display_name,
+        cfg.engine_settings
+            .as_ref()
+            .and_then(|e| e.agent(crate::settings::EngineAgentKind::Default))
+            .and_then(|a| a.effort),
+    ) {
+        let _ = deck_tx.send(chrome_note(notice));
+    }
     // An idle lead is waiting on the human, not queued behind a supervisor
     // (sent after the problems report — a Text event folds to `Running`).
     let _ = in_tx.send(Inbound::Status {

@@ -51,6 +51,27 @@ fn every_seeded_provider_declares_a_cache_posture() {
     }
 }
 
+/// The reasoning-axis sibling of the cache-posture guard: every seeded
+/// provider must declare how its reasoning/thinking budget is controlled (or
+/// that the shared adapter deliberately drops it). Born from the same silent
+/// per-provider divergence — a pinned effort reaching only Z.ai and OpenRouter
+/// and being dropped everywhere else with nothing enforcing the omission stays
+/// deliberate. A new provider cannot land without stating its reasoning
+/// posture and naming the witness that proves a `Controllable` control on the
+/// wire.
+#[test]
+fn every_seeded_provider_declares_a_reasoning_posture() {
+    for provider in PROVIDERS.iter().chain(std::iter::once(&LOCAL_PROVIDER)) {
+        assert!(
+            stella_model::provider_parity::reasoning_posture(provider.id).is_some(),
+            "provider `{}` has no ReasoningPosture row in \
+             stella-model/src/provider_parity.rs — add it (with a witness test for a \
+             Controllable control, or a note for a no-control posture) in this PR",
+            provider.id
+        );
+    }
+}
+
 #[test]
 fn alias_env_var_resolves_when_the_primary_is_unset() {
     // Synthetic provider with unique var names so parallel tests can't
