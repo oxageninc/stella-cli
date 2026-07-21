@@ -1,0 +1,22 @@
+[package]
+name = "stella-serve"
+description = "Headless engine server: drives the Stella engine over a wire protocol so a host (e.g. Oxagen) runs the Rust core under the hood. Every model and tool call is remoted back to the host — the engine holds no ambient authority."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[dependencies]
+stella-protocol = { path = "../stella-protocol" }
+stella-core = { path = "../stella-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }

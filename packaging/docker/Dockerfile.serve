@@ -1,0 +1,37 @@
+# stella-serve — the headless engine sidecar (ADR-033 Option B).
+#
+# Multi-stage: build the release binary against the pinned toolchain, then ship
+# a slim runtime that runs it. The host wires STELLA_SERVE_TOKEN and drives every
+# model/tool call back over the reverse-RPC protocol; this image serves no local
+# tool surface (STELLA_SERVE_TOOLS=remote).
+#
+#   docker build -f packaging/docker/Dockerfile.serve -t stella-serve .
+#   docker run -e STELLA_SERVE_TOKEN=$(openssl rand -hex 32) -p 8080:8080 stella-serve
+
+# rust-toolchain.toml pins the exact compiler; this base tag must track it.
+FROM rust:1.97-bookworm AS builder
+WORKDIR /src
+COPY . .
+# Build only the server binary and its dependency graph, in release.
+RUN cargo build --release --locked --bin stella-serve
+
+FROM debian:bookworm-slim AS runtime
+# rustls is used for TLS, so no OpenSSL runtime is needed; ca-certificates is
+# kept for outbound HTTPS should a future port need it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/stella-serve /usr/local/bin/stella-serve
+
+# Bind all interfaces inside the container; the bearer token is the auth gate and
+# the container runs inside the host's private network / tenant sandbox.
+ENV STELLA_SERVE_BIND=0.0.0.0:8080 \
+    STELLA_SERVE_TOOLS=remote
+EXPOSE 8080
+
+# The binary's own healthcheck probes /healthz — no wget/curl needed in the image.
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
+    CMD ["/usr/local/bin/stella-serve", "healthcheck"]
+
+# STELLA_SERVE_TOKEN must be supplied at run time.
+ENTRYPOINT ["/usr/local/bin/stella-serve"]
