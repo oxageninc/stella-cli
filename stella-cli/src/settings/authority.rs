@@ -12,6 +12,7 @@ use super::{
 /// `off` denies the corresponding capability. An `on` value permits a later
 /// explicit grant (such as repository trust), but never grants by itself.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedAuthoritySettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_prompts: Option<Toggle>,
@@ -132,5 +133,116 @@ pub(super) fn apply_tool_ceiling(settings: &mut Settings, authority: AuthorityPo
         if !authority.web_allowed {
             tools.web = Some(Toggle::Off);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{EngineAgentKind, ProjectTrust, Settings};
+
+    fn parsed(json: &str) -> Settings {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn captured_scope_snapshots_enforce_project_restoration_and_managed_ceiling() {
+        let user = parsed(
+            r#"{
+              "tools": {"bash": "on", "web": "off"},
+              "agent_engine_config": {
+                "agents": {"judge": {"prompt": "trusted prompt"}}
+              }
+            }"#,
+        );
+        let managed = parsed(
+            r#"{
+              "tools": {"bash": "off"},
+              "authority": {
+                "project_prompts": "off",
+                "project_custom_tools": "off"
+              }
+            }"#,
+        );
+        let project = parsed(
+            r#"{
+              "tools": {"bash": "on", "web": "on"},
+              "agent_engine_config": {
+                "agents": {"judge": {"prompt": "project prompt"}}
+              }
+            }"#,
+        );
+
+        let untrusted = Settings::merge_captured_scopes(
+            &user,
+            &managed,
+            &project,
+            ProjectTrust {
+                hooks: false,
+                credentials: false,
+            },
+        );
+        assert!(!untrusted.bash_tool_enabled(), "managed bash ceiling");
+        assert!(!untrusted.web_tools_enabled(), "project web grant restored");
+        assert_eq!(
+            untrusted
+                .agent_engine_config
+                .as_ref()
+                .and_then(|engine| engine.agent(EngineAgentKind::Judge))
+                .and_then(|agent| agent.prompt.as_deref()),
+            Some("trusted prompt")
+        );
+
+        let trusted = Settings::merge_captured_scopes(
+            &user,
+            &managed,
+            &project,
+            ProjectTrust {
+                hooks: true,
+                credentials: true,
+            },
+        );
+        assert!(
+            !trusted.bash_tool_enabled(),
+            "managed denial survives trust"
+        );
+        assert!(trusted.web_tools_enabled(), "trusted project may grant web");
+        assert_eq!(
+            trusted
+                .agent_engine_config
+                .as_ref()
+                .and_then(|engine| engine.agent(EngineAgentKind::Judge))
+                .and_then(|agent| agent.prompt.as_deref()),
+            Some("trusted prompt"),
+            "managed prompt denial survives trust"
+        );
+    }
+
+    #[test]
+    fn managed_authority_rejects_unknown_keys_through_settings_load() {
+        let _env = crate::test_env::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let workspace = dir.path().join("repo");
+        let managed = dir.path().join("managed.json");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&managed, r#"{"authority": {"project_promtps": "off"}}"#).unwrap();
+        // SAFETY: serialized behind the binary-wide env lock.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("STELLA_MANAGED_SETTINGS", &managed);
+            std::env::remove_var("STELLA_TRUST_PROJECT");
+            std::env::remove_var("STELLA_PROJECT_HOOKS");
+        }
+
+        let result = Settings::load(&workspace);
+
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("STELLA_MANAGED_SETTINGS");
+        }
+        let error = result.expect_err("authority typos must fail closed");
+        assert!(error.contains("project_promtps"), "{error}");
+        assert!(error.contains("unknown field"), "{error}");
     }
 }

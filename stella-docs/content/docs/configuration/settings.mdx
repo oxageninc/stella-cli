@@ -1,9 +1,9 @@
 ---
 title: settings.json
-description: Override any provider's base URL, API key, display name, or default model — merged across a project, org-managed, and user scope hierarchy.
+description: Configure providers, agents, tools, and managed authority across project, org-managed, and user scopes.
 ---
 
-`settings.json` is Stella's configuration file. It has five top-level sections, each with
+`settings.json` is Stella's configuration file. It has six top-level sections, each with
 its own merge rule across the [scope hierarchy](#the-scope-hierarchy):
 
 | Section | Configures | Merge across scopes |
@@ -13,6 +13,7 @@ its own merge rule across the [scope hierarchy](#the-scope-hierarchy):
 | [`hooks`](#lifecycle-hooks) | Shell commands on lifecycle events | concatenate |
 | [`tools`](#the-tools-section) | Built-in tool switches (today: `bash`) | last scope wins |
 | [`mcp`](#the-mcp-section) | MCP registry override | last scope wins |
+| [`authority`](#managed-authority-ceilings) | Managed ceilings for project prompts, custom tools, bash, web, and media approval | org-managed only; denial cannot be overridden |
 
 The `providers` map lets you override the built-in defaults for any provider — **without
 reaching for a provider-specific environment variable**. In **user scope**
@@ -80,10 +81,11 @@ The org-managed path is resolved as:
 2. `/Library/Application Support/stella/settings.json` on macOS, or
 3. `/etc/stella/settings.json` on other Unix.
 
-A project entry overrides an org-managed one, which overrides a user one — **per field**.
-So a project can change just a base URL while inheriting the API key from a higher scope.
-This lets an organization ship shared defaults (a gateway base URL, a team key) that a
-project can still override.
+Ordinary fields merge project over org-managed over user. Authority-sensitive fields are
+stricter: a project may narrow a grant with `"off"`, but it may not enable tools, replace
+an agent prompt, redirect credentials, or load executable custom tools until the user sets
+`STELLA_TRUST_PROJECT=1`. An org-managed denial is a ceiling even after that explicit
+trust. The legacy `STELLA_PROJECT_HOOKS=1` flag grants hooks only.
 
 <Callout type="info">
   A missing file at any scope is fine — it is simply skipped. A file that is present but
@@ -231,9 +233,35 @@ untrusted input and an outbound network channel. Logged-in fetches are configure
 separately in `~/.config/stella/web_auth.toml`.
 
 The values are the strings `"on"`/`"off"` — a bare boolean or a typo is a hard, named
-parse error rather than a silent ignore. Each field merges last-scope-wins independently,
-so a project can switch `web` on for a repo whose workflow needs it while your user scope
-keeps it off. See [Built-in tools](/docs/agent-tools) for what registers when.
+parse error rather than a silent ignore. Each field merges independently. A project
+`"off"` always narrows an earlier grant; project `"on"` requires
+`STELLA_TRUST_PROJECT=1`. A managed `"off"` remains a ceiling even for a trusted project.
+See [Built-in tools](/docs/agent-tools) for what registers when.
+
+## Managed authority ceilings
+
+Only the org-managed settings file may define the top-level `authority` section. User and
+project copies do not contribute runtime authority. Every value uses the same strict
+`"on"`/`"off"` vocabulary, and an unknown key is a hard load error so a misspelled policy
+cannot silently become permissive.
+
+```json title="org-managed (STELLA_MANAGED_SETTINGS)"
+{
+  "authority": {
+    "project_prompts": "off",
+    "project_custom_tools": "off",
+    "bash": "off",
+    "web": "off",
+    "media_requires_host_approval": "on"
+  }
+}
+```
+
+An `"off"` capability is a non-overridable ceiling. `"on"` only permits a later explicit
+grant; it never enables a capability by itself. For example, `project_custom_tools: "on"`
+still requires `STELLA_TRUST_PROJECT=1`, while `project_custom_tools: "off"` keeps
+workspace manifests disabled even when that trust flag is present. Media host approval
+defaults to required when the field is absent.
 
 ## The project trust boundary
 
@@ -248,9 +276,20 @@ file until you opt in with **`STELLA_TRUST_PROJECT=1`**:
   `providers.<id>.api_key`, `providers.<id>.api_key_env`, and `mcp.registry_url` are
   **silently dropped** (the trusted-scope values win) — otherwise a malicious repo could
   point a provider at its own base URL and exfiltrate the key you attach.
+- **Built-in tools.** Project `tools.bash: "on"` and `tools.web: "on"` do not grant those
+  capabilities until full project trust is present. Project `"off"` remains effective as
+  a restriction.
+- **Replacement prompts.** Project `agent_engine_config.agents.<role>.prompt` values are
+  restored from user/org-managed scopes unless full project trust is present and the
+  managed authority ceiling permits project prompts.
+- **Workspace custom tools.** Executable manifests under `.stella/tools/` are excluded
+  unless full project trust is present and managed policy permits them. User-global
+  manifests under `~/.config/stella/tools/` remain available.
 
-A stderr notice names anything skipped, so a trusted-but-forgotten flag is diagnosable.
-Cosmetic project fields (`name`, `default_model`, `dialect`) apply regardless of trust.
+A stderr notice names skipped hooks and credential-routing fields, so a
+trusted-but-forgotten flag is diagnosable. Cosmetic project fields (`name`,
+`default_model`, `dialect`) apply regardless of trust. Managed denials from the captured
+org settings snapshot always win; changing the file takes effect on the next settings load.
 
 ## Lifecycle hooks
 
