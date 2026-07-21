@@ -387,10 +387,16 @@ struct OpenAiInputTokensDetails {
 }
 
 /// Map the engine's one `ReasoningEffort` enum to the Responses API's
-/// `reasoning.effort` parameter, which only documents `low`/`medium`/`high`.
-/// `Xhigh` and `Max` have no native slot — rather than silently dropping the
-/// hint or panicking on an enum variant OpenAI's API doesn't model, both
-/// collapse to `"high"`, the closest tier the API actually accepts.
+/// `reasoning.effort` parameter. Audited against the vendor docs (2026-07):
+/// `reasoning.effort` now documents a model-dependent set that can include
+/// `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`, but which values a
+/// given model accepts varies per model. The adapter maps to the
+/// `low`/`medium`/`high` tiers every current gpt-5/o-series reasoning model
+/// accepts, and collapses `Xhigh`/`Max` to `"high"` rather than sending a tier
+/// the routed model might reject — the same "never send a value the model
+/// rejects" posture as the other adapters. (Offering the finer tiers would
+/// require per-model capability gating the picker vocabulary does not yet
+/// carry.)
 fn map_reasoning_effort(effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::Low => "low",
@@ -553,6 +559,7 @@ impl Provider for OpenAiProvider {
                 status,
                 retry_after_ms,
                 &body,
+                &self.model,
             ));
         }
 

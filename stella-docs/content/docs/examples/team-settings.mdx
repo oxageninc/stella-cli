@@ -13,12 +13,9 @@ and (optionally) the **org** carries policy. This page is the working pattern.
 Commit the shareable knowledge, ignore the local state and secrets:
 
 ```text title=".gitignore"
-.stella/*.db
-.stella/*.db-*
-.stella/mcp_oauth.json
+.stella/private/
 .stella/worktrees/
 .stella/exports/
-.stella/reflections.jsonl
 ```
 
 **Commit:** `domains.toml`, `memories/`, `rules/`, `skills/`, `commands/`, `tools/`,
@@ -105,8 +102,8 @@ written once via the interactive prompt). Personal endpoint routing — like a
 
 ## Shared spend visibility
 
-Telemetry is local-per-machine by design — there is no central server. For a team view,
-each seat's numbers are exportable and comparable:
+Community/default telemetry is local per machine with zero egress. For a team view,
+each seat's numbers remain manually exportable and comparable:
 
 ```bash
 stella stats --format csv > $(whoami)-stats.csv   # per-model $/resolved, resolve rate
@@ -116,6 +113,13 @@ stella observe                                     # or eyeball the Observatory 
 CI runs are the one place to centralize: run with `--output-format json --budget <usd>`
 and archive the summary artifact per pipeline — the
 [scripting page](/docs/scripting) has the recipes.
+
+An organization that needs managed operational visibility can provision
+[Oxagen Enterprise enrollment](/docs/telemetry#oxagen-enterprise-managed-export) from
+the org-managed scope. It cannot be enabled by a repo or user preference, permits only
+the process-free raw one-shot path, and exports a minimal content-free rollup to one
+exact allowlisted HTTPS sink. This is operational telemetry rather than a compliance
+log; the full run record and Observatory stay local.
 
 ## Related
 

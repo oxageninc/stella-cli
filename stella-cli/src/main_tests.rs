@@ -8,7 +8,8 @@
 use clap::{CommandFactory, Parser};
 
 use super::{
-    BUILD_VERSION_IDENTITY, Cli, Command, ConnectCmd, OutputFormat, version_static, version_string,
+    AuthCmd, BUILD_VERSION_IDENTITY, Cli, Command, ConnectCmd, OutputFormat, TelemetryCmd,
+    version_static, version_string,
 };
 
 /// The build script owns version stamping so both CLI surfaces consume the
@@ -29,6 +30,81 @@ fn cli_versions_use_the_build_script_literal() {
     assert_eq!(version_string(), expected);
 }
 
+#[cfg(unix)]
+fn legacy_codegraph_workspace(mode: u32) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dot = dir.path().join(".stella");
+    std::fs::create_dir_all(&dot).unwrap();
+    std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(mode)).unwrap();
+    let graph = stella_graph::CodeGraph::open(dir.path(), &dot.join("codegraph.db")).unwrap();
+    graph.shutdown();
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_snapshot_preflight_migrates_safe_legacy_codegraph() {
+    let dir = legacy_codegraph_workspace(0o700);
+    super::load_storage_snapshot_checked(dir.path()).unwrap();
+    assert!(!dir.path().join(".stella/codegraph.db").exists());
+    assert!(dir.path().join(".stella/private/codegraph.db").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_snapshot_preflight_reports_unsafe_legacy_codegraph() {
+    let dir = legacy_codegraph_workspace(0o777);
+    let error = super::load_storage_snapshot_checked(dir.path())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("legacy") && error.contains("private"),
+        "{error}"
+    );
+    assert!(dir.path().join(".stella/codegraph.db").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn observatory_preflight_migrates_safe_legacy_sqlite_stores() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dot = dir.path().join(".stella");
+    std::fs::create_dir_all(&dot).unwrap();
+    std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["store.db", "fleet.db", "context.db", "codegraph.db"] {
+        std::fs::write(dot.join(name), b"closed legacy sqlite file").unwrap();
+    }
+
+    super::preflight_observatory_stores(dir.path()).unwrap();
+    for name in ["store.db", "fleet.db", "context.db", "codegraph.db"] {
+        assert!(!dot.join(name).exists());
+        assert!(dot.join("private").join(name).exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn observatory_preflight_reports_unsafe_legacy_store() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dot = dir.path().join(".stella");
+    std::fs::create_dir_all(&dot).unwrap();
+    std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::write(dot.join("store.db"), b"unsafe legacy sqlite file").unwrap();
+
+    let error = super::preflight_observatory_stores(dir.path()).unwrap_err();
+    assert!(
+        error.contains("legacy") && error.contains("private"),
+        "{error}"
+    );
+    assert!(dot.join("store.db").exists());
+}
+
 /// clap's own consistency audit (conflicting ids, broken defaults,
 /// mis-typed value parsers) — panics on the first violation. Runs the same
 /// checks release builds skip, so a bad arg table fails here instead of at
@@ -36,6 +112,18 @@ fn cli_versions_use_the_build_script_literal() {
 #[test]
 fn clap_command_is_internally_consistent() {
     Cli::command().debug_assert();
+}
+
+#[test]
+fn telemetry_status_remains_a_distinct_top_level_command() {
+    let cli = Cli::try_parse_from(["stella", "telemetry", "status"])
+        .expect("`telemetry status` must parse independently of adjacent auth commands");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Telemetry {
+            cmd: TelemetryCmd::Status
+        })
+    ));
 }
 
 /// The load-bearing invariant: every flag defined at the root MUST be
@@ -187,4 +275,69 @@ fn connect_linear_paste_key_parses() {
         }) => assert!(!paste_key),
         _ => panic!("expected `connect linear`"),
     }
+}
+
+/// `stella auth set <provider> --key <k>` parses, and the global `--api-key`
+/// (a different secret — the model-provider credential) still parses
+/// independently on the same command line, same shape as `connect linear`.
+#[test]
+fn auth_set_key_parses_and_stays_independent_of_the_global_api_key() {
+    let cli = Cli::try_parse_from([
+        "stella",
+        "auth",
+        "set",
+        "zai",
+        "--key",
+        "sk-stored",
+        "--api-key",
+        "sk-model",
+    ])
+    .expect("`auth set <provider> --key <k>` must parse alongside the global --api-key");
+    assert_eq!(cli.globals.api_key.as_deref(), Some("sk-model"));
+    match cli.command {
+        Some(Command::Auth {
+            cmd:
+                AuthCmd::Set {
+                    provider,
+                    key,
+                    stdin,
+                },
+        }) => {
+            assert_eq!(provider, "zai");
+            assert_eq!(key.as_deref(), Some("sk-stored"));
+            assert!(!stdin);
+        }
+        _ => panic!("expected `auth set`"),
+    }
+}
+
+/// `--key` and `--stdin` are mutually exclusive — a user meaning to pipe a
+/// secret in via `--stdin` must not silently also accept a (likely absent)
+/// `--key` value.
+#[test]
+fn auth_set_rejects_key_and_stdin_together() {
+    // `Cli` derives no `Debug` (it carries the model API key), so match
+    // rather than `expect_err`/`unwrap_err` (both require `T: Debug`).
+    match Cli::try_parse_from(["stella", "auth", "set", "zai", "--key", "sk-x", "--stdin"]) {
+        Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict),
+        Ok(_) => panic!("--key and --stdin must conflict"),
+    }
+}
+
+#[test]
+fn auth_remove_and_list_parse() {
+    let cli = Cli::try_parse_from(["stella", "auth", "remove", "zai"])
+        .expect("`auth remove <provider>` must parse");
+    match cli.command {
+        Some(Command::Auth {
+            cmd: AuthCmd::Remove { provider },
+        }) => assert_eq!(provider, "zai"),
+        _ => panic!("expected `auth remove`"),
+    }
+
+    let cli = Cli::try_parse_from(["stella", "auth", "list"]).expect("`auth list` must parse");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Auth { cmd: AuthCmd::List })
+    ));
 }

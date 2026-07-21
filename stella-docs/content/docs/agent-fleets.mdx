@@ -50,7 +50,7 @@ stella fleet \
    that can block on stdin. Pass `--no-pipeline` to run the raw step loop
    instead of the staged pipeline.
 5. **Record.** Every attempt, commit, and dollar lands in the fleet ledger
-   at `.stella/fleet.db` — local SQLite, like all
+   at `.stella/private/fleet.db` — local SQLite, like all
    [Stella telemetry](/docs/telemetry). Past runs (tasks, attempts,
    successes, commits) also surface on the **Fleet runs** card of the
    [Observatory dashboard](/docs/telemetry/dashboard).
@@ -98,7 +98,7 @@ A task that declares `claims` (workspace-relative paths it intends to touch)
 holds them as **cooperative file locks** for the attempt's duration. A second
 task — or a second fleet run — that claims an already-held path fails that
 dispatch *by name* instead of silently racing another agent into the same
-file. The locks live in the `file_locks` table of `.stella/store.db`,
+file. The locks live in the `file_locks` table of `.stella/private/store.db`,
 separate from the fleet ledger, so they coordinate across concurrent fleet
 runs too.
 

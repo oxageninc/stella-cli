@@ -42,19 +42,43 @@ This has to exist and be writable before the first release:
    (Homebrew maps the tap `macanderson/tap` → repo `homebrew-tap`). It can
    start empty; the release job commits `Formula/stella.rb` into it.
 
-2. **Create a push token.** A GitHub token with **contents: write** on the tap
-   repo — a fine-grained PAT scoped to `macanderson/homebrew-tap`, or a classic
-   PAT with `repo`. The default `GITHUB_TOKEN` can't push to another repo, so a
-   dedicated one is required.
+2. **Create write access, either way** (the release job tries the deploy key
+   first, falling back to the token — see `.github/workflows/release.yml`'s
+   `homebrew` job):
+   - **SSH deploy key (what's actually configured today)** — generate a
+     dedicated keypair, add the public half as a **write-enabled deploy key**
+     on `macanderson/homebrew-tap` (repo Settings → Deploy keys), and the
+     private half as the `HOMEBREW_TAP_DEPLOY_KEY` secret below. Scoped to
+     exactly that one repo, unlike a PAT.
+   - **PAT (fallback)** — a GitHub token with **contents: write** on the tap
+     repo — a fine-grained PAT scoped to `macanderson/homebrew-tap`, or a
+     classic PAT with `repo`. The default `GITHUB_TOKEN` can't push to
+     another repo, so a dedicated one is required either way.
 
 3. **Add it as a secret** on **this** repo (`macanderson/stella`):
    Settings → Secrets and variables → Actions → New repository secret →
-   name `HOMEBREW_TAP_TOKEN`, value the token from step 2.
+   name `HOMEBREW_TAP_DEPLOY_KEY` (deploy key) or `HOMEBREW_TAP_TOKEN` (PAT).
 
 The prebuilt tarballs, checksums, and the `curl | sh` installer are published
 to this repo's GitHub Releases and need no extra secrets — only the Homebrew
-tap push does. If `HOMEBREW_TAP_TOKEN` is absent, the release still succeeds and
+tap push does. If neither secret is set, the release still succeeds and
 the `homebrew` job skips with a warning.
+
+**Optional — auto-merging the version-sync PR without a manual `--admin`.**
+`auto-tag.yml`'s `bot/version-sync` PR only carries a Cargo.toml/Cargo.lock
+diff, and branch protection's required `ci` checks never run on it the normal
+way (see #275): the workflow dispatches them itself, but the PR's own
+GITHUB_TOKEN authorship also spawns an unrunnable `pull_request`-triggered
+check suite that can leave `mergeable_state` stuck on "blocked" even once the
+dispatched run is green. The workflow verifies that dispatched run itself and
+then bypasses whatever is blocking with an admin-privileged merge — for that
+bypass to actually succeed (rather than fall back to arming ordinary
+auto-merge, which will just sit there the same way `--admin` used to be
+needed), add a **classic PAT with `repo` scope, owned by an account with
+admin/bypass rights on this repository**, as the `RELEASE_ADMIN_TOKEN` secret.
+Without it, sync PRs still get merged — just by a human running
+`gh pr merge bot/version-sync --squash --admin` once checks are green, same
+as before this workflow existed.
 
 ## Cut a release
 

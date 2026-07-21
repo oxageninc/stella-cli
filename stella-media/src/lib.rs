@@ -18,8 +18,8 @@
 //!   bounded model-repair loop, treating LLM SVG as untrusted code (L-V2).
 //! * [`preview`] — the terminal preview ladder (kitty / iTerm2 / plain), pure
 //!   string builders, no TTY writes.
-//! * [`cost_gate`] — the video confirmation gate:
-//!   deny-by-default headless, threshold-configurable.
+//! * [`cost_gate`] — host-owned approval for image and video spend,
+//!   deny-by-default when no host gate is injected.
 //! * [`jobs`] — persisted video-job state + live reconciliation so a
 //!   dollar-cost job survives a dropped terminal and is never reported from
 //!   cache (L-V3).
@@ -51,17 +51,20 @@ pub mod emit;
 pub mod error;
 mod http;
 pub mod jobs;
+pub mod operation_journal;
 pub mod preview;
 pub mod provider;
 pub mod svg;
 
 pub use artifact::{ArtifactStore, ManifestEntry};
-pub use cost_gate::{
-    CostDecision, CostGate, DEFAULT_VIDEO_COST_THRESHOLD_USD, HeadlessCostGate, evaluate_video_cost,
-};
+pub use cost_gate::{CostDecision, DenyMediaSpendGate, MediaSpendGate, MediaSpendRequest};
 pub use credential::{ApiKey, CredentialError};
 pub use error::MediaError;
 pub use jobs::{JobStore, resume};
+pub use operation_journal::{
+    MediaOperationClaim, MediaOperationJournal, MediaOperationRetention, MediaOperationState,
+    SqliteMediaOperationJournal,
+};
 pub use preview::{
     PreviewRung, detect as detect_preview, detect_from_env, render as render_preview,
 };

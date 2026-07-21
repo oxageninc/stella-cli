@@ -5,6 +5,7 @@
 //! — it must work first, not last.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,34 @@ pub struct ZaiProvider {
     /// carries a cost, it overrides catalog list pricing — the gateway
     /// routed the call, only it knows what the call cost.
     usage_accounting: bool,
+    /// Session-stable sticky-routing key, sent as OpenRouter's top-level
+    /// `session_id` (only for the `openrouter` identity — see the field on
+    /// [`ZaiRequest`]). One id per provider construction = one id per agent
+    /// run, so every turn of a session pins to the same upstream provider and
+    /// reuses the prompt cache the previous turn paid to write; distinct per
+    /// construction, so fleet siblings don't serialize on one shard. Mirrors
+    /// the OpenAI adapter's `prompt_cache_key` lifecycle. Volatile by design:
+    /// it rides as a request parameter and never enters the cached bytes.
+    session_id: String,
+}
+
+/// Process-wide monotonic suffix guaranteeing two [`ZaiProvider`]
+/// constructions in the same process — fleet siblings built back-to-back —
+/// get distinct session ids even when the nanosecond clock reads identically
+/// for both. Without it, a tight builder loop could mint colliding ids and
+/// serialize the whole fleet onto one cache shard, the opposite of the point.
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh session id, `stella-<pid>-<nanos>-<seq>`. Well under OpenRouter's
+/// 256-char limit. The pid+nanos pair scopes it to this run; the atomic seq
+/// makes same-nanos siblings provably distinct.
+fn new_session_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("stella-{}-{nanos:x}-{seq:x}", std::process::id())
 }
 
 impl ZaiProvider {
@@ -77,7 +106,17 @@ impl ZaiProvider {
             label: "Z.ai".to_string(),
             extra_headers: Vec::new(),
             usage_accounting: false,
+            session_id: new_session_id(),
         }
+    }
+
+    /// The session-stable sticky-routing id minted for this construction.
+    /// Test-only: the fleet-distinctness witness inspects it on the builder
+    /// (no live gateway), and the wire-gating tests assert it appears only on
+    /// the `openrouter` identity's body.
+    #[cfg(test)]
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -196,6 +235,29 @@ struct ZaiRequest<'a> {
     /// it, so any other identity keeps it off the wire.
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<ZaiCacheControl>,
+    /// OpenRouter's session-stable sticky-routing key (top-level `session_id`,
+    /// ≤256 chars): the gateway routes every request carrying the same id to
+    /// the same upstream provider + cache shard, so consecutive agent turns
+    /// reuse the prompt cache instead of landing on a fresh endpoint that
+    /// re-bills the whole prefix. Without it OpenRouter derives a routing key
+    /// from message hashing, which drifts as the conversation grows — the
+    /// exact reason a session's later turns miss the cache the earlier ones
+    /// wrote. Sent only for the `openrouter` identity (same 400-risk gating as
+    /// `reasoning`/`cache_control`); every other identity keeps it off the
+    /// wire. See the field on [`ZaiProvider`] for the one-per-session,
+    /// distinct-per-sibling lifecycle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    /// xAI's chat-completions reasoning control: a top-level `reasoning_effort`
+    /// string (`low`/`medium`/`high`, OpenAI-compatible). Grok's reasoning
+    /// models honor it; only sent when this adapter is serving the `xai`
+    /// identity AND the caller pinned an `effort`/`reasoning` preference. Every
+    /// other identity behind this shared adapter keeps it off the wire (same
+    /// 400-risk gating as `reasoning`/`cache_control`/`session_id`) — GLM,
+    /// DeepSeek, and local servers don't speak it, and an unknown key would
+    /// risk a hard 400. See [`xai_reasoning_effort`] for the shape rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
 }
 
 /// GLM's request-level thinking object: `{"type": "enabled"}` /
@@ -258,6 +320,64 @@ fn openrouter_reasoning(
             effort: None,
             enabled: Some(true),
         }),
+        (None, None) => None,
+    }
+}
+
+/// Whether an xAI model accepts the `reasoning_effort` parameter. Verified
+/// against xAI docs (2026-07): the ORIGINAL `grok-4` (and its dated snapshots,
+/// `grok-4-<date>`) reasons but rejects the param with a hard 400 ("does not
+/// support parameter reasoning_effort") — while grok-3-mini, the grok-4 point
+/// releases (`grok-4.1`/`.3`/`.5`), and the `grok-4-fast*` variants all accept
+/// it. Sending it to the original grok-4 (the currently-seeded xai default,
+/// deprecated and retiring 2026-08-15) would 400 every reasoning turn, so it is
+/// gated out here — grok-4 keeps the pre-wiring behaviour (reasons at its own
+/// fixed depth, effort dropped) instead of erroring. Fail-safe direction is to
+/// send: the fleet has trended toward universal support, and only the retiring
+/// original is denied.
+fn xai_supports_reasoning_effort(model: &str) -> bool {
+    if model == "grok-4" {
+        return false;
+    }
+    // A dated snapshot of the original (`grok-4-0709`) is digits after the
+    // `grok-4-` stem; named variants (`grok-4-fast-reasoning`) are not, and the
+    // point releases (`grok-4.5`) don't match the `grok-4-` prefix at all.
+    if let Some(rest) = model.strip_prefix("grok-4-") {
+        return !(!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
+    }
+    true
+}
+
+/// Map the engine's one `ReasoningEffort` enum to xAI's chat-completions
+/// `reasoning_effort`, which documents `low`/`medium`/`high`. Same collapse
+/// posture as `openai.rs::map_reasoning_effort`: never drop the hint, never
+/// panic on a variant Grok doesn't model — the finer `xhigh`/`max` tiers are
+/// model-dependent on xAI, so they collapse to the universally-safe `high`.
+fn map_xai_effort(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => "high",
+    }
+}
+
+/// Build xAI's `reasoning_effort` value from the request's reasoning/effort
+/// pair — the mirror of the OpenAI adapter's own reasoning match, since xAI's
+/// chat-completions dialect is OpenAI-compatible. Rules: an explicit off
+/// (`reasoning == Some(false)`) suppresses the field entirely even when an
+/// effort is pinned (an explicit off wins, and the docs' `none` value would
+/// 400 on always-reasoning Grok models); a pinned effort maps as
+/// [`map_xai_effort`]; a bare `Some(true)` with no effort turns thinking on at
+/// the middle tier; and neither set keeps the field off the wire (provider
+/// default, byte-stable with the pre-field body).
+fn xai_reasoning_effort(
+    reasoning: Option<bool>,
+    effort: Option<ReasoningEffort>,
+) -> Option<&'static str> {
+    match (reasoning, effort) {
+        (Some(false), _) => None,
+        (_, Some(effort)) => Some(map_xai_effort(effort)),
+        (Some(true), None) => Some("medium"),
         (None, None) => None,
     }
 }
@@ -740,12 +860,23 @@ impl ZaiProvider {
             reasoning: (self.id == "openrouter")
                 .then(|| openrouter_reasoning(req.reasoning, req.effort))
                 .flatten(),
+            // xAI's Grok reasoning models speak a top-level `reasoning_effort`
+            // (OpenAI-compatible), which the shared adapter used to drop
+            // silently for the xai identity. Gated exactly like `reasoning` is
+            // to openrouter: only the xai identity sends it, so no other
+            // OpenAI-compatible server sees a key it might reject — and, within
+            // xai, only for models that accept the param (the original grok-4
+            // 400s on it; see [`xai_supports_reasoning_effort`]).
+            reasoning_effort: (self.id == "xai" && xai_supports_reasoning_effort(&self.model))
+                .then(|| xai_reasoning_effort(req.reasoning, req.effort))
+                .flatten(),
             tools: to_zai_tools(&req.tools),
             usage: self
                 .usage_accounting
                 .then_some(ZaiUsageInclude { include: true }),
             cache_control: (self.id == "openrouter")
                 .then_some(ZaiCacheControl { kind: "ephemeral" }),
+            session_id: (self.id == "openrouter").then_some(self.session_id.as_str()),
         };
 
         let mut request = self
@@ -787,6 +918,7 @@ impl ZaiProvider {
                 status,
                 retry_after_ms,
                 &body,
+                &self.model,
             ));
         }
 

@@ -997,7 +997,7 @@ function renderImprove(skills) {
           <span class="when">${l.occurred_at ? agoMs(l.occurred_at * 1000) : ""}</span></div>
       </div>`).join("")
     : `<div class="empty">no distilled lessons yet — failed and hard-won turns are mined
-       into <code>.stella/reflections.jsonl</code></div>`;
+       into <code>.stella/private/reflections.jsonl</code></div>`;
 
   $("imp-learned").innerHTML = learned.length
     ? learned.map(s => `<div class="mem-card">

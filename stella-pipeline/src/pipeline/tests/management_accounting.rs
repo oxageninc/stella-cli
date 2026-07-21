@@ -33,7 +33,8 @@ async fn late_triage_is_ignored_but_awaited_and_metered() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -52,7 +53,8 @@ async fn late_triage_is_ignored_but_awaited_and_metered() {
     let started = std::time::Instant::now();
     let class = pipeline
         .triage("What is two plus two?", &mut budget, &mut total)
-        .await;
+        .await
+        .expect("the late but settled triage call remains within budget");
 
     assert!(started.elapsed() >= Duration::from_millis(20));
     assert_eq!(class, TaskClass::SimpleLookup);
@@ -97,7 +99,8 @@ async fn triage_budget_crossing_aborts_before_a_second_provider_call() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,

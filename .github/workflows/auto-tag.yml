@@ -21,12 +21,22 @@ name: auto-tag
 # manifests always match the newest release: a `bot/version-sync` branch bumps
 # `[workspace.package].version` (every crate inherits it), the workspace-member
 # entries in Cargo.lock, and the local build-from-source Homebrew formula, then
-# lands via a tiny auto-merge PR. A PR (not a direct push) because branch
-# protection requires changes to arrive by PR with the required `ci` checks
-# green; those checks are dispatched onto the branch explicitly because pushes
-# made with GITHUB_TOKEN never trigger `on: push`/`on: pull_request` workflows.
-# The bump commit carries `[skip release]`, so its merge can never cut another
-# release — the loop terminates after exactly one sync per release.
+# lands via a tiny PR. A PR (not a direct push) because branch protection
+# requires changes to arrive by PR with the required `ci` checks green; those
+# checks are dispatched onto the branch explicitly because pushes made with
+# GITHUB_TOKEN never trigger `on: push`/`on: pull_request` workflows. Despite
+# the dispatched run going green, this same GITHUB_TOKEN-authored PR still
+# ends up permanently `mergeable_state: blocked` (#264, #275) — most likely
+# because the PR also picks up a second, unrunnable `action_required` check
+# suite from ci.yml's natural `pull_request` trigger for the same reason, but
+# rather than fully disambiguate every possible blocker (conversation
+# resolution, staleness, that phantom suite), this workflow just verifies the
+# run it dispatched itself is green and then bypasses whatever is blocking
+# with an admin-privileged token (`RELEASE_ADMIN_TOKEN`, falling back to ordinary
+# auto-merge — see the last step) rather than requiring a human `--admin`
+# merge every release. The bump commit carries `[skip release]`, so its merge
+# can never cut another release — the loop terminates after exactly one sync
+# per release.
 #
 # GATED ON GREEN CI. This runs via `workflow_run` after the `ci` workflow
 # finishes on main, and only tags when that run *succeeded* — a commit that
@@ -42,6 +52,11 @@ on:
 
 concurrency:
   # Serialize so rapid merges compute their version off the previous tag.
+  # Waiting out the dispatched ci run (below) stretches each queued run from
+  # ~1 minute to the length of a full ci run (~4 minutes) — on a "shared,
+  # contested" main this can back the auto-tag queue up under a burst of
+  # merges. Not dangerous (still serialized, every failure path warns and
+  # exits 0 rather than jamming), just slower than before.
   group: auto-tag
   cancel-in-progress: false
 
@@ -186,7 +201,7 @@ jobs:
           - the workspace-member entries in \`Cargo.lock\`
           - \`packaging/homebrew/stella.rb\` (build-from-source formula)
 
-          The workflow dispatches the required \`ci\` checks onto this branch and enables auto-merge; no action is needed unless a check fails."
+          The workflow dispatches the required \`ci\` checks onto this branch and merges once they're green (past GitHub's phantom \`action_required\` check suite for this GITHUB_TOKEN-authored PR — see #275); no action is needed unless the dispatched run fails."
 
           existing="$(gh pr list --head "${branch}" --state open --json number --jq '.[0].number // empty')"
           if [ -n "${existing}" ]; then
@@ -195,9 +210,89 @@ jobs:
             gh pr create --base main --head "${branch}" --title "${title}" --body "${body}"
           fi
 
-          # Start the required checks — a GITHUB_TOKEN push doesn't — then arm
-          # auto-merge. If arming fails (e.g. auto-merge disabled repo-side),
-          # warn instead of failing: the release itself already shipped.
-          gh workflow run ci.yml --ref "${branch}"
-          gh pr merge "${branch}" --squash --auto \
-            || echo "::warning::could not enable auto-merge — merge the ${branch} PR manually once checks are green."
+      # Merging a Cargo-only bot/version-sync PR the normal way never
+      # resolves. Confirmed live on PR #287 (chore(release): sync versions to
+      # 0.4.51): its `workflow_dispatch`-triggered ci run posted both required
+      # check-runs as green, yet `mergeable_state` stayed "blocked" — most
+      # likely because a GITHUB_TOKEN-triggered event can never trigger a
+      # *new* workflow run (recursion guard), so ci.yml's *natural*
+      # `pull_request` trigger on this same GITHUB_TOKEN-authored PR still
+      # spawns a check suite that can only ever complete as a zero-job
+      # "action_required" phantom, which branch protection's required-status-
+      # check evaluation may treat as permanently unresolved. Rather than
+      # fully disambiguate every possible blocker (that phantom suite,
+      # conversation resolution, staleness), this step just verifies the run
+      # it dispatched itself actually went green and then bypasses whatever
+      # is blocking with an admin-privileged merge — every sync PR needed a
+      # manual `--admin` merge before this (#264, #275).
+      - name: Wait for the dispatched checks, then merge past the GITHUB_TOKEN phantom check suite
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ADMIN_MERGE_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
+          # Fixed by convention — see "Open the version-sync PR" above.
+          BRANCH: bot/version-sync
+        run: |
+          set -euo pipefail
+
+          # The previous step exits 0 early ("manifests already at ${version};
+          # nothing to sync") when the bump was a no-op — a step exiting 0 is
+          # a *success*, not a skip, so it doesn't stop this step from
+          # running. Without this guard, a no-op cycle would still dispatch a
+          # full ci run and then merge whatever bot/version-sync PR happens
+          # to be open — possibly a stale one left over from an earlier
+          # cycle. Bail out here if there's nothing open to merge.
+          if [ -z "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')" ]; then
+            echo "no open ${BRANCH} PR — nothing to merge."
+            exit 0
+          fi
+
+          latest_run_id() {
+            gh run list --workflow=ci.yml --branch="${BRANCH}" \
+              --event=workflow_dispatch --limit=1 --json databaseId \
+              --jq '.[0].databaseId // empty'
+          }
+
+          # Capture whatever was already the newest workflow_dispatch run
+          # for this branch (usually the previous sync's), so the poll below
+          # can tell a genuinely new run apart from a stale one still cached
+          # at dispatch time — the required checks must be validated against
+          # *this* commit, not a leftover run id.
+          previous_run_id="$(latest_run_id)"
+
+          # Start the required checks — a GITHUB_TOKEN push doesn't trigger
+          # ci.yml's own `on: pull_request`.
+          gh workflow run ci.yml --ref "${BRANCH}"
+
+          run_id=""
+          for _ in $(seq 1 15); do
+            candidate="$(latest_run_id)"
+            if [ -n "${candidate}" ] && [ "${candidate}" != "${previous_run_id}" ]; then
+              run_id="${candidate}"
+              break
+            fi
+            sleep 4
+          done
+          if [ -z "${run_id}" ]; then
+            echo "::warning::could not find the freshly dispatched ci run for ${BRANCH} — merge it manually once checks are green (see #275)."
+            exit 0
+          fi
+
+          if ! gh run watch "${run_id}" --exit-status; then
+            echo "::warning::the dispatched ci run for ${BRANCH} failed — NOT merging. Fix the failure and re-run ci.yml on the branch."
+            exit 0
+          fi
+
+          # RELEASE_ADMIN_TOKEN: a maintainer PAT with bypass rights on this
+          # branch's protection (documented in RELEASING.md). Without it,
+          # fall back to arming ordinary auto-merge plus a manual-merge
+          # warning — the phantom suite will still block it, but nothing
+          # regresses for a repo that hasn't set the secret up yet.
+          if [ -n "${ADMIN_MERGE_TOKEN:-}" ]; then
+            if GH_TOKEN="${ADMIN_MERGE_TOKEN}" gh pr merge "${BRANCH}" --squash --admin; then
+              exit 0
+            fi
+            echo "::warning::admin merge of ${BRANCH} with RELEASE_ADMIN_TOKEN failed — falling back to auto-merge."
+          fi
+          gh pr merge "${BRANCH}" --squash --auto \
+            || echo "::warning::could not enable auto-merge — merge the ${BRANCH} PR manually once checks are green (see #275)."

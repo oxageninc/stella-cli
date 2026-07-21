@@ -32,7 +32,7 @@ Every one of these is genuinely valued — pick the one that fits your energy:
 | 🧭 **Docs & examples** — fix a lie in the README before it fools someone else | Any `*.md` file, `--help` text, doc comments | Small |
 | 🔌 **A new provider adapter** — Stella is BYOK; every model provider we speak makes it more useful | `stella-model/src/` — copy the shape of an existing adapter | Medium |
 | 🛠 **A new built-in tool** | `stella-tools/src/` — implement the tool trait, register it | Medium |
-| 🌐 **An OCP provider** — implement the Open Context Protocol in your language and prove it green | [macanderson/opencontextprotocol](https://github.com/macanderson/opencontextprotocol) — its own repo, no Stella code required | Medium |
+| 🌐 **An OCP provider** — implement the Open Context Protocol in your language and prove it green | [macanderson/context-graph-protocol](https://github.com/macanderson/context-graph-protocol) — its own repo, no Stella code required | Medium |
 | 🏗 **Core engine work** | `good first issue` / `help wanted` labels | Varies |
 
 If you're not sure where something fits, open an issue first — a ten-line
@@ -92,7 +92,7 @@ Fourteen crates sounds like a lot; the rule of thumb is one sentence each:
 | Multimodal generation | `stella-media` |
 | Multi-agent fan-out, worktree isolation | `stella-fleet` |
 | The Observatory telemetry dashboard (`stella observe`) | `stella-observatory` |
-| The Open Context Protocol (wire types / host / conformance) | external repo: [`opencontextprotocol`](https://github.com/macanderson/opencontextprotocol) |
+| The Open Context Protocol (wire types / host / conformance) | external repo: [`context-graph-protocol`](https://github.com/macanderson/context-graph-protocol) |
 
 All of the crates ship in the CLI today: `stella-pipeline` drives the default
 `stella run` path, `stella-fleet` powers `stella fleet`, `stella-tui` is the
@@ -113,9 +113,14 @@ break them will be asked to restructure, no matter how good the feature is:
 2. **No I/O in the engine.** Decision logic (compaction, eviction, loop
    detection, budget) stays synchronous functions over owned data — that's
    what makes it property-testable.
-3. **No phone-home. Ever.** The only network traffic Stella may produce is to
-   the model provider the user chose. A PR adding any other outbound call —
-   telemetry, update checks, anything — will be rejected outright.
+3. **Zero telemetry egress by default.** Community/default Stella sends no
+   telemetry anywhere; the model provider selected by the user remains the
+   normal network exception. The only managed exception is explicit Oxagen
+   Enterprise enrollment: a signed org-managed document, an exact allowlisted
+   HTTPS sink, a closed content-free operational schema, and process-free
+   execution authority are all required. Prompts, paths, tool payloads/results,
+   reasoning, errors, git state, memories, rules, and local identifiers remain
+   local. Update checks and anonymous analytics are still out of bounds.
 4. **Serde-first.** Every type crossing a crate boundary round-trips through
    `serde_json` byte-for-byte. Add a round-trip test when you add a type.
 5. **Typed errors, no panics.** Library code returns typed, named errors —

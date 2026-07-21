@@ -347,10 +347,14 @@ pub(crate) struct GeminiUsageMetadata {
 }
 
 /// Map the engine's one `ReasoningEffort` enum to Gemini's
-/// `thinkingConfig.thinkingLevel`, which only accepts `"low"`/`"high"`
-/// (Gemini 3; there is no medium tier). Same collapse posture as
-/// `openai.rs::map_reasoning_effort`: never drop the hint, never panic on a
-/// variant the provider doesn't model.
+/// `thinkingConfig.thinkingLevel`. Audited against the vendor docs (2026-07):
+/// `thinkingLevel`'s accepted set is model-dependent — `gemini-3-pro` documents
+/// `low`/`high`, while some `gemini-3.x` flash models added `minimal`/`medium`.
+/// The adapter maps to the portable `low`/`high` pair that every current Gemini
+/// model accepts, so a request never 400s on a level the routed model lacks —
+/// the same "never send a value the model rejects" collapse posture as
+/// `openai.rs::map_reasoning_effort`. (`effort_levels` offers only low/high for
+/// the Gemini dialect, so this collapse is unreachable from the picker anyway.)
 pub(crate) fn map_thinking_level(effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::Low => "low",
@@ -549,6 +553,7 @@ pub(crate) fn build_generation_config(req: &CompletionRequest) -> Option<GeminiG
 pub(crate) async fn classify_google_error(
     label: &str,
     response: reqwest::Response,
+    model: &str,
 ) -> ProviderError {
     let status = response.status();
     let retry_after_ms = crate::http::parse_retry_after_ms(response.headers());
@@ -562,7 +567,7 @@ pub(crate) async fn classify_google_error(
     if status == reqwest::StatusCode::BAD_REQUEST && body.contains("API_KEY_INVALID") {
         return ProviderError::Auth(format!("{label} rejected the API key: {body}"));
     }
-    crate::http::classify_http_status(label, status, retry_after_ms, &body)
+    crate::http::classify_http_status(label, status, retry_after_ms, &body, model)
 }
 
 #[async_trait]
@@ -593,7 +598,7 @@ impl Provider for GeminiProvider {
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         if !response.status().is_success() {
-            return Err(classify_google_error("Gemini", response).await);
+            return Err(classify_google_error("Gemini", response, &self.model).await);
         }
 
         let (text, tool_calls, usage, finish_reason) =

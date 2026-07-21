@@ -72,7 +72,7 @@ Prefer an environment variable or `credentials.toml` for anything long-lived. A 
 | Observed | Omit `--budget` | Spend is metered for the cost summary but never blocks. |
 | Enforced | Pass `--budget <usd>` | A hard cap. Work aborts cleanly (never mid-tool) once spend exceeds the cap. |
 
-Token usage, cost, and per-step metering are recorded in a local SQLite store on your disk (`<workspace>/.stella/store.db`) — nothing is sent anywhere. See [`stella stats`](/docs/commands/stats).
+Token usage, cost, and per-step metering are recorded in a local SQLite store on your disk (`<workspace>/.stella/private/store.db`) — nothing is sent anywhere. See [`stella stats`](/docs/commands/stats).
 
 ## Model selection
 

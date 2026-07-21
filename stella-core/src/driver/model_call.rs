@@ -46,6 +46,7 @@ impl<'a> Engine<'a> {
         &self,
         step: usize,
         messages: &[CompletionMessage],
+        budget: &mut BudgetGuard,
         events: &EventSender,
     ) -> Result<CommittedStep, String> {
         let tools_schema = self.tools.schemas();
@@ -163,6 +164,18 @@ impl<'a> Engine<'a> {
             tool_calls: result.tool_calls.len(),
         });
 
+        // Settle the same landed call before the first post-provider await.
+        // This is separate from StepUsage because the budget guard is the
+        // execution control-plane ledger, while EventSender is the durable
+        // evidence boundary. Both must survive cancellation while a
+        // speculative read-only tool is still draining.
+        let budget_outcome = budget.record_spend(result.cost_usd);
+        let _ = events.send(AgentEvent::BudgetTick {
+            spent_usd: budget.spent_usd(),
+            limit_usd: budget.turn_limit_usd(),
+            mode: budget.mode(),
+        });
+
         // Preserve dispatch's speculation-harvest semantics, but only after
         // the completed paid call is journaled. Dropping this turn future now
         // cancels read-only speculative work without losing metering.
@@ -170,6 +183,7 @@ impl<'a> Engine<'a> {
 
         Ok(CommittedStep {
             result,
+            budget_outcome,
             read_only_tools,
             speculation,
             estimated_input_tokens,

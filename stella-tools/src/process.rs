@@ -581,6 +581,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_process_cannot_inherit_registered_host_credentials() {
+        let secret_name = "STELLA_TEST_PROCESS_VERIFY_SECRET";
+        let token_name = "STELLA_TEST_PROCESS_BEARER";
+        crate::exec::register_sensitive_env_names([secret_name, token_name]);
+        unsafe {
+            std::env::set_var(secret_name, "process-verification-secret");
+            std::env::set_var(token_name, "process-bearer-secret");
+        }
+        let (table, root) = tools();
+        let handle = start(&table, &root, &["env"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let output = ReadOutput(table)
+            .execute(&serde_json::json!({"handle": handle}), &root)
+            .await;
+        unsafe {
+            std::env::remove_var(secret_name);
+            std::env::remove_var(token_name);
+        }
+        let ToolOutput::Ok { content } = output else {
+            panic!("cannot read process output: {output:?}");
+        };
+        for forbidden in [
+            secret_name,
+            token_name,
+            "process-verification-secret",
+            "process-bearer-secret",
+        ] {
+            assert!(!content.contains(forbidden), "credential leaked: {content}");
+        }
+    }
+
+    #[tokio::test]
     async fn unknown_handles_are_named_errors_on_every_tool() {
         let (table, root) = tools();
         for out in [

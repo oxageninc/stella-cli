@@ -351,6 +351,36 @@ pub fn effort_levels_for_spec(provider_id: &str, model: &str) -> &'static [&'sta
     )
 }
 
+/// The one-line honest-degradation notice for a reasoning effort the selected
+/// provider's adapter cannot honor (issue #266), or `None` when the effort is
+/// respected — or none is pinned.
+///
+/// Keyed on the USER's explicit pin, not the auto-resolved effort:
+/// `effort_auto` synthesizes a per-agent effort nobody asked for, so firing on
+/// the resolved value would spam a boot notice on every `Unsupported` provider
+/// under auto mode. The caller passes the settings-pinned value, and the
+/// notice only fires when the provider's [`ReasoningPosture`] is `Unsupported`
+/// (the shared adapter drops the control) — a `Controllable` provider honors
+/// the effort and stays silent.
+///
+/// [`ReasoningPosture`]: stella_model::provider_parity::ReasoningPosture
+pub fn unsupported_effort_notice(
+    provider_id: &str,
+    provider_label: &str,
+    pinned_effort: Option<ReasoningEffort>,
+) -> Option<String> {
+    use stella_model::provider_parity::{ReasoningPosture, reasoning_posture};
+    let effort = pinned_effort?;
+    match reasoning_posture(provider_id) {
+        Some(ReasoningPosture::Unsupported { note }) => Some(format!(
+            "reasoning effort '{}' is pinned, but {provider_label} has no request-level reasoning \
+             control on this adapter — the pinned level is ignored ({note}).",
+            effort_to_str(effort),
+        )),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------
 // Enum ↔ string (the TUI edits strings; settings/serde hold enums)
 // ---------------------------------------------------------------------
@@ -824,6 +854,36 @@ mod tests {
         assert_eq!(
             effort_levels_for_spec("anthropic", "claude-fable-5"),
             &["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
+    fn unsupported_effort_notice_fires_only_on_pinned_effort_against_unsupported() {
+        // No pin → no notice, whatever the posture.
+        assert!(unsupported_effort_notice("deepseek", "DeepSeek", None).is_none());
+        // Controllable providers honor the effort → silent even when pinned.
+        assert!(unsupported_effort_notice("xai", "xAI", Some(ReasoningEffort::High)).is_none());
+        assert!(
+            unsupported_effort_notice("openrouter", "OpenRouter", Some(ReasoningEffort::Max))
+                .is_none()
+        );
+        // Unsupported provider + a user-pinned effort → one honest line naming
+        // the provider and the (ignored) level.
+        let notice = unsupported_effort_notice("deepseek", "DeepSeek", Some(ReasoningEffort::High))
+            .expect("deepseek is Unsupported");
+        assert!(notice.contains("DeepSeek"), "{notice}");
+        assert!(notice.contains("high"), "{notice}");
+        assert!(notice.contains("ignored"), "{notice}");
+        // local and bedrock are Unsupported too.
+        assert!(unsupported_effort_notice("local", "Local", Some(ReasoningEffort::Low)).is_some());
+        assert!(
+            unsupported_effort_notice("bedrock", "Bedrock", Some(ReasoningEffort::Medium))
+                .is_some()
+        );
+        // An unknown provider id has no posture row → no notice (the seeded
+        // completeness test guarantees real ids always have one).
+        assert!(
+            unsupported_effort_notice("no-such", "Nope", Some(ReasoningEffort::High)).is_none()
         );
     }
 

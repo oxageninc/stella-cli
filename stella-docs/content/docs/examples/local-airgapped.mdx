@@ -3,9 +3,12 @@ title: "Local & air-gapped"
 description: Run Stella entirely against local model servers — Ollama, vLLM, LM Studio, llama.cpp — with no API key, no metering, and (if you want) no network calls at all.
 ---
 
-Stella is BYOK with no phone-home — which means it also runs happily with **no key and no
-cloud at all**. Point it at any OpenAI-compatible local server and everything (the agent,
-telemetry, memories, the code graph) stays on your machine.
+Community/default Stella has zero telemetry egress, so it also runs happily with **no key
+and no cloud at all**. Point it at any OpenAI-compatible local server and the agent,
+telemetry, memories, and code graph stay on your machine. The sole exception is an
+[explicitly enrolled Oxagen Enterprise managed deployment](/docs/telemetry#oxagen-enterprise-managed-export),
+whose current signed policy authorizes a minimal content-free operational rollup to one
+exact HTTPS sink; do not enroll that mode on a fully air-gapped host.
 
 ## Quick: the `local` pseudo-provider
 
@@ -88,17 +91,19 @@ in the [single-key setup](/docs/examples/single-key).
 
 ## Fully air-gapped
 
-Stella's only self-initiated network call is the model-catalog refresh from
-`models.dev` (at most once per 24h). Turn it off and the machine's traffic is exactly
-your model server's:
+With no Oxagen Enterprise managed enrollment, Stella's only automatic network call
+outside your configured model and integration surfaces is the model-catalog refresh
+from `models.dev` (at most once per 24h). Turn it off for an air-gapped deployment:
 
 ```bash
 export STELLA_CATALOG_AUTO_REFRESH=0
 ```
 
-Everything else is already local: telemetry lands in `.stella/store.db`, the
+Community/default telemetry remains local in `.stella/private/store.db`, the
 [Observatory](/docs/telemetry/dashboard) binds `127.0.0.1`, memories and the code graph
-are files in your workspace. `stella init` works offline with a heuristic fallback.
+are files in your workspace, and `stella init` works offline with a heuristic fallback.
+For a strict air gap, leave Oxagen Enterprise telemetry unenrolled and configure only
+loopback model/integration endpoints.
 
 <Callout type="info">
   Local models have no catalog prices, so `stella stats` dollar columns read zero —

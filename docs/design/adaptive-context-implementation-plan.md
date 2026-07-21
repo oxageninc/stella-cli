@@ -257,9 +257,9 @@ and content fidelity are separate dimensions.
 Use the current Stella stores rather than creating parallel files:
 
 ```text
-.stella/context.db       lifecycle records, temporal links, retrieval metadata
-.stella/store.db         executions, events, tool calls, operational telemetry
-.stella/codegraph.db     source-code graph
+.stella/private/context.db       lifecycle records, temporal links, retrieval metadata
+.stella/private/store.db         executions, events, tool calls, operational telemetry
+.stella/private/codegraph.db     source-code graph
 .stella/rules/*.md       published repository steering
 .stella/settings.json    governance, learning, retention, and sharing settings
 .stella/context-snapshots/  optional derived cache, gitignored

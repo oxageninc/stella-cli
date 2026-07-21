@@ -142,7 +142,7 @@ fn bash_grep_is_symbol_shaped(command: &str) -> bool {
 /// drifted tree graph_query can't help — otherwise a symbol-shaped grep gets
 /// the same `graph_query` pointer the native search tools carry.
 fn graph_advisory(command: &str, root: &Path) -> Option<String> {
-    if !crate::graph::graph_available(root) {
+    if !matches!(crate::graph::graph_available(root), Ok(true)) {
         return None;
     }
     if let Some(target) = cd_escape_target(command, root) {
@@ -449,7 +449,7 @@ mod tests {
         }
     }
 
-    /// An indexed workspace — a source file plus a built `.stella/codegraph.db`,
+    /// An indexed workspace — a source file plus a built `.stella/private/codegraph.db`,
     /// exactly what `stella init` leaves so `graph_available` is true.
     fn indexed_tempdir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");

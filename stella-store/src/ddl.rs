@@ -1,6 +1,6 @@
 //! Every table and index the store owns, as DDL at the current
 //! [`SCHEMA_VERSION`](crate::migrations::SCHEMA_VERSION) — the one place the
-//! CURRENT shape of `.stella/store.db` is written down. Fresh databases get
+//! CURRENT shape of `.stella/private/store.db` is written down. Fresh databases get
 //! this whole schema in one shot
 //! ([`create_latest_schema`](crate::migrations::create_latest_schema));
 //! existing files reach the same shape table by table through
@@ -300,7 +300,7 @@ pub(crate) const EXECUTION_REFLECTION_DDL: &str =
      );";
 
 /// `reflections` DDL at [`SCHEMA_VERSION`](crate::migrations::SCHEMA_VERSION) — the durable, unified home for
-/// lessons and self-critiques (superset of the loose `.stella/reflections.jsonl`
+/// lessons and self-critiques (superset of the loose `.stella/private/reflections.jsonl`
 /// and the context.db memory nodes). `execution_id` is NULL for cross-turn
 /// lessons; `domains` is a JSON array of domain tags.
 pub(crate) const REFLECTIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS reflections (

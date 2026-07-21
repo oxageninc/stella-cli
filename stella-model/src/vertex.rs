@@ -116,7 +116,7 @@ impl Provider for VertexProvider {
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         if !response.status().is_success() {
-            return Err(classify_google_error("Vertex AI", response).await);
+            return Err(classify_google_error("Vertex AI", response, &self.model).await);
         }
 
         let (text, tool_calls, usage, finish_reason) =

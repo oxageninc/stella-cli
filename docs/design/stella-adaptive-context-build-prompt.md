@@ -361,9 +361,9 @@ the modes.
 Evolve existing stores in place:
 
 ```text
-.stella/context.db       lifecycle records and frame lineage
-.stella/store.db         raw execution and operational telemetry
-.stella/codegraph.db     source-code graph
+.stella/private/context.db       lifecycle records and frame lineage
+.stella/private/store.db         raw execution and operational telemetry
+.stella/private/codegraph.db     source-code graph
 .stella/rules/*.md       canonical published repository steering
 .stella/settings.json    configuration
 .stella/context-snapshots/  optional derived gitignored cache

@@ -3,7 +3,7 @@
 //! data dir. This is what lets the dashboard's project switcher drill into
 //! any workspace stella has ever touched — each request may carry
 //! `?project=<id>`, resolved here to that project's root so the per-workspace
-//! queries in [`crate::db`] run against *its* `.stella/store.db` instead.
+//! queries in [`crate::db`] run against *its* `.stella/private/store.db` instead.
 //!
 //! Same posture as everything else in the observatory: read-only, and a
 //! missing `usage.db` is a state (empty project list), never an error.
@@ -71,7 +71,7 @@ fn open_usage() -> Option<Connection> {
 
 /// Every project `usage.db` knows about, with its rollup headline numbers.
 /// The serving workspace is flagged `is_current` and listed first;
-/// `has_store` says whether drilling in will find a live `.stella/store.db`.
+/// `has_store` says whether drilling in will find a live `.stella/private/store.db`.
 pub fn projects(current_root: &Path) -> Value {
     let current_id = project_id_for(current_root);
     let Some(conn) = open_usage() else {
@@ -99,7 +99,9 @@ pub fn projects(current_root: &Path) -> Value {
         let mapped = stmt.query_map([], |r| {
             let project_id: String = r.get(0)?;
             let root_path: String = r.get(2)?;
-            let has_store = Path::new(&root_path).join(".stella/store.db").exists();
+            let has_store = Path::new(&root_path)
+                .join(".stella/private/store.db")
+                .exists();
             Ok(json!({
                 "project_id": project_id.clone(),
                 "name": r.get::<_, String>(1)?,

@@ -160,7 +160,7 @@ struct IntegrationsFile {
 /// The owner-only JSON store at `~/.config/stella/integrations.json`
 /// (override with `STELLA_INTEGRATIONS_FILE` — used by tests and unusual
 /// setups). User-global on purpose: a GitHub/Linear account connection is a
-/// property of the person, not the workspace — unlike `.stella/mcp_oauth.json`,
+/// property of the person, not the workspace — unlike `.stella/private/mcp_oauth.json`,
 /// which is per-project because MCP server sets are.
 #[derive(Debug, Clone)]
 pub struct TrackerStore {

@@ -56,6 +56,31 @@ pub const GIT_REPO_ENV_VARS: [&str; 8] = [
 /// pipe detection; tools stay colorless on pipes, as they'd be anywhere.
 pub const FORCED_COLOR_ENV_VARS: [&str; 3] = ["CLICOLOR_FORCE", "FORCE_COLOR", "GH_FORCE_TTY"];
 
+/// Compatibility facade for callers added on `main`; the canonical policy
+/// lives in `subprocess_env` so every subprocess shares one monotonic registry.
+pub fn register_sensitive_env_names<I, S>(names: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    crate::subprocess_env::register_sensitive_env_names(names);
+}
+
+/// Whether a name is currently classified as a host credential.
+pub fn is_sensitive_env_name(name: &str) -> bool {
+    crate::subprocess_env::is_sensitive_env_name(std::ffi::OsStr::new(name))
+}
+
+/// Remove every registered host credential from a model-controlled child.
+pub fn scrub_sensitive_env(cmd: &mut Command) {
+    crate::subprocess_env::scrub_sensitive_env(cmd);
+}
+
+/// Synchronous-command counterpart used by fixed helper probes.
+pub fn scrub_sensitive_std_env(cmd: &mut std::process::Command) {
+    crate::subprocess_env::scrub_sensitive_std_env(cmd);
+}
+
 /// Run `command` via `bash -c` in `dir`. Returns `(exit_code, combined
 /// stdout+stderr)`; `Err` is spawn failure or timeout (the process group is
 /// killed on timeout so nothing lingers).
@@ -316,6 +341,32 @@ mod tests {
             .expect("GitHub runner");
         assert_eq!(code, 0);
         assert_eq!(output, "|leaked||visible|present");
+    }
+
+    #[tokio::test]
+    async fn model_controlled_commands_cannot_inherit_registered_host_credentials() {
+        let secret_name = "STELLA_TEST_ENROLLMENT_VERIFY_SECRET";
+        let token_name = "STELLA_TEST_ENROLLMENT_BEARER";
+        register_sensitive_env_names([secret_name, token_name]);
+        unsafe {
+            std::env::set_var(secret_name, "verification-secret-value");
+            std::env::set_var(token_name, "bearer-secret-value");
+        }
+        let result = run_argv("env", &[], std::path::Path::new("/tmp"), 30).await;
+        unsafe {
+            std::env::remove_var(secret_name);
+            std::env::remove_var(token_name);
+        }
+        let (code, output) = result.unwrap();
+        assert_eq!(code, 0);
+        for forbidden in [
+            secret_name,
+            token_name,
+            "verification-secret-value",
+            "bearer-secret-value",
+        ] {
+            assert!(!output.contains(forbidden), "credential leaked: {output}");
+        }
     }
 
     /// Dropping the future mid-wait (a cancelled turn) must kill the whole

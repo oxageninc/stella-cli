@@ -55,7 +55,7 @@ stella mcp remove filesystem
 
 ### `stella mcp login <name>` / `stella mcp logout <name>`
 
-OAuth login to a configured HTTP server that requires it (and log back out). Tokens land in `.stella/mcp_oauth.json` and refresh automatically at session start.
+OAuth login to a configured HTTP server that requires it (and log back out). Tokens land in `.stella/private/mcp_oauth.json` and refresh automatically at session start.
 
 ```bash
 stella mcp login github
@@ -64,7 +64,7 @@ stella mcp logout github
 
 ### `stella mcp usage`
 
-Show MCP tool-usage telemetry from `.stella/store.db` — calls per server and tool.
+Show MCP tool-usage telemetry from `.stella/private/store.db` — calls per server and tool.
 
 ```bash
 stella mcp usage

@@ -13,6 +13,11 @@
 //! Audio/3D are explicitly future: the trait reserves
 //! that method-space by contract but ships no v1 stub, to avoid churning the
 //! port surface before there's a real adapter.
+//!
+//! Bundled adapters do not currently expose a documented remote idempotency
+//! facility. Callers must therefore claim the request's host-derived
+//! `operation_id` in the local durable operation journal before submission;
+//! adapters receive the key so a future supported vendor can forward it.
 
 use std::fmt;
 use std::str::FromStr;
@@ -132,6 +137,9 @@ impl MediaCapabilities {
 /// An image generation request.
 #[derive(Clone, Debug)]
 pub struct ImageRequest {
+    /// Host-derived, retry-stable operation key. Provider adapters may pass
+    /// it to a remote idempotency facility when one is supported.
+    pub operation_id: Option<String>,
     pub prompt: String,
     pub size: ImageSize,
     /// Number of candidate images (`--n`); at least 1.
@@ -146,6 +154,7 @@ impl ImageRequest {
         let prompt = prompt.into();
         let label = default_label(&prompt);
         Self {
+            operation_id: None,
             prompt,
             size,
             n: 1,
@@ -162,6 +171,9 @@ impl ImageRequest {
 /// A video generation request (cost-gated §6).
 #[derive(Clone, Debug)]
 pub struct VideoRequest {
+    /// Host-derived, retry-stable operation key. Provider adapters may pass
+    /// it to a remote idempotency facility when one is supported.
+    pub operation_id: Option<String>,
     pub prompt: String,
     pub duration_secs: u32,
     pub label: String,
@@ -172,6 +184,7 @@ impl VideoRequest {
         let prompt = prompt.into();
         let label = default_label(&prompt);
         Self {
+            operation_id: None,
             prompt,
             duration_secs: duration_secs.max(1),
             label,

@@ -10,7 +10,7 @@
 //! detection) — Phase 2.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,9 +25,9 @@ use stella_mcp::{McpConfig, McpServerConfig, McpToolSet};
 use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
 use stella_pipeline::{
-    AutoApproveGate, CmdOutcome, CommandRunner, ContextRecallPort, NoContextRecall, Pipeline,
-    PipelineConfig, PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort,
-    RepoStructurePort, StdioApprovalGate,
+    AlwaysAbortGate, CmdOutcome, ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig,
+    PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort, RepoStructurePort,
+    StdioApprovalGate,
 };
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{AgentEvent, CompletionMessage, ModelRef, Role, ToolOutput};
@@ -49,12 +49,18 @@ use stella_context::EpisodeOutcome;
 
 mod engine;
 mod goal;
+mod outcome;
 mod output;
 mod prompt;
 mod tools;
 
 pub(crate) use engine::*;
 pub(crate) use goal::*;
+use outcome::{
+    pipeline_episode_outcome, pipeline_failure_reason, pipeline_status_label,
+    pipeline_status_result,
+};
+pub(crate) use outcome::{pipeline_execution_closeout, settled_cost_since};
 use output::*;
 pub(crate) use prompt::*;
 pub(crate) use tools::*;
@@ -95,6 +101,7 @@ pub async fn run_one_shot(
     // A benchmark's durable sink is part of the accounting boundary. Prove the exact mounted file
     // is writable before provider construction or any code path that can make a paid call.
     preflight_durable_stream(format)?;
+    crate::enterprise_telemetry::authorize_one_shot(use_pipeline)?;
     if use_pipeline {
         run_pipeline_one_shot(cfg, prompt, budget_limit, format, test_command).await
     } else {
@@ -114,11 +121,12 @@ async fn run_pipeline_one_shot(
 ) -> Result<(), String> {
     let provider = build_provider(cfg)?;
     let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
-
+    let registry_options = registry_options(cfg);
     let registry: Arc<ToolRegistry> =
-        Arc::new(new_tool_registry(cfg.workspace_root.clone(), registry_options(cfg)).await);
-    populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+        Arc::new(new_tool_registry(cfg.workspace_root.clone(), registry_options.clone()).await);
+    populate_schema_index(&registry, &cfg.workspace_root)?;
+    let active_rules =
+        crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build + live-refresh the code graph in the background so the
     // pipeline's localize step can reach for `graph_query` once it is ready.
     // Status goes to stderr — stdout may be machine-readable JSON.
@@ -134,7 +142,7 @@ async fn run_pipeline_one_shot(
         Some(registry.mcp_usage_ledger()),
         format == OutputFormat::Text,
     )
-    .await;
+    .await?;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -168,10 +176,11 @@ async fn run_pipeline_one_shot(
         durable_pre_persisted,
     );
 
-    // Role wiring from `agent_engine_config`: per-role model pins (triage/
-    // judge), their adapters, and per-role request overrides. Notices are
-    // stderr diagnostics — stdout may be machine-readable JSON.
-    let wiring = resolve_engine_wiring(cfg, &model_ref);
+    // Role wiring from `agent_engine_config`: per-role model pins (worker/
+    // triage/judge), their adapters, and per-role request overrides. Notices
+    // are stderr diagnostics — stdout may be machine-readable JSON.
+    let configured = crate::config::discover_configured_providers();
+    let wiring = resolve_engine_wiring(cfg, &model_ref, &configured);
     for notice in &wiring.notices {
         eprintln!("  ! {notice}");
     }
@@ -179,10 +188,17 @@ async fn run_pipeline_one_shot(
         RoleProviderResolver::new(&*provider, model_ref.clone(), &wiring.extra_providers);
 
     let mut messages = vec![CompletionMessage::system(
-        with_session_hook_context(build_pipeline_system_prompt(cfg, &cfg.workspace_root), cfg)
-            .await,
+        with_session_hook_context(
+            build_pipeline_system_prompt(cfg, &cfg.workspace_root, &active_rules),
+            cfg,
+        )
+        .await,
     )];
-    let mut memory = SessionMemory::open(&cfg.workspace_root, format == OutputFormat::Text);
+    let mut memory = SessionMemory::open_with_authority(
+        &cfg.workspace_root,
+        format == OutputFormat::Text,
+        &cfg.authority,
+    );
     if let Some(m) = &memory {
         inject_recall_block(&mut messages, m.recall_block(prompt).await);
     }
@@ -203,26 +219,34 @@ async fn run_pipeline_one_shot(
         // Outermost: the discovery layer (tool_search/skill_search/mcp_search)
         // must see the complete advertised catalog below it.
         let tools =
-            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone());
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed);
 
-        let ws_ports = workspace_ports(cfg.workspace_root.clone(), cfg);
+        let ws_ports = workspace_ports(
+            cfg.workspace_root.clone(),
+            cfg,
+            registry_options,
+            active_rules.clone(),
+        )?;
 
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
         let is_text = format == OutputFormat::Text;
-        let pipeline_config = PipelineConfig {
-            engine: pipeline_engine_config_for(cfg),
-            role_overrides: wiring.role_overrides.clone(),
-            headless: !is_text,
-            headless_bypass_scope_review: !is_text,
-            // `--test-command` arms the deterministic verify ladder: the
-            // fail→pass flip oracle and SubmitFast/Revise decisions all key
-            // off it. Left unset, every verification escalates to the model
-            // judge.
-            test_command: test_command.map(str::to_string),
-            ..Default::default()
-        };
+        // Stdio approval requires a text-safe renderer plus two terminal
+        // handles: stdin must accept the decision and stdout must present the
+        // prompt. Redirected text is still rendered as text, but is headless
+        // and fails closed at scope review.
+        let approval_capability =
+            if is_text && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                PipelineApprovalCapability::Stdio
+            } else {
+                PipelineApprovalCapability::Unavailable
+            };
+        let mut pipeline_config =
+            pipeline_config_for_approval_capability(cfg, approval_capability, test_command);
+        pipeline_config.engine = pipeline_engine_config_for(cfg, &wiring.worker_model);
+        pipeline_config.role_overrides = wiring.role_overrides.clone();
 
         let stdio_gate = StdioApprovalGate;
         let no_recall = NoContextRecall;
@@ -241,11 +265,12 @@ async fn run_pipeline_one_shot(
             recall,
             repo: &ws_ports.repo_structure,
             repo_status: &ws_ports.repo_status,
-            commands: &ws_ports.command_runner,
-            approvals: if is_text {
+            diagnostics: &ws_ports.diagnostic_runner,
+            tests: &ws_ports.test_runner,
+            approvals: if approval_capability == PipelineApprovalCapability::Stdio {
                 &stdio_gate
             } else {
-                &AutoApproveGate
+                &HEADLESS_APPROVAL_GATE
             },
             sleeper: &TokioSleeper,
             hooks: cfg
@@ -266,16 +291,7 @@ async fn run_pipeline_one_shot(
 
     let files = registry.files_touched();
     if let Some((store, id)) = &execution {
-        let (outcome_label, cost) = match &result {
-            Ok(outcome) => {
-                let label = match outcome.status {
-                    PipelineStatus::Completed => "completed",
-                    PipelineStatus::Aborted { .. } => "aborted",
-                };
-                (label, outcome.total_cost_usd)
-            }
-            Err(_) => ("error", 0.0),
-        };
+        let (outcome_label, cost) = pipeline_execution_closeout(&result);
         if !record_execution_end(store, *id, &registry, outcome_label, cost) {
             warn_store_write_failed(
                 "the audit record (files touched / memory citations / outcome)",
@@ -289,10 +305,7 @@ async fn run_pipeline_one_shot(
         && (turn_warrants_reflection(&messages) || !files.is_empty())
     {
         let episode_outcome = match &result {
-            Ok(outcome) => match outcome.status {
-                PipelineStatus::Completed => EpisodeOutcome::Success,
-                PipelineStatus::Aborted { .. } => EpisodeOutcome::Aborted,
-            },
+            Ok(outcome) => pipeline_episode_outcome(&outcome.status),
             Err(_) => EpisodeOutcome::Failure,
         };
         m.record_episode(prompt, episode_outcome, &files, started_unix)
@@ -342,7 +355,10 @@ async fn run_pipeline_one_shot(
                 &*provider,
                 &reflect_transcript,
                 format != OutputFormat::Text,
-                result.is_ok(),
+                matches!(
+                    &result,
+                    Ok(outcome) if matches!(outcome.status, PipelineStatus::Completed)
+                ),
             )
             .await;
         surface_reflection(&report, format);
@@ -376,14 +392,8 @@ async fn run_pipeline_one_shot(
     match &result {
         Ok(outcome) => {
             if format == OutputFormat::Json {
-                let status_str = match outcome.status {
-                    PipelineStatus::Completed => "completed",
-                    PipelineStatus::Aborted { .. } => "aborted",
-                };
-                let reason_str = match &outcome.status {
-                    PipelineStatus::Completed => None,
-                    PipelineStatus::Aborted { reason } => Some(reason.clone()),
-                };
+                let status_str = pipeline_status_label(&outcome.status);
+                let reason_str = pipeline_failure_reason(&outcome.status);
                 let summary = serde_json::json!({
                     "status": status_str,
                     "text": outcome.final_text,
@@ -418,10 +428,7 @@ async fn run_pipeline_one_shot(
                 println!();
             }
 
-            match &outcome.status {
-                PipelineStatus::Completed => Ok(()),
-                PipelineStatus::Aborted { reason } => Err(reason.clone()),
-            }
+            pipeline_status_result(&outcome.status)
         }
         Err(e) => Err(e.to_string()),
     }
@@ -441,6 +448,9 @@ const REPL_RESERVED: &[&str] = &[
 /// the conversation, while `BudgetGuard::begin_turn` resets only the
 /// turn-scoped counter at the start of each one.
 pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<(), String> {
+    crate::enterprise_telemetry::authorize_execution_surface(
+        crate::enterprise_telemetry::ExecutionSurface::Interactive,
+    )?;
     let provider = build_provider(cfg)?;
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
         new_tool_registry(cfg.workspace_root.clone(), registry_options(cfg)).await,
@@ -451,9 +461,10 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         Some(registry.mcp_usage_ledger()),
         true,
     )
-    .await;
-    populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
+    .await?;
+    populate_schema_index(&registry, &cfg.workspace_root)?;
+    let active_rules =
+        crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build the code-graph index in the background (a cheap incremental
     // refresh if it already exists) and keep it fresh via the live watcher, so
     // `graph_query` becomes available this session without a manual `stella
@@ -485,15 +496,21 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     // Built once per session and reused verbatim on /clear — the byte-stable
     // prefix (instructions + baked memories + SessionStart hook context) is
     // the prompt-cache contract (see build_system_prompt).
-    let system_prompt =
-        with_session_hook_context(build_system_prompt(cfg, &cfg.workspace_root), cfg).await;
+    let system_prompt = with_session_hook_context(
+        build_system_prompt(cfg, &cfg.workspace_root, &active_rules),
+        cfg,
+    )
+    .await;
     let mut messages = vec![CompletionMessage::system(system_prompt.clone())];
-    let mut memory = SessionMemory::open(&cfg.workspace_root, true);
+    let mut memory = SessionMemory::open_with_authority(&cfg.workspace_root, true, &cfg.authority);
     // Custom extensions: ⚡ commands/skills invocable as `/name args`, custom
     // agents behind `/agents`. Reloaded after `/init`, which may adopt new
     // ones from `.claude/`/`.agents/`. Load problems print up front so a
     // definition that failed to parse is visible, not silently absent.
-    let mut custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
+    let mut custom = crate::extensions::CustomExtensions::load_with_authority(
+        &cfg.workspace_root,
+        &cfg.authority,
+    );
     if let Some(report) = custom.problems_report() {
         for line in report.lines() {
             println!("  {line}");
@@ -548,7 +565,10 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             continue;
         }
         if input == "/config" {
-            cfg.print_config();
+            // The REPL fallback has no startup dotenv-load record handy —
+            // the source label just degrades to the generic `env:VAR` form
+            // (see `Config::print_config`'s doc).
+            cfg.print_config(None);
             continue;
         }
         if input == "/help" {
@@ -576,20 +596,33 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                 Ok(_) => {
                     // A fresh index may name tables/types the schema gate
                     // should know about this session, not just the next one.
-                    populate_schema_index(&registry, &cfg.workspace_root);
+                    if let Err(error) = populate_schema_index(&registry, &cfg.workspace_root) {
+                        println!("  {} schema governance unavailable: {error}", "!".yellow());
+                        continue;
+                    }
                     // The code graph now exists — expose the `graph_query` tool
                     // to the rest of this session (it is registered only when
                     // an index is present, so a session that started without
                     // one otherwise wouldn't see it until relaunch).
-                    registry.enable_code_graph_if_available(&cfg.workspace_root);
+                    if let Err(error) = registry.enable_code_graph_if_available(&cfg.workspace_root)
+                    {
+                        println!("  {} graph tool unavailable: {error}", "!".yellow());
+                    }
                     // Re-open memory so recall/reflection use the taxonomy
                     // `/init` just wrote — otherwise the cached domains stay
                     // stale until the next launch.
-                    memory = SessionMemory::open(&cfg.workspace_root, true);
+                    memory = SessionMemory::open_with_authority(
+                        &cfg.workspace_root,
+                        true,
+                        &cfg.authority,
+                    );
                     // `/init` may also have adopted new custom
                     // commands/skills/agents — make them invocable now, and
                     // report anything that failed to load.
-                    custom = crate::extensions::CustomExtensions::load(&cfg.workspace_root);
+                    custom = crate::extensions::CustomExtensions::load_with_authority(
+                        &cfg.workspace_root,
+                        &cfg.authority,
+                    );
                     if let Some(report) = custom.problems_report() {
                         for line in report.lines() {
                             println!("  {line}");
@@ -806,7 +839,7 @@ pub(crate) async fn record_turn_episode(
     .await;
 }
 
-/// Build the workspace code-graph index into `.stella/codegraph.db` (the
+/// Build the workspace code-graph index into `.stella/private/codegraph.db` (the
 /// `stella-graph` tree-sitter indexer). This is the data side of `init`: the
 /// domain taxonomy tags graph nodes/edges, and the index makes the symbols +
 /// import edges queryable as `ContextFrame`s by the context plane.
@@ -844,10 +877,8 @@ async fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut
 fn index_workspace_graph_blocking(
     workspace_root: &std::path::Path,
 ) -> Result<GraphSummary, String> {
-    let dot_stella = workspace_root.join(".stella");
-    std::fs::create_dir_all(&dot_stella)
-        .map_err(|e| format!("! could not create .stella for the code graph: {e} — skipped"))?;
-    let db_path = dot_stella.join("codegraph.db");
+    let db_path = stella_store::workspace_private_sqlite_path(workspace_root, "codegraph.db")
+        .map_err(|e| format!("! could not prepare private code graph state: {e} — skipped"))?;
     let graph = stella_graph::CodeGraph::open(workspace_root, &db_path)
         .map_err(|e| format!("! code-graph store unavailable: {e} — skipped"))?;
     let stats = graph.index_all().map_err(|e| {
@@ -865,6 +896,7 @@ fn index_workspace_graph_blocking(
             .unwrap_or(stats.files_parsed + stats.files_skipped_unchanged),
         files_parsed: stats.files_parsed,
         files_unchanged: stats.files_skipped_unchanged,
+        files_skipped_generated: stats.files_skipped_generated,
     };
     graph.shutdown();
     Ok(summary)
@@ -877,13 +909,22 @@ struct GraphSummary {
     total_files: usize,
     files_parsed: usize,
     files_unchanged: usize,
+    /// Files this pass excluded as generated/minified (issue #272:
+    /// `.gitattributes` `linguist-generated=true`, `*.min.*`, or the
+    /// minified-content heuristic — see `stella_graph::generated`). Reported
+    /// separately from `total_files` so the exclusion is visible, not just
+    /// silently absent from the count.
+    files_skipped_generated: usize,
 }
 
 /// The `✓ code graph: N symbols, M imports…` summary line, shared by `stella
 /// init` and the session auto-builder so both surfaces read identically.
 /// Reports index totals; the parenthetical is this pass's parse/skip split.
+/// When this pass excluded any generated/minified files, an explicit
+/// "skipped N generated files" clause makes that visible rather than letting
+/// them silently vanish from the file count (issue #272).
 fn format_graph_stats(summary: &GraphSummary) -> String {
-    format!(
+    let base = format!(
         "✓ code graph: {} symbols, {} imports across {} file{} ({} re-parsed, {} unchanged this pass)",
         summary.total_symbols,
         summary.total_imports,
@@ -891,13 +932,25 @@ fn format_graph_stats(summary: &GraphSummary) -> String {
         if summary.total_files == 1 { "" } else { "s" },
         summary.files_parsed,
         summary.files_unchanged,
+    );
+    if summary.files_skipped_generated == 0 {
+        return base;
+    }
+    format!(
+        "{base} — skipped {} generated file{}",
+        summary.files_skipped_generated,
+        if summary.files_skipped_generated == 1 {
+            ""
+        } else {
+            "s"
+        }
     )
 }
 
 /// A session-lifetime holder for the live code graph. It keeps the in-process
 /// `notify` watcher (and its debounce task) alive so file changes — the
 /// agent's own edits and external ones — incrementally re-index into
-/// `.stella/codegraph.db` for the rest of the session. Dropping it (or calling
+/// `.stella/private/codegraph.db` for the rest of the session. Dropping it (or calling
 /// [`SessionGraph::shutdown`]) tears the watcher down cleanly. The mounted
 /// graph is installed only once the background build finishes, so an early
 /// session exit simply leaves the slot empty (and the never-installed watcher
@@ -932,7 +985,7 @@ impl Drop for SessionGraph {
 /// 2. The moment the index is ready the `graph_query` tool is enabled for the
 ///    rest of the session ([`ToolRegistry::enable_code_graph_if_available`])
 ///    and the schema gate learns any new table/type names — so a session that
-///    launched in a repo with no `.stella/codegraph.db` gains the tool
+///    launched in a repo with no `.stella/private/codegraph.db` gains the tool
 ///    mid-session, no restart, no manual `stella init`.
 /// 3. The live `notify` watcher is then armed via
 ///    [`stella_graph::CodeGraph::mount`] so subsequent edits incrementally
@@ -976,8 +1029,12 @@ pub(crate) fn spawn_session_graph(
         }
         // 2) Expose `graph_query` for the rest of the session and teach the
         //    schema gate any table/type names the fresh index now carries.
-        registry.enable_code_graph_if_available(&root);
-        populate_schema_index(&registry, &root);
+        if let Err(error) = registry.enable_code_graph_if_available(&root) {
+            status(format!("! graph tool unavailable: {error}"));
+        }
+        if let Err(error) = populate_schema_index(&registry, &root) {
+            status(format!("! schema governance unavailable: {error}"));
+        }
         on_ready();
         // 3) Arm the live watcher on a mounted graph kept alive for the
         //    session. Best-effort: a mount failure only loses live refresh, it
@@ -1066,7 +1123,9 @@ pub(crate) fn graph_snapshot_focus(
 ) -> Option<stella_tui::GraphSnapshot> {
     use stella_tui::{GraphEdge, GraphNode, GraphSnapshot};
 
-    let db_path = workspace_root.join(".stella").join("codegraph.db");
+    let db_path =
+        stella_store::existing_workspace_private_sqlite_path(workspace_root, "codegraph.db")
+            .ok()??;
     if !db_path.exists() {
         return None;
     }
@@ -1131,21 +1190,20 @@ pub(crate) fn graph_snapshot_focus(
     })
 }
 
-/// Seed the tool registry's storage-gate baseline with the assembled
-/// storage map (persisted index + `stella.storage.toml`). Best-effort: with
-/// no `.stella/codegraph.db` and no manifest the snapshot is empty and every
-/// gate mechanism is a no-op until `stella init` runs. The gate also
-/// re-reads the persisted map per gated write, so this baseline only has to
-/// cover session start.
-pub(crate) fn populate_schema_index(registry: &ToolRegistry, workspace_root: &std::path::Path) {
-    registry.update_storage_index(stella_graph::load_storage_snapshot(workspace_root));
+/// Seed the storage gate; unsafe legacy state is an error, not an empty map.
+pub(crate) fn populate_schema_index(
+    registry: &ToolRegistry,
+    workspace_root: &std::path::Path,
+) -> Result<(), String> {
+    registry.update_storage_index(stella_tools::graph::load_storage_snapshot(workspace_root)?);
+    Ok(())
 }
 
 /// `stella init` — infer the workspace's domain taxonomy, build the code-graph
 /// index, and write `.stella/domains.toml` (see `crate::domains`). Domain
 /// inference is model-assisted when a provider resolves, with a deterministic
 /// directory heuristic fallback, so init always succeeds — offline included.
-/// The code graph (`.stella/codegraph.db`) is built unconditionally: it needs
+/// The code graph (`.stella/private/codegraph.db`) is built unconditionally: it needs
 /// no provider, only the on-disk source tree.
 pub async fn run_init(
     model_override: Option<&str>,
@@ -1224,10 +1282,10 @@ pub(crate) enum McpPlan {
     Servers(Vec<McpServerConfig>),
 }
 
-/// Stage 1 of MCP assembly: read and parse the workspace config. Local file
-/// I/O only — never touches the network.
 pub(crate) fn load_mcp_plan(cfg: &Config) -> McpPlan {
-    if crate::settings::filesystem_settings_disabled() {
+    if crate::settings::filesystem_settings_disabled()
+        || crate::enterprise_telemetry::process_free_authority_active()
+    {
         return McpPlan::None;
     }
     let path = cfg.workspace_root.join(".stella").join("mcp.toml");
@@ -1304,19 +1362,19 @@ pub(crate) async fn connect_mcp(
     native: std::sync::Arc<dyn ToolExecutor>,
     usage: Option<stella_core::mcp_usage::McpUsageLedger>,
     print_diagnostics: bool,
-) -> Option<McpToolSet> {
+) -> Result<Option<McpToolSet>, String> {
     let servers = match load_mcp_plan(cfg) {
-        McpPlan::None => return None,
+        McpPlan::None => return Ok(None),
         McpPlan::Invalid(reason) => {
             if print_diagnostics {
                 eprintln!("  {} {reason}", "!".yellow());
             }
-            return None;
+            return Ok(None);
         }
         McpPlan::Servers(servers) => servers,
     };
     // A one-shot run has no interactive enable/disable, so no disabled set.
-    let auth = crate::mcp_cmd::oauth_manager(&cfg.workspace_root);
+    let auth = crate::mcp_cmd::oauth_manager(&cfg.workspace_root)?;
     let set = connect_mcp_servers(&servers, native, usage, None, Some(auth)).await;
     if print_diagnostics {
         for (name, reason) in set.failed_servers() {
@@ -1333,23 +1391,25 @@ pub(crate) async fn connect_mcp(
             );
         }
     }
-    Some(set)
+    Ok(Some(set))
 }
 
-/// Discover developer-defined custom script tools (.stella/tools/*.toml,
-/// then ~/.config/stella/tools/*.toml — workspace wins on collision; see
-/// stella_tools::custom). Broken manifests never abort a session: their
-/// diagnostics print once (text mode) and show up in `stella tools`.
 pub(crate) async fn discover_custom_tools(
     cfg: &Config,
     print_diagnostics: bool,
 ) -> Vec<CustomTool> {
+    if crate::enterprise_telemetry::process_free_authority_active() {
+        return Vec::new();
+    }
     // The manifest walk is synchronous directory I/O — off the runtime
     // worker thread it goes (#64).
     let root = cfg.workspace_root.clone();
-    let report = tokio::task::spawn_blocking(move || custom_tool_report_for_workspace(&root))
-        .await
-        .unwrap_or_else(|_| custom_tool_report_for_workspace(&cfg.workspace_root));
+    let include_workspace = cfg.authority.project_custom_tools_allowed;
+    let report = tokio::task::spawn_blocking(move || {
+        custom_tool_report_for_scopes(&root, include_workspace)
+    })
+    .await
+    .unwrap_or_else(|_| custom_tool_report_for_scopes(&cfg.workspace_root, include_workspace));
     if print_diagnostics {
         for diagnostic in &report.diagnostics {
             eprintln!(
@@ -1381,9 +1441,8 @@ pub fn run_tools_listing() -> Result<(), String> {
         std::env::current_dir().map_err(|e| format!("cannot determine workspace root: {e}"))?;
     tui::section_header("Stella tools");
 
-    // The listing mirrors a real session's surface, so the settings-driven
-    // switches (bash/web opt-ins) apply here exactly as they do at session
-    // start.
+    // The listing mirrors a real session's settings-driven tool switches
+    // (bash/web opt-ins).
     let settings = crate::settings::Settings::load(&workspace_root)?;
     let bash_enabled = settings.bash_tool_enabled();
     let web_enabled = settings.web_tools_enabled();
@@ -1392,6 +1451,7 @@ pub fn run_tools_listing() -> Result<(), String> {
         stella_tools::RegistryOptions {
             bash: bash_enabled,
             web: web_enabled,
+            ..Default::default()
         },
     );
     println!("  {}", "built-in:".dimmed());
@@ -1452,7 +1512,12 @@ pub fn run_tools_listing() -> Result<(), String> {
         );
     }
 
-    let report = custom::discover(&workspace_root);
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let report = custom::discover_in_scopes(
+        &workspace_root,
+        home.as_deref(),
+        settings.authority_policy.project_custom_tools_allowed,
+    );
     println!(
         "\n  {}",
         "custom (.stella/tools/, ~/.config/stella/tools/):".dimmed()
@@ -1589,7 +1654,7 @@ pub(crate) fn build_budget_guard(budget_limit: Option<f64>) -> BudgetGuard {
     }
 }
 
-/// Open the workspace SQLite store (`.stella/store.db`). Persistence is
+/// Open the workspace SQLite store (`.stella/private/store.db`). Persistence is
 /// observability, not a work dependency: a store that won't open warns once
 /// and the session runs on without it — never a startup failure.
 pub(crate) fn open_store(workspace_root: &std::path::Path) -> Option<Arc<Store>> {
@@ -1784,16 +1849,13 @@ async fn run_turn(
         durable_pre_persisted,
     );
 
-    // The tool set holds a tx clone (for AskUser events), so it must drop
-    // before the renderer is awaited — the channel only closes once EVERY
-    // sender is gone, and awaiting the renderer with a live sender would
-    // deadlock. The inner scope makes the drop order structural.
-    let outcome = {
-        // The tool stack, innermost out: native registry <- developer
-        // custom script tools (.stella/tools/, stella-tools::custom) <-
-        // ask_user (interactive.rs). Headless formats get the io that
-        // fails ask_user loudly instead of waiting on stdin that will
-        // never answer.
+    // The scoped tool set must drop its tx clone before awaiting the renderer.
+    let outcome = if crate::enterprise_telemetry::process_free_authority_active() {
+        let engine =
+            Engine::with_sleeper(provider, registry, engine_config_for(cfg), &TokioSleeper)
+                .with_calibration(calibration);
+        engine.run_turn_with_sender(messages, budget, &tx).await
+    } else {
         let customs = CustomToolSet::new(
             base_tools,
             custom_tools.to_vec(),
@@ -1812,6 +1874,7 @@ async fn run_turn(
         // keeps lean-mode activations across the per-turn stack rebuild.
         let tools =
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_project_prompts_allowed(cfg.authority.project_prompts_allowed)
                 .with_activation(activated.clone());
         let hook_runner = ShellHookRunner;
         let mut engine =
@@ -2032,9 +2095,9 @@ pub(crate) fn record_execution_end(
     let _ = store.materialize_tool_calls(execution_id);
     let _ = store.finalize_execution_reflection(execution_id);
     let _ = store.sync_to_usage_default(execution_id);
+    let _ = crate::enterprise_telemetry::enqueue_finalized_execution(store, execution_id);
     files_ok && citations_ok && uses_ok && mcp_usage_ok && finish_ok
 }
-
 /// The registry's MCP tool-usage ledger as store rows. This DRAINS the ledger
 /// (like memory citations) so each call persists under exactly one execution —
 /// re-persisting under later turns would inflate the per-tool call counts.

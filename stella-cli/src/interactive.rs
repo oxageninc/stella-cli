@@ -248,7 +248,9 @@ impl<'a> InteractiveToolSet<'a> {
 
     /// Enable the skills-registry tools (search_skills / install_skill).
     pub fn with_skill_registry(mut self, registry: SkillRegistry) -> Self {
-        self.skills = Some(registry);
+        if !crate::enterprise_telemetry::process_free_authority_active() {
+            self.skills = Some(registry);
+        }
         self
     }
 

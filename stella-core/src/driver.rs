@@ -151,7 +151,8 @@ pub enum TurnOutcome {
     Completed { text: String, cost_usd: f64 },
     /// The turn ended before completion: budget enforced, a loop was
     /// detected, retries were exhausted, or the step cap was hit. It is a
-    /// clean abort, but landed calls remain real spend and travel with it.
+    /// clean abort — never mid-tool — but landed calls remain real spend and
+    /// travel with it.
     Aborted { reason: String, cost_usd: f64 },
 }
 
@@ -220,6 +221,7 @@ const MAX_CONCURRENT_TOOL_CALLS: usize = 8;
 /// own paid-call telemetry.
 struct CommittedStep {
     result: CompletionResultAlias,
+    budget_outcome: BudgetOutcome,
     /// Names of tools whose schemas declare `read_only`, snapshotted from
     /// the same `schemas()` call the request itself was built from.
     read_only_tools: HashSet<String>,
@@ -389,6 +391,9 @@ impl<'a> Engine<'a> {
                     };
                 }
             }
+            if let Some(reason) = check_budget(budget, events) {
+                return aborted(reason, total_cost_usd);
+            }
             total_cost_usd += self
                 .run_compaction_pass(step, messages, calibration_model.as_deref(), budget, events)
                 .await;
@@ -400,15 +405,14 @@ impl<'a> Engine<'a> {
                 return aborted(reason, total_cost_usd);
             }
 
-            let committed = match self.run_model_call(step, messages, events).await {
+            let committed = match self.run_model_call(step, messages, budget, events).await {
                 Ok(committed) => committed,
                 Err(reason) => return aborted(reason, total_cost_usd),
             };
             calibration_model = Some(committed.result.model.clone());
             total_cost_usd += committed.result.cost_usd;
 
-            if let Some(reason) = self.handle_committed_result(&committed, budget, messages, events)
-            {
+            if let Some(reason) = self.handle_committed_result(&committed, messages, events) {
                 return aborted(reason, total_cost_usd);
             }
 
@@ -654,7 +658,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Bookkeeping for the call that just committed: drift feedback into
-    /// the attached calibration and budget accounting. `StepUsage` has
+    /// the attached calibration. `StepUsage` and budget accounting have
     /// already crossed the durability boundary in [`Engine::run_model_call`]
     /// before any speculative tool drain. `Some` is the turn's clean
     /// abort — this call's spend pushed the turn over an enforced limit —
@@ -663,7 +667,6 @@ impl<'a> Engine<'a> {
     fn handle_committed_result(
         &self,
         committed: &CommittedStep,
-        budget: &mut BudgetGuard,
         messages: &mut Vec<CompletionMessage>,
         events: &EventSender,
     ) -> Option<String> {
@@ -682,17 +685,11 @@ impl<'a> Engine<'a> {
             );
         }
 
-        let outcome = budget.record_spend(result.cost_usd);
-        let _ = events.send(AgentEvent::BudgetTick {
-            spent_usd: budget.spent_usd(),
-            limit_usd: budget.turn_limit_usd(),
-            mode: budget.mode(),
-        });
         let BudgetOutcome::AbortTurn {
             spent_usd,
             limit_usd,
             ..
-        } = outcome
+        } = committed.budget_outcome
         else {
             return None;
         };
@@ -2269,7 +2266,10 @@ mod tests {
         match outcome {
             TurnOutcome::Aborted { reason, cost_usd } => {
                 assert!(reason.contains("budget"));
-                assert!((cost_usd - 0.0001).abs() < 1e-9);
+                assert!(
+                    (cost_usd - 0.0001).abs() < 1e-9,
+                    "the abort must retain the settled over-cap call: {cost_usd}"
+                );
             }
             other => panic!("expected a budget abort, got {other:?}"),
         }
@@ -3159,4 +3159,6 @@ mod tests {
         );
         assert!(payloads[0].contains("\"event\":\"SessionStart\""));
     }
+
+    mod task4;
 }

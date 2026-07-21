@@ -135,7 +135,7 @@ struct TokenFile {
 }
 
 /// The owner-only JSON token file (path chosen by the caller — the CLI puts
-/// it at `.stella/mcp_oauth.json`, beside `mcp.toml`). Every operation
+/// it at `.stella/private/mcp_oauth.json`). Every operation
 /// re-reads and atomically rewrites; contention is a non-issue at this scale
 /// and it keeps concurrent sessions from clobbering each other's logins.
 #[derive(Debug, Clone)]
@@ -149,36 +149,73 @@ impl TokenStore {
     }
 
     fn load(&self) -> Result<TokenFile, McpError> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|e| {
-                McpError::Auth(format!(
-                    "token store {} is corrupt: {e} — delete it and log in again",
-                    self.path.display()
-                ))
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TokenFile::default()),
-            Err(e) => Err(McpError::Auth(format!(
+        if std::fs::symlink_metadata(&self.path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(TokenFile::default());
+        }
+        use std::io::Read as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        let mut file = open_private_token_file(&self.path, options)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(|e| {
+            McpError::Auth(format!(
                 "cannot read token store {}: {e}",
                 self.path.display()
-            ))),
-        }
+            ))
+        })?;
+        serde_json::from_str(&text).map_err(|e| {
+            McpError::Auth(format!(
+                "token store {} is corrupt: {e} — delete it and log in again",
+                self.path.display()
+            ))
+        })
     }
 
     fn save(&self, file: &TokenFile) -> Result<(), McpError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| McpError::Auth(format!("cannot create {}: {e}", parent.display())))?;
-        }
+        let parent = ensure_private_token_parent(&self.path)?;
         let json = serde_json::to_string_pretty(file)
             .map_err(|e| McpError::Auth(format!("cannot serialize token store: {e}")))?;
-        let tmp = self
-            .path
-            .with_extension(format!("tmp.{}", std::process::id()));
-        write_owner_only(&tmp, json.as_bytes())
-            .map_err(|e| McpError::Auth(format!("cannot write {}: {e}", tmp.display())))?;
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| McpError::Auth(format!("cannot replace {}: {e}", self.path.display())))?;
-        Ok(())
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(McpError::Auth(format!(
+                "token store {} is not a regular file",
+                self.path.display()
+            )));
+        }
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        let tmp = self.path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut output = open_private_token_file(&tmp, options)?;
+        let result = (|| {
+            output
+                .write_all(json.as_bytes())
+                .map_err(|e| McpError::Auth(format!("cannot write {}: {e}", tmp.display())))?;
+            output
+                .sync_data()
+                .map_err(|e| McpError::Auth(format!("cannot fsync {}: {e}", tmp.display())))?;
+            drop(output);
+            std::fs::rename(&tmp, &self.path).map_err(|e| {
+                McpError::Auth(format!("cannot replace {}: {e}", self.path.display()))
+            })?;
+            std::fs::File::open(&parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| McpError::Auth(format!("cannot fsync {}: {e}", parent.display())))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     /// The stored tokens for `server`, if a login has completed.
@@ -209,23 +246,91 @@ impl TokenStore {
     }
 }
 
-fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(bytes)
+#[cfg(unix)]
+fn ensure_private_token_parent(path: &Path) -> Result<PathBuf, McpError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let parent = path
+        .parent()
+        .ok_or_else(|| McpError::Auth(format!("token path {} has no parent", path.display())))?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(McpError::Auth(format!(
+                "token directory {} is not a real directory",
+                parent.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(parent).map_err(|e| {
+                McpError::Auth(format!(
+                    "cannot create token directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        Err(error) => {
+            return Err(McpError::Auth(format!(
+                "cannot inspect token directory {}: {error}",
+                parent.display()
+            )));
+        }
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        McpError::Auth(format!(
+            "cannot restrict token directory {}: {e}",
+            parent.display()
+        ))
+    })?;
+    Ok(parent.to_path_buf())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_token_parent(path: &Path) -> Result<PathBuf, McpError> {
+    Err(McpError::Auth(format!(
+        "secure OAuth token persistence is unsupported on this platform: {}",
+        path.display()
+    )))
+}
+
+#[cfg(unix)]
+fn open_private_token_file(
+    path: &Path,
+    mut options: std::fs::OpenOptions,
+) -> Result<std::fs::File, McpError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    options.mode(0o600);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .map_err(|e| McpError::Auth(format!("cannot open token store {}: {e}", path.display())))?;
+    let metadata = file.metadata().map_err(|e| {
+        McpError::Auth(format!(
+            "cannot inspect token store {}: {e}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(McpError::Auth(format!(
+            "token store {} is not a single-link regular file",
+            path.display()
+        )));
     }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| McpError::Auth(format!("cannot restrict {}: {e}", path.display())))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_private_token_file(
+    path: &Path,
+    _options: std::fs::OpenOptions,
+) -> Result<std::fs::File, McpError> {
+    Err(McpError::Auth(format!(
+        "secure OAuth token persistence is unsupported on this platform: {}",
+        path.display()
+    )))
 }
 
 // ── Runtime: manager + per-server token source ──────────────────────────────
@@ -1015,7 +1120,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn token_store_file_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{PermissionsExt, symlink};
         let dir = std::env::temp_dir().join(format!("stella-oauth-mode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = TokenStore::new(dir.join("mcp_oauth.json"));
@@ -1039,6 +1144,34 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+
+        let outside = dir.with_extension("outside.json");
+        std::fs::write(&outside, "{}\n").unwrap();
+        std::fs::remove_file(dir.join("mcp_oauth.json")).unwrap();
+        symlink(&outside, dir.join("mcp_oauth.json")).unwrap();
+        assert!(
+            store
+                .put(
+                    "s",
+                    &OAuthTokens {
+                        access_token: "b".into(),
+                        refresh_token: None,
+                        expires_at: None,
+                        token_endpoint: "t".into(),
+                        client_id: "c".into(),
+                        client_secret: None,
+                        scope: None,
+                        resource: "r".into(),
+                    },
+                )
+                .is_err(),
+            "token store must reject a symlink target"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "{}\n");
+        let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
