@@ -857,6 +857,7 @@ fn index_workspace_graph_blocking(
             .unwrap_or(stats.files_parsed + stats.files_skipped_unchanged),
         files_parsed: stats.files_parsed,
         files_unchanged: stats.files_skipped_unchanged,
+        files_skipped_generated: stats.files_skipped_generated,
     };
     graph.shutdown();
     Ok(summary)
@@ -869,13 +870,22 @@ struct GraphSummary {
     total_files: usize,
     files_parsed: usize,
     files_unchanged: usize,
+    /// Files this pass excluded as generated/minified (issue #272:
+    /// `.gitattributes` `linguist-generated=true`, `*.min.*`, or the
+    /// minified-content heuristic — see `stella_graph::generated`). Reported
+    /// separately from `total_files` so the exclusion is visible, not just
+    /// silently absent from the count.
+    files_skipped_generated: usize,
 }
 
 /// The `✓ code graph: N symbols, M imports…` summary line, shared by `stella
 /// init` and the session auto-builder so both surfaces read identically.
 /// Reports index totals; the parenthetical is this pass's parse/skip split.
+/// When this pass excluded any generated/minified files, an explicit
+/// "skipped N generated files" clause makes that visible rather than letting
+/// them silently vanish from the file count (issue #272).
 fn format_graph_stats(summary: &GraphSummary) -> String {
-    format!(
+    let base = format!(
         "✓ code graph: {} symbols, {} imports across {} file{} ({} re-parsed, {} unchanged this pass)",
         summary.total_symbols,
         summary.total_imports,
@@ -883,6 +893,18 @@ fn format_graph_stats(summary: &GraphSummary) -> String {
         if summary.total_files == 1 { "" } else { "s" },
         summary.files_parsed,
         summary.files_unchanged,
+    );
+    if summary.files_skipped_generated == 0 {
+        return base;
+    }
+    format!(
+        "{base} — skipped {} generated file{}",
+        summary.files_skipped_generated,
+        if summary.files_skipped_generated == 1 {
+            ""
+        } else {
+            "s"
+        }
     )
 }
 

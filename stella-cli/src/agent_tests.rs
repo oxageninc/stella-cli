@@ -468,3 +468,77 @@ fn judge_build_failure_falls_back_to_the_worker() {
         "a judge adapter that fails to build must fall back to the worker provider"
     );
 }
+
+/// Issue #272: `stella init`'s summary line must surface generated/minified
+/// exclusion count, not let excluded files silently vanish from the totals.
+/// Tested on the pure builder/output functions, never a live TTY.
+#[test]
+fn format_graph_stats_reports_generated_skip_count_when_nonzero() {
+    let summary = GraphSummary {
+        total_symbols: 12,
+        total_imports: 4,
+        total_files: 3,
+        files_parsed: 2,
+        files_unchanged: 1,
+        files_skipped_generated: 5,
+    };
+    let line = format_graph_stats(&summary);
+    assert!(
+        line.contains("skipped 5 generated files"),
+        "line should surface the skip count: {line}"
+    );
+    assert!(line.contains("12 symbols"), "{line}");
+}
+
+#[test]
+fn format_graph_stats_omits_the_skip_clause_when_nothing_was_skipped() {
+    let summary = GraphSummary {
+        total_symbols: 1,
+        total_imports: 0,
+        total_files: 1,
+        files_parsed: 1,
+        files_unchanged: 0,
+        files_skipped_generated: 0,
+    };
+    let line = format_graph_stats(&summary);
+    assert!(
+        !line.contains("skipped"),
+        "no skip clause when nothing was excluded: {line}"
+    );
+}
+
+#[test]
+fn format_graph_stats_uses_singular_file_for_a_count_of_one() {
+    let summary = GraphSummary {
+        total_symbols: 0,
+        total_imports: 0,
+        total_files: 0,
+        files_parsed: 0,
+        files_unchanged: 0,
+        files_skipped_generated: 1,
+    };
+    let line = format_graph_stats(&summary);
+    assert!(line.contains("skipped 1 generated file"), "{line}");
+    assert!(
+        !line.contains("generated files"),
+        "singular, not plural, for a count of one: {line}"
+    );
+}
+
+/// End-to-end through the real builder `stella init` calls
+/// ([`index_workspace_graph_blocking`]): a `*.min.*` file sitting at the
+/// workspace root (no denied directory involved) must be excluded and
+/// counted, while an ordinary file alongside it indexes normally.
+#[test]
+fn index_workspace_graph_blocking_reports_generated_skips_end_to_end() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("app.min.js"), "function refresh(){}\n").unwrap();
+    std::fs::write(ws.path().join("main.rs"), "pub fn run() {}\n").unwrap();
+
+    let summary = index_workspace_graph_blocking(ws.path()).expect("index build succeeds");
+    assert_eq!(summary.total_files, 1, "the minified file is never indexed");
+    assert_eq!(summary.files_skipped_generated, 1);
+
+    let line = format_graph_stats(&summary);
+    assert!(line.contains("skipped 1 generated file"), "{line}");
+}
