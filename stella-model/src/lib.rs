@@ -14,6 +14,7 @@ pub mod modelsdev;
 pub mod openai;
 pub mod provider;
 pub mod provider_listing;
+pub mod provider_parity;
 pub mod sse;
 pub mod vertex;
 pub mod zai;
