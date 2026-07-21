@@ -32,7 +32,7 @@ Every one of these is genuinely valued — pick the one that fits your energy:
 | 🧭 **Docs & examples** — fix a lie in the README before it fools someone else | Any `*.md` file, `--help` text, doc comments | Small |
 | 🔌 **A new provider adapter** — Stella is BYOK; every model provider we speak makes it more useful | `stella-model/src/` — copy the shape of an existing adapter | Medium |
 | 🛠 **A new built-in tool** | `stella-tools/src/` — implement the tool trait, register it | Medium |
-| 🌐 **An OCP provider** — implement the Open Context Protocol in your language and prove it green | [macanderson/opencontextprotocol](https://github.com/macanderson/opencontextprotocol) — its own repo, no Stella code required | Medium |
+| 🌐 **An OCP provider** — implement the Open Context Protocol in your language and prove it green | [macanderson/context-graph-protocol](https://github.com/macanderson/context-graph-protocol) — its own repo, no Stella code required | Medium |
 | 🏗 **Core engine work** | `good first issue` / `help wanted` labels | Varies |
 
 If you're not sure where something fits, open an issue first — a ten-line
@@ -92,7 +92,7 @@ Fourteen crates sounds like a lot; the rule of thumb is one sentence each:
 | Multimodal generation | `stella-media` |
 | Multi-agent fan-out, worktree isolation | `stella-fleet` |
 | The Observatory telemetry dashboard (`stella observe`) | `stella-observatory` |
-| The Open Context Protocol (wire types / host / conformance) | external repo: [`opencontextprotocol`](https://github.com/macanderson/opencontextprotocol) |
+| The Open Context Protocol (wire types / host / conformance) | external repo: [`context-graph-protocol`](https://github.com/macanderson/context-graph-protocol) |
 
 All of the crates ship in the CLI today: `stella-pipeline` drives the default
 `stella run` path, `stella-fleet` powers `stella fleet`, `stella-tui` is the

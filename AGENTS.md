@@ -191,7 +191,7 @@ Fourteen crates. The one-sentence rule of thumb:
 | Multimodal generation | `stella-media` | |
 | Multi-agent fan-out, worktree isolation | `stella-fleet` | |
 | The Observatory telemetry dashboard (`stella observe`) | `stella-observatory` | Loopback-only, read-only, embedded HTML. |
-| Open Context Protocol (wire types / host / conformance) | external repo: [`opencontextprotocol`](https://github.com/macanderson/opencontextprotocol) | Split out of this workspace; Stella depends on it via git. `ocp-types` stays dependency-light by contract. |
+| Open Context Protocol (wire types / host / conformance) | external repo: [`context-graph-protocol`](https://github.com/macanderson/context-graph-protocol) | Split out of this workspace; Stella depends on it via git as `ocp-types`/`ocp-host` (package-renamed from `contextgraph-types`/`contextgraph-host`). Stays dependency-light by contract. |
 
 **Status — what ships.** The live runtime path is
 `stella-cli` → `stella-core` → `stella-model` / `stella-tools` / `stella-store` /

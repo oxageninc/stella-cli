@@ -505,7 +505,7 @@ repository and is pulled in as a pinned git dependency, not as workspace members
 | `stella-media` | Multimodal generation behind one `MediaProvider` port — `generate_svg` always on; `generate_image` and `generate_video`/`poll_video` registered when a media-capable key is set (video behind a headless cost gate) |
 | `stella-tui` | The Command Deck — a pure event-fold core + thin crossterm shell |
 | `stella-observatory` | The Observatory — `stella observe`'s loopback-only telemetry dashboard over the local SQLite stores |
-| Open Context Protocol | Its own project now: [macanderson/opencontextprotocol](https://github.com/macanderson/opencontextprotocol) — wire types, host runtime, and the public conformance suite. Stella is its reference host and depends on it via git. |
+| Open Context Protocol | Its own project now: [macanderson/context-graph-protocol](https://github.com/macanderson/context-graph-protocol) — wire types, host runtime, and the public conformance suite. Stella is its reference host and depends on it via git. |
 
 The repo is a **monorepo**: alongside the Rust workspace, the documentation
 site ([stella.oxagen.sh](https://stella.oxagen.sh)) lives at `stella-docs/`

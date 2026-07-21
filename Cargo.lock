@@ -416,6 +416,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "contextgraph-host"
+version = "0.1.0"
+source = "git+https://github.com/macanderson/context-graph-protocol?rev=58a933a2e1f894ae98adc9994bd9d0062a610ae8#58a933a2e1f894ae98adc9994bd9d0062a610ae8"
+dependencies = [
+ "async-trait",
+ "contextgraph-types",
+ "futures-util",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "contextgraph-types"
+version = "0.1.0"
+source = "git+https://github.com/macanderson/context-graph-protocol?rev=58a933a2e1f894ae98adc9994bd9d0062a610ae8#58a933a2e1f894ae98adc9994bd9d0062a610ae8"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1989,30 +2013,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ocp-host"
-version = "0.1.0"
-source = "git+https://github.com/macanderson/opencontextprotocol?rev=7912257c51c796083e4e137ff80a8d18c957f965#7912257c51c796083e4e137ff80a8d18c957f965"
-dependencies = [
- "async-trait",
- "futures-util",
- "libc",
- "ocp-types",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
-]
-
-[[package]]
-name = "ocp-types"
-version = "0.1.0"
-source = "git+https://github.com/macanderson/opencontextprotocol?rev=7912257c51c796083e4e137ff80a8d18c957f965#7912257c51c796083e4e137ff80a8d18c957f965"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3052,10 +3052,10 @@ dependencies = [
  "async-trait",
  "clap",
  "colored",
+ "contextgraph-host",
+ "contextgraph-types",
  "dotenvy",
  "libc",
- "ocp-host",
- "ocp-types",
  "rpassword",
  "serde",
  "serde_json",
@@ -3081,7 +3081,7 @@ name = "stella-context"
 version = "0.4.51"
 dependencies = [
  "async-trait",
- "ocp-types",
+ "contextgraph-types",
  "proptest",
  "rusqlite",
  "serde",
@@ -3129,8 +3129,8 @@ dependencies = [
 name = "stella-graph"
 version = "0.4.51"
 dependencies = [
+ "contextgraph-types",
  "notify",
- "ocp-types",
  "rusqlite",
  "serde",
  "serde_json",
