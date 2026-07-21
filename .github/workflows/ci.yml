@@ -19,7 +19,20 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # PR pushes share a group keyed on the PR ref and cancel-in-progress, so a
+  # rapid string of pushes to the same PR only pays for the latest one. Pushes
+  # to main must NOT share a group across commits: GitHub only keeps one
+  # "in progress" and one "queued" run per concurrency group — a third push
+  # arriving while a prior main run is still queued silently cancels that
+  # queued run rather than running it. That's how #258/#259/#261 landing in
+  # quick succession broke main's file-size ratchet (command_deck.rs,
+  # config.rs) on 2026-07-21 without a single red run to point at: several of
+  # the intermediate push-triggered checks were superseded before they ever
+  # started. Keying the group on github.sha for non-PR events gives every
+  # commit to main its own group, so its full-repo check (fmt + ratchet +
+  # clippy + test, over ALL tracked files — see check-file-sizes.sh) always
+  # runs to completion and a ratchet-breaking union goes red within one run.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
