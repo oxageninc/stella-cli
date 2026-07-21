@@ -20,6 +20,7 @@ fn scrub_model_subprocess(command: &mut tokio::process::Command) {
 
 /// The single filesystem-isolation seam for developer script-tool discovery.
 /// Both the session stack and candidate workspaces use this exact report.
+#[cfg(test)]
 pub(crate) fn custom_tool_report_for_workspace(
     root: &std::path::Path,
 ) -> stella_tools::custom::DiscoveryReport {

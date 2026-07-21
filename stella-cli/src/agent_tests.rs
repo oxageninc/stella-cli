@@ -492,6 +492,7 @@ fn benchmark_gate_excludes_hostile_filesystem_steering_and_extensions() {
 
     let mut cfg = cfg_for("zai");
     cfg.workspace_root = root.to_path_buf();
+    cfg.authority.project_prompts_allowed = true;
 
     let rules = crate::rules::load_workspace_rules(root, &cfg.authority);
     let prompt = build_pipeline_system_prompt(&cfg, root, &rules);

@@ -2,6 +2,35 @@
 
 use super::*;
 
+struct DelayedProvider {
+    result: TokioMutex<Option<CompletionResult>>,
+    delay: Duration,
+}
+
+#[async_trait]
+impl Provider for DelayedProvider {
+    fn id(&self) -> &str {
+        "delayed"
+    }
+
+    async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResult, ProviderError> {
+        tokio::time::sleep(self.delay).await;
+        self.result
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| ProviderError::Terminal("delayed provider exhausted".into()))
+    }
+}
+
+struct AnyProvider<'p>(&'p dyn Provider);
+
+impl ProviderResolver for AnyProvider<'_> {
+    fn provider_for(&self, _model: &ModelRef) -> Option<&dyn Provider> {
+        Some(self.0)
+    }
+}
+
 /// Missing the triage decision deadline must not cancel a paid provider call.
 /// The late answer is ignored for classification, but its exact usage/cost is
 /// emitted and charged before triage returns.

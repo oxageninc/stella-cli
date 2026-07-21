@@ -76,7 +76,7 @@ async fn aborted_pipeline_totals_match_every_management_and_execute_usage_record
         },
         tx,
         PipelineConfig {
-            test_command: Some("run-tests".into()),
+            test_command: Some("cargo test".into()),
             ..PipelineConfig::default()
         },
     );
