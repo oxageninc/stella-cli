@@ -31,7 +31,7 @@
 //! use stella_graph::CodeGraph;
 //!
 //! # fn main() -> Result<(), stella_graph::GraphError> {
-//! let graph = CodeGraph::open(Path::new("."), Path::new("./.stella/codegraph.db"))?;
+//! let graph = CodeGraph::open(Path::new("."), Path::new("./.stella/private/codegraph.db"))?;
 //! graph.index_all()?;
 //! for frame in graph.definitions("run_turn")? {
 //!     // Cite by the human label, never the raw id (L-C4).
@@ -77,7 +77,10 @@ pub fn load_storage_snapshot(workspace_root: &std::path::Path) -> StorageSnapsho
     let manifest = manifest::StorageManifest::load(workspace_root)
         .ok()
         .flatten();
-    let db_path = workspace_root.join(".stella").join("codegraph.db");
+    let db_path = workspace_root
+        .join(".stella")
+        .join("private")
+        .join("codegraph.db");
     let rows = if db_path.exists() {
         store::open(&db_path)
             .and_then(|conn| store::storage_rows(&conn))

@@ -1,5 +1,5 @@
 //! The code-graph view: files and import edges out of the workspace's
-//! `.stella/codegraph.db` (written by `stella-graph`'s tree-sitter indexer),
+//! `.stella/private/codegraph.db` (written by `stella-graph`'s tree-sitter indexer),
 //! flattened into the `{nodes, edges}` shape a force-directed canvas wants.
 //!
 //! The indexer resolves TS/JS/Python *relative* imports to concrete files
@@ -24,7 +24,10 @@ const MAX_NODES: usize = 600;
 /// Build the graph snapshot, or an empty one while `codegraph.db` doesn't
 /// exist (the dashboard renders a "run stella to index" empty state).
 pub fn snapshot(workspace_root: &Path) -> Value {
-    let path = workspace_root.join(".stella").join("codegraph.db");
+    let path = workspace_root
+        .join(".stella")
+        .join("private")
+        .join("codegraph.db");
     let empty = json!({
         "nodes": [], "edges": [], "groups": [],
         "total_files": 0, "total_symbols": 0, "truncated": 0,

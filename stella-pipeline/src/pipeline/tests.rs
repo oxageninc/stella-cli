@@ -20,7 +20,9 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 
 use crate::ports::{
-    AdoptedChange, AutoApproveGate, CmdOutcome, NoContextRecall, NoRepoStatus, NoRepoStructure,
+    AdoptedChange, ArtifactIdentity, ArtifactKind, AutoApproveGate, CmdOutcome,
+    DiagnosticInvocation, DiagnosticRunner, NoContextRecall, NoRepoStatus, NoRepoStructure,
+    TestInvocation, TestRunner,
 };
 
 // ---- test doubles ---------------------------------------------------
@@ -55,6 +57,10 @@ impl RepoStatusPort for FakeRepoStatus {
 struct SeqRepoStatus {
     snapshots: std::sync::Mutex<VecDeque<HashMap<String, String>>>,
     last: std::sync::Mutex<HashMap<String, String>>,
+    tracked_snapshots: std::sync::Mutex<VecDeque<HashMap<String, String>>>,
+    tracked_last: std::sync::Mutex<HashMap<String, String>>,
+    artifact_identity: Option<ArtifactIdentity>,
+    artifact_identities: std::sync::Mutex<VecDeque<Option<ArtifactIdentity>>>,
 }
 impl SeqRepoStatus {
     fn new(snapshots: Vec<Vec<(&str, &str)>>) -> Self {
@@ -70,7 +76,36 @@ impl SeqRepoStatus {
         Self {
             snapshots: std::sync::Mutex::new(mapped),
             last: std::sync::Mutex::new(HashMap::new()),
+            tracked_snapshots: std::sync::Mutex::new(VecDeque::new()),
+            tracked_last: std::sync::Mutex::new(HashMap::new()),
+            artifact_identity: None,
+            artifact_identities: std::sync::Mutex::new(VecDeque::new()),
         }
+    }
+
+    fn with_tracked(mut self, snapshots: Vec<Vec<(&str, &str)>>) -> Self {
+        self.tracked_snapshots = std::sync::Mutex::new(
+            snapshots
+                .into_iter()
+                .map(|files| {
+                    files
+                        .into_iter()
+                        .map(|(p, fp)| (p.to_string(), fp.to_string()))
+                        .collect()
+                })
+                .collect(),
+        );
+        self
+    }
+
+    fn with_artifact_identity(mut self, identity: ArtifactIdentity) -> Self {
+        self.artifact_identity = Some(identity);
+        self
+    }
+
+    fn with_artifact_identities(self, identities: Vec<Option<ArtifactIdentity>>) -> Self {
+        *self.artifact_identities.lock().unwrap() = identities.into();
+        self
     }
 }
 #[async_trait]
@@ -84,6 +119,35 @@ impl RepoStatusPort for SeqRepoStatus {
             }
             None => self.last.lock().unwrap().clone(),
         }
+    }
+
+    async fn tracked_fingerprints(&self) -> HashMap<String, String> {
+        let mut q = self.tracked_snapshots.lock().unwrap();
+        match q.pop_front() {
+            Some(next) => {
+                *self.tracked_last.lock().unwrap() = next.clone();
+                next
+            }
+            None => self.tracked_last.lock().unwrap().clone(),
+        }
+    }
+
+    async fn artifact_identity(&self, path: &str) -> Option<ArtifactIdentity> {
+        if let Some(identity) = self.artifact_identities.lock().unwrap().pop_front() {
+            return identity;
+        }
+        self.artifact_identity.clone().or_else(|| {
+            self.last
+                .lock()
+                .unwrap()
+                .get(path)
+                .map(|fingerprint| ArtifactIdentity {
+                    fingerprint: fingerprint.clone(),
+                    kind: ArtifactKind::Regular,
+                    mode: 0o100644,
+                    link_count: 1,
+                })
+        })
     }
 }
 
@@ -164,29 +228,13 @@ impl ScriptedRunner {
     }
 }
 #[async_trait]
-impl CommandRunner for ScriptedRunner {
-    async fn run(&self, cmd: &str) -> CmdOutcome {
-        // Order matters: the no-index numstat and ls-files probes both
-        // contain "diff"/"git", so match them before the generic diff.
-        if cmd.contains("ls-files") {
-            let listing = self
-                .untracked
-                .iter()
-                .map(|(p, _)| p.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            return CmdOutcome {
-                exit_code: 0,
-                stdout_tail: listing,
-                stderr_tail: String::new(),
-            };
-        }
-        if cmd.contains("--no-index") && cmd.contains("--numstat") {
-            // Report `<added>\t0\t<path>` for the file named in the cmd.
+impl DiagnosticRunner for ScriptedRunner {
+    async fn run_diagnostic(&self, invocation: &DiagnosticInvocation) -> CmdOutcome {
+        if let DiagnosticInvocation::UntrackedNumstat { path } = invocation {
             let numstat = self
                 .untracked
                 .iter()
-                .find(|(p, _)| cmd.contains(p.as_str()))
+                .find(|(candidate, _)| candidate == path)
                 .map(|(p, n)| format!("{n}\t0\t{p}"))
                 .unwrap_or_default();
             return CmdOutcome {
@@ -195,13 +243,24 @@ impl CommandRunner for ScriptedRunner {
                 stderr_tail: String::new(),
             };
         }
-        if cmd.contains("diff") {
+        if matches!(invocation, DiagnosticInvocation::GitDiff) {
             return CmdOutcome {
                 exit_code: 0,
                 stdout_tail: self.diff.clone(),
                 stderr_tail: String::new(),
             };
         }
+        CmdOutcome {
+            exit_code: 0,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl TestRunner for ScriptedRunner {
+    async fn run_test(&self, _invocation: &TestInvocation) -> CmdOutcome {
         let passed = self
             .test_results
             .lock()
@@ -238,9 +297,17 @@ impl ToolExecutor for EmptyTools {
 /// never the real tree's.
 struct NeverRunner;
 #[async_trait]
-impl CommandRunner for NeverRunner {
-    async fn run(&self, cmd: &str) -> CmdOutcome {
-        panic!("the session CommandRunner must not serve isolated candidates (got `{cmd}`)");
+impl DiagnosticRunner for NeverRunner {
+    async fn run_diagnostic(&self, invocation: &DiagnosticInvocation) -> CmdOutcome {
+        panic!(
+            "the session DiagnosticRunner must not serve isolated candidates (got {invocation:?})"
+        );
+    }
+}
+#[async_trait]
+impl TestRunner for NeverRunner {
+    async fn run_test(&self, invocation: &TestInvocation) -> CmdOutcome {
+        panic!("the session TestRunner must not serve isolated candidates (got {invocation:?})");
     }
 }
 struct NeverRepoStatus;
@@ -255,10 +322,12 @@ impl RepoStatusPort for NeverRepoStatus {
 /// canned adoption outcome, and a shared log of lifecycle calls.
 struct FakeWorkspace {
     id: usize,
+    root: String,
     tools: EmptyTools,
-    commands: ScriptedRunner,
-    repo_status: NoRepoStatus,
+    diagnostics: ScriptedRunner,
+    repo_status: SeqRepoStatus,
     adopt_result: Result<Vec<AdoptedChange>, WorkspaceError>,
+    sealed_unchanged: bool,
     log: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -271,25 +340,58 @@ impl FakeWorkspace {
     ) -> Self {
         Self {
             id,
+            root: "/candidate/workspace".into(),
             tools: EmptyTools,
-            commands: ScriptedRunner::new(test_results, "@@ -1 +1 @@\n-a\n+b"),
-            repo_status: NoRepoStatus,
+            diagnostics: ScriptedRunner::new(test_results, "@@ -1 +1 @@\n-a\n+b"),
+            repo_status: SeqRepoStatus::new(vec![]),
             adopt_result,
+            sealed_unchanged: true,
             log,
         }
+    }
+
+    fn with_repo_status(mut self, repo_status: SeqRepoStatus) -> Self {
+        self.repo_status = repo_status;
+        self
+    }
+
+    fn with_post_verification_drift(mut self) -> Self {
+        self.sealed_unchanged = false;
+        self
+    }
+
+    fn with_root(mut self, root: impl Into<String>) -> Self {
+        self.root = root.into();
+        self
     }
 }
 
 #[async_trait]
 impl CandidateWorkspace for FakeWorkspace {
+    fn root(&self) -> &str {
+        &self.root
+    }
     fn tools(&self) -> &dyn ToolExecutor {
         &self.tools
     }
-    fn commands(&self) -> &dyn CommandRunner {
-        &self.commands
+    fn witness_tools(&self) -> &dyn ToolExecutor {
+        &self.tools
+    }
+    fn diagnostics(&self) -> &dyn DiagnosticRunner {
+        &self.diagnostics
+    }
+    fn tests(&self) -> &dyn TestRunner {
+        &self.diagnostics
     }
     fn repo_status(&self) -> &dyn RepoStatusPort {
         &self.repo_status
+    }
+    async fn seal(&self) -> Result<(), WorkspaceError> {
+        self.log.lock().unwrap().push(format!("seal:{}", self.id));
+        Ok(())
+    }
+    async fn sealed_is_unchanged(&self) -> Result<bool, WorkspaceError> {
+        Ok(self.sealed_unchanged)
     }
     async fn adopt(&self) -> Result<Vec<AdoptedChange>, WorkspaceError> {
         self.log.lock().unwrap().push(format!("adopt:{}", self.id));
@@ -434,7 +536,7 @@ async fn single_task_with_a_flip_submits_fast_and_skips_the_judge() {
 
     let config = PipelineConfig {
         test_command: Some("cargo test -p x".into()),
-        diff_command: Some("git diff".into()),
+        diff_diagnostic: Some(DiagnosticInvocation::GitDiff),
         ..PipelineConfig::default()
     };
     let pipeline = Pipeline::new(
@@ -445,7 +547,8 @@ async fn single_task_with_a_flip_submits_fast_and_skips_the_judge() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -510,7 +613,7 @@ async fn a_queued_steer_is_injected_into_the_execute_turn() {
 
     let config = PipelineConfig {
         test_command: Some("cargo test -p x".into()),
-        diff_command: Some("git diff".into()),
+        diff_diagnostic: Some(DiagnosticInvocation::GitDiff),
         ..PipelineConfig::default()
     };
     let pipeline = Pipeline::new(
@@ -521,7 +624,8 @@ async fn a_queued_steer_is_injected_into_the_execute_turn() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -578,7 +682,7 @@ async fn misclassified_lookup_that_touches_files_still_gets_verified() {
 
     let config = PipelineConfig {
         test_command: None,
-        diff_command: Some("git diff".into()),
+        diff_diagnostic: Some(DiagnosticInvocation::GitDiff),
         ..PipelineConfig::default()
     };
     let pipeline = Pipeline::new(
@@ -589,7 +693,8 @@ async fn misclassified_lookup_that_touches_files_still_gets_verified() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -647,7 +752,8 @@ async fn clean_lookup_skips_plan_verify_and_judge() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -682,7 +788,7 @@ async fn clean_lookup_skips_plan_verify_and_judge() {
 /// A multi-step plan above the scope-review thresholds, running headless
 /// with no bypass, is a named error (never a silent auto-approve).
 #[tokio::test]
-async fn headless_scope_review_without_bypass_is_a_named_error() {
+async fn paid_headless_scope_review_error_retains_settled_cost() {
     // triage → "multi"; plan → a 6-step JSON array (default threshold 5).
     let provider = ScriptedProvider::new(vec![
         text_result("multi"),
@@ -712,7 +818,8 @@ async fn headless_scope_review_without_bypass_is_a_named_error() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -733,7 +840,11 @@ async fn headless_scope_review_without_bypass_is_a_named_error() {
         )
         .await
         .expect_err("headless scope review must be a named error");
-    assert_eq!(err, PipelineError::ScopeReviewRequiredHeadless);
+    assert_eq!(err.cause, PipelineError::ScopeReviewRequiredHeadless);
+    assert!(
+        (err.total_cost_usd - 0.0002).abs() < 1e-9,
+        "triage and plan spend must survive the hard error: {err:?}"
+    );
 }
 
 /// The user aborting at the scope-review gate ends the run cleanly (not an
@@ -763,7 +874,8 @@ async fn user_abort_at_scope_review_is_a_clean_abort() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -796,14 +908,6 @@ fn count_diff_lines_ignores_headers() {
     assert_eq!(count_diff_lines(diff), 2);
 }
 
-#[test]
-fn shell_single_quote_neutralizes_metacharacters() {
-    assert_eq!(shell_single_quote("a b"), "'a b'");
-    // An embedded quote can't break out — the classic '\'' escape.
-    assert_eq!(shell_single_quote("a'b"), r"'a'\''b'");
-    assert_eq!(shell_single_quote("x; rm -rf ~"), "'x; rm -rf ~'");
-}
-
 /// P1/P2 regression: a large NEW file must contribute its real added-line
 /// count (not a flat 1, which slipped a 10k-line file under the diff
 /// budget), and a file already untracked before the turn must not be
@@ -832,7 +936,8 @@ async fn gather_diff_counts_real_new_file_lines_and_excludes_pre_existing() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -844,8 +949,12 @@ async fn gather_diff_counts_real_new_file_lines_and_excludes_pre_existing() {
     );
 
     let surface = CandidateSurface {
-        commands: &runner,
+        diagnostics: &runner,
+        tests: &runner,
         repo_status: &repo_status,
+        cwd: None,
+        hook_runner: None,
+        workspace: None,
     };
     // No baseline → the file is this turn's; its real 5000 lines count.
     let (lines, text) = pipeline.gather_diff(surface, &HashMap::new()).await;
@@ -878,7 +987,11 @@ async fn gather_diff_counts_real_new_file_lines_and_excludes_pre_existing() {
 fn assemble_user_message_puts_recall_before_the_task() {
     let frames = vec![RecalledFrame {
         citation_label: "driver.rs".into(),
+        provider: "code-graph".into(),
         source: "code-graph".into(),
+        kind: "symbol".into(),
+        uri: None,
+        method: None,
         content: "run_turn".into(),
         token_cost: 5,
         id: None,
@@ -902,47 +1015,25 @@ async fn witness_authored_command_arms_the_flip_oracle_and_submits_fast() {
     // triage → "single"; witness author turn → marker line; worker → done.
     let provider = ScriptedProvider::new(vec![
         text_result("single"),
-        text_result("wrote the test.\nTEST_COMMAND: run-witness"),
+        text_result("wrote the test.\nTEST_COMMAND: cargo test --test witness witness -- --exact"),
         text_result("done"),
     ]);
-    let resolver = OneProvider(&provider);
     // Test-command pops: witness fail-check (fail), per-candidate baseline
     // (fail), post-execute observation (pass) → a genuine flip.
-    let runner = ScriptedRunner::new(vec![false, false, true], "@@ -1 +1 @@\n-old\n+new");
-    let tools = EmptyTools;
-    let recall = NoContextRecall;
-    let repo = NoRepoStructure;
-    let repo_status = NoRepoStatus;
-    let approvals = AutoApproveGate;
-    let sleeper = NoopSleeper;
-    let router = router();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
-    let pipeline = Pipeline::new(
-        PipelinePorts {
-            router: &router,
-            providers: &resolver,
-            tools: &tools,
-            recall: &recall,
-            repo: &repo,
-            repo_status: &repo_status,
-            commands: &runner,
-            approvals: &approvals,
-            sleeper: &sleeper,
-            hooks: None,
-            candidate_workspaces: None,
-            steering: None,
-        },
-        tx,
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let workspace =
+        FakeWorkspace::new(0, vec![false, false, true], Ok(vec![]), log.clone()).with_repo_status(
+            SeqRepoStatus::new(vec![vec![], vec![("tests/witness.rs", "w1")]]),
+        );
+    let port = FakeWorkspacePort::new(vec![Ok(workspace)], log);
+    let (outcome, events, _) = run_isolated(
+        &provider,
+        &port,
         PipelineConfig::default(),
-    );
-
-    let mut messages = vec![CompletionMessage::system("sys")];
-    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
-    let outcome = pipeline
-        .run("Fix the retry bug", &mut messages, &mut budget)
-        .await
-        .expect("run succeeds");
+        "Fix the retry bug",
+    )
+    .await;
+    let outcome = outcome.expect("run succeeds");
 
     assert_eq!(outcome.status, PipelineStatus::Completed);
     let verdict = outcome.verdict.expect("verified");
@@ -953,101 +1044,61 @@ async fn witness_authored_command_arms_the_flip_oracle_and_submits_fast() {
         verdict.summary
     );
     assert!(
-        verdict.summary.contains("run-witness"),
+        verdict
+            .summary
+            .contains("cargo test --test witness witness -- --exact"),
         "the evidence names the witness command: {}",
         verdict.summary
     );
 
-    let s = stages(&drain(&mut rx));
+    let s = stages(&events);
     assert!(s.contains(&StageKind::Witness), "witness stage emitted");
     assert!(!s.contains(&StageKind::Judge), "judge skipped on the flip");
 }
 
 /// A witness whose test passes on the unmodified code proves nothing: one
-/// bounded repair retry, and if it still passes the witness is discarded —
-/// the run degrades to model-judge verification instead of failing.
+/// bounded repair retry, and if it still passes the contaminated candidate is
+/// discarded rather than letting author-written files reach adoption.
 #[tokio::test]
-async fn a_witness_that_never_fails_is_discarded_and_the_judge_verifies() {
+async fn a_witness_that_never_fails_aborts_and_removes_the_candidate() {
     let provider = ScriptedProvider::new(vec![
         text_result("single"),
-        text_result("TEST_COMMAND: always-green"),
+        text_result("TEST_COMMAND: cargo test --test witness always_green -- --exact"),
         // The repair attempt also yields a command that passes.
-        text_result("TEST_COMMAND: still-green"),
-        text_result("done"),                  // worker
-        text_result("PASS matches the goal"), // judge (no flip evidence)
+        text_result("TEST_COMMAND: cargo test --test witness still_green -- --exact"),
     ]);
-    let resolver = OneProvider(&provider);
     // Pops: witness check (pass), repair check (pass) → discard. Then no
     // test command exists for the candidate, so no further pops.
-    let runner = ScriptedRunner::new(vec![true, true], "@@ -1 +1 @@\n-a\n+b");
-    let tools = EmptyTools;
-    let recall = NoContextRecall;
-    let repo = NoRepoStructure;
-    let repo_status = NoRepoStatus;
-    let approvals = AutoApproveGate;
-    let sleeper = NoopSleeper;
-    let router = router();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
-    let pipeline = Pipeline::new(
-        PipelinePorts {
-            router: &router,
-            providers: &resolver,
-            tools: &tools,
-            recall: &recall,
-            repo: &repo,
-            repo_status: &repo_status,
-            commands: &runner,
-            approvals: &approvals,
-            sleeper: &sleeper,
-            hooks: None,
-            candidate_workspaces: None,
-            steering: None,
-        },
-        tx,
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let workspace =
+        FakeWorkspace::new(0, vec![true, true], Ok(vec![]), log.clone()).with_repo_status(
+            SeqRepoStatus::new(vec![vec![], vec![("tests/witness.rs", "w1")]]),
+        );
+    let port = FakeWorkspacePort::new(vec![Ok(workspace)], log.clone());
+    let (outcome, _, _) = run_isolated(
+        &provider,
+        &port,
         PipelineConfig::default(),
-    );
-
-    let mut messages = vec![CompletionMessage::system("sys")];
-    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
-    let outcome = pipeline
-        .run("Fix the retry bug", &mut messages, &mut budget)
-        .await
-        .expect("run succeeds");
-
-    assert_eq!(outcome.status, PipelineStatus::Completed);
-    let verdict = outcome.verdict.expect("verified");
-    assert!(verdict.passed);
-    assert!(
-        !verdict.deterministic,
-        "no flip → the model judge decided, not the ladder"
-    );
-    let events = drain(&mut rx);
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::Error { message, retryable: true } if message.contains("witness")
-        )),
-        "the discarded witness is warned about, never silent"
-    );
-    assert!(stages(&events).contains(&StageKind::Judge));
+        "Fix the retry bug",
+    )
+    .await;
+    let outcome = outcome.expect("invalid witness is a truthful abort");
+    assert!(matches!(outcome.status, PipelineStatus::Aborted { .. }));
+    assert_eq!(*log.lock().unwrap(), vec!["create", "remove:0"]);
 }
 
 /// Tamper exclusion: the worker modified the witness test file after it
-/// was authored, so the observed fail→pass flip is NOT credited — the
-/// evidence degrades to inconclusive and the model judge decides.
+/// was authored, so the candidate hard-fails without judge override.
 #[tokio::test]
-async fn a_tampered_witness_file_excludes_the_flip_from_evidence() {
+async fn a_tampered_witness_file_hard_fails_before_judge_evaluation() {
     let provider = ScriptedProvider::new(vec![
         text_result("single"),
-        text_result("TEST_COMMAND: run-witness"),
+        text_result("TEST_COMMAND: cargo test --test witness witness -- --exact"),
         text_result("done"),                     // worker
-        text_result("FAIL the test was edited"), // judge on tampered evidence
+        text_result("FAIL the test was edited"), // must remain unused
     ]);
-    let resolver = OneProvider(&provider);
     // witness check (fail), baseline (fail), post-execute (pass) → the
-    // oracle flips — but the tamper check below must void the credit.
-    let runner = ScriptedRunner::new(vec![false, false, true], "@@ -1 +1 @@\n-a\n+b");
+    // oracle flips — but the tamper check below must hard-fail the candidate.
     // untracked_fingerprints call order: witness-before (empty),
     // witness-after (test authored at w1 → watchlist), candidate
     // untracked_before, gather_diff after execute, tamper check — where
@@ -1058,54 +1109,36 @@ async fn a_tampered_witness_file_excludes_the_flip_from_evidence() {
         vec![("tests/witness.rs", "w1")],
         vec![("tests/witness.rs", "w1")],
         vec![("tests/witness.rs", "w2")],
+    ])
+    .with_artifact_identities(vec![
+        Some(ArtifactIdentity {
+            fingerprint: "w1".into(),
+            kind: ArtifactKind::Regular,
+            mode: 0o100644,
+            link_count: 1,
+        }),
+        Some(ArtifactIdentity {
+            fingerprint: "w2".into(),
+            kind: ArtifactKind::Regular,
+            mode: 0o100644,
+            link_count: 1,
+        }),
     ]);
-    let tools = EmptyTools;
-    let recall = NoContextRecall;
-    let repo = NoRepoStructure;
-    let approvals = AutoApproveGate;
-    let sleeper = NoopSleeper;
-    let router = router();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
     let config = PipelineConfig {
         max_revisions: 0, // judge FAIL ends the run — keeps the script short
         ..PipelineConfig::default()
     };
-    let pipeline = Pipeline::new(
-        PipelinePorts {
-            router: &router,
-            providers: &resolver,
-            tools: &tools,
-            recall: &recall,
-            repo: &repo,
-            repo_status: &repo_status,
-            commands: &runner,
-            approvals: &approvals,
-            sleeper: &sleeper,
-            hooks: None,
-            candidate_workspaces: None,
-            steering: None,
-        },
-        tx,
-        config,
-    );
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let workspace = FakeWorkspace::new(0, vec![false, false, true], Ok(vec![]), log.clone())
+        .with_repo_status(repo_status);
+    let port = FakeWorkspacePort::new(vec![Ok(workspace)], log);
+    let (outcome, events, _) = run_isolated(&provider, &port, config, "Fix the retry bug").await;
+    let outcome = outcome.expect("run succeeds");
 
-    let mut messages = vec![CompletionMessage::system("sys")];
-    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
-    let outcome = pipeline
-        .run("Fix the retry bug", &mut messages, &mut budget)
-        .await
-        .expect("run succeeds");
-
-    let verdict = outcome.verdict.expect("verified");
-    assert!(!verdict.passed, "the judge failed the tampered work");
+    assert!(matches!(outcome.status, PipelineStatus::Aborted { .. }));
     assert!(
-        !verdict.deterministic,
-        "a tampered flip must never submit fast — it degrades to the judge"
-    );
-    assert!(
-        stages(&drain(&mut rx)).contains(&StageKind::Judge),
-        "tamper forces the model judge instead of SubmitFast"
+        !stages(&events).contains(&StageKind::Judge),
+        "tamper is not eligible for judge override"
     );
 }
 
@@ -1148,7 +1181,8 @@ async fn second_consecutive_red_verification_gets_judge_guidance() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -1194,12 +1228,12 @@ async fn run_isolated(
     config: PipelineConfig,
     goal: &str,
 ) -> (
-    Result<PipelineOutcome, PipelineError>,
+    Result<PipelineOutcome, PipelineRunError>,
     Vec<AgentEvent>,
     Vec<CompletionMessage>,
 ) {
     let resolver = OneProvider(provider);
-    let commands = NeverRunner;
+    let diagnostics = NeverRunner;
     let repo_status = NeverRepoStatus;
     let tools = EmptyTools;
     let recall = NoContextRecall;
@@ -1216,7 +1250,8 @@ async fn run_isolated(
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &commands,
+            diagnostics: &diagnostics,
+            tests: &diagnostics,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -1234,7 +1269,7 @@ async fn run_isolated(
 
 fn isolated_config(n: u32) -> PipelineConfig {
     PipelineConfig {
-        test_command: Some("run-tests".into()),
+        test_command: Some("cargo test".into()),
         // A red first candidate must fail immediately, not revise — keeps
         // the scripts to one worker turn per candidate.
         max_revisions: 0,
@@ -1341,7 +1376,8 @@ async fn single_shot_never_touches_the_candidate_workspace_port() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -1350,7 +1386,7 @@ async fn single_shot_never_touches_the_candidate_workspace_port() {
         },
         tx,
         PipelineConfig {
-            test_command: Some("run-tests".into()),
+            test_command: Some("cargo test".into()),
             ..PipelineConfig::default()
         },
     );
@@ -1401,7 +1437,7 @@ async fn a_failed_snapshot_scores_an_aborted_candidate_and_the_run_continues() {
     let log = log.lock().unwrap().clone();
     assert_eq!(
         log,
-        vec!["create", "create", "adopt:1", "remove:1"],
+        vec!["create", "create", "seal:1", "adopt:1", "remove:1"],
         "no adoption or removal for the never-created workspace"
     );
 }
@@ -1494,7 +1530,8 @@ async fn best_of_n_without_a_port_degrades_to_the_shared_tree_with_a_warning() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -1522,3 +1559,6 @@ async fn best_of_n_without_a_port_degrades_to_the_shared_tree_with_a_warning() {
         "shared-tree degradation must be loud"
     );
 }
+
+mod task4;
+mod task5;

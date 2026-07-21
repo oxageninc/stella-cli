@@ -175,19 +175,13 @@ impl SessionRegistry {
     /// record — except for [`SessionRegistry::set_status`]'s
     /// archive/cleanup writes from the viewer.
     pub fn upsert(&self, record: &SessionRecord) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|e| StoreError(format!("cannot create {}: {e}", self.dir.display())))?;
+        crate::ensure_private_dir(&self.dir)?;
         let mut stamped = record.clone();
         stamped.updated_at_ms = now_ms();
         let json = serde_json::to_string_pretty(&stamped)
             .map_err(|e| StoreError(format!("cannot serialize session record: {e}")))?;
         let path = self.path_for(&record.id);
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&tmp, json)
-            .map_err(|e| StoreError(format!("cannot write {}: {e}", tmp.display())))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| StoreError(format!("cannot replace {}: {e}", path.display())))?;
-        Ok(())
+        crate::write_private_atomic(&path, json.as_bytes(), false)
     }
 
     /// All records, newest-started first, with dead-process downgrade
@@ -200,11 +194,15 @@ impl SessionRegistry {
         };
         let mut records: Vec<SessionRecord> = entries
             .filter_map(|entry| {
-                let path = entry.ok()?.path();
+                let entry = entry.ok()?;
+                if !entry.file_type().ok()?.is_file() {
+                    return None;
+                }
+                let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("json") {
                     return None;
                 }
-                let text = std::fs::read_to_string(&path).ok()?;
+                let text = crate::read_private_to_string(&path).ok()?;
                 let mut record: SessionRecord = serde_json::from_str(&text).ok()?;
                 record.status = Self::presented_status(&record);
                 Some(record)
@@ -216,7 +214,7 @@ impl SessionRegistry {
 
     /// Read one record (no liveness downgrade — the raw stored state).
     pub fn get(&self, id: &str) -> Option<SessionRecord> {
-        let text = std::fs::read_to_string(self.path_for(id)).ok()?;
+        let text = crate::read_private_to_string(&self.path_for(id)).ok()?;
         serde_json::from_str(&text).ok()
     }
 
@@ -437,6 +435,52 @@ mod tests {
         // Removing a missing record (and missing sidecar) stays a clean no.
         assert!(!reg.remove(&rec.id).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_directory_and_record_are_owner_only_and_existing_modes_are_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let reg = SessionRegistry::open(&dir);
+        let rec = SessionRecord::new("/private/workspace", "private prompt");
+        reg.upsert(&rec).unwrap();
+        let record = reg.path_for(&rec.id);
+        let mode = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&record), 0o600);
+
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o666)).unwrap();
+        reg.upsert(&rec).unwrap();
+        assert_eq!(mode(&record), 0o600, "atomic replacement remains private");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_rejects_a_symlink_record_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = SessionRegistry::open(&dir);
+        let rec = SessionRecord::new("/w", "private");
+        let target = tmp.path().join("outside.json");
+        std::fs::write(&target, "outside").unwrap();
+        symlink(&target, reg.path_for(&rec.id)).unwrap();
+
+        assert!(reg.upsert(&rec).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside");
     }
 
     #[test]

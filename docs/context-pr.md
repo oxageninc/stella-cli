@@ -90,7 +90,7 @@ shipped today and is the surface a Context PR changes:
   through `stella_store::Store::upsert_rule`; those rules merge with
   provenance path `store://rules/<id>.md`.
 - **An evidence-gated promotion primitive.** `stella memory promote <id>`
-  promotes a memory from `.stella/context.db` into `.stella/rules/<id>.md` —
+  promotes a memory from `.stella/private/context.db` into `.stella/rules/<id>.md` —
   but only when the memory has earned strictly more than the required number
   of consecutive positive citations since its last negative remark. It
   refuses to clobber an existing (possibly hand-edited) rule file.

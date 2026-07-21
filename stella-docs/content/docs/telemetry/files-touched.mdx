@@ -128,7 +128,7 @@ stella --output-format json run --no-pipeline "add a --health flag and wire the 
 ### Persisted to the local store
 
 Every execution's file-touch ledger is written to Stella's local session store at
-`<workspace>/.stella/store.db` (one row per touched path, with the CRUD letters, line-delta
+`<workspace>/.stella/private/store.db` (one row per touched path, with the CRUD letters, line-delta
 totals, and the JSON audit log). Like the rest of [Stella's telemetry](/docs/telemetry),
 it stays entirely on your machine.
 

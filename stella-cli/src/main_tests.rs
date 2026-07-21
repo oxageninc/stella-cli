@@ -7,7 +7,82 @@
 
 use clap::{CommandFactory, Parser};
 
-use super::{AuthCmd, Cli, Command, ConnectCmd, OutputFormat};
+use super::{AuthCmd, Cli, Command, ConnectCmd, OutputFormat, TelemetryCmd};
+
+#[cfg(unix)]
+fn legacy_codegraph_workspace(mode: u32) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dot = dir.path().join(".stella");
+    std::fs::create_dir_all(&dot).unwrap();
+    std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(mode)).unwrap();
+    let graph = stella_graph::CodeGraph::open(dir.path(), &dot.join("codegraph.db")).unwrap();
+    graph.shutdown();
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_snapshot_preflight_migrates_safe_legacy_codegraph() {
+    let dir = legacy_codegraph_workspace(0o700);
+    super::load_storage_snapshot_checked(dir.path()).unwrap();
+    assert!(!dir.path().join(".stella/codegraph.db").exists());
+    assert!(dir.path().join(".stella/private/codegraph.db").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_snapshot_preflight_reports_unsafe_legacy_codegraph() {
+    let dir = legacy_codegraph_workspace(0o777);
+    let error = super::load_storage_snapshot_checked(dir.path())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("legacy") && error.contains("private"),
+        "{error}"
+    );
+    assert!(dir.path().join(".stella/codegraph.db").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn observatory_preflight_migrates_safe_legacy_sqlite_stores() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dot = dir.path().join(".stella");
+    std::fs::create_dir_all(&dot).unwrap();
+    std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["store.db", "fleet.db", "context.db", "codegraph.db"] {
+        std::fs::write(dot.join(name), b"closed legacy sqlite file").unwrap();
+    }
+
+    super::preflight_observatory_stores(dir.path()).unwrap();
+    for name in ["store.db", "fleet.db", "context.db", "codegraph.db"] {
+        assert!(!dot.join(name).exists());
+        assert!(dot.join("private").join(name).exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn observatory_preflight_reports_unsafe_legacy_store() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dot = dir.path().join(".stella");
+    std::fs::create_dir_all(&dot).unwrap();
+    std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::write(dot.join("store.db"), b"unsafe legacy sqlite file").unwrap();
+
+    let error = super::preflight_observatory_stores(dir.path()).unwrap_err();
+    assert!(
+        error.contains("legacy") && error.contains("private"),
+        "{error}"
+    );
+    assert!(dot.join("store.db").exists());
+}
 
 /// clap's own consistency audit (conflicting ids, broken defaults,
 /// mis-typed value parsers) — panics on the first violation. Runs the same
@@ -16,6 +91,18 @@ use super::{AuthCmd, Cli, Command, ConnectCmd, OutputFormat};
 #[test]
 fn clap_command_is_internally_consistent() {
     Cli::command().debug_assert();
+}
+
+#[test]
+fn telemetry_status_remains_a_distinct_top_level_command() {
+    let cli = Cli::try_parse_from(["stella", "telemetry", "status"])
+        .expect("`telemetry status` must parse independently of adjacent auth commands");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Telemetry {
+            cmd: TelemetryCmd::Status
+        })
+    ));
 }
 
 /// The load-bearing invariant: every flag defined at the root MUST be

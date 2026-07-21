@@ -112,17 +112,11 @@ impl NotificationStore {
     /// Persist `notification` (its own file — concurrent producers never
     /// clobber each other).
     pub fn push(&self, notification: &Notification) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|e| StoreError(format!("cannot create {}: {e}", self.dir.display())))?;
+        crate::ensure_private_dir(&self.dir)?;
         let json = serde_json::to_string_pretty(notification)
             .map_err(|e| StoreError(format!("cannot serialize notification: {e}")))?;
         let path = self.path_for(&notification.id);
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&tmp, json)
-            .map_err(|e| StoreError(format!("cannot write {}: {e}", tmp.display())))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| StoreError(format!("cannot replace {}: {e}", path.display())))?;
-        Ok(())
+        crate::write_private_atomic(&path, json.as_bytes(), false)
     }
 
     /// All notifications, newest first. Unreadable files are skipped.
@@ -136,7 +130,7 @@ impl NotificationStore {
                 if path.extension().and_then(|e| e.to_str()) != Some("json") {
                     return None;
                 }
-                serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()
+                serde_json::from_str(&crate::read_private_to_string(&path).ok()?).ok()
             })
             .collect();
         items.sort_by_key(|n| std::cmp::Reverse(n.created_at_ms));
@@ -151,7 +145,7 @@ impl NotificationStore {
     /// Mark one read; returns whether it existed.
     pub fn mark_read(&self, id: &str) -> Result<bool> {
         let path = self.path_for(id);
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(text) = crate::read_private_to_string(&path) else {
             return Ok(false);
         };
         let Ok(mut notification) = serde_json::from_str::<Notification>(&text) else {
@@ -226,6 +220,36 @@ mod tests {
         assert_eq!(store.unread_count(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notification_user_data_is_owner_only_and_symlinks_are_rejected() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("notifications");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let store = NotificationStore::open(&dir);
+        let first = Notification::new("private", "sensitive body", "session");
+        store.push(&first).unwrap();
+        let mode = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&store.path_for(&first.id)), 0o600);
+
+        let second = Notification::new("other", "private", "session");
+        let target = tmp.path().join("outside.json");
+        std::fs::write(&target, "outside").unwrap();
+        symlink(&target, store.path_for(&second.id)).unwrap();
+        assert!(store.push(&second).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside");
     }
 
     #[test]

@@ -11,86 +11,81 @@
 //! through the `ArtifactStore` into `.stella/artifacts/` — the single
 //! allowed writer — and every tool reports the citation-ready path.
 //!
-//! Video is an async, dollar-cost job behind the cost gate
-//! A tool call has no interactive confirmation
-//! surface, so `generate_video` runs the gate headless — deny by default,
-//! with the explicit `confirm_spend` input as the `--yes`-equivalent bypass
-//! the model passes only after the user approved the reported estimate. The
-//! submitted handle is persisted through the `JobStore` so a dropped session
-//! never orphans a paid job; `poll_video` reconciles it live against the
-//! provider (L-V3) and persists the finished artifact under the identity
-//! assigned at submit.
+//! Image and video submissions cross a host-owned spend gate before touching
+//! the provider. Tool arguments cannot approve spend; callers without an
+//! injected host gate deny by default. The registry constructs an approving
+//! tool only in explicit [`HostDataIsolation::ProcessFree`] mode, which omits
+//! process-launching/delegating built-ins from that executor. A submitted
+//! video handle is persisted through the `JobStore` so a dropped session never
+//! orphans a paid job; `poll_video` reconciles it live against the provider
+//! (L-V3) and persists the finished artifact under the identity assigned at
+//! submit.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use stella_media::{
-    ArtifactStore, DEFAULT_SVG_ATTEMPTS, DEFAULT_VIDEO_COST_THRESHOLD_USD, HeadlessCostGate,
-    ImageRequest, ImageSize, JobStore, MediaJobState, MediaKind, MediaProvider, SvgPipeline,
-    VideoRequest, evaluate_video_cost,
+    CostDecision, DEFAULT_SVG_ATTEMPTS, DenyMediaSpendGate, ImageRequest, ImageSize, MediaKind,
+    MediaOperationClaim, MediaOperationJournal, MediaOperationState, MediaProvider, MediaSpendGate,
+    MediaSpendRequest, SvgPipeline, VideoRequest,
 };
 use stella_protocol::tool::{ToolOutput, ToolSchema};
 
 use crate::registry::Tool;
 
-/// Default duration used for the video cost estimate when the model omits
-/// `duration_secs`.
+mod authority;
+mod backend;
+mod poll_video;
+pub(crate) use authority::process_free;
+#[cfg(test)]
+use authority::unix_now;
+use authority::{
+    DeniedOperationIds, open_jobs, open_store, operation_key, reconciliation_required,
+    spend_denied, video_submitted,
+};
+pub use authority::{HostDataIsolation, HostMediaOperation, MediaOperationIdSource};
+pub use backend::{MediaBackend, detect_media_backend};
+pub use poll_video::PollVideo;
+
+/// Default video duration when the model omits `duration_secs`.
 const DEFAULT_VIDEO_DURATION_SECS: u32 = 5;
 
-/// The media backends resolved from the environment: an image-capable
-/// provider (detection keys on it), plus the same key family's video
-/// provider when it has one.
-pub struct MediaBackend {
-    pub image: Arc<dyn MediaProvider>,
-    /// `None` when the configured key family has no video adapter (OpenAI in
-    /// v1) — the video tool pair stays unregistered.
-    pub video: Option<Arc<dyn MediaProvider>>,
+pub struct GenerateImage {
+    provider: Arc<dyn MediaProvider>,
+    spend_gate: Arc<dyn MediaSpendGate>,
+    operation_ids: Arc<dyn MediaOperationIdSource>,
+    operation_journal: Option<Arc<dyn MediaOperationJournal>>,
 }
 
-/// Detect a media-capable BYOK backend from provider env keys. Z.ai wins
-/// when several are set (the same "most specific configured backend first"
-/// rule as the issue tools' Linear-over-GitHub precedence); it is also the
-/// only key family with a video adapter (CogVideoX).
-pub fn detect_media_backend() -> Option<MediaBackend> {
-    if let Ok(key) = stella_media::ApiKey::from_env("ZAI_API_KEY") {
-        return Some(MediaBackend {
-            image: Arc::new(stella_media::adapters::ZaiImageProvider::new(
-                key.clone(),
-                stella_media::adapters::zai_image::DEFAULT_MODEL,
-            )),
-            video: Some(Arc::new(stella_media::adapters::ZaiVideoProvider::new(
-                key,
-                stella_media::adapters::zai_video::DEFAULT_MODEL,
-            ))),
-        });
+impl GenerateImage {
+    /// Construct with the secure deny-by-default host gate.
+    pub fn new(provider: Arc<dyn MediaProvider>) -> Self {
+        Self {
+            provider,
+            spend_gate: Arc::new(DenyMediaSpendGate),
+            // This source is paired only with the deny gate. Approving hosts
+            // must inject a retry-stable logical invocation identity.
+            operation_ids: Arc::new(DeniedOperationIds),
+            operation_journal: None,
+        }
     }
-    if let Ok(key) = stella_media::ApiKey::from_env("OPENAI_API_KEY") {
-        return Some(MediaBackend {
-            image: Arc::new(stella_media::adapters::OpenAiImageProvider::new(
-                key,
-                stella_media::adapters::openai_image::DEFAULT_MODEL,
-            )),
-            video: None,
-        });
+
+    /// Construct with host-owned approval and retry-stable invocation identity.
+    pub(crate) fn with_host_context(
+        provider: Arc<dyn MediaProvider>,
+        spend_gate: Arc<dyn MediaSpendGate>,
+        operation_ids: Arc<dyn MediaOperationIdSource>,
+        operation_journal: Arc<dyn MediaOperationJournal>,
+    ) -> Self {
+        Self {
+            provider,
+            spend_gate,
+            operation_ids,
+            operation_journal: Some(operation_journal),
+        }
     }
-    None
 }
-
-/// Open the workspace's artifact store (`.stella/artifacts/`) — the one
-/// sanctioned writer for generated media.
-fn open_store(root: &std::path::Path) -> Result<ArtifactStore, ToolOutput> {
-    ArtifactStore::open(root.join(".stella").join("artifacts")).map_err(|e| ToolOutput::Error {
-        message: format!("artifact store unavailable: {e}"),
-    })
-}
-
-/// The video job store (`jobs.json`) lives inside the same artifacts root.
-fn open_jobs(root: &std::path::Path) -> JobStore {
-    JobStore::open(root.join(".stella").join("artifacts"))
-}
-
-pub struct GenerateImage(pub Arc<dyn MediaProvider>);
 
 #[async_trait]
 impl Tool for GenerateImage {
@@ -148,34 +143,132 @@ impl Tool for GenerateImage {
             request.label = label.to_string();
         }
 
-        let artifact = match self.0.generate_image(request).await {
-            Ok(a) => a,
-            Err(e) => {
-                return ToolOutput::Error {
-                    message: format!("image generation failed: {e}"),
+        let (operation_id, expires_at) = operation_key(
+            self.operation_ids.as_ref(),
+            MediaKind::Image,
+            self.provider.id(),
+        );
+        request.operation_id = Some(operation_id.clone());
+        let Some(journal) = &self.operation_journal else {
+            return ToolOutput::Error {
+                message: "media spend requires host approval and a host operation journal".into(),
+            };
+        };
+        match journal.claim(
+            &operation_id,
+            MediaKind::Image,
+            self.provider.id(),
+            expires_at,
+        ) {
+            Ok(MediaOperationClaim::New) => {}
+            Ok(MediaOperationClaim::Existing(MediaOperationState::ImageCompleted {
+                artifact_id,
+            })) => {
+                return ToolOutput::Ok {
+                    content: format!("image operation already completed as `{artifact_id}`"),
                 };
             }
+            Ok(MediaOperationClaim::Existing(state)) => {
+                return reconciliation_required(&operation_id, format!("state {state:?}"));
+            }
+            Ok(MediaOperationClaim::Expired) => {
+                return reconciliation_required(&operation_id, "operation identity expired");
+            }
+            Err(error) => {
+                return ToolOutput::Error {
+                    message: format!("media_operation_journal_unavailable: {error}"),
+                };
+            }
+        }
+        let capabilities = self.provider.capabilities();
+        let estimate = capabilities.estimate_image(request.n, request.size);
+        let spend_request = MediaSpendRequest::new(
+            operation_id.clone(),
+            MediaKind::Image,
+            self.provider.id(),
+            estimate.as_ref().map(|estimate| estimate.estimated_usd),
+            estimate.map_or_else(
+                || {
+                    format!(
+                        "{} image(s) at {} (cost unavailable)",
+                        request.n, request.size
+                    )
+                },
+                |estimate| estimate.detail,
+            ),
+        );
+        if self.spend_gate.authorize(&spend_request).await != CostDecision::Approve {
+            if let Err(error) = journal.cancel(&operation_id) {
+                return reconciliation_required(&operation_id, error);
+            }
+            return spend_denied(&spend_request);
+        }
+
+        let artifact = match self.provider.generate_image(request).await {
+            Ok(a) => a,
+            Err(error) => return reconciliation_required(&operation_id, error),
         };
 
         let store = match open_store(root) {
             Ok(s) => s,
-            Err(e) => return e,
+            Err(error) => return reconciliation_required(&operation_id, format!("{error:?}")),
         };
         match store.save_artifact(&artifact) {
-            Ok(saved) => ToolOutput::Ok {
-                content: format!(
+            Ok(saved) => {
+                let content = format!(
                     "generated \"{}\" → {} ({}, model {}, ${:.4})",
                     saved.label, saved.path, size, artifact.model, artifact.cost_usd
-                ),
-            },
-            Err(e) => ToolOutput::Error {
-                message: format!("could not persist the artifact: {e}"),
-            },
+                );
+                if let Err(error) = journal.finalize(
+                    &operation_id,
+                    MediaOperationState::ImageCompleted {
+                        artifact_id: saved.id.clone(),
+                    },
+                ) {
+                    return reconciliation_required(&operation_id, error);
+                }
+                ToolOutput::Ok { content }
+            }
+            Err(error) => reconciliation_required(&operation_id, error),
         }
     }
 }
 
-pub struct GenerateVideo(pub Arc<dyn MediaProvider>);
+pub struct GenerateVideo {
+    provider: Arc<dyn MediaProvider>,
+    spend_gate: Arc<dyn MediaSpendGate>,
+    operation_ids: Arc<dyn MediaOperationIdSource>,
+    operation_journal: Option<Arc<dyn MediaOperationJournal>>,
+}
+
+impl GenerateVideo {
+    /// Construct with the secure deny-by-default host gate.
+    pub fn new(provider: Arc<dyn MediaProvider>) -> Self {
+        Self {
+            provider,
+            spend_gate: Arc::new(DenyMediaSpendGate),
+            // This source is paired only with the deny gate. Approving hosts
+            // must inject a retry-stable logical invocation identity.
+            operation_ids: Arc::new(DeniedOperationIds),
+            operation_journal: None,
+        }
+    }
+
+    /// Construct with host-owned approval and retry-stable invocation identity.
+    pub(crate) fn with_host_context(
+        provider: Arc<dyn MediaProvider>,
+        spend_gate: Arc<dyn MediaSpendGate>,
+        operation_ids: Arc<dyn MediaOperationIdSource>,
+        operation_journal: Arc<dyn MediaOperationJournal>,
+    ) -> Self {
+        Self {
+            provider,
+            spend_gate,
+            operation_ids,
+            operation_journal: Some(operation_journal),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for GenerateVideo {
@@ -184,9 +277,8 @@ impl Tool for GenerateVideo {
             name: "generate_video".into(),
             description: "Submit an asynchronous text-to-video job with the configured BYOK \
                           video provider; returns the job id to check with poll_video. Video \
-                          costs real money: any job with a positive estimated cost is denied \
-                          unless `confirm_spend` is true — set it only after the user has \
-                          approved the estimate this tool reports."
+                          costs real money and requires approval from the host runtime before \
+                          provider submission."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -203,11 +295,6 @@ impl Tool for GenerateVideo {
                     "label": {
                         "type": "string",
                         "description": "Short human label for the artifact filename"
-                    },
-                    "confirm_spend": {
-                        "type": "boolean",
-                        "description": "Explicit, user-approved consent to spend the estimated \
-                                        cost (default false: the cost gate denies the job)"
                     }
                 },
                 "required": ["prompt"]
@@ -238,179 +325,88 @@ impl Tool for GenerateVideo {
             request.label = label.to_string();
         }
 
-        // The cost gate, headless: deny by default,
-        // `confirm_spend` is the explicit `--yes`-equivalent bypass. No rate
-        // card means no estimate, and an unpriced (free-tier) job is not
-        // gated — the same rule as `evaluate_video_cost`'s zero-cost path.
-        let confirm_spend = input
-            .get("confirm_spend")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if let Some(estimate) = self.0.capabilities().estimate_video(duration_secs) {
-            let gate = HeadlessCostGate::new(confirm_spend);
-            if let Err(e) = evaluate_video_cost(&estimate, DEFAULT_VIDEO_COST_THRESHOLD_USD, &gate)
-            {
-                return ToolOutput::Error {
-                    message: format!(
-                        "{e} ({}). Ask the user to approve the spend, then retry with \
-                         `confirm_spend: true`.",
-                        estimate.detail
+        let (operation_id, expires_at) = operation_key(
+            self.operation_ids.as_ref(),
+            MediaKind::Video,
+            self.provider.id(),
+        );
+        request.operation_id = Some(operation_id.clone());
+        let Some(journal) = &self.operation_journal else {
+            return ToolOutput::Error {
+                message: "media spend requires host approval and a host operation journal".into(),
+            };
+        };
+        match journal.claim(
+            &operation_id,
+            MediaKind::Video,
+            self.provider.id(),
+            expires_at,
+        ) {
+            Ok(MediaOperationClaim::New) => {}
+            Ok(MediaOperationClaim::Existing(MediaOperationState::VideoSubmitted {
+                provider_job_id,
+            })) => {
+                return ToolOutput::Ok {
+                    content: format!("video operation already exists as job `{provider_job_id}`"),
+                };
+            }
+            Ok(MediaOperationClaim::Existing(MediaOperationState::VideoCompleted {
+                provider_job_id,
+            })) => {
+                return ToolOutput::Ok {
+                    content: format!(
+                        "video operation already completed as job `{provider_job_id}`"
                     ),
                 };
             }
-        }
-
-        let job = match self.0.generate_video(request).await {
-            Ok(job) => job,
-            Err(e) => {
+            Ok(MediaOperationClaim::Existing(state)) => {
+                return reconciliation_required(&operation_id, format!("state {state:?}"));
+            }
+            Ok(MediaOperationClaim::Expired) => {
+                return reconciliation_required(&operation_id, "operation identity expired");
+            }
+            Err(error) => {
                 return ToolOutput::Error {
-                    message: format!("video submission failed: {e}"),
+                    message: format!("media_operation_journal_unavailable: {error}"),
                 };
             }
+        }
+        let estimate = self.provider.capabilities().estimate_video(duration_secs);
+        let spend_request = MediaSpendRequest::new(
+            operation_id.clone(),
+            MediaKind::Video,
+            self.provider.id(),
+            estimate.as_ref().map(|estimate| estimate.estimated_usd),
+            estimate.map_or_else(
+                || format!("{duration_secs}s video (cost unavailable)"),
+                |estimate| estimate.detail,
+            ),
+        );
+        if self.spend_gate.authorize(&spend_request).await != CostDecision::Approve {
+            if let Err(error) = journal.cancel(&operation_id) {
+                return reconciliation_required(&operation_id, error);
+            }
+            return spend_denied(&spend_request);
+        }
+
+        let job = match self.provider.generate_video(request).await {
+            Ok(job) => job,
+            Err(error) => return reconciliation_required(&operation_id, error),
         };
         // Persist the handle BEFORE reporting success — a paid job whose id
         // exists only in this reply would be orphaned by a dropped session.
-        if let Err(e) = open_jobs(root).record(&job) {
-            return ToolOutput::Error {
-                message: format!(
-                    "video job `{}` was submitted but its handle could not be persisted: {e}",
-                    job.provider_job_id
-                ),
-            };
+        if let Err(error) = open_jobs(root).record(&job) {
+            return reconciliation_required(&operation_id, error);
         }
-        ToolOutput::Ok {
-            content: format!(
-                "submitted video job `{}` (model {}, ~${:.4} for {}s) — the job runs \
-                 asynchronously; check it with poll_video",
-                job.provider_job_id, job.model, job.estimated_cost_usd, duration_secs
-            ),
+        if let Err(error) = journal.finalize(
+            &operation_id,
+            MediaOperationState::VideoSubmitted {
+                provider_job_id: job.provider_job_id.clone(),
+            },
+        ) {
+            return reconciliation_required(&operation_id, error);
         }
-    }
-}
-
-pub struct PollVideo(pub Arc<dyn MediaProvider>);
-
-#[async_trait]
-impl Tool for PollVideo {
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "poll_video".into(),
-            description: "Check a video job submitted with generate_video, reconciling its \
-                          state live against the provider. On success the video is saved \
-                          under .stella/artifacts/ and the file path is returned; while \
-                          queued/running, call again after a short wait."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "job_id": {
-                        "type": "string",
-                        "description": "The provider job id returned by generate_video"
-                    }
-                },
-                "required": ["job_id"]
-            }),
-            read_only: false,
-        }
-    }
-
-    async fn execute(&self, input: &Value, root: &std::path::Path) -> ToolOutput {
-        let Some(job_id) = input.get("job_id").and_then(|v| v.as_str()) else {
-            return ToolOutput::Error {
-                message: "`job_id` is required".into(),
-            };
-        };
-        let jobs = open_jobs(root);
-        // The persisted handle supplies the identity assigned at submit
-        // (artifact id, label); the state below never comes from it.
-        let job = match jobs.get(job_id) {
-            Ok(Some(job)) => job,
-            Ok(None) => {
-                return ToolOutput::Error {
-                    message: format!(
-                        "no persisted video job `{job_id}` — was it submitted with \
-                         generate_video?"
-                    ),
-                };
-            }
-            Err(e) => {
-                return ToolOutput::Error {
-                    message: format!("video job store unavailable: {e}"),
-                };
-            }
-        };
-        // Live reconciliation (L-V3): report the provider's answer, never a
-        // cached state.
-        let status = match stella_media::resume(&jobs, self.0.as_ref(), job_id).await {
-            Ok(status) => status,
-            Err(e) => {
-                return ToolOutput::Error {
-                    message: format!("video poll failed: {e}"),
-                };
-            }
-        };
-        match status.state {
-            MediaJobState::Succeeded => {
-                let Some(artifact) = status.artifact else {
-                    return ToolOutput::Error {
-                        message: format!(
-                            "video job `{job_id}` succeeded but the provider returned no \
-                             artifact"
-                        ),
-                    };
-                };
-                let store = match open_store(root) {
-                    Ok(s) => s,
-                    Err(e) => return e,
-                };
-                // Persist under the id assigned at submit, so events and the
-                // final file share one identity across a resume.
-                match store.save_with_id(
-                    &job.artifact_id,
-                    &artifact.bytes,
-                    artifact.kind,
-                    &artifact.extension,
-                    &artifact.label,
-                ) {
-                    Ok(saved) => {
-                        // Best-effort: a stale handle is re-reconciled live
-                        // on any later poll, never replayed from cache.
-                        let _ = jobs.remove(job_id);
-                        ToolOutput::Ok {
-                            content: format!(
-                                "video \"{}\" → {} (model {}, ${:.4})",
-                                saved.label, saved.path, artifact.model, artifact.cost_usd
-                            ),
-                        }
-                    }
-                    Err(e) => ToolOutput::Error {
-                        message: format!("could not persist the video: {e}"),
-                    },
-                }
-            }
-            MediaJobState::Failed { reason } => {
-                let _ = jobs.remove(job_id);
-                ToolOutput::Error {
-                    message: format!("video job `{job_id}` failed: {reason}"),
-                }
-            }
-            MediaJobState::Queued | MediaJobState::Running => {
-                let state = match status.state {
-                    MediaJobState::Queued => "queued",
-                    _ => "running",
-                };
-                let progress = status
-                    .progress
-                    .map(|p| format!(" ({:.0}% reported)", p * 100.0))
-                    .unwrap_or_default();
-                ToolOutput::Ok {
-                    content: format!(
-                        "video job `{job_id}` is {state}{progress} — poll again after a \
-                         short wait"
-                    ),
-                }
-            }
-        }
+        video_submitted(&job)
     }
 }
 
@@ -493,13 +489,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use stella_media::{
-        MediaArtifact, MediaCapabilities, MediaError, MediaJob, MediaJobStatus, MediaKind,
-        VideoRequest,
+        CostDecision, JobStore, MediaArtifact, MediaCapabilities, MediaError, MediaJob,
+        MediaJobState, MediaJobStatus, MediaKind, MediaSpendGate, MediaSpendRequest, VideoRequest,
     };
 
-    /// A deterministic in-memory provider: one fixed PNG-ish artifact, no
-    /// network — the same fake-backed seam discipline as the fleet/monitor
-    /// ports.
+    /// Deterministic provider: one fixed PNG-ish artifact, no network.
     struct FakeImages;
 
     #[async_trait]
@@ -531,8 +525,230 @@ mod tests {
         }
     }
 
+    struct CountingImages {
+        submits: AtomicUsize,
+        manifest_blocker: Option<std::path::PathBuf>,
+    }
+
+    #[async_trait]
+    impl MediaProvider for CountingImages {
+        fn id(&self) -> &str {
+            "counting"
+        }
+
+        fn capabilities(&self) -> MediaCapabilities {
+            MediaCapabilities {
+                provider_id: "counting".into(),
+                image: true,
+                image_usd_each: Some(0.01),
+                ..Default::default()
+            }
+        }
+
+        async fn generate_image(&self, req: ImageRequest) -> Result<MediaArtifact, MediaError> {
+            let attempt = self.submits.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0
+                && let Some(blocker) = &self.manifest_blocker
+            {
+                std::fs::create_dir_all(blocker).unwrap();
+            }
+            Ok(MediaArtifact {
+                kind: MediaKind::Image,
+                bytes: vec![0x89, b'P', b'N', b'G'],
+                extension: "png".into(),
+                label: req.label,
+                model: "counting-image-1".into(),
+                cost_usd: 0.01,
+            })
+        }
+
+        async fn generate_video(&self, _req: VideoRequest) -> Result<MediaJob, MediaError> {
+            Err(MediaError::Transport("not under test".into()))
+        }
+
+        async fn poll_video(&self, _job: &MediaJob) -> Result<MediaJobStatus, MediaError> {
+            Err(MediaError::Transport("not under test".into()))
+        }
+    }
+
+    struct ApproveSpendGate {
+        calls: AtomicUsize,
+    }
+
+    struct FixedOperationIds(&'static str);
+
+    impl MediaOperationIdSource for FixedOperationIds {
+        fn operation_id(&self) -> HostMediaOperation {
+            HostMediaOperation {
+                opaque_id: self.0.to_string(),
+                expires_at: unix_now() + 3600,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MediaSpendGate for ApproveSpendGate {
+        async fn authorize(&self, _request: &MediaSpendRequest) -> CostDecision {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            CostDecision::Approve
+        }
+    }
+
+    fn approving_gate() -> Arc<dyn MediaSpendGate> {
+        Arc::new(ApproveSpendGate {
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn operation_journal() -> Arc<dyn MediaOperationJournal> {
+        Arc::new(
+            stella_media::SqliteMediaOperationJournal::open_in_memory(Default::default()).unwrap(),
+        )
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum SubmissionEvent {
+        Gate(MediaKind, String),
+        Provider(MediaKind, String),
+    }
+
+    struct OrderedGate(Arc<std::sync::Mutex<Vec<SubmissionEvent>>>);
+
+    #[async_trait]
+    impl MediaSpendGate for OrderedGate {
+        async fn authorize(&self, request: &MediaSpendRequest) -> CostDecision {
+            self.0.lock().unwrap().push(SubmissionEvent::Gate(
+                request.kind,
+                request.operation_id.clone(),
+            ));
+            CostDecision::Approve
+        }
+    }
+
+    struct OrderedProvider {
+        events: Arc<std::sync::Mutex<Vec<SubmissionEvent>>>,
+        image_price: Option<f64>,
+        video_price: Option<f64>,
+    }
+
+    #[async_trait]
+    impl MediaProvider for OrderedProvider {
+        fn id(&self) -> &str {
+            "ordered"
+        }
+
+        fn capabilities(&self) -> MediaCapabilities {
+            MediaCapabilities {
+                provider_id: "ordered".into(),
+                image: true,
+                video: true,
+                image_usd_each: self.image_price,
+                video_usd_per_second: self.video_price,
+                ..Default::default()
+            }
+        }
+
+        async fn generate_image(&self, req: ImageRequest) -> Result<MediaArtifact, MediaError> {
+            self.events.lock().unwrap().push(SubmissionEvent::Provider(
+                MediaKind::Image,
+                req.operation_id.unwrap(),
+            ));
+            Ok(MediaArtifact {
+                kind: MediaKind::Image,
+                bytes: b"image".to_vec(),
+                extension: "png".into(),
+                label: req.label,
+                model: "ordered-image".into(),
+                cost_usd: self.image_price.unwrap_or_default(),
+            })
+        }
+
+        async fn generate_video(&self, req: VideoRequest) -> Result<MediaJob, MediaError> {
+            self.events.lock().unwrap().push(SubmissionEvent::Provider(
+                MediaKind::Video,
+                req.operation_id.unwrap(),
+            ));
+            Ok(MediaJob {
+                artifact_id: "med_ordered".into(),
+                provider_id: "ordered".into(),
+                provider_job_id: "ordered-job".into(),
+                kind: MediaKind::Video,
+                model: "ordered-video".into(),
+                estimated_cost_usd: self.video_price.unwrap_or_default() * 5.0,
+                submitted_at: 1_700_000_000,
+                label: req.label,
+            })
+        }
+
+        async fn poll_video(&self, _job: &MediaJob) -> Result<MediaJobStatus, MediaError> {
+            Err(MediaError::Transport("not under test".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn priced_and_unpriced_media_share_gate_then_provider_order() {
+        for (kind, price, host_id) in [
+            (MediaKind::Image, Some(0.01), "host-priced-image"),
+            (MediaKind::Image, None, "host-unpriced-image"),
+            (MediaKind::Video, Some(0.2), "host-priced-video"),
+            (MediaKind::Video, None, "host-unpriced-video"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = Arc::new(OrderedProvider {
+                events: events.clone(),
+                image_price: if kind == MediaKind::Image {
+                    price
+                } else {
+                    None
+                },
+                video_price: if kind == MediaKind::Video {
+                    price
+                } else {
+                    None
+                },
+            });
+            let gate = Arc::new(OrderedGate(events.clone()));
+            let ids = Arc::new(FixedOperationIds(host_id));
+            let journal = operation_journal();
+            let tool: Arc<dyn Tool> = match kind {
+                MediaKind::Image => Arc::new(GenerateImage::with_host_context(
+                    provider, gate, ids, journal,
+                )),
+                MediaKind::Video => Arc::new(GenerateVideo::with_host_context(
+                    provider, gate, ids, journal,
+                )),
+                MediaKind::Svg => unreachable!(),
+            };
+            for _ in 0..2 {
+                let out = tool
+                    .execute(&serde_json::json!({"prompt": "same"}), dir.path())
+                    .await;
+                assert!(matches!(out, ToolOutput::Ok { .. }), "{out:?}");
+            }
+            let actual = events.lock().unwrap().clone();
+            assert_eq!(actual.len(), 2, "{kind:?} at {price:?}: {actual:?}");
+            let operation_id = match &actual[0] {
+                SubmissionEvent::Gate(_, operation_id) => operation_id.clone(),
+                event => panic!("gate must be first: {event:?}"),
+            };
+            assert_eq!(
+                actual,
+                vec![
+                    SubmissionEvent::Gate(kind, operation_id.clone()),
+                    SubmissionEvent::Provider(kind, operation_id),
+                ]
+            );
+        }
+    }
+
     fn tool() -> GenerateImage {
-        GenerateImage(Arc::new(FakeImages))
+        GenerateImage::with_host_context(
+            Arc::new(FakeImages),
+            approving_gate(),
+            Arc::new(FixedOperationIds("host-test-image")),
+            operation_journal(),
+        )
     }
 
     #[test]
@@ -540,6 +756,191 @@ mod tests {
         let schema = tool().schema();
         assert_eq!(schema.name, "generate_image");
         assert!(!schema.read_only);
+    }
+
+    #[tokio::test]
+    async fn image_without_a_host_gate_is_denied_before_submission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(CountingImages {
+            submits: AtomicUsize::new(0),
+            manifest_blocker: None,
+        });
+        let out = GenerateImage::new(provider.clone())
+            .execute(&serde_json::json!({"prompt": "a star"}), dir.path())
+            .await;
+        match out {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("host approval"), "{message}");
+            }
+            ToolOutput::Ok { content } => panic!("the host gate must deny: {content}"),
+        }
+        assert_eq!(provider.submits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn media_approval_requires_a_process_free_registry() {
+        let provider = Arc::new(CountingImages {
+            submits: AtomicUsize::new(0),
+            manifest_blocker: None,
+        });
+        let gate = Arc::new(ApproveSpendGate {
+            calls: AtomicUsize::new(0),
+        });
+        let backend = || MediaBackend {
+            image: provider.clone(),
+            video: None,
+        };
+
+        let denied_root = tempfile::tempdir().expect("tempdir");
+        let denied = crate::registry::ToolRegistry::with_backends_and_options(
+            denied_root.path().to_path_buf(),
+            None,
+            Some(backend()),
+            crate::registry::RegistryOptions {
+                media_requires_host_approval: false,
+                media_spend_gate: Some(gate.clone()),
+                media_operation_ids: Some(Arc::new(FixedOperationIds("host-denied-image"))),
+                media_operation_journal: Some(operation_journal()),
+                ..Default::default()
+            },
+        );
+        let denied_out = denied
+            .execute("generate_image", &serde_json::json!({"prompt": "a star"}))
+            .await;
+        assert!(denied_out.is_error(), "{denied_out:?}");
+        assert_eq!(provider.submits.load(Ordering::SeqCst), 0);
+
+        let missing_id_root = tempfile::tempdir().expect("tempdir");
+        let missing_id = crate::registry::ToolRegistry::with_backends_and_options(
+            missing_id_root.path().to_path_buf(),
+            None,
+            Some(backend()),
+            crate::registry::RegistryOptions {
+                media_requires_host_approval: true,
+                media_spend_gate: Some(gate.clone()),
+                ..Default::default()
+            },
+        );
+        let missing_id_out = missing_id
+            .execute("generate_image", &serde_json::json!({"prompt": "a star"}))
+            .await;
+        assert!(missing_id_out.is_error(), "{missing_id_out:?}");
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.submits.load(Ordering::SeqCst), 0);
+
+        let missing_journal = crate::registry::ToolRegistry::with_backends_and_options(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            None,
+            Some(backend()),
+            crate::registry::RegistryOptions {
+                media_requires_host_approval: true,
+                media_spend_gate: Some(gate.clone()),
+                media_operation_ids: Some(Arc::new(FixedOperationIds("host-missing-journal"))),
+                ..Default::default()
+            },
+        );
+        let missing_journal_out = missing_journal
+            .execute("generate_image", &serde_json::json!({"prompt": "a star"}))
+            .await;
+        assert!(
+            format!("{missing_journal_out:?}").contains("operation journal"),
+            "{missing_journal_out:?}"
+        );
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.submits.load(Ordering::SeqCst), 0);
+
+        let unconfined_root = tempfile::tempdir().expect("tempdir");
+        let unconfined = crate::registry::ToolRegistry::with_backends_and_options(
+            unconfined_root.path().to_path_buf(),
+            None,
+            Some(backend()),
+            crate::registry::RegistryOptions {
+                media_requires_host_approval: true,
+                media_spend_gate: Some(gate.clone()),
+                media_operation_ids: Some(Arc::new(FixedOperationIds("host-approved-image"))),
+                media_operation_journal: Some(operation_journal()),
+                ..Default::default()
+            },
+        );
+        let unconfined_out = unconfined
+            .execute("generate_image", &serde_json::json!({"prompt": "a star"}))
+            .await;
+
+        assert!(unconfined_out.is_error(), "{unconfined_out:?}");
+        let unconfined_names: Vec<_> = unconfined
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        for expected in ["build_project", "run_tests", "start_process"] {
+            assert!(
+                unconfined_names.iter().any(|name| name == expected),
+                "ordinary registry lost {expected}: {unconfined_names:?}"
+            );
+        }
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.submits.load(Ordering::SeqCst), 0);
+
+        let isolated_root = tempfile::tempdir().expect("tempdir");
+        let isolated = crate::registry::ToolRegistry::with_backends_and_options(
+            isolated_root.path().to_path_buf(),
+            Some(crate::issues::IssueBackend::GitHub),
+            Some(backend()),
+            crate::registry::RegistryOptions {
+                bash: true,
+                media_requires_host_approval: true,
+                media_spend_gate: Some(gate.clone()),
+                media_operation_ids: Some(Arc::new(FixedOperationIds("host-isolated-image"))),
+                media_operation_journal: Some(operation_journal()),
+                media_host_data_isolation: Some(HostDataIsolation::ProcessFree),
+                ..Default::default()
+            },
+        );
+        let isolated_names: Vec<_> = isolated
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        for forbidden in [
+            "bash",
+            "verify_done",
+            "build_project",
+            "run_tests",
+            "run_lint",
+            "format_code",
+            "start_process",
+            "read_output",
+            "send_stdin",
+            "stop_process",
+            "run_script",
+            "repo_status",
+            "repo_commit",
+            "repo_push",
+            "repo_pull",
+            "repo_rollback",
+            "ci_status",
+            "screenshot",
+            "task_assign",
+            "gather_context",
+            "grep",
+            "glob",
+            "explorations",
+            "save_exploration",
+            "create_issue",
+            "start_work_on_issue",
+        ] {
+            assert!(
+                !isolated_names.iter().any(|name| name == forbidden),
+                "process-free registry exposed {forbidden}: {isolated_names:?}"
+            );
+        }
+        let isolated_out = isolated
+            .execute("generate_image", &serde_json::json!({"prompt": "a star"}))
+            .await;
+
+        assert!(!isolated_out.is_error(), "{isolated_out:?}");
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.submits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -596,6 +997,7 @@ mod tests {
         usd_per_second: Option<f64>,
         state: std::sync::Mutex<MediaJobState>,
         submits: AtomicUsize,
+        journal_blocker: Option<std::path::PathBuf>,
     }
 
     impl FakeVideo {
@@ -604,6 +1006,16 @@ mod tests {
                 usd_per_second,
                 state: std::sync::Mutex::new(state),
                 submits: AtomicUsize::new(0),
+                journal_blocker: None,
+            })
+        }
+
+        fn with_journal_blocker(blocker: std::path::PathBuf) -> Arc<Self> {
+            Arc::new(Self {
+                usd_per_second: Some(0.2),
+                state: std::sync::Mutex::new(MediaJobState::Running),
+                submits: AtomicUsize::new(0),
+                journal_blocker: Some(blocker),
             })
         }
     }
@@ -625,7 +1037,12 @@ mod tests {
             Err(MediaError::Transport("not under test".into()))
         }
         async fn generate_video(&self, req: VideoRequest) -> Result<MediaJob, MediaError> {
-            self.submits.fetch_add(1, Ordering::SeqCst);
+            let attempt = self.submits.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0
+                && let Some(blocker) = &self.journal_blocker
+            {
+                std::fs::create_dir_all(blocker).unwrap();
+            }
             let estimated_cost_usd = self
                 .capabilities()
                 .estimate_video(req.duration_secs)
@@ -634,7 +1051,7 @@ mod tests {
             Ok(MediaJob {
                 artifact_id: "med_fake".into(),
                 provider_id: "fake".into(),
-                provider_job_id: "vid-1".into(),
+                provider_job_id: format!("vid-{}", attempt + 1),
                 kind: MediaKind::Video,
                 model: "fake-video-1".into(),
                 estimated_cost_usd,
@@ -664,42 +1081,63 @@ mod tests {
         JobStore::open(root.join(".stella").join("artifacts"))
     }
 
-    /// Submit through the tool with consent, so the poll tests exercise the
-    /// real persisted handle.
-    async fn submit(fake: &Arc<FakeVideo>, root: &std::path::Path) {
-        let out = GenerateVideo(fake.clone())
-            .execute(
-                &serde_json::json!({"prompt": "a teaser", "confirm_spend": true}),
-                root,
-            )
-            .await;
+    /// Submit through an approving host gate so poll tests exercise the real
+    /// persisted handle.
+    async fn submit(
+        fake: &Arc<FakeVideo>,
+        root: &std::path::Path,
+    ) -> Arc<dyn MediaOperationJournal> {
+        let journal = operation_journal();
+        let out = GenerateVideo::with_host_context(
+            fake.clone(),
+            approving_gate(),
+            Arc::new(FixedOperationIds("host-submit-video")),
+            journal.clone(),
+        )
+        .execute(&serde_json::json!({"prompt": "a teaser"}), root)
+        .await;
         assert!(matches!(out, ToolOutput::Ok { .. }), "{out:?}");
+        journal
     }
 
     #[test]
     fn video_and_svg_schemas_are_mutating_and_named() {
         let fake = FakeVideo::new(Some(0.2), MediaJobState::Running);
         for (schema, name) in [
-            (GenerateVideo(fake.clone()).schema(), "generate_video"),
-            (PollVideo(fake).schema(), "poll_video"),
+            (
+                GenerateVideo::with_host_context(
+                    fake.clone(),
+                    approving_gate(),
+                    Arc::new(FixedOperationIds("host-schema-video")),
+                    operation_journal(),
+                )
+                .schema(),
+                "generate_video",
+            ),
+            (PollVideo::new(fake).schema(), "poll_video"),
             (GenerateSvg.schema(), "generate_svg"),
         ] {
             assert_eq!(schema.name, name);
             assert!(!schema.read_only);
+            assert!(
+                schema.input_schema["properties"]
+                    .get("confirm_spend")
+                    .is_none(),
+                "model schemas must not expose spend authority"
+            );
         }
     }
 
     #[tokio::test]
-    async fn video_without_confirm_spend_is_denied_before_submission() {
+    async fn video_without_a_host_gate_is_denied_before_submission() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = FakeVideo::new(Some(0.2), MediaJobState::Running);
-        let out = GenerateVideo(fake.clone())
+        let out = GenerateVideo::new(fake.clone())
             .execute(&serde_json::json!({"prompt": "a teaser"}), dir.path())
             .await;
         match out {
             ToolOutput::Error { message } => {
-                assert!(message.contains("cost gate"), "{message}");
-                assert!(message.contains("confirm_spend"), "{message}");
+                assert!(message.contains("host approval"), "{message}");
             }
             ToolOutput::Ok { content } => panic!("the gate must deny: {content}"),
         }
@@ -712,10 +1150,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn video_with_confirm_spend_submits_and_persists_the_handle() {
+    async fn model_controlled_confirm_spend_cannot_authorize_video() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = FakeVideo::new(Some(0.2), MediaJobState::Running);
-        let out = GenerateVideo(fake.clone())
+        let out = GenerateVideo::new(fake.clone())
             .execute(
                 &serde_json::json!({
                     "prompt": "a teaser", "duration_secs": 10,
@@ -725,31 +1163,113 @@ mod tests {
             )
             .await;
         match out {
-            ToolOutput::Ok { content } => {
-                assert!(content.contains("vid-1"), "{content}");
-                assert!(content.contains("poll_video"), "{content}");
+            ToolOutput::Error { message } => {
+                assert!(message.contains("host approval"), "{message}");
             }
-            ToolOutput::Error { message } => panic!("expected success: {message}"),
+            ToolOutput::Ok { content } => {
+                panic!("model-controlled consent must not pass: {content}")
+            }
         }
-        let job = job_store(dir.path())
-            .get("vid-1")
-            .unwrap()
-            .expect("handle persisted for resume");
-        assert_eq!(job.label, "teaser");
-        assert!((job.estimated_cost_usd - 2.0).abs() < 1e-9);
+        assert_eq!(fake.submits.load(Ordering::SeqCst), 0);
+        assert!(job_store(dir.path()).list().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn video_without_a_rate_card_is_not_gated() {
-        // No rate card → no estimate → the unpriced (free-tier) job passes
-        // without consent, matching `evaluate_video_cost`'s zero-cost rule.
+    async fn video_without_a_rate_card_still_requires_host_approval() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = FakeVideo::new(None, MediaJobState::Running);
-        let out = GenerateVideo(fake.clone())
+        let out = GenerateVideo::new(fake.clone())
             .execute(&serde_json::json!({"prompt": "a teaser"}), dir.path())
             .await;
-        assert!(matches!(out, ToolOutput::Ok { .. }), "{out:?}");
+        assert!(matches!(out, ToolOutput::Error { .. }), "{out:?}");
+        assert_eq!(fake.submits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn video_completion_journal_failure_is_reconciliation_required_and_retry_safe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir
+            .path()
+            .join(".stella")
+            .join("artifacts")
+            .join("jobs.json.lock");
+        let fake = FakeVideo::with_journal_blocker(blocker.clone());
+        let tool = GenerateVideo::with_host_context(
+            fake.clone(),
+            approving_gate(),
+            Arc::new(FixedOperationIds("host-retry-video")),
+            operation_journal(),
+        );
+        let input = serde_json::json!({"prompt": "a teaser"});
+
+        let first = tool.execute(&input, dir.path()).await;
+        let ToolOutput::Error { message } = first else {
+            panic!("persistence failure must be terminal: {first:?}");
+        };
+        assert!(message.contains("reconciliation_required"), "{message}");
+        assert!(!message.contains("a teaser"), "{message}");
         assert_eq!(fake.submits.load(Ordering::SeqCst), 1);
+
+        std::fs::remove_dir(&blocker).unwrap();
+        let retry = tool.execute(&input, dir.path()).await;
+        let ToolOutput::Error { message } = retry else {
+            panic!("an ambiguous pending operation must not resubmit: {retry:?}");
+        };
+        assert!(message.contains("reconciliation_required"), "{message}");
+        assert_eq!(fake.submits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn image_artifact_failure_is_reconciliation_required_and_retry_safe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir
+            .path()
+            .join(".stella")
+            .join("artifacts")
+            .join(".manifest.json.tmp");
+        let provider = Arc::new(CountingImages {
+            submits: AtomicUsize::new(0),
+            manifest_blocker: Some(blocker.clone()),
+        });
+        let tool = GenerateImage::with_host_context(
+            provider.clone(),
+            approving_gate(),
+            Arc::new(FixedOperationIds("host-retry-image")),
+            operation_journal(),
+        );
+        let input = serde_json::json!({"prompt": "a star"});
+
+        let first = tool.execute(&input, dir.path()).await;
+        let ToolOutput::Error { message } = first else {
+            panic!("artifact failure must be terminal: {first:?}");
+        };
+        assert!(message.contains("reconciliation_required"), "{message}");
+        assert!(!message.contains("a star"), "{message}");
+        assert_eq!(provider.submits.load(Ordering::SeqCst), 1);
+
+        std::fs::remove_dir(&blocker).unwrap();
+        let retry = tool.execute(&input, dir.path()).await;
+        assert!(matches!(retry, ToolOutput::Error { .. }), "{retry:?}");
+        assert_eq!(provider.submits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn distinct_host_operation_ids_allow_intentional_identical_video_generations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = FakeVideo::new(Some(0.2), MediaJobState::Running);
+        let input = serde_json::json!({"prompt": "same teaser"});
+        for operation_id in ["host-intent-one", "host-intent-two"] {
+            let out = GenerateVideo::with_host_context(
+                fake.clone(),
+                approving_gate(),
+                Arc::new(FixedOperationIds(operation_id)),
+                operation_journal(),
+            )
+            .execute(&input, dir.path())
+            .await;
+            assert!(matches!(out, ToolOutput::Ok { .. }), "{out:?}");
+        }
+        assert_eq!(fake.submits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -757,7 +1277,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = FakeVideo::new(Some(0.2), MediaJobState::Running);
         submit(&fake, dir.path()).await;
-        let out = PollVideo(fake)
+        let out = PollVideo::new(fake)
             .execute(&serde_json::json!({"job_id": "vid-1"}), dir.path())
             .await;
         match out {
@@ -774,8 +1294,8 @@ mod tests {
     async fn poll_success_persists_the_video_and_forgets_the_job() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = FakeVideo::new(Some(0.2), MediaJobState::Succeeded);
-        submit(&fake, dir.path()).await;
-        let out = PollVideo(fake.clone())
+        let journal = submit(&fake, dir.path()).await;
+        let out = PollVideo::with_operation_journal(fake.clone(), journal.clone())
             .execute(&serde_json::json!({"job_id": "vid-1"}), dir.path())
             .await;
         match out {
@@ -795,12 +1315,60 @@ mod tests {
             job_store(dir.path()).get("vid-1").unwrap().is_none(),
             "a terminal, persisted job is forgotten"
         );
+        let replay = GenerateVideo::with_host_context(
+            fake.clone(),
+            approving_gate(),
+            Arc::new(FixedOperationIds("host-submit-video")),
+            journal,
+        )
+        .execute(&serde_json::json!({"prompt": "a teaser"}), dir.path())
+        .await;
+        let ToolOutput::Ok { content } = replay else {
+            panic!("completed operation must replay: {replay:?}");
+        };
+        assert!(content.contains("already completed"), "{content}");
+        assert_eq!(fake.submits.load(Ordering::SeqCst), 1);
         // A second poll of the forgotten job is a named error, never a
         // stale replay.
-        let again = PollVideo(fake)
+        let again = PollVideo::new(fake)
             .execute(&serde_json::json!({"job_id": "vid-1"}), dir.path())
             .await;
         assert!(matches!(again, ToolOutput::Error { .. }), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn poll_does_not_report_success_when_job_cleanup_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = FakeVideo::new(Some(0.2), MediaJobState::Succeeded);
+        let journal = submit(&fake, dir.path()).await;
+        let lock = dir.path().join(".stella/artifacts/jobs.json.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+
+        let out = PollVideo::with_operation_journal(fake.clone(), journal.clone())
+            .execute(&serde_json::json!({"job_id": "vid-1"}), dir.path())
+            .await;
+
+        match out {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("reconciliation_required"), "{message}");
+            }
+            ToolOutput::Ok { content } => panic!("stale handle reported success: {content}"),
+        }
+        assert!(job_store(dir.path()).get("vid-1").unwrap().is_some());
+        let replay = GenerateVideo::with_host_context(
+            fake.clone(),
+            approving_gate(),
+            Arc::new(FixedOperationIds("host-submit-video")),
+            journal,
+        )
+        .execute(&serde_json::json!({"prompt": "a teaser"}), dir.path())
+        .await;
+        let ToolOutput::Ok { content } = replay else {
+            panic!("completion must survive cleanup failure: {replay:?}");
+        };
+        assert!(content.contains("already completed"), "{content}");
+        assert_eq!(fake.submits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -813,7 +1381,7 @@ mod tests {
             },
         );
         submit(&fake, dir.path()).await;
-        let out = PollVideo(fake)
+        let out = PollVideo::new(fake)
             .execute(&serde_json::json!({"job_id": "vid-1"}), dir.path())
             .await;
         match out {
@@ -827,14 +1395,14 @@ mod tests {
     async fn poll_unknown_job_and_missing_id_are_named_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = FakeVideo::new(Some(0.2), MediaJobState::Running);
-        let unknown = PollVideo(fake.clone())
+        let unknown = PollVideo::new(fake.clone())
             .execute(&serde_json::json!({"job_id": "ghost"}), dir.path())
             .await;
         match unknown {
             ToolOutput::Error { message } => assert!(message.contains("ghost"), "{message}"),
             ToolOutput::Ok { content } => panic!("unknown job must error: {content}"),
         }
-        let no_id = PollVideo(fake)
+        let no_id = PollVideo::new(fake)
             .execute(&serde_json::json!({}), dir.path())
             .await;
         assert!(matches!(no_id, ToolOutput::Error { .. }));

@@ -30,6 +30,9 @@ mod credential_status;
 mod discovery;
 mod domains;
 mod engine_config;
+mod enterprise_telemetry;
+#[cfg(test)]
+mod enterprise_telemetry_tests;
 mod env_files;
 mod export;
 mod extensions;
@@ -251,7 +254,7 @@ enum Command {
     /// Fan tasks out to a fleet of worker agents in ONE shared tree —
     /// coordinated by cooperative claims (lock-on-first-write, sub-second,
     /// rivals named), wave-scheduled by dependency, every attempt, commit,
-    /// and dollar recorded in .stella/fleet.db. Tasks opting into
+    /// and dollar recorded in .stella/private/fleet.db. Tasks opting into
     /// isolation = "isolated" get a dedicated worktree whose fleet/<task>
     /// branch is left in place for review.
     Fleet {
@@ -292,7 +295,7 @@ enum Command {
 
     /// Query the code graph built by `stella init` — symbol definitions and
     /// references, a file's imports/importers, or its graph neighborhood.
-    /// Offline: reads .stella/codegraph.db, needs no API key.
+    /// Offline: reads .stella/private/codegraph.db, needs no API key.
     Graph {
         /// What to ask the graph
         #[arg(value_enum)]
@@ -314,7 +317,7 @@ enum Command {
 
     /// Inspect the storage map — every storage layer, namespace, relation,
     /// and field, with intent/boundaries from stella.storage.toml. Offline:
-    /// reads .stella/codegraph.db + the manifest, needs no API key.
+    /// reads .stella/private/codegraph.db + the manifest, needs no API key.
     Storage {
         #[command(subcommand)]
         cmd: StorageCmd,
@@ -327,7 +330,7 @@ enum Command {
     },
 
     /// Summarize cost, tokens, and resolve rate per provider/model from
-    /// local telemetry (.stella/store.db) — $/resolved-task receipts
+    /// local telemetry (.stella/private/store.db) — $/resolved-task receipts
     Stats {
         /// Output format: table (aligned, with TOTAL row), json, or csv
         #[arg(long, value_enum, default_value = "table")]
@@ -339,8 +342,15 @@ enum Command {
         provider: Option<String>,
     },
 
+    /// Inspect or explicitly flush the managed enterprise operational spool.
+    /// Disabled by default; requires a signed org-managed enrollment.
+    Telemetry {
+        #[command(subcommand)]
+        cmd: TelemetryCmd,
+    },
+
     /// Open the Observatory — a local web dashboard over this workspace's
-    /// telemetry (.stella/store.db + fleet.db): spend, tokens, cache
+    /// telemetry (.stella/private/store.db + fleet.db): spend, tokens, cache
     /// traffic, tool calls, files touched, memory citations, reflections,
     /// and fleet runs. Binds 127.0.0.1 only and opens the stores strictly
     /// read-only — nothing ever leaves this machine.
@@ -396,6 +406,16 @@ enum Command {
 
     /// Print the version and exit
     Version,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+enum TelemetryCmd {
+    /// Show enrollment state, pending bytes/rows, and local drop count.
+    Status,
+    /// Attempt one bounded delivery batch now.
+    Flush,
+    /// Explicitly discard rows bound to a superseded enrolled sink.
+    RolloverDiscard,
 }
 
 /// `stella auth` subcommands — the whole `~/.config/stella/credentials.toml`
@@ -526,7 +546,7 @@ pub enum McpCmd {
         name: String,
     },
     /// OAuth login to a configured http server (opens your browser; tokens
-    /// land owner-only in .stella/mcp_oauth.json and auto-refresh)
+    /// land owner-only in .stella/private/mcp_oauth.json and auto-refresh)
     Login {
         /// The configured server's local name
         name: String,
@@ -536,7 +556,7 @@ pub enum McpCmd {
         /// The configured server's local name
         name: String,
     },
-    /// Show MCP tool-usage telemetry (.stella/store.db): calls per server/tool
+    /// Show MCP tool-usage telemetry (.stella/private/store.db): calls per server/tool
     Usage,
 }
 
@@ -684,9 +704,18 @@ enum StorageCmd {
 /// `stella observe` — serve the Observatory dashboard for this workspace on
 /// `127.0.0.1` until interrupted. Telemetry stores are opened read-only; the
 /// page and its assets are embedded, so nothing is fetched from anywhere.
+fn preflight_observatory_stores(root: &std::path::Path) -> Result<(), String> {
+    for name in ["store.db", "fleet.db", "context.db", "codegraph.db"] {
+        stella_store::existing_workspace_private_sqlite_path(root, name)
+            .map_err(|e| format!("cannot resolve private Observatory state `{name}`: {e}"))?;
+    }
+    Ok(())
+}
+
 fn run_observe(port: u16, open: bool) -> Result<(), String> {
     let root =
         std::env::current_dir().map_err(|e| format!("cannot determine workspace root: {e}"))?;
+    preflight_observatory_stores(&root)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -813,11 +842,18 @@ fn run_graph(op: GraphOp, target: &str) -> Result<(), String> {
 /// gate enforces (docs/design/storage-map.md). Reads the persisted index +
 /// stella.storage.toml; empty output means `stella init` hasn't indexed any
 /// storage yet.
+fn load_storage_snapshot_checked(
+    root: &std::path::Path,
+) -> Result<stella_graph::StorageSnapshot, String> {
+    stella_tools::graph::load_storage_snapshot(root)
+        .map_err(|e| format!("cannot resolve private storage-map index: {e}"))
+}
+
 fn run_storage(cmd: &StorageCmd) -> Result<(), String> {
     use stella_graph::storage::{dedup_key, display_address, embed_card, normalize_name};
     let root =
         std::env::current_dir().map_err(|e| format!("cannot determine workspace root: {e}"))?;
-    let snapshot = stella_graph::load_storage_snapshot(&root);
+    let snapshot = load_storage_snapshot_checked(&root)?;
     if snapshot.relations.is_empty() && snapshot.layers.is_empty() {
         println!(
             "{}",
@@ -1022,9 +1058,20 @@ fn main() -> ExitCode {
     // resolution see project keys. Runs here at single-threaded startup where
     // mutating the process environment is safe. The live shell always wins;
     // `STELLA_NO_ENV_FILE=1` opts out entirely.
-    let loaded_env = env_files::maybe_load();
+    let managed_snapshot = settings::Settings::load_managed_telemetry_snapshot()
+        .ok()
+        .flatten();
+    let authority_snapshot =
+        enterprise_telemetry::StartupAuthoritySnapshot::capture(managed_snapshot.as_ref());
+    let mut loaded_env = env_files::maybe_load();
+    let _rejected_privileged = authority_snapshot.restore_after_project_env(&loaded_env.names);
 
     let cli = Cli::parse();
+
+    enterprise_telemetry::start_best_effort_flush();
+    loaded_env
+        .names
+        .retain(|name| !stella_tools::exec::is_sensitive_env_name(name));
 
     // Value-free confirmation (names only), gated on STELLA_ENV_DEBUG + a TTY +
     // a human output format so it never pollutes json/stream-json.
@@ -1088,6 +1135,11 @@ fn run(cli: Cli, loaded_env: &env_files::Loaded) -> Result<(), String> {
             // needs `validate` by ref), so `format` binds as `&StatsFormat`;
             // it is `Copy`, so deref rather than move.
             return stats::run_stats(*format, provider.as_deref());
+        }
+        Some(Command::Telemetry { cmd }) => {
+            // Managed operational export is independent of model/provider
+            // configuration. Community/default status constructs no client.
+            return enterprise_telemetry::run_command(*cmd);
         }
         Some(Command::Memory { cmd }) => {
             // Reads local stores only (list) / writes one rule file
@@ -1284,6 +1336,7 @@ fn run(cli: Cli, loaded_env: &env_files::Loaded) -> Result<(), String> {
         | Command::Scripts { .. }
         | Command::Storage { .. }
         | Command::Stats { .. }
+        | Command::Telemetry { .. }
         | Command::Memory { .. }
         | Command::Mcp { .. }
         | Command::Connect { .. }

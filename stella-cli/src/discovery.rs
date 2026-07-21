@@ -11,8 +11,8 @@
 //!   advertises (native registry, `mcp__server__tool` MCP tools, custom
 //!   script tools, session tools) by keyword, `+required` term, or
 //!   `select:exact,names`.
-//! - **`skill_search`** — search the skills *installed* in this workspace
-//!   (`.stella/skills/` + the user-global directory), optionally returning
+//! - **`skill_search`** — search user-global skills plus authority-permitted
+//!   workspace skills, optionally returning
 //!   the best match's full instructions. Distinct from the existing
 //!   `search_skills`, which queries the public internet registry for skills
 //!   to install.
@@ -164,6 +164,7 @@ pub struct DiscoveryToolSet<'a> {
     registry: Box<dyn McpRegistrySearch>,
     lean: Option<LeanConfig>,
     activated: ActivatedTools,
+    include_workspace_skills: bool,
 }
 
 impl<'a> DiscoveryToolSet<'a> {
@@ -179,7 +180,15 @@ impl<'a> DiscoveryToolSet<'a> {
             workspace_root,
             lean: lean_from_env(),
             activated: new_activation(),
+            include_workspace_skills: false,
         }
+    }
+
+    /// Add workspace skill definitions only when the effective prompt-source
+    /// authority permits them; the default remains user-global only.
+    pub fn with_project_prompts_allowed(mut self, allowed: bool) -> Self {
+        self.include_workspace_skills = allowed;
+        self
     }
 
     /// Share a session-scoped activation handle so lean-mode activations
@@ -237,8 +246,8 @@ impl<'a> DiscoveryToolSet<'a> {
             },
             ToolSchema {
                 name: SKILL_SEARCH.into(),
-                description: "Search the skills INSTALLED in this workspace (.stella/skills/ \
-                              plus the user-global skills directory) and rank them by fit for a \
+                description: "Search user-global skills plus authority-permitted workspace \
+                              skills and rank them by fit for a \
                               task. Set include_body: true to also get the top match's full \
                               instructions when you intend to apply it. Use this FIRST; \
                               search_skills queries the public internet registry for skills you \
@@ -395,10 +404,12 @@ impl<'a> DiscoveryToolSet<'a> {
         // Fresh load (a handful of file reads) so a skill installed or
         // auto-created seconds ago is already findable.
         let root = self.workspace_root.clone();
-        let skills =
-            tokio::task::spawn_blocking(move || crate::memory::load_workspace_skills(&root))
-                .await
-                .unwrap_or_default();
+        let include_workspace = self.include_workspace_skills;
+        let skills = tokio::task::spawn_blocking(move || {
+            crate::memory::load_workspace_skills_with_authority(&root, include_workspace).skills
+        })
+        .await
+        .unwrap_or_default();
         let candidates: Vec<Candidate> = skills
             .iter()
             .map(|s| Candidate {
@@ -1035,7 +1046,7 @@ mod tests {
         unsafe { std::env::set_var("HOME", home.path()) };
 
         let inner = FakeInner;
-        let set = full_set(&inner, ws.to_path_buf());
+        let set = full_set(&inner, ws.to_path_buf()).with_project_prompts_allowed(true);
         let out = tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(set.execute(SKILL_SEARCH, &input));

@@ -1,5 +1,5 @@
 //! `stella-store` — the session's local SQLite database at
-//! `.stella/store.db`: durable state, full execution records, and
+//! `.stella/private/store.db`: durable state, full execution records, and
 //! analytics-grade telemetry, all on the user's disk (no server, no
 //! account — the local-first non-negotiable).
 //!
@@ -93,8 +93,14 @@ use stella_protocol::{AgentEvent, TaskItem, TaskStatus, ToolOutput};
 //   usage      `usage.db` — user-tier cross-project telemetry aggregate
 mod ddl;
 mod migrations;
+mod private;
+#[cfg(test)]
+mod private_state_tests;
+#[cfg(test)]
+mod quarantine_tests;
 
 pub mod catalog;
+pub mod enterprise_telemetry;
 pub mod journal;
 pub mod notify;
 pub mod sessions;
@@ -114,6 +120,15 @@ pub use catalog::CatalogStore;
 // natural name. Reach the writer through its module.
 pub use journal::JournalRecord;
 pub use notify::{Notification, NotificationStore};
+pub use private::{
+    WORKSPACE_PRIVATE_DIR, append_workspace_private_line, existing_workspace_private_sqlite_path,
+    existing_workspace_private_state_path, read_sensitive_file_to_string,
+    workspace_private_sqlite_path, workspace_private_state_path, write_sensitive_file_atomic,
+};
+pub(crate) use private::{
+    ensure_private_dir, ensure_workspace_generated_ignore, ensure_workspace_state_dir,
+    open_private_file, open_private_sqlite, read_private_to_string, write_private_atomic,
+};
 pub use sessions::{SessionRecord, SessionRegistry, SessionStatus};
 
 /// FNV-1a/64 hex — a stable, dependency-free digest for prompt hashes and
@@ -158,6 +173,10 @@ fn validate_json_properties(properties: &str) -> Result<()> {
     serde_json::from_str::<serde_json::Value>(properties)
         .map(|_| ())
         .map_err(|e| StoreError(format!("graph properties are not valid JSON: {e}")))
+}
+
+fn sqlite_i64(name: &str, value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| StoreError(format!("{name} exceeds SQLite INTEGER range")))
 }
 
 /// One StepUsage-shaped telemetry record (mirrors the event, plus the
@@ -495,30 +514,25 @@ impl UsageStatsRow {
 ///   ignored (the DB open right after surfaces a genuinely unusable
 ///   directory).
 fn harden_workspace_dir(dir: &Path, created: bool) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(dir)
+        .map_err(|e| StoreError(format!("cannot inspect {}: {e}", dir.display())))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StoreError(format!(
+            "workspace state path {} is not a real directory",
+            dir.display()
+        )));
+    }
     #[cfg(unix)]
     if created {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
             StoreError(format!(
-                "could not restrict permissions on freshly created {} (chmod 0700 failed: {e}); \
-                 refusing transcript persistence rather than writing sensitive session data \
-                 into a world-readable directory",
+                "could not restrict freshly created {}: {e}",
                 dir.display()
             ))
         })?;
     }
-    let gitignore = dir.join(".gitignore");
-    // create_new: AlreadyExists (pre-existing or created by a concurrent
-    // session between any check and this open) leaves the file untouched —
-    // success; other errors are best-effort ignored, like the write itself.
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&gitignore)
-    {
-        use std::io::Write;
-        let _ = file.write_all(b"*.db\n*.db-wal\n*.db-shm\nreflections.jsonl\n");
-    }
+    ensure_workspace_generated_ignore(dir)?;
     Ok(())
 }
 
@@ -532,15 +546,14 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (creating if needed) the workspace database at `.stella/store.db`
+    /// Open (creating if needed) at `.stella/private/store.db`
     /// and apply the schema.
     pub fn open(workspace_root: &Path) -> Result<Self> {
-        let dir = workspace_root.join(".stella");
-        let created = !dir.exists();
-        std::fs::create_dir_all(&dir).map_err(|e| StoreError(e.to_string()))?;
+        let (dir, created) = ensure_workspace_state_dir(workspace_root)?;
         harden_workspace_dir(&dir, created)?;
+        let db_path = workspace_private_sqlite_path(workspace_root, "store.db")?;
         Self::init(
-            Connection::open(dir.join("store.db"))?,
+            open_private_sqlite(&db_path)?,
             Some(workspace_root.to_path_buf()),
         )
     }
@@ -576,6 +589,7 @@ impl Store {
             root,
         };
         store.migrate()?;
+        enterprise_telemetry::initialize_store_export_schema(&mut store.lock())?;
         Ok(store)
     }
 
@@ -681,11 +695,9 @@ impl Store {
         Ok(())
     }
 
-    /// Append one event to the execution's stream. `seq` is the caller's
-    /// monotonically increasing counter (the event drain loop owns order).
-    /// `(execution_id, seq)` is UNIQUE — a double-write of the same stream
-    /// position errors instead of silently corrupting the replay.
+    /// Append one uniquely sequenced event to the execution stream.
     pub fn record_event(&self, execution_id: i64, seq: u64, event: &AgentEvent) -> Result<()> {
+        let seq = sqlite_i64("event sequence", seq)?;
         let payload = serde_json::to_string(event).map_err(|e| StoreError(e.to_string()))?;
         // Read the internally-tagged `type` from the parsed value rather than
         // string-scanning for the first `"type":"` literal — the scan silently
@@ -697,15 +709,26 @@ impl Store {
             .unwrap_or_else(|| "unknown".into());
         self.lock().execute(
             "INSERT INTO events (execution_id, seq, event_type, payload) VALUES (?, ?, ?, ?)",
-            params![execution_id, seq as i64, event_type, payload],
+            params![execution_id, seq, event_type, payload],
         )?;
         Ok(())
     }
 
-    /// Record one model call's telemetry. `(execution_id, step)` is UNIQUE —
-    /// `StepUsage` lands exactly once per step, and a double-write would
-    /// double-count tokens and cost in `usage_stats`.
+    /// Record one uniquely stepped model call's telemetry.
     pub fn record_telemetry(&self, execution_id: i64, row: &TelemetryRow) -> Result<()> {
+        let step = sqlite_i64("telemetry step", row.step)?;
+        let input_tokens = sqlite_i64("telemetry input tokens", row.input_tokens)?;
+        let estimated_input_tokens = sqlite_i64(
+            "telemetry estimated input tokens",
+            row.estimated_input_tokens,
+        )?;
+        let output_tokens = sqlite_i64("telemetry output tokens", row.output_tokens)?;
+        let cache_read_tokens = sqlite_i64("telemetry cache-read tokens", row.cache_read_tokens)?;
+        let cache_miss_tokens = sqlite_i64("telemetry cache-miss tokens", row.cache_miss_tokens)?;
+        let cache_write_tokens =
+            sqlite_i64("telemetry cache-write tokens", row.cache_write_tokens)?;
+        let duration_ms = sqlite_i64("telemetry duration", row.duration_ms)?;
+        let tool_calls = sqlite_i64("telemetry tool calls", row.tool_calls)?;
         self.lock().execute(
             "INSERT INTO telemetry (execution_id, step, provider, model, input_tokens, \
              estimated_input_tokens, output_tokens, cache_read_tokens, cache_miss_tokens, \
@@ -713,19 +736,19 @@ impl Store {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 execution_id,
-                row.step as i64,
+                step,
                 row.provider,
                 row.model,
-                row.input_tokens as i64,
-                row.estimated_input_tokens as i64,
-                row.output_tokens as i64,
-                row.cache_read_tokens as i64,
-                row.cache_miss_tokens as i64,
-                row.cache_write_tokens as i64,
+                input_tokens,
+                estimated_input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_miss_tokens,
+                cache_write_tokens,
                 row.cost_usd,
-                row.duration_ms as i64,
+                duration_ms,
                 row.retries,
-                row.tool_calls as i64,
+                tool_calls,
             ],
         )?;
         Ok(())
@@ -772,12 +795,12 @@ impl Store {
         Ok(samples)
     }
 
-    /// Persist the file-touch telemetry for an execution: one row per
-    /// normalized path. UNIQUE (execution_id, path) makes a duplicate record
-    /// for the same path an error instead of a silent double-count.
+    /// Persist one file-touch row per normalized execution path.
     pub fn record_files_touched(&self, execution_id: i64, files: &[FileTouchRow]) -> Result<()> {
         let conn = self.lock();
         for row in files {
+            let lines_added = sqlite_i64("file lines added", row.lines_added)?;
+            let lines_removed = sqlite_i64("file lines removed", row.lines_removed)?;
             conn.execute(
                 "INSERT INTO files_touched \
                  (execution_id, path, ops, lines_added, lines_removed, events) \
@@ -786,8 +809,8 @@ impl Store {
                     execution_id,
                     row.path,
                     row.ops,
-                    row.lines_added as i64,
-                    row.lines_removed as i64,
+                    lines_added,
+                    lines_removed,
                     row.events_json,
                 ],
             )?;
@@ -795,11 +818,7 @@ impl Store {
         Ok(())
     }
 
-    /// Persist the memory citations for an execution: one row per cited
-    /// memory. UNIQUE (execution_id, memory_id) makes a duplicate citation of
-    /// the same memory within one execution an error instead of a silent
-    /// double-count — the session ledger already collapses re-cites to the
-    /// model's latest judgment before handing rows in.
+    /// Persist one citation row per execution/memory pair.
     pub fn record_memory_citations(
         &self,
         execution_id: i64,
@@ -823,8 +842,7 @@ impl Store {
         Ok(())
     }
 
-    /// Record the agent invocations drained from one execution's ledger —
-    /// one row per invocation, never aggregated (see [`AgentUseRow`]).
+    /// Record non-aggregated agent invocations from one execution.
     pub fn record_agent_uses(&self, execution_id: i64, uses: &[AgentUseRow]) -> Result<()> {
         let conn = self.lock();
         for row in uses {
@@ -889,19 +907,17 @@ impl Store {
         Ok(stats)
     }
 
-    /// The public ids (`nod_…`) of memories that are quarantined from recall:
-    /// cited untruthful at least [`QUARANTINE_NEGATIVES_THRESHOLD`] times.
-    /// These are excluded from the recall block so a stale/wrong memory that
-    /// multiple agents verified as false stops misleading future turns.
-    /// Best-effort: a query failure returns an empty set (recall proceeds
-    /// unfiltered rather than failing).
-    pub fn quarantined_memory_ids(&self) -> std::collections::HashSet<String> {
-        self.memory_citation_stats()
-            .unwrap_or_default()
+    /// Public ids (`nod_…`) cited untruthful at least
+    /// [`QUARANTINE_NEGATIVES_THRESHOLD`] times and excluded from recall.
+    /// A query failure is explicit because an empty set means the query
+    /// succeeded and no memories are quarantined.
+    pub fn quarantined_memory_ids(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(self
+            .memory_citation_stats()?
             .into_iter()
             .filter(|s| s.quarantined)
             .map(|s| s.memory_id)
-            .collect()
+            .collect())
     }
 
     /// Persist the MCP tool calls recorded during an execution: one row per
@@ -3133,6 +3149,12 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(root.join(".stella")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join(".stella"), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
         // Simulate a database created before drift correction: the telemetry
         // table exists WITHOUT estimated_input_tokens and already has a row.
         {
@@ -3254,6 +3276,12 @@ mod tests {
         ));
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join(".stella")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join(".stella"), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
         root
     }
 
@@ -3898,16 +3926,36 @@ mod tests {
         let gitignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         assert!(gitignore.contains("*.db"));
         assert!(gitignore.contains("reflections.jsonl"));
+        assert!(gitignore.lines().any(|line| line.trim() == "private/"));
         assert!(!gitignore.lines().any(|l| l.trim() == "*"));
 
-        // A pre-existing .gitignore is left alone (user may have customized).
-        // Under create_new this same path also covers the race where another
-        // session drops the file between open's checks — never truncated.
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        let ignored = std::process::Command::new("git")
+            .args(["check-ignore", ".stella/private/mcp_oauth.json"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            ignored.status.success(),
+            "private OAuth tokens must never stage"
+        );
+
+        // A pre-existing customized ignore keeps its contents and gains the
+        // private-state rule exactly once.
         std::fs::write(dir.join(".gitignore"), "custom\n").unwrap();
         drop(Store::open(&root).unwrap());
         assert_eq!(
             std::fs::read_to_string(dir.join(".gitignore")).unwrap(),
-            "custom\n"
+            "custom\nprivate/\n"
+        );
+        drop(Store::open(&root).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".gitignore")).unwrap(),
+            "custom\nprivate/\n"
         );
 
         #[cfg(unix)]

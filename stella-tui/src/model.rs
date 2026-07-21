@@ -1243,7 +1243,11 @@ mod tests {
             frames: vec![ContextFrameRef {
                 id: Some("913d6df1-uuid".into()),
                 citation_label: "driver.rs step-driver".into(),
+                provider: "code-graph".into(),
                 source: "code-graph".into(),
+                kind: "symbol".into(),
+                uri: None,
+                method: None,
                 token_cost: 100,
             }],
             provider_mix: vec![ProviderShare {

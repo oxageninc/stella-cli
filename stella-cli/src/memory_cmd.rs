@@ -1,8 +1,8 @@
 //! `stella memory` — the human window into the memory-citation loop.
 //!
 //! `list` ranks the project's memories most-cited first, joining the
-//! citation feedback the agent recorded (`cite_memory` → `.stella/store.db`)
-//! with the memories themselves (`.stella/context.db`), and flags the ones
+//! citation feedback the agent recorded (`cite_memory` → `.stella/private/store.db`)
+//! with the memories themselves (`.stella/private/context.db`), and flags the ones
 //! that have earned rule promotion. `promote <id>` turns an eligible memory
 //! into a project rule at `.stella/rules/<slug>.md` — the rules engine's own
 //! authoring format (`stella_core::rules`), so the promoted file is loaded
@@ -58,7 +58,7 @@ pub fn run_memory_list(format: MemoryFormat) -> Result<(), String> {
 
     if rows.is_empty() {
         let message = "No memories recorded yet — run `stella chat`/`stella run` and let the \
-                       post-turn reflection populate .stella/context.db.";
+                       post-turn reflection populate .stella/private/context.db.";
         match format {
             MemoryFormat::Table => println!("{message}"),
             MemoryFormat::Json => {
@@ -105,10 +105,12 @@ pub fn run_memory_list(format: MemoryFormat) -> Result<(), String> {
 /// store would create `.stella/` and empty databases as a side effect, so
 /// a missing file reads as "nothing yet", never a write.
 fn list_rows(workspace_root: &std::path::Path) -> Result<Vec<MemoryListRow>, String> {
-    let context_db = workspace_root.join(".stella").join("context.db");
-    if !context_db.exists() {
+    let Some(context_db) =
+        stella_store::existing_workspace_private_sqlite_path(workspace_root, "context.db")
+            .map_err(|e| format!("cannot resolve context store: {e}"))?
+    else {
         return Ok(Vec::new());
-    }
+    };
     let context =
         ContextStore::open(&context_db).map_err(|e| format!("cannot open context store: {e}"))?;
     let memories = context
@@ -146,10 +148,12 @@ fn promote_in(workspace_root: &std::path::Path, id: &str) -> Result<(), String> 
         ));
     }
 
-    let context_db = workspace_root.join(".stella").join("context.db");
-    if !context_db.exists() {
-        return Err("no .stella/context.db in this workspace — nothing to promote".into());
-    }
+    let context_db =
+        stella_store::existing_workspace_private_sqlite_path(workspace_root, "context.db")
+            .map_err(|e| format!("cannot resolve context store: {e}"))?
+            .ok_or_else(|| {
+                "no private context.db in this workspace — nothing to promote".to_string()
+            })?;
     let context =
         ContextStore::open(&context_db).map_err(|e| format!("cannot open context store: {e}"))?;
     let node = context
@@ -195,11 +199,13 @@ fn promote_in(workspace_root: &std::path::Path, id: &str) -> Result<(), String> 
     }
 }
 
-/// Citation stats from `.stella/store.db`, or empty when the store does not
+/// Citation stats from `.stella/private/store.db`, or empty when the store does not
 /// exist yet (never create it from a read-only command).
 fn citation_stats(workspace_root: &std::path::Path) -> Result<Vec<MemoryCitationStats>, String> {
-    let store_db = workspace_root.join(".stella").join("store.db");
-    if !store_db.exists() {
+    if stella_store::existing_workspace_private_sqlite_path(workspace_root, "store.db")
+        .map_err(|e| format!("cannot resolve local store: {e}"))?
+        .is_none()
+    {
         return Ok(Vec::new());
     }
     let store = Store::open(workspace_root).map_err(|e| format!("cannot open local store: {e}"))?;
@@ -266,7 +272,7 @@ pub fn run_memory_validate() -> Result<(), String> {
         std::env::current_dir().map_err(|e| format!("cannot determine workspace root: {e}"))?;
     let rows = validate_memories(&workspace_root)?;
     if rows.is_empty() {
-        println!("No memories to validate — .stella/context.db is empty or missing.");
+        println!("No memories to validate — .stella/private/context.db is empty or missing.");
         return Ok(());
     }
 
@@ -333,10 +339,12 @@ fn extract_path_anchors(text: &str) -> Vec<String> {
 
 /// Validate all memories in a workspace against the current file tree.
 fn validate_memories(workspace_root: &std::path::Path) -> Result<Vec<MemoryValidationRow>, String> {
-    let context_db = workspace_root.join(".stella").join("context.db");
-    if !context_db.exists() {
+    let Some(context_db) =
+        stella_store::existing_workspace_private_sqlite_path(workspace_root, "context.db")
+            .map_err(|e| format!("cannot resolve context store: {e}"))?
+    else {
         return Ok(Vec::new());
-    }
+    };
     let context =
         ContextStore::open(&context_db).map_err(|e| format!("cannot open context store: {e}"))?;
     let memories = context
@@ -606,8 +614,8 @@ mod tests {
         let root = dir.path();
         let lesson = "Never edit generated files under gen/ — regenerate them instead.";
 
-        std::fs::create_dir_all(root.join(".stella")).unwrap();
-        let context = ContextStore::open(root.join(".stella").join("context.db")).unwrap();
+        let context_db = stella_store::workspace_private_sqlite_path(root, "context.db").unwrap();
+        let context = ContextStore::open(context_db).unwrap();
         context
             .upsert(stella_context::ContextDelta {
                 memories: vec![stella_context::MemoryInput::new(
@@ -701,8 +709,8 @@ mod tests {
         let root = tempdir().unwrap();
         // Create the stores + a memory node referencing a path that exists
         // and one that does not.
-        let context_db = root.path().join(".stella").join("context.db");
-        std::fs::create_dir_all(context_db.parent().unwrap()).unwrap();
+        let context_db =
+            stella_store::workspace_private_sqlite_path(root.path(), "context.db").unwrap();
         std::fs::create_dir_all(root.path().join("stella-cli/src")).unwrap();
         std::fs::write(root.path().join("stella-cli/src/agent.rs"), "pub fn x() {}").unwrap();
         // Write memories via the context store's async upsert.

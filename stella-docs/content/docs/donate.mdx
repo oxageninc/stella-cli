@@ -1,10 +1,13 @@
 ---
 title: Donate
-description: Stella is free, BYOK, phone-home-free, and vendor-agnostic — built and funded by one person. If it saves you time or money, consider sponsoring.
+description: Stella is free, BYOK, zero-telemetry-egress by default, and vendor-agnostic — built and funded by one person. If it saves you time or money, consider sponsoring.
 ---
 
-Stella is free software. There is no account, no subscription, no telemetry
-endpoint, and no upsell — and keeping it that way is the point.
+Stella is free software. Community/default use has no account or subscription and zero
+telemetry egress — and keeping that independent default is the point. Organizations
+may separately provision the explicit, signed
+[Oxagen Enterprise managed mode](/docs/telemetry#oxagen-enterprise-managed-export);
+that narrow operational boundary does not change the Community default.
 
 If Stella saves you time or money, please consider sponsoring its development:
 
@@ -36,10 +39,11 @@ piece of systems engineering, built and maintained by one person:
 
 Stella is built on a few non-negotiable principles:
 
-- **No phone-home.** The only network traffic Stella produces goes to the model
-  provider *you* chose. All telemetry — executions, tokens, cost, the
-  files-touched ledger — lands in a local SQLite database on your disk and
-  never leaves your machine.
+- **Zero telemetry egress by default.** Community/default telemetry — executions,
+  tokens, cost, the files-touched ledger, and content — stays in local SQLite. Your
+  selected model provider remains the normal BYOK network path. Only an explicitly
+  enrolled Oxagen Enterprise managed seat can export the documented minimal,
+  content-free operational rollup to its exact allowlisted HTTPS sink.
 - **Bring your own key.** Your credentials, your provider relationship, your
   bill. No middleman markup, no metered proxy, no lock-in.
 - **Model and vendor agnostic.** Anthropic, OpenAI, Google (Gemini and
@@ -53,8 +57,8 @@ Stella is built on a few non-negotiable principles:
 
 That combination — local-first, BYOK, vendor-neutral, permissively licensed —
 is what open source is supposed to be like. It is also precisely the
-combination that no venture-funded agent product can offer you, because there
-is nothing to monetize in it.
+combination the Community edition can offer without an account or hosted telemetry
+dependency.
 
 ## Other ways to help
 

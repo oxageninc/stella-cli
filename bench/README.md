@@ -91,7 +91,7 @@ python -m swebench.harness.run_evaluation \
 
 ## How benchmark cost maps to Stella's own telemetry
 
-Every Stella run also writes to the workspace's local `.stella/store.db` — the
+Every Stella run also writes to the workspace's local `.stella/private/store.db` — the
 same executions, tokens, and `$`/resolved-task receipts you can read with
 `stella stats` or browse in the [Observatory](../README.md#observatory)
 dashboard (`stella observe`). A benchmark run and Stella's own metering agree by

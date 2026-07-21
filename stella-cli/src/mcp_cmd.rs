@@ -23,10 +23,17 @@ pub fn mcp_toml_path(workspace_root: &Path) -> PathBuf {
 /// Load `.stella/mcp.toml` (an absent file is an empty config, not an error).
 pub fn load_config(workspace_root: &Path) -> Result<McpConfig, String> {
     let path = mcp_toml_path(workspace_root);
-    match std::fs::read_to_string(&path) {
+    match stella_store::read_sensitive_file_to_string(&path) {
         Ok(text) => McpConfig::from_toml_str(&text)
             .map_err(|e| format!("{} is invalid: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(McpConfig::default()),
+        Err(_)
+            if matches!(
+                std::fs::symlink_metadata(&path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(McpConfig::default())
+        }
         Err(e) => Err(format!("cannot read {}: {e}", path.display())),
     }
 }
@@ -35,35 +42,23 @@ pub fn load_config(workspace_root: &Path) -> Result<McpConfig, String> {
 /// since it may hold credentials.
 pub fn save_config(workspace_root: &Path, cfg: &McpConfig) -> Result<(), String> {
     let path = mcp_toml_path(workspace_root);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     let toml = cfg.to_toml_string().map_err(|e| e.to_string())?;
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    write_owner_only(&tmp, toml.as_bytes())
-        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
-    Ok(())
-}
-
-fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
+    stella_store::write_sensitive_file_atomic(&path, toml.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 /// The configured MCP registry URL (settings.json `mcp.registry_url`, else the
@@ -72,6 +67,23 @@ pub fn resolve_registry_url(workspace_root: &Path) -> String {
     Settings::load(workspace_root)
         .map(|s| s.mcp_registry_url())
         .unwrap_or_else(|_| stella_mcp::DEFAULT_REGISTRY_URL.to_string())
+}
+
+/// Deck-mode report for MCP connection outcomes, including total failure.
+pub(crate) fn mcp_outcome_report(connected: &[&str], failed: &[(String, String)]) -> String {
+    let mut lines = match connected.len() {
+        0 => vec!["no MCP servers connected — continuing with native tools only".to_string()],
+        n => vec![format!(
+            "{n} MCP server(s) connected: {}",
+            connected.join(", ")
+        )],
+    };
+    lines.extend(
+        failed
+            .iter()
+            .map(|(name, reason)| format!("MCP server `{name}` unavailable: {reason}")),
+    );
+    lines.join("\n")
 }
 
 /// Search a registry over HTTP (async, non-blocking).
@@ -124,16 +136,20 @@ pub fn remove(workspace_root: &Path, name: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
-/// The workspace's OAuth token store, beside `mcp.toml` (owner-only JSON).
-pub fn oauth_store_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".stella").join("mcp_oauth.json")
+/// Resolve the workspace's owner-only OAuth token store, migrating a safe
+/// legacy `.stella/mcp_oauth.json` before any caller constructs a token store.
+pub fn oauth_store_path(workspace_root: &Path) -> Result<PathBuf, String> {
+    stella_store::workspace_private_state_path(workspace_root, "mcp_oauth.json")
+        .map_err(|e| format!("cannot resolve private MCP OAuth token store: {e}"))
 }
 
 /// The session's OAuth manager: lazy per-server bearer sources over the
 /// workspace token store. Cheap; construct once per connect.
-pub fn oauth_manager(workspace_root: &Path) -> std::sync::Arc<stella_mcp::OAuthManager> {
-    std::sync::Arc::new(stella_mcp::OAuthManager::new(oauth_store_path(
-        workspace_root,
+pub fn oauth_manager(
+    workspace_root: &Path,
+) -> Result<std::sync::Arc<stella_mcp::OAuthManager>, String> {
+    Ok(std::sync::Arc::new(stella_mcp::OAuthManager::new(
+        oauth_store_path(workspace_root)?,
     )))
 }
 
@@ -163,7 +179,7 @@ pub async fn oauth_login(
     notify: &mut (dyn FnMut(stella_mcp::LoginEvent) + Send),
 ) -> Result<(), String> {
     let url = http_server_url(workspace_root, server)?;
-    let store_path = oauth_store_path(workspace_root);
+    let store_path = oauth_store_path(workspace_root)?;
     let tokens = stella_mcp::oauth::login(
         server,
         &url,
@@ -184,16 +200,16 @@ pub async fn oauth_login(
 
 /// Forget a server's OAuth tokens; returns whether any existed.
 pub fn oauth_logout(workspace_root: &Path, server: &str) -> Result<bool, String> {
-    stella_mcp::TokenStore::new(oauth_store_path(workspace_root))
+    stella_mcp::TokenStore::new(oauth_store_path(workspace_root)?)
         .remove(server)
         .map_err(|e| e.to_string())
 }
 
 /// The configured servers that currently hold OAuth logins.
-pub fn oauth_logged_in(workspace_root: &Path) -> Vec<String> {
-    stella_mcp::TokenStore::new(oauth_store_path(workspace_root))
+pub fn oauth_logged_in(workspace_root: &Path) -> Result<Vec<String>, String> {
+    stella_mcp::TokenStore::new(oauth_store_path(workspace_root)?)
         .logged_in_servers()
-        .unwrap_or_default()
+        .map_err(|e| e.to_string())
 }
 
 /// Best-effort `open`/`xdg-open`/`start` of the authorize URL. Failure is
@@ -213,10 +229,12 @@ fn open_in_browser(url: &str) {
 }
 
 /// Per-(server, tool) usage aggregates from local telemetry
-/// (`.stella/store.db`). Missing store → empty (never creates the file).
+/// (`.stella/private/store.db`). Missing store → empty (never creates the file).
 pub fn usage_stats(workspace_root: &Path) -> Result<Vec<stella_store::McpUsageStat>, String> {
-    let db = workspace_root.join(".stella").join("store.db");
-    if !db.exists() {
+    if stella_store::existing_workspace_private_sqlite_path(workspace_root, "store.db")
+        .map_err(|e| format!("cannot resolve store: {e}"))?
+        .is_none()
+    {
         return Ok(Vec::new());
     }
     let store =
@@ -409,7 +427,7 @@ fn run_login(workspace_root: &Path, name: &str) -> Result<(), String> {
     println!(
         "  {} logged in — tokens in {} (auto-refreshed; `stella mcp logout {name}` to forget)",
         "◆".bright_cyan(),
-        oauth_store_path(workspace_root).display()
+        oauth_store_path(workspace_root)?.display()
     );
     Ok(())
 }
@@ -428,7 +446,7 @@ fn run_logout(workspace_root: &Path, name: &str) -> Result<(), String> {
 }
 
 fn run_usage(workspace_root: &Path) -> Result<(), String> {
-    crate::tui::section_header("MCP tool usage (.stella/store.db)");
+    crate::tui::section_header("MCP tool usage (.stella/private/store.db)");
     let stats = usage_stats(workspace_root)?;
     if stats.is_empty() {
         println!(
@@ -521,5 +539,89 @@ mod tests {
         assert!(load_config(&dir).unwrap().names().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_config_is_owner_only_and_rejects_symlink_targets() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = McpConfig::default();
+        save_config(dir.path(), &cfg).unwrap();
+        assert_eq!(
+            std::fs::metadata(mcp_toml_path(dir.path()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let target = dir.path().join("outside.toml");
+        std::fs::write(&target, "[servers]\n").unwrap();
+        std::fs::remove_file(mcp_toml_path(dir.path())).unwrap();
+        symlink(&target, mcp_toml_path(dir.path())).unwrap();
+        assert!(save_config(dir.path(), &cfg).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "[servers]\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oauth_path_migrates_a_safe_legacy_token_store_into_private_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dot = dir.path().join(".stella");
+        std::fs::create_dir_all(&dot).unwrap();
+        std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let previous_generated = "*.db\n*.db-wal\n*.db-shm\nreflections.jsonl\n";
+        let custom = "# keep this custom rule\nexports/\n";
+        let ignore_path = dot.join(".gitignore");
+        std::fs::write(&ignore_path, format!("{previous_generated}{custom}")).unwrap();
+        std::fs::set_permissions(&ignore_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let legacy = dot.join("mcp_oauth.json");
+        std::fs::write(&legacy, br#"{"servers":{}}"#).unwrap();
+
+        let resolved: Result<PathBuf, String> = oauth_store_path(dir.path());
+        let resolved = resolved.unwrap();
+        assert_eq!(resolved, dot.join("private/mcp_oauth.json"));
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read(resolved).unwrap(), br#"{"servers":{}}"#);
+        assert_eq!(
+            std::fs::read_to_string(&ignore_path).unwrap(),
+            format!("{previous_generated}{custom}private/\n")
+        );
+        assert_eq!(
+            std::fs::metadata(&ignore_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640,
+            "committable ignore mode must survive the atomic update"
+        );
+        oauth_store_path(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ignore_path)
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "private/")
+                .count(),
+            1,
+            "idempotent resolution must not duplicate the ignore rule"
+        );
+
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let ignored = std::process::Command::new("git")
+            .args(["check-ignore", ".stella/private/mcp_oauth.json"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(ignored.status.success(), "OAuth tokens must never stage");
     }
 }

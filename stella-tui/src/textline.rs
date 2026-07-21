@@ -854,7 +854,11 @@ mod tests {
                 frames: vec![ContextFrameRef {
                     id: None,
                     citation_label: "l".into(),
+                    provider: "p".into(),
                     source: "s".into(),
+                    kind: String::new(),
+                    uri: None,
+                    method: None,
                     token_cost: 1,
                 }],
                 provider_mix: vec![],
@@ -962,7 +966,11 @@ mod tests {
             frames: vec![ContextFrameRef {
                 id: None,
                 citation_label: "driver.rs".into(),
+                provider: "code-graph".into(),
                 source: "code-graph".into(),
+                kind: "symbol".into(),
+                uri: None,
+                method: None,
                 token_cost: 120,
             }],
             provider_mix: vec![ProviderShare {
