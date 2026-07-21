@@ -248,6 +248,16 @@ struct ZaiRequest<'a> {
     /// distinct-per-sibling lifecycle.
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
+    /// xAI's chat-completions reasoning control: a top-level `reasoning_effort`
+    /// string (`low`/`medium`/`high`, OpenAI-compatible). Grok's reasoning
+    /// models honor it; only sent when this adapter is serving the `xai`
+    /// identity AND the caller pinned an `effort`/`reasoning` preference. Every
+    /// other identity behind this shared adapter keeps it off the wire (same
+    /// 400-risk gating as `reasoning`/`cache_control`/`session_id`) — GLM,
+    /// DeepSeek, and local servers don't speak it, and an unknown key would
+    /// risk a hard 400. See [`xai_reasoning_effort`] for the shape rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
 }
 
 /// GLM's request-level thinking object: `{"type": "enabled"}` /
@@ -310,6 +320,40 @@ fn openrouter_reasoning(
             effort: None,
             enabled: Some(true),
         }),
+        (None, None) => None,
+    }
+}
+
+/// Map the engine's one `ReasoningEffort` enum to xAI's chat-completions
+/// `reasoning_effort`, which documents `low`/`medium`/`high`. Same collapse
+/// posture as `openai.rs::map_reasoning_effort`: never drop the hint, never
+/// panic on a variant Grok doesn't model — the finer `xhigh`/`max` tiers are
+/// model-dependent on xAI, so they collapse to the universally-safe `high`.
+fn map_xai_effort(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => "high",
+    }
+}
+
+/// Build xAI's `reasoning_effort` value from the request's reasoning/effort
+/// pair — the mirror of the OpenAI adapter's own reasoning match, since xAI's
+/// chat-completions dialect is OpenAI-compatible. Rules: an explicit off
+/// (`reasoning == Some(false)`) suppresses the field entirely even when an
+/// effort is pinned (an explicit off wins, and the docs' `none` value would
+/// 400 on always-reasoning Grok models); a pinned effort maps as
+/// [`map_xai_effort`]; a bare `Some(true)` with no effort turns thinking on at
+/// the middle tier; and neither set keeps the field off the wire (provider
+/// default, byte-stable with the pre-field body).
+fn xai_reasoning_effort(
+    reasoning: Option<bool>,
+    effort: Option<ReasoningEffort>,
+) -> Option<&'static str> {
+    match (reasoning, effort) {
+        (Some(false), _) => None,
+        (_, Some(effort)) => Some(map_xai_effort(effort)),
+        (Some(true), None) => Some("medium"),
         (None, None) => None,
     }
 }
@@ -791,6 +835,14 @@ impl ZaiProvider {
                 .flatten(),
             reasoning: (self.id == "openrouter")
                 .then(|| openrouter_reasoning(req.reasoning, req.effort))
+                .flatten(),
+            // xAI's Grok reasoning models speak a top-level `reasoning_effort`
+            // (OpenAI-compatible), which the shared adapter used to drop
+            // silently for the xai identity. Gated exactly like `reasoning` is
+            // to openrouter: only the xai identity sends it, so no other
+            // OpenAI-compatible server sees a key it might reject.
+            reasoning_effort: (self.id == "xai")
+                .then(|| xai_reasoning_effort(req.reasoning, req.effort))
                 .flatten(),
             tools: to_zai_tools(&req.tools),
             usage: self

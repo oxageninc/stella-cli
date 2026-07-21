@@ -1243,17 +1243,19 @@ async fn openrouter_identity_maps_reasoning_to_the_gateway_object() {
     assert!(!bodies[0].contains("thinking"), "{}", bodies[0]);
 }
 
-/// Identities other than Z.ai and OpenRouter (xAI, DeepSeek, local, …)
-/// have no known reasoning field on this dialect: the hint is ignored
-/// rather than guessed at — an unknown key risks a hard 400.
+/// Identities with no known reasoning field on this dialect (DeepSeek, local,
+/// settings-defined servers) ignore the hint rather than guessing at it — an
+/// unknown key risks a hard 400. (Z.ai, OpenRouter, and xAI DO speak a
+/// reasoning control and are covered by their own witnesses; DeepSeek's
+/// reasoner reasons unconditionally with no request-level dial.)
 #[tokio::test]
 async fn other_identities_ignore_reasoning_entirely() {
     let server = MockServer::start().await;
     mock_ok(&server).await;
 
-    let provider = ZaiProvider::new(ApiKey::new("xai-test"), "grok-4")
+    let provider = ZaiProvider::new(ApiKey::new("sk-deepseek-test"), "deepseek-reasoner")
         .with_base_url(server.uri())
-        .with_identity("xai", "xAI");
+        .with_identity("deepseek", "DeepSeek");
     provider
         .complete(CompletionRequest {
             messages: vec![CompletionMessage::user("hi")],
@@ -1269,7 +1271,119 @@ async fn other_identities_ignore_reasoning_entirely() {
 
     let body = first_request_body(&server).await;
     assert!(!body.contains("thinking"), "{body}");
+    // Neither the openrouter `reasoning` object nor xAI's `reasoning_effort`.
     assert!(!body.contains("reasoning"), "{body}");
     // cache_control is OpenRouter-only, same 400 risk as the fields above.
     assert!(!body.contains("cache_control"), "{body}");
+}
+
+/// xAI's Grok reasoning models speak a top-level `reasoning_effort` on the
+/// OpenAI-compatible chat-completions dialect. The shared adapter used to drop
+/// a pinned effort silently for the xai identity; now it maps `effort`
+/// (low/medium/high, finer tiers collapsing to high) and honors an explicit
+/// on/off, gated to the xai identity exactly like `reasoning` is gated to
+/// openrouter. This is the reasoning-parity-matrix witness for `xai`.
+#[tokio::test]
+async fn xai_identity_maps_effort_to_reasoning_effort() {
+    let server = MockServer::start().await;
+    mock_ok(&server).await;
+
+    let provider = ZaiProvider::new(ApiKey::new("xai-test"), "grok-4")
+        .with_base_url(server.uri())
+        .with_identity("xai", "xAI");
+    let req = |reasoning, effort| CompletionRequest {
+        messages: vec![CompletionMessage::user("hi")],
+        max_output_tokens: None,
+        temperature: None,
+        effort,
+        tools: vec![],
+        reasoning,
+        params: None,
+    };
+    // Pinned effort (reasoning not suppressed) → the mapped level.
+    provider
+        .complete(req(None, Some(ReasoningEffort::Low)))
+        .await
+        .expect("low");
+    provider
+        .complete(req(None, Some(ReasoningEffort::Medium)))
+        .await
+        .expect("medium");
+    // Max collapses to "high" — the top tier Grok models across the fleet.
+    provider
+        .complete(req(None, Some(ReasoningEffort::Max)))
+        .await
+        .expect("max");
+    // Explicit off wins even over a pinned effort → field suppressed (xAI's
+    // `none` would 400 on always-reasoning Grok models).
+    provider
+        .complete(req(Some(false), Some(ReasoningEffort::High)))
+        .await
+        .expect("off");
+    // Bare on with no effort → the middle tier, mirroring the OpenAI adapter.
+    provider.complete(req(Some(true), None)).await.expect("on");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    let bodies: Vec<String> = requests
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert!(
+        bodies[0].contains("\"reasoning_effort\":\"low\""),
+        "{}",
+        bodies[0]
+    );
+    assert!(
+        bodies[1].contains("\"reasoning_effort\":\"medium\""),
+        "{}",
+        bodies[1]
+    );
+    assert!(
+        bodies[2].contains("\"reasoning_effort\":\"high\""),
+        "{}",
+        bodies[2]
+    );
+    assert!(!bodies[3].contains("reasoning_effort"), "{}", bodies[3]);
+    assert!(
+        bodies[4].contains("\"reasoning_effort\":\"medium\""),
+        "{}",
+        bodies[4]
+    );
+    // xAI never speaks GLM's `thinking` object or OpenRouter's `reasoning`.
+    assert!(!bodies[0].contains("thinking"), "{}", bodies[0]);
+    assert!(
+        !bodies[0].contains("\"reasoning\":"),
+        "{}",
+        bodies[0]
+    );
+}
+
+/// The byte-stability contract for `reasoning_effort`: the field is xai-only,
+/// so the default Z.ai identity must NEVER send it — not even when the caller
+/// pins an effort. (GLM speaks its own `thinking` on/off switch, covered by
+/// [`zai_identity_maps_reasoning_to_glm_thinking_object`]; effort has no dial
+/// there.) Guards the same "the omission stays deliberate" invariant the
+/// parity matrix exists to enforce.
+#[tokio::test]
+async fn zai_identity_never_sends_reasoning_effort_even_when_pinned() {
+    let server = MockServer::start().await;
+    mock_ok(&server).await;
+
+    let provider =
+        ZaiProvider::new(ApiKey::new("sk-test-zai"), "glm-5.2").with_base_url(server.uri());
+    provider
+        .complete(CompletionRequest {
+            messages: vec![CompletionMessage::user("hi")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: Some(ReasoningEffort::Max),
+            tools: vec![],
+            reasoning: Some(true),
+            params: None,
+        })
+        .await
+        .expect("should succeed");
+
+    let body = first_request_body(&server).await;
+    assert!(!body.contains("reasoning_effort"), "{body}");
 }
