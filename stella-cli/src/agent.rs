@@ -196,18 +196,23 @@ async fn run_pipeline_one_shot(
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
         let is_text = format == OutputFormat::Text;
-        let pipeline_config = PipelineConfig {
-            engine: pipeline_engine_config_for(cfg, &wiring.worker_model),
-            role_overrides: wiring.role_overrides.clone(),
-            headless: !is_text,
-            headless_bypass_scope_review: !is_text,
-            // `--test-command` arms the deterministic verify ladder: the
-            // fail→pass flip oracle and SubmitFast/Revise decisions all key
-            // off it. Left unset, every verification escalates to the model
-            // judge.
-            test_command: test_command.map(str::to_string),
-            ..Default::default()
-        };
+        // Stdio approval requires a text-safe renderer plus two terminal
+        // handles: stdin must accept the decision and stdout must present the
+        // prompt. Redirected text is still rendered as text, but is headless
+        // and fails closed at scope review.
+        let approval_capability =
+            if is_text && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                PipelineApprovalCapability::Stdio
+            } else {
+                PipelineApprovalCapability::Unavailable
+            };
+        let mut pipeline_config = pipeline_config_for_approval_capability(
+            cfg,
+            approval_capability,
+            test_command,
+            &wiring.worker_model,
+        );
+        pipeline_config.role_overrides = wiring.role_overrides.clone();
 
         let stdio_gate = StdioApprovalGate;
         let no_recall = NoContextRecall;

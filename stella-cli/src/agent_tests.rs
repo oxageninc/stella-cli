@@ -435,10 +435,12 @@ async fn untrusted_project_custom_tools_are_absent_from_the_runtime_surface() {
 fn non_tty_text_output_is_headless_without_losing_text_rendering() {
     let cfg = cfg_for("zai");
     let format = OutputFormat::Text;
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
     let non_tty = pipeline_config_for_approval_capability(
         &cfg,
         PipelineApprovalCapability::Unavailable,
         None,
+        &model_ref,
     );
     assert!(
         non_tty.headless,
@@ -450,8 +452,12 @@ fn non_tty_text_output_is_headless_without_losing_text_rendering() {
     );
     assert_eq!(format, OutputFormat::Text, "rendering remains text");
 
-    let interactive =
-        pipeline_config_for_approval_capability(&cfg, PipelineApprovalCapability::Stdio, None);
+    let interactive = pipeline_config_for_approval_capability(
+        &cfg,
+        PipelineApprovalCapability::Stdio,
+        None,
+        &model_ref,
+    );
     assert!(
         !interactive.headless,
         "an explicit interactive approval host retains scope review"
