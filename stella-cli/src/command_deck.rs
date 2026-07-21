@@ -4177,7 +4177,7 @@ async fn run_lead_turn(
     if let Some((store, id)) = &execution {
         let (outcome_label, cost) = match &outcome {
             TurnOutcome::Completed { cost_usd, .. } => ("completed", *cost_usd),
-            TurnOutcome::Aborted { .. } => ("aborted", 0.0),
+            TurnOutcome::Aborted { cost_usd, .. } => ("aborted", *cost_usd),
         };
         if !agent::record_execution_end(store, *id, registry, outcome_label, cost) {
             let _ = in_tx.send(Inbound::Event {
@@ -4205,7 +4205,7 @@ async fn run_lead_turn(
 
     match outcome {
         TurnOutcome::Completed { .. } => Ok(()),
-        TurnOutcome::Aborted { reason } => Err(reason),
+        TurnOutcome::Aborted { reason, .. } => Err(reason),
     }
 }
 
@@ -4353,6 +4353,7 @@ async fn run_lead_pipeline_turn(
             Ok(outcome) => {
                 let label = match outcome.status {
                     PipelineStatus::Completed => "completed",
+                    PipelineStatus::VerificationFailed { .. } => "verification_failed",
                     PipelineStatus::Aborted { .. } => "aborted",
                 };
                 (label, outcome.total_cost_usd)
@@ -4386,6 +4387,9 @@ async fn run_lead_pipeline_turn(
     match result {
         Ok(outcome) => match outcome.status {
             PipelineStatus::Completed => Ok(()),
+            PipelineStatus::VerificationFailed { verdict } => {
+                Err(format!("verification failed: {}", verdict.summary))
+            }
             PipelineStatus::Aborted { reason } => Err(reason),
         },
         Err(e) => Err(e.to_string()),

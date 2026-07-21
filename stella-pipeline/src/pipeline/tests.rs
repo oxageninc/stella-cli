@@ -1522,3 +1522,5 @@ async fn best_of_n_without_a_port_degrades_to_the_shared_tree_with_a_warning() {
         "shared-tree degradation must be loud"
     );
 }
+
+mod task4;

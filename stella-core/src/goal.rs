@@ -138,7 +138,7 @@ impl Engine<'_> {
             budget.begin_turn();
             match self.run_turn(messages, budget, events).await {
                 TurnOutcome::Completed { .. } => {}
-                TurnOutcome::Aborted { reason } => {
+                TurnOutcome::Aborted { reason, .. } => {
                     return GoalOutcome::Unmet {
                         rounds: round,
                         reason: format!("working turn aborted: {reason}"),
@@ -269,7 +269,7 @@ impl Engine<'_> {
                 });
                 Ok((verdict, cost_usd))
             }
-            TurnOutcome::Aborted { reason } => Err(reason),
+            TurnOutcome::Aborted { reason, .. } => Err(reason),
         }
     }
 }

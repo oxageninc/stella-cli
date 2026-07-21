@@ -498,8 +498,8 @@ async fn run_worker(
         RacedTurn::Outcome(stella_core::TurnOutcome::Completed { cost_usd, .. }) => {
             ("completed", cost_usd, WorkerEnd::Done)
         }
-        RacedTurn::Outcome(stella_core::TurnOutcome::Aborted { reason }) => {
-            ("aborted", 0.0, WorkerEnd::Failed(reason))
+        RacedTurn::Outcome(stella_core::TurnOutcome::Aborted { reason, cost_usd }) => {
+            ("aborted", cost_usd, WorkerEnd::Failed(reason))
         }
         RacedTurn::Stopped => ("cancelled", 0.0, WorkerEnd::Stopped),
     };

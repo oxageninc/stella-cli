@@ -598,6 +598,10 @@ async fn run_task(
         match raced {
             Raced::Outcome(Ok(outcome)) => match outcome.status {
                 PipelineStatus::Completed => (truncate(&outcome.final_text), true),
+                PipelineStatus::VerificationFailed { verdict } => (
+                    truncate(&format!("verification failed: {}", verdict.summary)),
+                    false,
+                ),
                 PipelineStatus::Aborted { reason } => (truncate(&reason), false),
             },
             Raced::Outcome(Err(e)) => (truncate(&e.to_string()), false),
@@ -628,7 +632,7 @@ async fn run_task(
         };
         match raced {
             Raced::Outcome(TurnOutcome::Completed { text, .. }) => (truncate(&text), true),
-            Raced::Outcome(TurnOutcome::Aborted { reason }) => (truncate(&reason), false),
+            Raced::Outcome(TurnOutcome::Aborted { reason, .. }) => (truncate(&reason), false),
             Raced::Stopped => (STOPPED.to_string(), false),
         }
     };

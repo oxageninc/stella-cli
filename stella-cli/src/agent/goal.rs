@@ -593,11 +593,21 @@ async fn run_goal_pipeline_turn(
             match pipeline.run(&round_goal, messages, budget).await {
                 Ok(outcome) => {
                     total_cost_usd += outcome.total_cost_usd;
-                    if let PipelineStatus::Aborted { reason } = outcome.status {
-                        result = Some(Err(format!(
-                            "goal not met: working round aborted: {reason}"
-                        )));
-                        break;
+                    match outcome.status {
+                        PipelineStatus::Completed => {}
+                        PipelineStatus::VerificationFailed { verdict } => {
+                            result = Some(Err(format!(
+                                "goal not met: verification failed: {}",
+                                verdict.summary
+                            )));
+                            break;
+                        }
+                        PipelineStatus::Aborted { reason } => {
+                            result = Some(Err(format!(
+                                "goal not met: working round aborted: {reason}"
+                            )));
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
@@ -678,13 +688,16 @@ async fn run_goal_pipeline_turn(
 
     drop(tx);
     let _ = renderer.await;
+    // The shared guard is the settled ledger, including a judge turn that
+    // aborted after spending and therefore returned no `judge_cost` value.
+    let total_cost_usd = budget.session_spent_usd();
     let files = registry.files_touched();
     if let Some((store, id)) = &execution {
-        let (outcome_label, _) = match &goal_result {
-            Ok(()) => ("goal_met", 0.0),
-            Err(_) => ("goal_unmet", 0.0),
+        let outcome_label = match &goal_result {
+            Ok(()) => "goal_met",
+            Err(_) => "goal_unmet",
         };
-        if !record_execution_end(store, *id, registry, outcome_label, 0.0) {
+        if !record_execution_end(store, *id, registry, outcome_label, total_cost_usd) {
             warn_store_write_failed(
                 "the audit record (files touched / memory citations / outcome)",
             );

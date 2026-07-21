@@ -51,11 +51,13 @@ use stella_context::EpisodeOutcome;
 
 mod engine;
 mod goal;
+mod outcome;
 mod prompt;
 mod tools;
 
 pub(crate) use engine::*;
 pub(crate) use goal::*;
+use outcome::*;
 pub(crate) use prompt::*;
 pub(crate) use tools::*;
 
@@ -245,13 +247,10 @@ async fn run_pipeline_one_shot(
     let files = registry.files_touched();
     if let Some((store, id)) = &execution {
         let (outcome_label, cost) = match &result {
-            Ok(outcome) => {
-                let label = match outcome.status {
-                    PipelineStatus::Completed => "completed",
-                    PipelineStatus::Aborted { .. } => "aborted",
-                };
-                (label, outcome.total_cost_usd)
-            }
+            Ok(outcome) => (
+                pipeline_status_label(&outcome.status),
+                outcome.total_cost_usd,
+            ),
             Err(_) => ("error", 0.0),
         };
         if !record_execution_end(store, *id, &registry, outcome_label, cost) {
@@ -267,10 +266,7 @@ async fn run_pipeline_one_shot(
         && (turn_warrants_reflection(&messages) || !files.is_empty())
     {
         let episode_outcome = match &result {
-            Ok(outcome) => match outcome.status {
-                PipelineStatus::Completed => EpisodeOutcome::Success,
-                PipelineStatus::Aborted { .. } => EpisodeOutcome::Aborted,
-            },
+            Ok(outcome) => pipeline_episode_outcome(&outcome.status),
             Err(_) => EpisodeOutcome::Failure,
         };
         m.record_episode(prompt, episode_outcome, &files, started_unix)
@@ -314,7 +310,10 @@ async fn run_pipeline_one_shot(
                 &*provider,
                 &reflect_transcript,
                 format != OutputFormat::Text,
-                result.is_ok(),
+                matches!(
+                    &result,
+                    Ok(outcome) if matches!(outcome.status, PipelineStatus::Completed)
+                ),
             )
             .await;
         surface_reflection(&report, format);
@@ -348,14 +347,8 @@ async fn run_pipeline_one_shot(
     match &result {
         Ok(outcome) => {
             if format == OutputFormat::Json {
-                let status_str = match outcome.status {
-                    PipelineStatus::Completed => "completed",
-                    PipelineStatus::Aborted { .. } => "aborted",
-                };
-                let reason_str = match &outcome.status {
-                    PipelineStatus::Completed => None,
-                    PipelineStatus::Aborted { reason } => Some(reason.clone()),
-                };
+                let status_str = pipeline_status_label(&outcome.status);
+                let reason_str = pipeline_failure_reason(&outcome.status);
                 let summary = serde_json::json!({
                     "status": status_str,
                     "text": outcome.final_text,
@@ -390,10 +383,7 @@ async fn run_pipeline_one_shot(
                 println!();
             }
 
-            match &outcome.status {
-                PipelineStatus::Completed => Ok(()),
-                PipelineStatus::Aborted { reason } => Err(reason.clone()),
-            }
+            pipeline_status_result(&outcome.status)
         }
         Err(e) => Err(e.to_string()),
     }
@@ -1844,7 +1834,7 @@ async fn run_turn(
     if let Some((store, id)) = &execution {
         let (outcome_label, cost) = match &outcome {
             TurnOutcome::Completed { cost_usd, .. } => ("completed", *cost_usd),
-            TurnOutcome::Aborted { .. } => ("aborted", 0.0),
+            TurnOutcome::Aborted { cost_usd, .. } => ("aborted", *cost_usd),
         };
         if !record_execution_end(store, *id, registry, outcome_label, cost) {
             warn_store_write_failed(
@@ -1861,7 +1851,9 @@ async fn run_turn(
             TurnOutcome::Completed { text, cost_usd } => {
                 ("completed", Some(text.clone()), Some(*cost_usd), None)
             }
-            TurnOutcome::Aborted { reason } => ("aborted", None, None, Some(reason.clone())),
+            TurnOutcome::Aborted { reason, cost_usd } => {
+                ("aborted", None, Some(*cost_usd), Some(reason.clone()))
+            }
         };
         let summary = serde_json::json!({
             "status": status,
@@ -1895,7 +1887,7 @@ async fn run_turn(
             }
             Ok(())
         }
-        TurnOutcome::Aborted { reason } => Err(reason),
+        TurnOutcome::Aborted { reason, .. } => Err(reason),
     }
 }
 

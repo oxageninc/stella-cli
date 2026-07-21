@@ -41,7 +41,7 @@ use std::time::Duration;
 use stella_core::hooks::{HookRunner, Hooks};
 use stella_core::retry::{RetryPolicy, Sleeper, retry_with_backoff};
 use stella_core::router::{FallbackInfo, RouterError};
-use stella_core::{BudgetGuard, BudgetOutcome, Engine, EngineConfig, Router, TurnOutcome};
+use stella_core::{BudgetGuard, Engine, EngineConfig, Router, TurnOutcome};
 use stella_protocol::{
     AgentEvent, CompletionMessage, CompletionRequest, CompletionResult, ContextFrameRef,
     JudgeEvidence, ModelRef, Provider, ProviderShare, Role, StageKind,
@@ -69,16 +69,13 @@ use crate::witness::{
     Witness, parse_witness_command, tampered_paths, witness_prompt, witness_repair_prompt,
     witness_watchlist,
 };
-
-/// A minimal default system prompt, used only when the caller hands `run` an
-/// empty message vector. Real callers seed their own stable system prefix
-/// (which becomes the cached prompt prefix, L-E8).
+mod stage_budget;
+use stage_budget::{PipelineBudgetAbort, aborted_before_execute, budget_abort, record_and_tick};
+/// Minimal fallback when the caller supplies no stable system prefix.
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a precise, careful software engineering agent. Make the smallest correct change.";
 
-/// The witness author's system prompt — small and fixed. The task prompt
-/// (goal + recall + repo structure, split context like the planner's) is
-/// [`witness_prompt`].
+/// Small fixed system prompt for the independent witness author.
 const WITNESS_SYSTEM_PROMPT: &str = "You are a precise test author. You write minimal failing tests that pin down intended \
      behavior. You never modify production code and never fix the problem yourself.";
 
@@ -262,13 +259,16 @@ impl Verdict {
 /// How a pipeline run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipelineStatus {
-    /// The staged flow ran to completion. Inspect [`PipelineOutcome::verdict`]
-    /// for whether the work verified — a `Completed` run with a failed verdict
-    /// means the revise budget was exhausted without passing.
     Completed,
+    /// Verification remained red after the revision budget was exhausted.
+    VerificationFailed {
+        verdict: Verdict,
+    },
     /// The run ended early: a step aborted (budget/loop/step-cap), or the user
     /// aborted at scope review.
-    Aborted { reason: String },
+    Aborted {
+        reason: String,
+    },
 }
 
 /// The result of one [`Pipeline::run`].
@@ -502,6 +502,17 @@ impl<'a> Pipeline<'a> {
         let (task_class, frames) =
             tokio::join!(self.triage(goal, budget, &mut total_cost), recall_future);
         self.emit_context_recall(&frames);
+        let task_class = match task_class {
+            Ok(task_class) => task_class,
+            Err(abort) => {
+                return Ok(aborted_before_execute(
+                    &self.events,
+                    resolve_task_class(None, goal),
+                    total_cost,
+                    &abort.reason,
+                ));
+            }
+        };
         // The volatile recall+goal message rides AFTER the stable system
         // prefix (L-E8) — see assemble_user_message.
         messages.push(CompletionMessage::user(assemble_user_message(
@@ -511,10 +522,20 @@ impl<'a> Pipeline<'a> {
         // --- 3. Plan (skipped for simple/single-task). ---------------------
         let plan: Option<Vec<PlanStep>> = if task_class.plans() {
             let repo_structure = self.repo.structure_summary().await;
-            Some(
-                self.plan_stage(goal, &frames, &repo_structure, budget, &mut total_cost)
-                    .await,
-            )
+            match self
+                .plan_stage(goal, &frames, &repo_structure, budget, &mut total_cost)
+                .await
+            {
+                Ok(plan) => Some(plan),
+                Err(abort) => {
+                    return Ok(aborted_before_execute(
+                        &self.events,
+                        task_class,
+                        total_cost,
+                        &abort.reason,
+                    ));
+                }
+            }
         } else {
             None
         };
@@ -525,7 +546,8 @@ impl<'a> Pipeline<'a> {
                 Some(steps) => Some(steps),
                 None => {
                     // User aborted (or trimmed to nothing) at the gate.
-                    return Ok(self.aborted_before_execute(
+                    return Ok(aborted_before_execute(
+                        &self.events,
                         task_class,
                         total_cost,
                         "aborted at scope review",
@@ -539,9 +561,20 @@ impl<'a> Pipeline<'a> {
         // After scope review (never author a witness for a plan the user may
         // abort), before the candidate loop (one witness is the shared
         // yardstick every candidate is measured by).
-        let witness = self
+        let witness = match self
             .witness_stage(goal, &frames, task_class, budget, &mut total_cost)
-            .await;
+            .await
+        {
+            Ok(witness) => witness,
+            Err(abort) => {
+                return Ok(aborted_before_execute(
+                    &self.events,
+                    task_class,
+                    total_cost,
+                    &abort.reason,
+                ));
+            }
+        };
 
         // --- 5. Execute + verify (single-shot or best-of-N). ---------------
         let worker = match self.resolve_provider(Role::Worker) {
@@ -618,8 +651,14 @@ impl<'a> Pipeline<'a> {
             model: worker_model_label,
             cost_usd: total_cost,
         });
+        let status = match &best.verdict {
+            Some(verdict) if !verdict.passed => PipelineStatus::VerificationFailed {
+                verdict: verdict.clone(),
+            },
+            _ => PipelineStatus::Completed,
+        };
         Ok(PipelineOutcome {
-            status: PipelineStatus::Completed,
+            status,
             task_class,
             final_text: best.final_text,
             total_cost_usd: total_cost,
@@ -633,7 +672,12 @@ impl<'a> Pipeline<'a> {
     // Stage: triage
     // ------------------------------------------------------------------
 
-    async fn triage(&self, goal: &str, budget: &mut BudgetGuard, total: &mut f64) -> TaskClass {
+    async fn triage(
+        &self,
+        goal: &str,
+        budget: &mut BudgetGuard,
+        total: &mut f64,
+    ) -> Result<TaskClass, PipelineBudgetAbort> {
         self.emit(AgentEvent::Stage {
             name: StageKind::Triage,
         });
@@ -641,7 +685,7 @@ impl<'a> Pipeline<'a> {
             Ok(r) => r,
             // Triage resolution failure is soft: fall through to the full path
             // via the deterministic floor. Never fail the run on triage.
-            Err(_) => return resolve_task_class(None, goal),
+            Err(_) => return Ok(resolve_task_class(None, goal)),
         };
         if let Some(fb) = &resolved.fallback {
             self.emit_fallback(fb);
@@ -660,12 +704,13 @@ impl<'a> Pipeline<'a> {
         let model_class = match timeout(self.config.triage_latency_ceiling, call).await {
             Ok(Ok(result)) => {
                 *total += result.cost_usd;
-                self.record_and_tick(budget, result.cost_usd);
-                classify_triage_response(&result.text)
+                let model_class = classify_triage_response(&result.text);
+                record_and_tick(budget, result.cost_usd, &self.events)?;
+                model_class
             }
             Ok(Err(_)) | Err(_) => None,
         };
-        resolve_task_class(model_class, goal)
+        Ok(resolve_task_class(model_class, goal))
     }
 
     // ------------------------------------------------------------------
@@ -679,7 +724,7 @@ impl<'a> Pipeline<'a> {
         repo_structure: &str,
         budget: &mut BudgetGuard,
         total: &mut f64,
-    ) -> Vec<PlanStep> {
+    ) -> Result<Vec<PlanStep>, PipelineBudgetAbort> {
         self.emit(AgentEvent::Stage {
             name: StageKind::Plan,
         });
@@ -687,7 +732,7 @@ impl<'a> Pipeline<'a> {
 
         let resolved = match self.resolve_provider(Role::Plan) {
             Ok(r) => r,
-            Err(_) => return fallback_plan(),
+            Err(_) => return Ok(fallback_plan()),
         };
         if let Some(fb) = &resolved.fallback {
             self.emit_fallback(fb);
@@ -706,13 +751,13 @@ impl<'a> Pipeline<'a> {
             .await
         {
             Ok(r) => r,
-            Err(_) => return fallback_plan(),
+            Err(_) => return Ok(fallback_plan()),
         };
         *total += result.cost_usd;
-        self.record_and_tick(budget, result.cost_usd);
+        record_and_tick(budget, result.cost_usd, &self.events)?;
 
         if let Some(steps) = parse_plan(&result.text) {
-            return steps;
+            return Ok(steps);
         }
 
         // One bounded JSON-repair retry (L-V2), deterministic (no retry-hang).
@@ -726,15 +771,15 @@ impl<'a> Pipeline<'a> {
             .await
         {
             *total += repair.cost_usd;
-            self.record_and_tick(budget, repair.cost_usd);
+            record_and_tick(budget, repair.cost_usd, &self.events)?;
             if let Some(steps) = parse_plan(&repair.text) {
-                return steps;
+                return Ok(steps);
             }
         }
 
         // Degrade to a single-step plan rather than failing — a planner that
         // won't produce a parseable plan must still let the work proceed.
-        fallback_plan()
+        Ok(fallback_plan())
     }
 
     // ------------------------------------------------------------------
@@ -1086,7 +1131,10 @@ impl<'a> Pipeline<'a> {
                     state.final_text = text;
                     *total += cost_usd;
                 }
-                TurnOutcome::Aborted { reason } => return Err(reason),
+                TurnOutcome::Aborted { reason, cost_usd } => {
+                    *total += cost_usd;
+                    return Err(reason);
+                }
             }
         } else {
             let n = steps.len();
@@ -1105,7 +1153,10 @@ impl<'a> Pipeline<'a> {
                         state.final_text = text;
                         *total += cost_usd;
                     }
-                    TurnOutcome::Aborted { reason } => return Err(reason),
+                    TurnOutcome::Aborted { reason, cost_usd } => {
+                        *total += cost_usd;
+                        return Err(reason);
+                    }
                 }
             }
         }
@@ -1200,9 +1251,8 @@ impl<'a> Pipeline<'a> {
                     // worker — spend one judge call on course-correction
                     // (event-triggered, never a fixed midpoint checkpoint).
                     let mut reason = evidence.summary.clone();
-                    if self.config.distress_guidance
-                        && state.revisions >= 1
-                        && let Some(guidance) = self
+                    if self.config.distress_guidance && state.revisions >= 1 {
+                        match self
                             .judge_guidance(
                                 goal,
                                 &state.diff_text,
@@ -1211,9 +1261,16 @@ impl<'a> Pipeline<'a> {
                                 total,
                             )
                             .await
-                    {
-                        reason.push_str("\n\nIndependent reviewer course-correction:\n");
-                        reason.push_str(&guidance);
+                        {
+                            Ok(Some(guidance)) => {
+                                reason.push_str("\n\nIndependent reviewer course-correction:\n");
+                                reason.push_str(&guidance);
+                            }
+                            Ok(None) => {}
+                            Err(abort) => {
+                                return CandidateResult::aborted(state.messages, abort.reason);
+                            }
+                        }
                     }
                     if let Err(reason) = self
                         .revise_candidate(engine, surface, budget, &reason, total, &mut state)
@@ -1239,7 +1296,7 @@ impl<'a> Pipeline<'a> {
                             tampered.join(", ")
                         ));
                     }
-                    let verdict = self
+                    let verdict = match self
                         .judge(
                             goal,
                             &state.diff_text,
@@ -1248,7 +1305,13 @@ impl<'a> Pipeline<'a> {
                             budget,
                             total,
                         )
-                        .await;
+                        .await
+                    {
+                        Ok(verdict) => verdict,
+                        Err(abort) => {
+                            return CandidateResult::aborted(state.messages, abort.reason);
+                        }
+                    };
                     let evidence = model_verdict_evidence(&verdict);
                     self.emit(AgentEvent::JudgeVerdict {
                         passed: verdict.passed,
@@ -1367,7 +1430,10 @@ impl<'a> Pipeline<'a> {
                 *final_text = text;
                 *total += cost_usd;
             }
-            TurnOutcome::Aborted { reason } => return Err(reason),
+            TurnOutcome::Aborted { reason, cost_usd } => {
+                *total += cost_usd;
+                return Err(reason);
+            }
         }
         let (dl, dt) = self.gather_diff(surface, untracked_before).await;
         self.emit(AgentEvent::Stage {
@@ -1398,12 +1464,12 @@ impl<'a> Pipeline<'a> {
         task_class: TaskClass,
         budget: &mut BudgetGuard,
         total: &mut f64,
-    ) -> Option<Witness> {
+    ) -> Result<Option<Witness>, PipelineBudgetAbort> {
         if self.config.test_command.is_some()
             || !self.config.witness_writer
             || !task_class.verifies_unconditionally()
         {
-            return None;
+            return Ok(None);
         }
         self.emit(AgentEvent::Stage {
             name: StageKind::Witness,
@@ -1413,7 +1479,7 @@ impl<'a> Pipeline<'a> {
             .or_else(|_| self.resolve_provider(Role::Worker))
         {
             Ok(r) => r,
-            Err(_) => return None,
+            Err(_) => return Ok(None),
         };
         if let Some(fb) = &resolved.fallback {
             self.emit_fallback(fb);
@@ -1446,12 +1512,16 @@ impl<'a> Pipeline<'a> {
                 *total += cost_usd;
                 text
             }
-            TurnOutcome::Aborted { reason } => {
+            TurnOutcome::Aborted { reason, cost_usd } => {
+                *total += cost_usd;
+                if let Some(abort) = budget_abort(budget.evaluate()) {
+                    return Err(abort);
+                }
                 self.warn(format!(
                     "witness author turn aborted ({reason}); verification falls back to the \
                      model judge"
                 ));
-                return None;
+                return Ok(None);
             }
         };
         let Some(mut command) = parse_witness_command(&text) else {
@@ -1460,7 +1530,7 @@ impl<'a> Pipeline<'a> {
                  the model judge"
                     .to_string(),
             );
-            return None;
+            return Ok(None);
         };
 
         // The witness must fail on the unmodified code — only a fail→pass
@@ -1476,12 +1546,16 @@ impl<'a> Pipeline<'a> {
                     *total += cost_usd;
                     text
                 }
-                TurnOutcome::Aborted { reason } => {
+                TurnOutcome::Aborted { reason, cost_usd } => {
+                    *total += cost_usd;
+                    if let Some(abort) = budget_abort(budget.evaluate()) {
+                        return Err(abort);
+                    }
                     self.warn(format!(
                         "witness repair turn aborted ({reason}); verification falls back to \
                          the model judge"
                     ));
-                    return None;
+                    return Ok(None);
                 }
             };
             command = parse_witness_command(&repaired).unwrap_or(command);
@@ -1491,15 +1565,15 @@ impl<'a> Pipeline<'a> {
                      discarded; verification falls back to the model judge"
                         .to_string(),
                 );
-                return None;
+                return Ok(None);
             }
         }
 
         let after = self.repo_status.untracked_fingerprints().await;
-        Some(Witness {
+        Ok(Some(Witness {
             command,
             files: witness_watchlist(&before, &after),
-        })
+        }))
     }
 
     // ------------------------------------------------------------------
@@ -1517,8 +1591,11 @@ impl<'a> Pipeline<'a> {
         evidence_summary: &str,
         budget: &mut BudgetGuard,
         total: &mut f64,
-    ) -> Option<String> {
-        let resolved = self.resolve_provider(Role::Judge).ok()?;
+    ) -> Result<Option<String>, PipelineBudgetAbort> {
+        let resolved = match self.resolve_provider(Role::Judge) {
+            Ok(resolved) => resolved,
+            Err(_) => return Ok(None),
+        };
         if let Some(fb) = &resolved.fallback {
             self.emit_fallback(fb);
         }
@@ -1537,11 +1614,15 @@ impl<'a> Pipeline<'a> {
         {
             Ok(result) => {
                 *total += result.cost_usd;
-                self.record_and_tick(budget, result.cost_usd);
+                record_and_tick(budget, result.cost_usd, &self.events)?;
                 let text = result.text.trim().to_string();
-                if text.is_empty() { None } else { Some(text) }
+                if text.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(text))
+                }
             }
-            Err(_) => None,
+            Err(_) => Ok(None),
         }
     }
 
@@ -1553,14 +1634,14 @@ impl<'a> Pipeline<'a> {
         inputs: &LadderInputs,
         budget: &mut BudgetGuard,
         total: &mut f64,
-    ) -> ModelJudgeVerdict {
+    ) -> Result<ModelJudgeVerdict, PipelineBudgetAbort> {
         self.emit(AgentEvent::Stage {
             name: StageKind::Judge,
         });
         let resolved = match self.resolve_provider(Role::Judge) {
             Ok(r) => r,
             // Judge unresolvable → conservative heuristic verdict (L-E11).
-            Err(_) => return heuristic_fallback(inputs),
+            Err(_) => return Ok(heuristic_fallback(inputs)),
         };
         if let Some(fb) = &resolved.fallback {
             self.emit_fallback(fb);
@@ -1580,10 +1661,12 @@ impl<'a> Pipeline<'a> {
         {
             Ok(result) => {
                 *total += result.cost_usd;
-                self.record_and_tick(budget, result.cost_usd);
-                parse_judge_response(&result.text).unwrap_or_else(|| heuristic_fallback(inputs))
+                let verdict = parse_judge_response(&result.text)
+                    .unwrap_or_else(|| heuristic_fallback(inputs));
+                record_and_tick(budget, result.cost_usd, &self.events)?;
+                Ok(verdict)
             }
-            Err(_) => heuristic_fallback(inputs),
+            Err(_) => Ok(heuristic_fallback(inputs)),
         }
     }
 
@@ -1765,16 +1848,6 @@ impl<'a> Pipeline<'a> {
         (lines, text)
     }
 
-    fn record_and_tick(&self, budget: &mut BudgetGuard, cost_usd: f64) -> BudgetOutcome {
-        let outcome = budget.record_spend(cost_usd);
-        self.emit(AgentEvent::BudgetTick {
-            spent_usd: budget.spent_usd(),
-            limit_usd: budget.turn_limit_usd(),
-            mode: budget.mode(),
-        });
-        outcome
-    }
-
     fn emit_context_recall(&self, frames: &[RecalledFrame]) {
         if frames.is_empty() {
             return;
@@ -1813,29 +1886,6 @@ impl<'a> Pipeline<'a> {
             to: fb.to.clone(),
             reason: fb.reason.clone(),
         });
-    }
-
-    fn aborted_before_execute(
-        &self,
-        task_class: TaskClass,
-        total_cost: f64,
-        reason: &str,
-    ) -> PipelineOutcome {
-        self.emit(AgentEvent::Error {
-            message: reason.to_string(),
-            retryable: false,
-        });
-        PipelineOutcome {
-            status: PipelineStatus::Aborted {
-                reason: reason.to_string(),
-            },
-            task_class,
-            final_text: String::new(),
-            total_cost_usd: total_cost,
-            verdict: None,
-            revisions: 0,
-            candidates_run: 0,
-        }
     }
 
     /// A non-fatal degradation the user should see (witness discarded,
