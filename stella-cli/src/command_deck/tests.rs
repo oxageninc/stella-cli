@@ -1,3 +1,7 @@
+use super::skills::{
+    build_skill_creation_prompt, extract_skill_md, extract_skill_md_from_use, parse_installs_count,
+    parse_skill_hits, rank_hits,
+};
 use super::*;
 
 #[test]
