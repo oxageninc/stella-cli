@@ -585,6 +585,14 @@ struct ZaiUsage {
     /// call, only it knows which upstream (at which price) served it.
     #[serde(default)]
     cost: Option<f64>,
+    /// DeepSeek's native cache-hit field: the platform reports prompt-cache
+    /// hits as TOP-LEVEL `prompt_cache_hit_tokens` (paired with
+    /// `prompt_cache_miss_tokens`; hits + misses = `prompt_tokens`) and does
+    /// NOT send an OpenAI-style `prompt_tokens_details` object. Absent on
+    /// every other endpoint this adapter serves, where `serde(default)`
+    /// keeps it 0.
+    #[serde(default)]
+    prompt_cache_hit_tokens: u64,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -904,7 +912,14 @@ async fn aggregate_zai_stream(
                 usage.input_tokens = u.prompt_tokens;
                 usage.output_tokens = u.completion_tokens;
                 let details = u.prompt_tokens_details.unwrap_or_default();
-                usage.cached_input_tokens = details.cached_tokens;
+                // Two wire spellings for the same fact: the OpenAI-compatible
+                // details object, or DeepSeek's native top-level field — take
+                // whichever the server spoke (never both on one endpoint).
+                usage.cached_input_tokens = if details.cached_tokens > 0 {
+                    details.cached_tokens
+                } else {
+                    u.prompt_cache_hit_tokens
+                };
                 usage.cache_write_tokens = details.cache_write_tokens;
                 if u.cost.is_some() {
                     reported_cost_usd = u.cost;

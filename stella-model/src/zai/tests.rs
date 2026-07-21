@@ -1007,6 +1007,46 @@ async fn complete_surfaces_cache_write_tokens() {
     assert_eq!(result.usage.cache_write_tokens, 600);
 }
 
+/// DeepSeek's native endpoint reports cache hits as TOP-LEVEL
+/// `prompt_cache_hit_tokens` and sends no OpenAI-style
+/// `prompt_tokens_details` object at all. Dropping the native field (the
+/// prior behavior) pinned the cache stat at 0% and billed every cached
+/// token at the full input rate for every DeepSeek run — the same defect
+/// class as the OpenRouter CACHE-0% bug, one provider over.
+#[tokio::test]
+async fn deepseek_native_cache_hit_tokens_surface_as_cached_input() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":100,\"prompt_cache_hit_tokens\":300,\"prompt_cache_miss_tokens\":700}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = ZaiProvider::new(ApiKey::new("sk-ds-test"), "deepseek-chat")
+        .with_base_url(server.uri())
+        .with_identity("deepseek", "DeepSeek");
+    let result = provider
+        .complete(CompletionRequest {
+            messages: vec![CompletionMessage::user("hi")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+            reasoning: None,
+            params: None,
+        })
+        .await
+        .expect("should succeed");
+
+    assert_eq!(result.usage.input_tokens, 1000);
+    assert_eq!(result.usage.cached_input_tokens, 300);
+}
+
 #[tokio::test]
 async fn zai_identity_maps_reasoning_to_glm_thinking_object() {
     let server = MockServer::start().await;

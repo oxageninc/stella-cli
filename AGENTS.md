@@ -123,6 +123,20 @@ regardless of how good the feature is:
    *after* the stable prefix (see `stella-cli/src/agent.rs::build_system_prompt`
    and `stella-cli/src/memory.rs` for the L-E8 discipline).
 
+8. **Provider feature parity is declared, not assumed.** Providers diverge
+   in sneaky ways (Anthropic's prompt cache is explicit opt-in; DeepSeek
+   spells its cache-hit telemetry differently; only OpenRouter speaks the
+   normalized `reasoning` object). Any per-provider feature divergence is
+   recorded as a matrix in `stella-model/src/provider_parity.rs`, where each
+   provider id declares its posture and names the **witness test** proving
+   it on the wire. Tests enforce the matrix from both sides: `stella-cli`'s
+   config tests fail if a seeded provider lacks a row, and `stella-model`'s
+   parity tests fail if a row's witness test no longer exists. Adding a
+   provider — or a new divergent feature axis — means updating the matrix
+   in the same PR. Born from a real defect: OpenRouter ran Claude models
+   with ZERO prompt caching for months because nothing enforced the cache
+   axis.
+
 ---
 
 ## The definition of done: witness tests
