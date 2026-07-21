@@ -139,10 +139,11 @@ async fn run_pipeline_one_shot(
     let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let renderer = spawn_renderer(rx, format, execution.clone(), cfg.provider.id.to_string());
 
-    // Role wiring from `agent_engine_config`: per-role model pins (triage/
-    // judge), their adapters, and per-role request overrides. Notices are
-    // stderr diagnostics — stdout may be machine-readable JSON.
-    let wiring = resolve_engine_wiring(cfg, &model_ref);
+    // Role wiring from `agent_engine_config`: per-role model pins (worker/
+    // triage/judge), their adapters, and per-role request overrides. Notices
+    // are stderr diagnostics — stdout may be machine-readable JSON.
+    let configured = crate::config::discover_configured_providers();
+    let wiring = resolve_engine_wiring(cfg, &model_ref, &configured);
     for notice in &wiring.notices {
         eprintln!("  ! {notice}");
     }
@@ -180,7 +181,7 @@ async fn run_pipeline_one_shot(
 
         let is_text = format == OutputFormat::Text;
         let pipeline_config = PipelineConfig {
-            engine: pipeline_engine_config_for(cfg),
+            engine: pipeline_engine_config_for(cfg, &wiring.worker_model),
             role_overrides: wiring.role_overrides.clone(),
             headless: !is_text,
             headless_bypass_scope_review: !is_text,

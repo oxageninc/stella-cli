@@ -4273,10 +4273,11 @@ async fn run_lead_pipeline_turn(
         };
 
         let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
-        // Role wiring from `agent_engine_config`: triage/judge pins + their
-        // adapters + per-role request overrides. Notices land in the
+        // Role wiring from `agent_engine_config`: worker/triage/judge pins +
+        // their adapters + per-role request overrides. Notices land in the
         // transcript — stderr is invisible under the alternate screen.
-        let wiring = agent::resolve_engine_wiring(cfg, &model_ref);
+        let configured = crate::config::discover_configured_providers();
+        let wiring = agent::resolve_engine_wiring(cfg, &model_ref, &configured);
         for notice in &wiring.notices {
             let _ = tx.send(AgentEvent::Text {
                 delta: format!("! {notice}\n"),
@@ -4314,7 +4315,7 @@ async fn run_lead_pipeline_turn(
             steering: Some(steering),
         };
         let config = PipelineConfig {
-            engine: agent::pipeline_engine_config_for(cfg),
+            engine: agent::pipeline_engine_config_for(cfg, &wiring.worker_model),
             role_overrides: wiring.role_overrides.clone(),
             headless: true,
             headless_bypass_scope_review: true,
