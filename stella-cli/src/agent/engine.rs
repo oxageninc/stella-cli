@@ -74,16 +74,24 @@ pub(crate) fn pipeline_engine_config_for(cfg: &Config) -> EngineConfig {
 pub(crate) const HEADLESS_SCOPE_REVIEW_BYPASS: bool = false;
 pub(crate) const HEADLESS_APPROVAL_GATE: AlwaysAbortGate = AlwaysAbortGate;
 
-/// Build the one-shot pipeline config without treating output serialization
-/// as execution authority.
-pub(crate) fn pipeline_config_for_output(
+/// Approval port the one-shot host can actually service. This is explicit so
+/// output serialization cannot silently stand in for execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipelineApprovalCapability {
+    Stdio,
+    Unavailable,
+}
+
+/// Build the one-shot pipeline config from the host's approval capability.
+/// Rendering remains a separate concern owned by the event renderer.
+pub(crate) fn pipeline_config_for_approval_capability(
     cfg: &Config,
-    format: OutputFormat,
+    approval: PipelineApprovalCapability,
     test_command: Option<&str>,
 ) -> PipelineConfig {
     PipelineConfig {
         engine: pipeline_engine_config_for(cfg),
-        headless: format != OutputFormat::Text,
+        headless: approval == PipelineApprovalCapability::Unavailable,
         headless_bypass_scope_review: HEADLESS_SCOPE_REVIEW_BYPASS,
         test_command: test_command.map(str::to_string),
         ..Default::default()

@@ -402,21 +402,31 @@ async fn untrusted_project_custom_tools_are_absent_from_the_runtime_surface() {
 }
 
 #[test]
-fn json_output_is_headless_without_granting_scope_approval() {
+fn non_tty_text_output_is_headless_without_losing_text_rendering() {
     let cfg = cfg_for("zai");
-    let json = pipeline_config_for_output(&cfg, OutputFormat::Json, None);
-    assert!(
-        json.headless,
-        "JSON is a machine/headless presentation mode"
+    let format = OutputFormat::Text;
+    let non_tty = pipeline_config_for_approval_capability(
+        &cfg,
+        PipelineApprovalCapability::Unavailable,
+        None,
     );
     assert!(
-        !json.headless_bypass_scope_review,
+        non_tty.headless,
+        "text redirected through a non-TTY host cannot prompt for approval"
+    );
+    assert!(
+        !non_tty.headless_bypass_scope_review,
         "output serialization must never grant execution authority"
     );
+    assert_eq!(format, OutputFormat::Text, "rendering remains text");
 
-    let text = pipeline_config_for_output(&cfg, OutputFormat::Text, None);
-    assert!(!text.headless, "text mode retains interactive scope review");
-    assert!(!text.headless_bypass_scope_review);
+    let interactive =
+        pipeline_config_for_approval_capability(&cfg, PipelineApprovalCapability::Stdio, None);
+    assert!(
+        !interactive.headless,
+        "an explicit interactive approval host retains scope review"
+    );
+    assert!(!interactive.headless_bypass_scope_review);
 }
 
 #[test]

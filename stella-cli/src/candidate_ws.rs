@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use stella_core::rules::Rule;
 use stella_fleet::git::{GitCli, SystemGitCli};
 use stella_pipeline::ports::{
     AdoptedChange, CandidateWorkspace, CandidateWorkspacePort, CommandRunner, RepoStatusPort,
@@ -209,7 +210,10 @@ pub(crate) struct GitCandidateWorkspaces {
     /// stay isolated). Cloned per candidate; the manifests are identical to
     /// the session's because the snapshot is a copy of the real tree.
     custom_tools: Vec<CustomTool>,
-    authority: crate::settings::AuthorityPolicy,
+    /// Immutable rules resolved from the real session workspace before any
+    /// shadow exists. Candidate discovery must never depend on which ignored
+    /// or store-backed policy files happened to enter a git snapshot.
+    active_rules: Arc<[Rule]>,
 }
 
 impl GitCandidateWorkspaces {
@@ -217,13 +221,13 @@ impl GitCandidateWorkspaces {
         root: PathBuf,
         options: RegistryOptions,
         custom_tools: Vec<CustomTool>,
-        authority: crate::settings::AuthorityPolicy,
+        active_rules: Vec<Rule>,
     ) -> Self {
         Self {
             root,
             options,
             custom_tools,
-            authority,
+            active_rules: active_rules.into(),
         }
     }
 
@@ -273,7 +277,7 @@ impl GitCandidateWorkspaces {
                 // not be a way around them. Applied while `registry` is still
                 // a plain `ToolRegistry`, before it moves into the `Arc`.
                 crate::agent::populate_schema_index(&registry, &ws_root);
-                crate::rules::enforce_workspace_rules(&registry, &ws_root, &self.authority);
+                crate::rules::attach_rule_guards(&registry, self.active_rules.to_vec());
                 // The candidate's tool surface: the snapshot-rooted registry
                 // plus the session's custom script tools, owned as one value
                 // (the workspace outlives every borrow). Custom tools re-root
@@ -704,7 +708,7 @@ mod tests {
             root.clone(),
             RegistryOptions::default(),
             Vec::new(),
-            crate::settings::AuthorityPolicy::default(),
+            Vec::new(),
         );
 
         let ws = port.create_workspace().await.unwrap();
@@ -770,7 +774,7 @@ mod tests {
             root.clone(),
             RegistryOptions::default(),
             custom_tools,
-            crate::settings::AuthorityPolicy::default(),
+            Vec::new(),
         );
         let ws = port.create_workspace().await.unwrap();
 
@@ -805,13 +809,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_backed_guard_survives_candidate_snapshot_and_winner_adoption() {
+        let root = scaffold("storeguard");
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n.stella/store.db*\n").unwrap();
+        {
+            let store = stella_store::Store::open(&root).unwrap();
+            store
+                .upsert_rule(
+                    "protect-store-path",
+                    "---\nguard-tool: Write\nguard-deny-path: protected/**\n---\nStore guard remains binding in candidates.",
+                    "ext:policy",
+                )
+                .unwrap();
+        }
+        let authority = crate::settings::AuthorityPolicy {
+            project_prompts_allowed: true,
+            ..crate::settings::AuthorityPolicy::default()
+        };
+        let active_rules = crate::rules::load_workspace_rules(&root, &authority);
+        let port = GitCandidateWorkspaces::new(
+            root.clone(),
+            RegistryOptions::default(),
+            Vec::new(),
+            active_rules,
+        );
+        let ws = port.create_workspace().await.unwrap();
+
+        let output = ws
+            .tools()
+            .execute(
+                "write_file",
+                &serde_json::json!({"path": "protected/store.txt", "content": "no\n"}),
+            )
+            .await;
+        let adopted = ws.adopt().await.unwrap();
+        let landed = root.join("protected/store.txt").exists();
+        ws.remove().await;
+        assert_no_candidate_worktrees(&root);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(
+            output.is_error(),
+            "candidate bypassed store guard: {output:?}"
+        );
+        assert!(
+            adopted.is_empty(),
+            "prohibited change was adoptable: {adopted:?}"
+        );
+        assert!(!landed, "winner adopted a store-guarded change");
+    }
+
+    #[tokio::test]
+    async fn ignored_rule_guard_survives_candidate_snapshot_and_winner_adoption() {
+        let root = scaffold("ignoredguard");
+        std::fs::write(
+            root.join(".gitignore"),
+            "ignored.txt\n.stella/rules/protect-ignored.md\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".stella/rules")).unwrap();
+        std::fs::write(
+            root.join(".stella/rules/protect-ignored.md"),
+            "---\nguard-tool: Write\nguard-deny-path: protected/**\n---\nIgnored file guard remains binding in candidates.",
+        )
+        .unwrap();
+        let authority = crate::settings::AuthorityPolicy {
+            project_prompts_allowed: true,
+            ..crate::settings::AuthorityPolicy::default()
+        };
+        let active_rules = crate::rules::load_workspace_rules(&root, &authority);
+        let port = GitCandidateWorkspaces::new(
+            root.clone(),
+            RegistryOptions::default(),
+            Vec::new(),
+            active_rules,
+        );
+        let ws = port.create_workspace().await.unwrap();
+
+        let output = ws
+            .tools()
+            .execute(
+                "write_file",
+                &serde_json::json!({"path": "protected/ignored.txt", "content": "no\n"}),
+            )
+            .await;
+        let adopted = ws.adopt().await.unwrap();
+        let landed = root.join("protected/ignored.txt").exists();
+        ws.remove().await;
+        assert_no_candidate_worktrees(&root);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(
+            output.is_error(),
+            "candidate bypassed ignored guard: {output:?}"
+        );
+        assert!(
+            adopted.is_empty(),
+            "prohibited change was adoptable: {adopted:?}"
+        );
+        assert!(!landed, "winner adopted an ignored-rule-guarded change");
+    }
+
+    #[tokio::test]
     async fn winner_adoption_lands_only_the_winners_changes() {
         let root = scaffold("adopt");
         let port = GitCandidateWorkspaces::new(
             root.clone(),
             RegistryOptions::default(),
             Vec::new(),
-            crate::settings::AuthorityPolicy::default(),
+            Vec::new(),
         );
         let loser = port.create_workspace().await.unwrap();
         let winner = port.create_workspace().await.unwrap();
@@ -866,7 +972,7 @@ mod tests {
             root.clone(),
             RegistryOptions::default(),
             Vec::new(),
-            crate::settings::AuthorityPolicy::default(),
+            Vec::new(),
         );
         let ws = port.create_workspace().await.unwrap();
 
@@ -917,7 +1023,7 @@ mod tests {
             root.clone(),
             RegistryOptions::default(),
             Vec::new(),
-            crate::settings::AuthorityPolicy::default(),
+            Vec::new(),
         );
         match port.create_workspace().await {
             Err(WorkspaceError::Snapshot { reason }) => {

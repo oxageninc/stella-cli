@@ -126,6 +126,10 @@ pub(crate) fn workspace_ports(root: std::path::PathBuf, cfg: &Config) -> Workspa
         cfg.authority.project_custom_tools_allowed,
     )
     .tools;
+    // Resolve policy against the real session workspace exactly once. Every
+    // best-of-N shadow receives this immutable snapshot; ignored rule files
+    // and store-backed guards therefore cannot disappear during git overlay.
+    let active_rules = crate::rules::load_workspace_rules(&root, &cfg.authority);
     WorkspacePorts {
         repo_structure: GitRepoStructure { root: root.clone() },
         repo_status: GitRepoStatus { root: root.clone() },
@@ -134,7 +138,7 @@ pub(crate) fn workspace_ports(root: std::path::PathBuf, cfg: &Config) -> Workspa
             root,
             registry_options(cfg),
             custom_tools,
-            cfg.authority,
+            active_rules,
         ),
     }
 }

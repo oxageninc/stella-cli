@@ -10,7 +10,7 @@
 //! detection) — Phase 2.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -184,7 +184,18 @@ async fn run_pipeline_one_shot(
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
         let is_text = format == OutputFormat::Text;
-        let mut pipeline_config = pipeline_config_for_output(cfg, format, test_command);
+        // Stdio approval requires a text-safe renderer plus two terminal
+        // handles: stdin must accept the decision and stdout must present the
+        // prompt. Redirected text is still rendered as text, but is headless
+        // and fails closed at scope review.
+        let approval_capability =
+            if is_text && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                PipelineApprovalCapability::Stdio
+            } else {
+                PipelineApprovalCapability::Unavailable
+            };
+        let mut pipeline_config =
+            pipeline_config_for_approval_capability(cfg, approval_capability, test_command);
         pipeline_config.role_overrides = wiring.role_overrides.clone();
 
         let stdio_gate = StdioApprovalGate;
@@ -205,7 +216,7 @@ async fn run_pipeline_one_shot(
             repo: &ws_ports.repo_structure,
             repo_status: &ws_ports.repo_status,
             commands: &ws_ports.command_runner,
-            approvals: if is_text {
+            approvals: if approval_capability == PipelineApprovalCapability::Stdio {
                 &stdio_gate
             } else {
                 &HEADLESS_APPROVAL_GATE

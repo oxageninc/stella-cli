@@ -102,10 +102,7 @@ fn store_rule_files(workspace_root: &Path) -> Vec<RuleFile> {
 }
 
 /// The session's full rule source: extension-authored store rules first
-/// (lowest precedence), then the on-disk rule files in directory order —
-/// the engine's merge lets any rule FILE (user, `.claude`, `.stella`)
-/// override a store rule with the same id, so the human's checked-in files
-/// keep final say over machine-written rules.
+/// (lowest precedence), then the on-disk rule files in directory order.
 struct SessionRuleSource {
     store_files: Vec<RuleFile>,
     include_project: bool,
@@ -126,7 +123,10 @@ impl RuleSource for SessionRuleSource {
 
 /// Load the user rule directory and, when the effective authority permits
 /// project prompts, the workspace store plus `.claude/rules` and
-/// `.stella/rules`. Visible sources merge by id in precedence order.
+/// `.stella/rules`. Prompt-only rules retain the historical latest-wins
+/// precedence, while user-global hard guards are monotonic: a project rule
+/// with the same id can never remove them, and a distinct project guard is
+/// added under a provenance-qualified id so both constraints remain armed.
 /// Called once per session: the result feeds both the Tier-1 prompt
 /// section and the Tier-2 guards, so the two enforcement surfaces can
 /// never disagree about what was loaded.
@@ -156,21 +156,71 @@ fn load_rules_from_with_authority(
     user_rules_dir: Option<PathBuf>,
     include_project: bool,
 ) -> Vec<Rule> {
-    let opts = LoadRulesOptions {
+    let user_opts = LoadRulesOptions {
         cwd: workspace_root.display().to_string(),
         user_rules_dir: user_rules_dir
             .map(|dir| dir.display().to_string())
             .unwrap_or_default(),
     };
-    let source = SessionRuleSource {
-        store_files: if include_project {
-            store_rule_files(workspace_root)
-        } else {
-            Vec::new()
+    let user_rules = load_rules(
+        &SessionRuleSource {
+            store_files: Vec::new(),
+            include_project: false,
         },
-        include_project,
+        &user_opts,
+    );
+    if !include_project {
+        return user_rules;
+    }
+
+    // Load the project tier independently. An empty first directory keeps
+    // RuleSource's directory contract intact while preventing user files
+    // from entering the lower-trust merge a second time.
+    let project_opts = LoadRulesOptions {
+        cwd: workspace_root.display().to_string(),
+        user_rules_dir: String::new(),
     };
-    load_rules(&source, &opts)
+    let project_rules = load_rules(
+        &SessionRuleSource {
+            store_files: store_rule_files(workspace_root),
+            include_project: true,
+        },
+        &project_opts,
+    );
+    merge_rule_trust_tiers(user_rules, project_rules)
+}
+
+/// Merge already-resolved trust tiers without allowing a lower-trust rule to
+/// weaken a user hard guard. Prompt-only user rules retain the established
+/// project-overrides-user behavior. When both tiers carry different guards
+/// under one id, keep the user rule at the canonical id and add the project
+/// rule under a stable qualified id so guard evaluation sees both.
+fn merge_rule_trust_tiers(mut user_rules: Vec<Rule>, project_rules: Vec<Rule>) -> Vec<Rule> {
+    for mut project_rule in project_rules {
+        let same_id = user_rules
+            .iter()
+            .position(|user_rule| user_rule.id == project_rule.id);
+        let Some(index) = same_id else {
+            user_rules.push(project_rule);
+            continue;
+        };
+        if user_rules[index].guard.is_none() {
+            user_rules[index] = project_rule;
+            continue;
+        }
+        if project_rule.guard.is_some() && project_rule.guard != user_rules[index].guard {
+            let base = format!("{}@project", project_rule.id);
+            let mut qualified = base.clone();
+            let mut suffix = 2;
+            while user_rules.iter().any(|rule| rule.id == qualified) {
+                qualified = format!("{base}-{suffix}");
+                suffix += 1;
+            }
+            project_rule.id = qualified;
+            user_rules.push(project_rule);
+        }
+    }
+    user_rules
 }
 
 /// Session wiring shorthand: load the workspace rules and attach their
@@ -392,6 +442,78 @@ mod tests {
             "untrusted guard blocked the tool: {result:?}"
         );
         assert!(root.path().join("blocked/allowed.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn trusted_project_same_id_cannot_weaken_a_user_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        write_rule(
+            &user.path().join("rules"),
+            "protect-secrets.md",
+            "---\nguard-tool: Write\nguard-deny-path: secrets/**\n---\nUser guard must remain binding.",
+        );
+        write_rule(
+            &root.path().join(".stella/rules"),
+            "protect-secrets.md",
+            "Project text deliberately removes the hard guard.",
+        );
+
+        let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
+        let rules =
+            load_rules_from_with_authority(root.path(), Some(user.path().join("rules")), true);
+        attach_rule_guards(&registry, rules);
+
+        let denied = registry
+            .execute(
+                "write_file",
+                &serde_json::json!({"path": "secrets/token.txt", "content": "x\n"}),
+            )
+            .await;
+        let ToolOutput::Error { message } = denied else {
+            panic!("a project rule with the same id must not weaken the user guard");
+        };
+        assert!(message.contains("protect-secrets"), "{message}");
+        assert!(
+            message.contains("User guard must remain binding."),
+            "{message}"
+        );
+        assert!(!root.path().join("secrets/token.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn same_id_user_and_project_guards_are_additive() {
+        let root = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        write_rule(
+            &user.path().join("rules"),
+            "protected.md",
+            "---\nguard-tool: Write\nguard-deny-path: user-only/**\n---\nUser path is protected.",
+        );
+        write_rule(
+            &root.path().join(".stella/rules"),
+            "protected.md",
+            "---\nguard-tool: Write\nguard-deny-path: project-only/**\n---\nProject path is protected.",
+        );
+        let rules =
+            load_rules_from_with_authority(root.path(), Some(user.path().join("rules")), true);
+        assert_eq!(rules.len(), 2, "both trust-tier guards must remain active");
+
+        let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
+        attach_rule_guards(&registry, rules);
+        for path in ["user-only/blocked.txt", "project-only/blocked.txt"] {
+            let output = registry
+                .execute(
+                    "write_file",
+                    &serde_json::json!({"path": path, "content": "x\n"}),
+                )
+                .await;
+            assert!(
+                output.is_error(),
+                "same-id guard did not block {path}: {output:?}"
+            );
+            assert!(!root.path().join(path).exists());
+        }
     }
 
     #[test]
