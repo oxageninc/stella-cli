@@ -36,6 +36,8 @@ const MAX_BEARER_BYTES: usize = 8 * 1024;
 const MAX_ENROLLMENT_LIFETIME_S: i64 = 90 * 24 * 60 * 60;
 const MAX_CLOCK_SKEW_S: i64 = 5 * 60;
 const MAX_BATCH_EVENTS: usize = 50;
+const MAX_BACKFILL_ROWS_PER_RUNTIME: usize = 256;
+const COMPLETED_LEDGER_RETENTION_ROWS: usize = 2_048;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const LEASE_MS: i64 = 30_000;
@@ -187,12 +189,17 @@ pub(crate) struct VerifiedEnrollment {
 }
 
 impl VerifiedEnrollment {
-    fn context(&self, identity: OperationalIdentity) -> Result<OperationalEventContext, String> {
+    fn context(
+        &self,
+        identity: OperationalIdentity,
+        export_nonce: &str,
+    ) -> Result<OperationalEventContext, String> {
         OperationalEventContext::new(
             self.enrollment_id.clone(),
             self.organization_id.clone(),
             self.workspace_id.clone(),
             identity,
+            export_nonce,
             self.model_catalog.clone(),
         )
         .map_err(|error| error.to_string())
@@ -206,6 +213,71 @@ impl VerifiedEnrollment {
 
 pub(crate) fn process_free_authority_active() -> bool {
     PROCESS_FREE_AUTHORITY.load(Ordering::Acquire)
+}
+
+/// Every production constructor that can assemble an agent execution surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionSurface {
+    RawOneShot,
+    PipelineOneShot,
+    Goal,
+    Fleet,
+    Deck,
+    Interactive,
+    WorkspacePorts,
+    CandidateWorkspace,
+}
+
+impl ExecutionSurface {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 8] = [
+        Self::RawOneShot,
+        Self::PipelineOneShot,
+        Self::Goal,
+        Self::Fleet,
+        Self::Deck,
+        Self::Interactive,
+        Self::WorkspacePorts,
+        Self::CandidateWorkspace,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RawOneShot => "raw_one_shot",
+            Self::PipelineOneShot => "pipeline_one_shot",
+            Self::Goal => "goal",
+            Self::Fleet => "fleet",
+            Self::Deck => "deck",
+            Self::Interactive => "interactive",
+            Self::WorkspacePorts => "workspace_ports",
+            Self::CandidateWorkspace => "candidate_workspace",
+        }
+    }
+}
+
+pub(crate) fn authorize_execution_surface(surface: ExecutionSurface) -> Result<(), String> {
+    authorize_execution_surface_with(surface, process_free_authority_active())
+}
+
+pub(crate) fn authorize_one_shot(use_pipeline: bool) -> Result<(), String> {
+    authorize_execution_surface(if use_pipeline {
+        ExecutionSurface::PipelineOneShot
+    } else {
+        ExecutionSurface::RawOneShot
+    })
+}
+
+pub(crate) fn authorize_execution_surface_with(
+    surface: ExecutionSurface,
+    process_free: bool,
+) -> Result<(), String> {
+    if process_free && surface != ExecutionSurface::RawOneShot {
+        return Err(format!(
+            "enterprise telemetry process-free authority rejects `{}` execution surface",
+            surface.as_str()
+        ));
+    }
+    Ok(())
 }
 
 fn activate_process_free_authority(enrollment: &VerifiedEnrollment) {
@@ -646,7 +718,7 @@ pub(crate) fn validate_response_status(status: reqwest::StatusCode) -> Result<()
 /// Verified enrollment plus its bounded spool and delivery adapter.
 pub(crate) struct EnterpriseTelemetryRuntime {
     enrollment: VerifiedEnrollment,
-    context: OperationalEventContext,
+    identity: OperationalIdentity,
     spool: EnterpriseTelemetrySpool,
     sender: Arc<dyn BatchSender>,
 }
@@ -681,29 +753,35 @@ where
         .begin_enterprise_enrollment(&enrollment.sink_fingerprint)
         .map_err(|error| error.to_string())?;
     let identity = operational_identity(&store, &spool_path)?;
-    let context = enrollment.context(identity)?;
     let spool = EnterpriseTelemetrySpool::open_at(&spool_path, SpoolLimits::default())
         .map_err(|error| error.to_string())?;
     register_verified_credentials(&enrollment);
     let sender = build_sender()?;
     let runtime = EnterpriseTelemetryRuntime {
         enrollment,
-        context,
+        identity,
         spool,
         sender,
     };
     // Replay durable fail-open intents from earlier post-enrollment closeout.
-    for execution_id in store
-        .pending_enterprise_exports(&runtime.enrollment.sink_fingerprint)
+    for pending in store
+        .pending_enterprise_export_page(
+            &runtime.enrollment.sink_fingerprint,
+            None,
+            MAX_BACKFILL_ROWS_PER_RUNTIME,
+        )
         .map_err(|error| error.to_string())?
     {
         let Some(rollup) = store
-            .execution_rollup(execution_id, workspace_root)
+            .execution_rollup(pending.execution_id, workspace_root)
             .map_err(|error| error.to_string())?
         else {
             continue;
         };
-        let event = StellaOperationalEventV1::from_finalized_rollup(&runtime.context, &rollup)
+        let context = runtime
+            .enrollment
+            .context(runtime.identity.clone(), &pending.export_nonce)?;
+        let event = StellaOperationalEventV1::from_finalized_rollup(&context, &rollup)
             .map_err(|error| error.to_string())?;
         match runtime
             .spool
@@ -715,11 +793,20 @@ where
             .map_err(|error| error.to_string())?
         {
             EnqueueOutcome::Retained | EnqueueOutcome::Duplicate => store
-                .mark_enterprise_export_spooled(&runtime.enrollment.sink_fingerprint, execution_id)
+                .mark_enterprise_export_spooled(
+                    &runtime.enrollment.sink_fingerprint,
+                    pending.execution_id,
+                )
                 .map_err(|error| error.to_string())?,
             EnqueueOutcome::DroppedNew => {}
         }
     }
+    store
+        .compact_enterprise_export_ledger(
+            &runtime.enrollment.sink_fingerprint,
+            COMPLETED_LEDGER_RETENTION_ROWS,
+        )
+        .map_err(|error| error.to_string())?;
     Ok(Some(runtime))
 }
 
@@ -746,7 +833,10 @@ impl EnterpriseTelemetryRuntime {
         rollup: &ExecutionRollupRow,
         now_ms: i64,
     ) -> Result<EnqueueOutcome, String> {
-        let event = StellaOperationalEventV1::from_finalized_rollup(&self.context, rollup)
+        let context = self
+            .enrollment
+            .context(self.identity.clone(), "00000000000000000000000000000000")?;
+        let event = StellaOperationalEventV1::from_finalized_rollup(&context, rollup)
             .map_err(|error| error.to_string())?;
         self.spool
             .enqueue(&self.enrollment.sink_fingerprint, &event, now_ms)
@@ -879,13 +969,14 @@ pub(crate) fn run_command(command: TelemetryCmd) -> Result<(), String> {
                 .status_for_sink(&enrollment.sink_fingerprint)
                 .map_err(|error| error.to_string())?;
             println!(
-                "enterprise telemetry: enrolled; pending={} ({} bytes); stranded={} ({} bytes); physical={} bytes; dropped={}; rollover_discarded={}",
+                "enterprise telemetry: enrolled; pending={} ({} bytes); stranded={} ({} bytes); physical={} bytes; dropped={}; corrupt_dropped={}; rollover_discarded={}",
                 status.pending_rows,
                 status.pending_payload_bytes,
                 status.stranded_rows,
                 status.stranded_payload_bytes,
                 status.physical_bytes,
                 status.dropped_rows,
+                status.corrupt_dropped_rows,
                 status.rollover_discarded_rows
             );
             Ok(())
@@ -946,12 +1037,12 @@ pub(crate) fn enqueue_finalized_execution(
     };
     let enrollment = verify_managed_enrollment(managed, now_s)?;
     // Durable intent precedes every host-spool filesystem operation.
-    if !store
+    let Some(export_nonce) = store
         .mark_enterprise_export_pending(&enrollment.sink_fingerprint, execution_id)
         .map_err(|error| error.to_string())?
-    {
+    else {
         return Ok(FinalizationEnqueueOutcome::Ineligible);
-    }
+    };
     let Some(rollup) = store
         .execution_rollup(execution_id, workspace)
         .map_err(|error| error.to_string())?
@@ -961,7 +1052,7 @@ pub(crate) fn enqueue_finalized_execution(
     let spool_path = host_spool_path(workspace)?;
     let spool = EnterpriseTelemetrySpool::open_at(&spool_path, SpoolLimits::default())
         .map_err(|error| error.to_string())?;
-    let context = enrollment.context(operational_identity(store, &spool_path)?)?;
+    let context = enrollment.context(operational_identity(store, &spool_path)?, &export_nonce)?;
     let event = StellaOperationalEventV1::from_finalized_rollup(&context, &rollup)
         .map_err(|error| error.to_string())?;
     let outcome = spool

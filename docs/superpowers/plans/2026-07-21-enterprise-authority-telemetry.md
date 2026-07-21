@@ -203,3 +203,35 @@ pub struct AuthorityPolicy {
 - [ ] Push, wait for GitHub CI, fix until every required check is green, and mark the PR ready for review.
 - [ ] Commit with `git commit -s -m "docs(enterprise): define governed telemetry boundary"`.
 
+### Task 9: Enterprise telemetry review hardening
+
+**Files:**
+- Modify: `stella-cli/src/enterprise_telemetry.rs`
+- Modify: `stella-cli/src/enterprise_telemetry_tests.rs`
+- Modify: `stella-cli/src/agent.rs`
+- Modify: `stella-cli/src/agent/goal.rs`
+- Modify: `stella-cli/src/agent/tools.rs`
+- Modify: `stella-cli/src/command_deck.rs`
+- Modify: `stella-cli/src/fleet_cmd.rs`
+- Modify: `stella-store/src/enterprise_telemetry.rs`
+- Modify: `stella-store/tests/enterprise_telemetry.rs`
+- Modify: `docs/design/enterprise-authority-telemetry.md`
+- Modify: `task-7-report.md`
+
+**Interfaces:**
+- Produces: `ExecutionSurface` and a first-line `authorize_execution_surface` gate
+- Produces: paged ledger rows carrying a persistent per-export CSPRNG nonce
+- Produces: sink-local enqueue eviction, one-time clock rebase, transactional corruption quarantine, and durable corruption telemetry
+
+- [x] Add production-surface tests enumerating raw one-shot, pipeline, goal, fleet, deck, interactive, and candidate/workspace-port construction. Under active `ProcessFree`, allow only the raw registry-only one-shot and return a named authority error before provider/process port construction everywhere else.
+- [x] Run the focused CLI tests and observe failures because pipeline modes and `workspace_ports` remain constructible.
+- [x] Add a first-line surface gate and a raw tool-surface branch with no MCP, custom tools, interactive tools, skills, discovery actions, hooks, or pipeline ports. Make `workspace_ports` return `Result<WorkspacePorts, String>` and fail closed before custom-tool discovery.
+- [x] Add store tests proving capacity never evicts another sink, rollback rebases once without clearing a live concurrent lease, retry deadlines stay within an inclusive 375-second horizon, clone-copied stores receive different first-export nonces while retrying one ledger row keeps its ID, backfill is page bounded across 10,000 rows, completed ledger rows compact under retention, malformed rows quarantine without blocking valid successors, and the largest rounded floating-point cost is rejected.
+- [x] Run the focused store tests and observe each new assertion fail against the current implementation.
+- [x] Persist `export_nonce` when the ledger row is first inserted and accept it in `OperationalEventContext`; derive the event ID from that nonce. Replace unbounded pending reads with `pending_enterprise_export_page(sink, after, limit)` and compact only completed rows whose idempotency record is already held by the spool/event state.
+- [x] Make capacity enforcement select only unleased rows for the inserting sink and drop the new row when global capacity is occupied by other sinks. Persist a per-sink clock anchor; on rollback translate created/retry/lease deadlines once by the observed delta, preserving lease ownership. Use one 375-second maximum retry horizon including jitter.
+- [x] Decode and validate payload/event-id/sink consistency inside the claim transaction. Move malformed rows to a quarantine table, increment `corrupt_dropped_rows`, and continue selecting later valid rows within the same bounded scan.
+- [x] Replace unchecked float-to-integer rounding with a representable upper-bound check that rejects equality/rounding edges before casting.
+- [x] Re-run focused RED tests to green, then full store/CLI/tools tests, production-surface tests, formatting, Clippy with warnings denied, file-size gate, and diff checks.
+- [x] Update the design and `task-7-report.md` with exact invariants and fresh command evidence.
+- [x] Commit with `git commit -s -m "fix(telemetry): close process and spool review gaps"`; do not push.

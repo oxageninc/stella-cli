@@ -12,7 +12,8 @@ After every centralized terminal closeout, Stella derives one content-free
 `StellaOperationalEventV1` and durably inserts it into a separate owner-only,
 host-data SQLite spool. Delivery is at-least-once with deterministic event IDs,
 sink-scoped claims/acks/retries, leases, jittered retry backoff, hard row/byte
-capacity, oldest-unleased eviction, and durable drop/rollover counters.
+capacity, sink-local oldest-unleased eviction, and durable
+drop/corruption/rollover counters.
 `stella telemetry status` reports payload and physical SQLite/WAL/SHM health,
 `flush` performs one explicit bounded delivery, and `rollover-discard` is the
 only path that discards rows stranded by sink rotation.
@@ -31,8 +32,10 @@ part of the design contract.
   finalized outcome, duration, token/cost totals, tool-call/file-change counts,
   and whether output was produced.
 - The deterministic event ID hashes a domain-separated framed schema/class,
-  enrollment/tenant, persistent random installation/store UUIDs, and execution
-  row identity; local inputs are never serialized.
+  enrollment/tenant, persistent random installation/store UUIDs, execution row
+  identity, and a per-export CSPRNG nonce persisted in the ledger. Copied stores
+  mint different first-export IDs while one ledger retry remains stable; local
+  inputs are never serialized.
 - Provider/model dimensions come from a signed closed catalog. Unknown or
   custom values serialize only as `other`.
 - Enrollment is accepted only from the managed settings snapshot. User and
@@ -50,19 +53,24 @@ part of the design contract.
   project dotenv loading and restored afterward. Only a fully verified
   enrollment may register scrub names.
 - Active enrollment requires signed and host-permitted `process_free`
-  authority. Stella proves the registry before constructing a client and
-  removes subprocess/search controls, hooks, MCP, custom commands, and skill
-  search/install from the active agent surface.
+  authority. Only raw one-shot execution is admitted, directly over the
+  concrete process-free registry. Pipeline, goal, fleet, deck, interactive,
+  workspace-port, and candidate constructors fail by name before provider or
+  subprocess-port construction; MCP, custom, interactive, skill, discovery,
+  hook, typed-test, and Git-diagnostic wrappers are not constructed.
 - All session/model-controlled child spawns scrub registered credentials.
   Scrubbing is not a same-user boundary: production enrollment requires an OS
   account/container boundary from untrusted co-tenants; a request-scoped
   credential broker remains the preferred follow-on.
-- Host delivery may fail, retry, or lose an oldest record under the explicit
-  capacity policy, but it never changes a completed agent outcome.
+- Host delivery may fail, retry, or lose an oldest record from the inserting
+  sink under the explicit capacity policy, but it never evicts another sink or
+  changes a completed agent outcome.
 - Signing and bearer references and values must be distinct. Enrollment expiry
   is checked again on every send, and HTTP ignores ambient proxy variables.
 - A persistent post-enrollment export ledger records retry intent before spool
-  I/O and backfills missed enqueues without exporting pre-enrollment history.
+  I/O and backfills missed enqueues in pages of at most 256 without exporting
+  pre-enrollment history. Completed rows compact behind a durable idempotency
+  boundary while retaining the newest 2,048 records.
 
 ## TDD evidence
 
@@ -98,8 +106,15 @@ redirect helper. Focused regressions then established and closed these cases:
 - the process-free surface enumeration is GREEN: every built-in process/search
   action and `search_skills`/`install_skill` is absent; and
 - the export-ledger witness is GREEN: pre-enrollment executions are excluded,
-  post-enrollment pending intent survives reopen, and startup backfill retains
-  it in the sink-scoped spool.
+  post-enrollment pending intent survives reopen, a 10,050-row outage is paged,
+  two startup runs advance by exactly 256 rows each, and completed history
+  compacts without minting a replacement nonce;
+- the spool hardening witnesses are GREEN: capacity never evicts another sink,
+  rollback repair preserves a concurrent live lease and rebases once, retry
+  horizon is at most 375 seconds, and malformed rows quarantine before lease
+  while later valid rows continue; and
+- the numeric boundary witness is GREEN: the rounded `u64` upper edge is
+  rejected before float-to-integer conversion.
 
 ## Implementation notes
 
@@ -107,6 +122,8 @@ redirect helper. Focused regressions then established and closed these cases:
   spool. The CLI adapter alone owns enrollment verification and HTTP.
 - The spool defaults to 10,000 rows and 16 MiB. Claims are additionally capped
   at 1,000 events and 16 MiB; production delivery uses 50 events and 256 KiB.
+- Corrupt payloads are retained only as metadata in quarantine; status exposes
+  the durable corruption-drop count without exposing malformed payload bytes.
 - HTTP disables proxies and redirects, uses 2-second connect and 5-second total timeouts,
   and caps response bodies at 64 KiB while streaming.
 - SQLite uses a 100 ms busy timeout so telemetry contention fails open quickly.
@@ -116,17 +133,17 @@ redirect helper. Focused regressions then established and closed these cases:
 
 ## Verification
 
-- `cargo test -p stella-store`: 87 unit and 17 enterprise telemetry integration
+- `cargo test -p stella-store`: 87 unit and 23 enterprise telemetry integration
   tests passed.
 - `cargo test -p stella-tools`: 335 unit tests passed; 1 existing sandbox test
   remained ignored; 4 media replay tests passed. The 6 tracker and 8 web
   localhost integration tests passed outside the restricted network sandbox.
-- `cargo test -p stella-cli`: 368 tests passed, including the project-dotenv
+- `cargo test -p stella-cli`: 371 tests passed, including the project-dotenv
   provenance and credential non-disclosure witnesses.
 - `cargo clippy -p stella-store -p stella-tools -p stella-cli --all-targets --
   -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
-- `make sizes`: all 300 tracked Rust files passed the ratchet.
+- `make sizes`: all 305 tracked Rust files passed the ratchet.
 - `git diff --check`: passed.
 - The required documentation search confirmed that existing absolute
   no-phone-home claims need the precise managed-enrollment exception. Those

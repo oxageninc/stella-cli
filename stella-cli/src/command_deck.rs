@@ -273,9 +273,9 @@ pub async fn run_deck_session(
     no_anim: bool,
     resume: Option<crate::session_persist::ResumeRequest>,
 ) -> Result<(), String> {
-    // ── Session assembly (still on the normal screen — prints are fine) ────
-    // MCP connect is NOT here: it can block up to 10s per server, so it runs
-    // after the deck task spawns, narrated as transcript events (#98).
+    crate::enterprise_telemetry::authorize_execution_surface(
+        crate::enterprise_telemetry::ExecutionSurface::Deck,
+    )?;
     let provider = agent::build_provider(cfg)?;
     let registry_options = agent::registry_options(cfg);
     let registry: Arc<ToolRegistry> = Arc::new(
@@ -4342,7 +4342,7 @@ async fn run_lead_pipeline_turn(
             cfg,
             registry_options.clone(),
             active_rules.clone(),
-        );
+        )?;
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = match memory {
             Some(m) => m,

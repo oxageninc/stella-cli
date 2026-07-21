@@ -78,6 +78,7 @@ pub async fn run_one_shot(
     use_pipeline: bool,
     test_command: Option<&str>,
 ) -> Result<(), String> {
+    crate::enterprise_telemetry::authorize_one_shot(use_pipeline)?;
     if use_pipeline {
         run_pipeline_one_shot(cfg, prompt, budget_limit, format, test_command).await
     } else {
@@ -188,7 +189,7 @@ async fn run_pipeline_one_shot(
             cfg,
             registry_options,
             active_rules.clone(),
-        );
+        )?;
 
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
@@ -402,6 +403,9 @@ const REPL_RESERVED: &[&str] = &[
 /// the conversation, while `BudgetGuard::begin_turn` resets only the
 /// turn-scoped counter at the start of each one.
 pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<(), String> {
+    crate::enterprise_telemetry::authorize_execution_surface(
+        crate::enterprise_telemetry::ExecutionSurface::Interactive,
+    )?;
     let provider = build_provider(cfg)?;
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
         ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
@@ -1791,16 +1795,13 @@ async fn run_turn(
     let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let renderer = spawn_renderer(rx, format, execution.clone(), cfg.provider.id.to_string());
 
-    // The tool set holds a tx clone (for AskUser events), so it must drop
-    // before the renderer is awaited — the channel only closes once EVERY
-    // sender is gone, and awaiting the renderer with a live sender would
-    // deadlock. The inner scope makes the drop order structural.
-    let outcome = {
-        // The tool stack, innermost out: native registry <- developer
-        // custom script tools (.stella/tools/, stella-tools::custom) <-
-        // ask_user (interactive.rs). Headless formats get the io that
-        // fails ask_user loudly instead of waiting on stdin that will
-        // never answer.
+    // The scoped tool set must drop its tx clone before awaiting the renderer.
+    let outcome = if crate::enterprise_telemetry::process_free_authority_active() {
+        let engine =
+            Engine::with_sleeper(provider, registry, engine_config_for(cfg), &TokioSleeper)
+                .with_calibration(calibration);
+        engine.run_turn(messages, budget, &tx).await
+    } else {
         let customs = CustomToolSet::new(
             base_tools,
             custom_tools.to_vec(),
@@ -1812,8 +1813,6 @@ async fn run_turn(
             default_ask_io(format == OutputFormat::Text),
         )
         .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
-        // Outermost discovery layer; the session-scoped `activated` handle
-        // keeps lean-mode activations across the per-turn stack rebuild.
         let tools =
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
                 .with_project_prompts_allowed(cfg.authority.project_prompts_allowed)

@@ -70,6 +70,9 @@ pub async fn run_fleet(
     watch: bool,
     use_pipeline: bool,
 ) -> Result<(), String> {
+    crate::enterprise_telemetry::authorize_execution_surface(
+        crate::enterprise_telemetry::ExecutionSurface::Fleet,
+    )?;
     let root = cfg.workspace_root.clone();
     let plan = load_plan(prompts, plan_file)?;
     plan.validate().map_err(|e| format!("invalid plan: {e}"))?;
@@ -550,7 +553,7 @@ async fn run_task(
             &cfg,
             registry_options,
             active_rules.clone(),
-        );
+        )?;
         let recall = NoContextRecall;
         let hook_runner = ShellHookRunner;
         let ports = PipelinePorts {

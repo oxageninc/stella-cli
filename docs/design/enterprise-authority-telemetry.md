@@ -75,10 +75,14 @@ they are not treated as process confinement.
 An enrolled telemetry claim must request `process_free`, and the secure
 administrator-managed policy must independently permit exactly that mode.
 Before an HTTP client is constructed, Stella builds and inspects a process-free
-`ToolRegistry`. The active session then uses the same construction: bash, web,
-fixed-command search, process/test controls, issue probes, hooks, MCP, custom
-commands, and skill search/install are absent. This is a capability property of
-the constructed surface, not an environment-variable attestation.
+`ToolRegistry`. While that authority is active, the only admitted execution
+surface is the raw one-shot engine directly over that concrete registry.
+Pipeline one-shot, goal, fleet, deck, interactive, workspace-port, and candidate
+workspace constructors return a named authority error before provider or
+subprocess-capable port construction. The raw path does not construct MCP,
+custom, interactive, skill, discovery-action, hook, typed-test, Git diagnostic,
+or candidate-workspace wrappers. This is a production composition property,
+not an environment-variable or synthetic-registry attestation.
 
 Child-environment scrubbing is defense in depth, not a same-user security
 boundary. Deployments that provide telemetry credentials in environment
@@ -121,15 +125,22 @@ separation.
 
 The event id is domain-separated and length-framed over schema, class,
 enrollment, organization, workspace, a persistent random installation UUID, a
-persistent random store UUID, and the local execution row id. Installation and
-store identities never serialize. Provider/model dimensions are admitted only
+persistent random store UUID, the local execution row id, and a CSPRNG nonce
+persisted when that export-ledger row is first created. A copied store therefore
+creates a different first-export ID, while retries of one ledger row remain
+stable. Installation/store identities and the nonce never serialize.
+Provider/model dimensions are admitted only
 by the signed catalog; every unknown pair projects to the closed `other/other`
 dimension.
 
 Every terminal path, including cancellation, first passes through one closeout
 aggregator. A per-store enrollment boundary excludes pre-enrollment history; a
 persistent local ledger records post-enrollment export intent before spool I/O
-and backfills missed enqueues at startup. Events then enter a separate bounded
+and backfills at most 256 missed enqueues per runtime construction. Repeated
+startups make bounded progress without allocating an outage-sized vector.
+Spooled ledger rows retain the newest 2,048 records; older completed rows compact
+behind a durable per-enrollment execution boundary so closeout cannot mint a new
+nonce for compacted history. Events then enter a separate bounded
 SQLite spool after local finalization. Delivery is at-least-once with
 deterministic event IDs. Each row is immutably bound to a cryptographic sink
 fingerprint; claim, acknowledgement, and retry require that exact sink. Rotated
@@ -143,10 +154,16 @@ network I/O; the next startup or explicit flush retries it. Failure remains
 locally visible and never changes the agent outcome. The spool reports retained,
 duplicate, and dropped-new outcomes separately, tracks database/WAL/SHM disk
 bytes, repairs retry/lease deadlines after clock rollback, orders equal-time
-rows by a monotonic insertion sequence, and applies bounded retry jitter. A
-full spool may evict the oldest unleased operational event and increments a
-durable drop counter. Delivery disables ambient HTTP proxies, redirects, and
-unbounded request/response bodies.
+rows by a monotonic insertion sequence, and applies bounded retry jitter. Clock
+rollback translates created/retry/lease deadlines once against a persisted
+per-sink clock anchor and preserves live lease ownership. Retry delay including
+jitter is capped at an inclusive 375 seconds. Capacity enforcement may evict
+only an unleased row belonging to the inserting sink; if another sink consumes
+the global budget, the new row is dropped. Malformed rows are validated before
+lease, moved transactionally to metadata-only quarantine, counted durably, and
+cannot block a later valid row. Cost conversion rejects non-finite, negative,
+and rounded `u64` upper-bound values before casting. Delivery disables ambient
+HTTP proxies, redirects, and unbounded request/response bodies.
 
 `compliance_audit` enrollment is rejected in this phase. Compliance delivery
 requires a non-evicting ledger, server receipts, retention/hold semantics, and

@@ -11,9 +11,9 @@ use stella_store::enterprise_telemetry::StellaOperationalEventV1;
 use stella_store::usage::ExecutionRollupRow;
 
 use crate::enterprise_telemetry::{
-    BatchSender, StartupAuthoritySnapshot, build_runtime_from_managed, canonical_enrollment_bytes,
-    host_spool_path, prove_process_free_surface, validate_response_status,
-    verify_managed_enrollment,
+    BatchSender, ExecutionSurface, StartupAuthoritySnapshot, authorize_execution_surface_with,
+    build_runtime_from_managed, canonical_enrollment_bytes, host_spool_path,
+    prove_process_free_surface, validate_response_status, verify_managed_enrollment,
 };
 use crate::settings::Settings;
 use crate::{Cli, Command, TelemetryCmd};
@@ -79,6 +79,49 @@ fn process_free_surface_enumeration_omits_every_spawn_and_extension_action() {
             !names.contains(forbidden),
             "process action exposed: {forbidden}"
         );
+    }
+}
+
+#[test]
+fn process_free_authority_allows_only_the_registry_only_raw_one_shot_surface() {
+    let allowed = authorize_execution_surface_with(ExecutionSurface::RawOneShot, true);
+    assert!(
+        allowed.is_ok(),
+        "raw one-shot is the sole process-free engine path"
+    );
+
+    for surface in [
+        ExecutionSurface::PipelineOneShot,
+        ExecutionSurface::Goal,
+        ExecutionSurface::Fleet,
+        ExecutionSurface::Deck,
+        ExecutionSurface::Interactive,
+        ExecutionSurface::WorkspacePorts,
+        ExecutionSurface::CandidateWorkspace,
+    ] {
+        let error = authorize_execution_surface_with(surface, true).unwrap_err();
+        assert!(error.contains("enterprise telemetry process-free authority"));
+        assert!(error.contains(surface.as_str()), "{surface:?}: {error}");
+    }
+}
+
+#[test]
+fn production_process_free_surface_matrix_enumerates_every_constructor() {
+    assert_eq!(
+        ExecutionSurface::ALL,
+        [
+            ExecutionSurface::RawOneShot,
+            ExecutionSurface::PipelineOneShot,
+            ExecutionSurface::Goal,
+            ExecutionSurface::Fleet,
+            ExecutionSurface::Deck,
+            ExecutionSurface::Interactive,
+            ExecutionSurface::WorkspacePorts,
+            ExecutionSurface::CandidateWorkspace,
+        ]
+    );
+    for surface in ExecutionSurface::ALL {
+        assert!(authorize_execution_surface_with(surface, false).is_ok());
     }
 }
 
@@ -610,6 +653,79 @@ fn failed_delivery_stays_retryable_and_success_acks_the_same_event() {
 }
 
 #[test]
+fn startup_backfill_processes_one_bounded_page_and_progresses_across_runs() {
+    let _env = crate::test_env::lock();
+    let _restore = EnvRestore::capture(&[
+        "STELLA_DATA_DIR",
+        "STELLA_TEST_VERIFY_SECRET",
+        "STELLA_TEST_TELEMETRY_TOKEN",
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    unsafe {
+        std::env::set_var("STELLA_DATA_DIR", dir.path().join("host-data"));
+        std::env::set_var(
+            "STELLA_TEST_VERIFY_SECRET",
+            "0123456789abcdef0123456789abcdef",
+        );
+        std::env::set_var("STELLA_TEST_TELEMETRY_TOKEN", "separate-token");
+    }
+    let secret = b"0123456789abcdef0123456789abcdef";
+    let managed = signed_managed("STELLA_TEST_VERIFY_SECRET", secret, valid_claims());
+    let enrollment = verify_managed_enrollment(&managed, 1_700_000_001).unwrap();
+    let store = stella_store::Store::open(&workspace).unwrap();
+    store
+        .begin_enterprise_enrollment(enrollment.sink_fingerprint())
+        .unwrap();
+    for index in 0..600 {
+        let id = store
+            .begin_execution(
+                "run",
+                &format!("outage-{index}"),
+                "anthropic",
+                "anthropic/claude-sonnet-4",
+            )
+            .unwrap();
+        store.finish_execution(id, "completed", 0.0).unwrap();
+        store
+            .mark_enterprise_export_pending(enrollment.sink_fingerprint(), id)
+            .unwrap()
+            .unwrap();
+    }
+    drop(store);
+    let pending_count = || {
+        let store = stella_store::Store::open(&workspace).unwrap();
+        let mut after = None;
+        let mut count = 0;
+        loop {
+            let page = store
+                .pending_enterprise_export_page(enrollment.sink_fingerprint(), after, 256)
+                .unwrap();
+            count += page.len();
+            let Some(last) = page.last() else {
+                break count;
+            };
+            after = Some(last.execution_id);
+        }
+    };
+    let sender = Arc::new(Sender {
+        attempts: AtomicUsize::new(0),
+        fail: Mutex::new(false),
+    });
+    build_runtime_from_managed(Some(&managed), &workspace, 1_700_000_001, || {
+        Ok(sender.clone() as Arc<dyn BatchSender>)
+    })
+    .unwrap();
+    assert_eq!(pending_count(), 344);
+    build_runtime_from_managed(Some(&managed), &workspace, 1_700_000_001, || {
+        Ok(sender.clone() as Arc<dyn BatchSender>)
+    })
+    .unwrap();
+    assert_eq!(pending_count(), 88);
+}
+
+#[test]
 fn credential_rotation_failure_releases_the_claim_to_retry_state() {
     let _env = crate::test_env::lock();
     let names = [
@@ -790,11 +906,12 @@ fn finalization_stays_successful_when_telemetry_host_state_is_rejected() {
             .join("model-visible-data/enterprise-telemetry.db")
             .exists()
     );
+    let pending = store
+        .pending_enterprise_export_page(enrollment.sink_fingerprint(), None, 256)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
     assert_eq!(
-        store
-            .pending_enterprise_exports(enrollment.sink_fingerprint())
-            .unwrap(),
-        vec![id],
+        pending[0].execution_id, id,
         "fail-open spool rejection must remain durably visible for backfill"
     );
     unsafe {

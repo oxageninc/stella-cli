@@ -35,18 +35,27 @@ pub(crate) async fn run_raw_one_shot(
         Box::new(|line| eprintln!("  {line}")),
         Box::new(|| {}),
     );
-    let mcp = connect_mcp(
-        cfg,
-        registry.clone(),
-        Some(registry.mcp_usage_ledger()),
-        format == OutputFormat::Text,
-    )
-    .await?;
+    let process_free = crate::enterprise_telemetry::process_free_authority_active();
+    let mcp = if process_free {
+        None
+    } else {
+        connect_mcp(
+            cfg,
+            registry.clone(),
+            Some(registry.mcp_usage_ledger()),
+            format == OutputFormat::Text,
+        )
+        .await?
+    };
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
     };
-    let custom_tools = discover_custom_tools(cfg, format == OutputFormat::Text).await;
+    let custom_tools = if process_free {
+        Vec::new()
+    } else {
+        discover_custom_tools(cfg, format == OutputFormat::Text).await
+    };
     let mut budget = build_budget_guard(budget_limit);
     let store = open_store(&cfg.workspace_root);
     let calibration = seed_calibration(&store, cfg);
@@ -175,6 +184,9 @@ pub async fn run_goal_cmd(
     budget_limit: Option<f64>,
     use_pipeline: bool,
 ) -> Result<(), String> {
+    crate::enterprise_telemetry::authorize_execution_surface(
+        crate::enterprise_telemetry::ExecutionSurface::Goal,
+    )?;
     let provider = build_provider(cfg)?;
     let registry_options = registry_options(cfg);
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
@@ -536,7 +548,7 @@ async fn run_goal_pipeline_turn(
             cfg,
             registry_options,
             active_rules.clone(),
-        );
+        )?;
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = &no_recall;
         let hook_runner = ShellHookRunner;

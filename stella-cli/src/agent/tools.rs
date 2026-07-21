@@ -257,7 +257,13 @@ pub(crate) fn workspace_ports(
     cfg: &Config,
     registry_options: stella_tools::RegistryOptions,
     active_rules: crate::rules::ResolvedRules,
-) -> WorkspacePorts {
+) -> Result<WorkspacePorts, String> {
+    crate::enterprise_telemetry::authorize_execution_surface(
+        crate::enterprise_telemetry::ExecutionSurface::WorkspacePorts,
+    )?;
+    crate::enterprise_telemetry::authorize_execution_surface(
+        crate::enterprise_telemetry::ExecutionSurface::CandidateWorkspace,
+    )?;
     // The candidate registry mirrors the session's custom tool surface —
     // discovered from the same root, so a candidate sees exactly the custom
     // tools the session does (re-rooted at its snapshot at create time).
@@ -268,7 +274,7 @@ pub(crate) fn workspace_ports(
         cfg.authority.project_custom_tools_allowed,
     )
     .tools;
-    WorkspacePorts {
+    Ok(WorkspacePorts {
         repo_structure: GitRepoStructure { root: root.clone() },
         repo_status: GitRepoStatus { root: root.clone() },
         diagnostic_runner: GitDiagnosticRunner { root: root.clone() },
@@ -279,7 +285,7 @@ pub(crate) fn workspace_ports(
             custom_tools,
             active_rules,
         ),
-    }
+    })
 }
 
 /// Workspace-rooted closed Git diagnostics. Every variant maps to fixed argv;

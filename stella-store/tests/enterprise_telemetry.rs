@@ -43,6 +43,7 @@ fn context() -> OperationalEventContext {
             "22222222-2222-4222-8222-222222222222",
         )
         .unwrap(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         [ManagedModelDimension::new("anthropic", "anthropic/claude-sonnet-4").unwrap()],
     )
     .unwrap()
@@ -157,6 +158,7 @@ fn event_rejects_unfinished_or_unbounded_rollups() {
             "22222222-2222-4222-8222-222222222222",
         )
         .unwrap(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         [],
     );
     assert!(invalid.is_err());
@@ -166,6 +168,13 @@ fn event_rejects_unfinished_or_unbounded_rollups() {
     let event =
         StellaOperationalEventV1::from_finalized_rollup(&context(), &path_like_model).unwrap();
     assert_eq!(serde_json::to_value(event).unwrap()["model"], "other");
+
+    let mut rounded_upper_edge = rollup(3);
+    rounded_upper_edge.cost_usd = (u64::MAX as f64) / 1_000_000.0;
+    assert!(
+        StellaOperationalEventV1::from_finalized_rollup(&context(), &rounded_upper_edge).is_err(),
+        "the f64 value equal to the rounded u64 upper boundary must be rejected before cast"
+    );
 }
 
 #[test]
@@ -212,6 +221,7 @@ fn event_ids_are_domain_separated_framed_and_bound_to_host_and_store() {
             organization,
             "workspace_01",
             identity,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             [ManagedModelDimension::new("anthropic", "anthropic/claude-sonnet-4").unwrap()],
         )
         .unwrap()
@@ -456,27 +466,135 @@ fn an_oversized_new_event_reports_dropped_new_not_success() {
 }
 
 #[test]
-fn clock_rollback_repairs_future_retry_and_lease_deadlines() {
+fn capacity_never_evicts_rows_owned_by_another_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("enterprise-telemetry.db");
+    let spool = EnterpriseTelemetrySpool::open_at(
+        &path,
+        SpoolLimits {
+            max_rows: 2,
+            max_bytes: 64 * 1024,
+        },
+    )
+    .unwrap();
+    let first = StellaOperationalEventV1::from_finalized_rollup(&context(), &rollup(1)).unwrap();
+    let second = StellaOperationalEventV1::from_finalized_rollup(&context(), &rollup(2)).unwrap();
+    let rotated = StellaOperationalEventV1::from_finalized_rollup(&context(), &rollup(3)).unwrap();
+    assert_eq!(
+        spool.enqueue(SINK_A, &first, 1).unwrap(),
+        EnqueueOutcome::Retained
+    );
+    assert_eq!(
+        spool.enqueue(SINK_A, &second, 2).unwrap(),
+        EnqueueOutcome::Retained
+    );
+
+    assert_eq!(
+        spool.enqueue(SINK_B, &rotated, 3).unwrap(),
+        EnqueueOutcome::DroppedNew,
+        "a newly rotated sink cannot consume capacity by evicting the old sink"
+    );
+    assert_eq!(spool.status_for_sink(SINK_A).unwrap().pending_rows, 2);
+    assert_eq!(spool.status_for_sink(SINK_B).unwrap().pending_rows, 0);
+}
+
+#[test]
+fn clock_rollback_rebases_once_without_clearing_a_live_lease() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("enterprise-telemetry.db");
     let spool = EnterpriseTelemetrySpool::open_at(&path, SpoolLimits::default()).unwrap();
     let event = StellaOperationalEventV1::from_finalized_rollup(&context(), &rollup(1)).unwrap();
     spool.enqueue(SINK_A, &event, 100_000).unwrap();
-    let claimed = spool
-        .claim_batch(SINK_A, "future-worker", 100_000, 30_000, 1, 64 * 1024)
-        .unwrap();
-    spool
-        .retry(SINK_A, "future-worker", &claimed, 100_000)
-        .unwrap();
-
-    let repaired = spool
-        .claim_batch(SINK_A, "rolled-back", 1_000, 1_000, 1, 64 * 1024)
-        .unwrap();
     assert_eq!(
-        repaired.len(),
-        1,
-        "future deadlines cannot strand rows after clock rollback"
+        spool
+            .claim_batch(SINK_A, "future-worker", 100_000, 30_000, 1, 64 * 1024)
+            .unwrap()
+            .len(),
+        1
     );
+    let concurrent = EnterpriseTelemetrySpool::open_at(&path, SpoolLimits::default()).unwrap();
+
+    assert!(
+        concurrent
+            .claim_batch(SINK_A, "rolled-back-a", 1_000, 1_000, 1, 64 * 1024)
+            .unwrap()
+            .is_empty(),
+        "rollback repair must preserve the original owner's rebased live lease"
+    );
+    assert!(
+        spool
+            .claim_batch(SINK_A, "rolled-back-b", 1_000, 1_000, 1, 64 * 1024)
+            .unwrap()
+            .is_empty(),
+        "a concurrent caller at the same repaired epoch must not rebase again"
+    );
+    assert_eq!(
+        concurrent
+            .claim_batch(SINK_A, "after-expiry", 31_000, 1_000, 1, 64 * 1024)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn retry_deadline_never_exceeds_the_inclusive_375_second_horizon() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("enterprise-telemetry.db");
+    let spool = EnterpriseTelemetrySpool::open_at(&path, SpoolLimits::default()).unwrap();
+    let event = StellaOperationalEventV1::from_finalized_rollup(&context(), &rollup(1)).unwrap();
+    spool.enqueue(SINK_A, &event, 0).unwrap();
+    let inspect = rusqlite::Connection::open(&path).unwrap();
+    let mut now = 0_i64;
+    for attempt in 0..10 {
+        let owner = format!("worker-{attempt}");
+        let claimed = spool
+            .claim_batch(SINK_A, &owner, now, 1_000, 1, 64 * 1024)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        spool.retry(SINK_A, &owner, &claimed, now).unwrap();
+        let deadline: i64 = inspect
+            .query_row(
+                "SELECT next_attempt_ms FROM operational_spool WHERE sink_fingerprint = ?1",
+                [SINK_A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(deadline >= now);
+        assert!(
+            deadline <= now + 375_000,
+            "attempt {attempt}: {deadline} > {now}"
+        );
+        now = deadline;
+    }
+}
+
+#[test]
+fn malformed_spool_row_is_quarantined_before_lease_and_does_not_block_good_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("enterprise-telemetry.db");
+    let spool = EnterpriseTelemetrySpool::open_at(&path, SpoolLimits::default()).unwrap();
+    let corrupt_id = format!("evt_{}", "c".repeat(64));
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "INSERT INTO operational_spool
+         (event_id, sink_fingerprint, payload, payload_bytes, created_at_ms)
+         VALUES (?1, ?2, ?3, 1, 0)",
+        rusqlite::params![corrupt_id, SINK_A, vec![b'{']],
+    )
+    .unwrap();
+    drop(raw);
+    let good = StellaOperationalEventV1::from_finalized_rollup(&context(), &rollup(9)).unwrap();
+    spool.enqueue(SINK_A, &good, 1).unwrap();
+
+    let claimed = spool
+        .claim_batch(SINK_A, "worker", 10, 1_000, 1, 64 * 1024)
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].event.event_id(), good.event_id());
+    let status = spool.status_for_sink(SINK_A).unwrap();
+    assert_eq!(status.corrupt_dropped_rows, 1);
+    assert_eq!(status.pending_rows, 1);
 }
 
 #[test]
@@ -597,6 +715,69 @@ fn installation_and_store_identities_persist_and_reset_on_their_real_boundaries(
 }
 
 #[test]
+fn cloned_store_uses_a_fresh_persistent_export_nonce_per_ledger_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let store = Store::open(&source).unwrap();
+    store.begin_enterprise_enrollment(SINK_A).unwrap();
+    let execution = store
+        .begin_execution("run", "same", "anthropic", "model")
+        .unwrap();
+    store.finish_execution(execution, "completed", 0.0).unwrap();
+    let store_uuid = store.enterprise_store_uuid().unwrap();
+    drop(store);
+
+    let source_db = source.join(".stella/private/store.db");
+    let clone_a = dir.path().join("clone-a");
+    let clone_b = dir.path().join("clone-b");
+    let db_a = stella_store::workspace_private_sqlite_path(&clone_a, "store.db").unwrap();
+    let db_b = stella_store::workspace_private_sqlite_path(&clone_b, "store.db").unwrap();
+    std::fs::copy(&source_db, &db_a).unwrap();
+    std::fs::copy(&source_db, &db_b).unwrap();
+
+    let a = Store::open(&clone_a).unwrap();
+    let b = Store::open(&clone_b).unwrap();
+    assert_eq!(a.enterprise_store_uuid().unwrap(), store_uuid);
+    assert_eq!(b.enterprise_store_uuid().unwrap(), store_uuid);
+    let nonce_a = a
+        .mark_enterprise_export_pending(SINK_A, execution)
+        .unwrap()
+        .unwrap();
+    let nonce_b = b
+        .mark_enterprise_export_pending(SINK_A, execution)
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        nonce_a, nonce_b,
+        "clones must not derive the same export id"
+    );
+    assert_eq!(
+        a.mark_enterprise_export_pending(SINK_A, execution)
+            .unwrap()
+            .unwrap(),
+        nonce_a,
+        "retrying one ledger row must reuse its persisted nonce"
+    );
+
+    let identity =
+        OperationalIdentity::new("11111111-1111-4111-8111-111111111111", &store_uuid).unwrap();
+    let event = |nonce: &str| {
+        let context = OperationalEventContext::new(
+            "enroll_01",
+            "org_01",
+            "workspace_01",
+            identity.clone(),
+            nonce,
+            [ManagedModelDimension::new("anthropic", "anthropic/claude-sonnet-4").unwrap()],
+        )
+        .unwrap();
+        StellaOperationalEventV1::from_finalized_rollup(&context, &rollup(execution)).unwrap()
+    };
+    assert_ne!(event(&nonce_a).event_id(), event(&nonce_b).event_id());
+}
+
+#[test]
 fn export_ledger_backfills_only_post_enrollment_pending_executions() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -607,23 +788,122 @@ fn export_ledger_backfills_only_post_enrollment_pending_executions() {
         .unwrap();
     store.finish_execution(old, "completed", 0.0).unwrap();
     store.begin_enterprise_enrollment(SINK_A).unwrap();
-    assert!(!store.mark_enterprise_export_pending(SINK_A, old).unwrap());
+    assert!(
+        store
+            .mark_enterprise_export_pending(SINK_A, old)
+            .unwrap()
+            .is_none()
+    );
 
     let new = store
         .begin_execution("run", "new", "anthropic", "model")
         .unwrap();
     store.finish_execution(new, "completed", 0.0).unwrap();
-    assert!(store.mark_enterprise_export_pending(SINK_A, new).unwrap());
-    assert_eq!(store.pending_enterprise_exports(SINK_A).unwrap(), vec![new]);
+    assert!(
+        store
+            .mark_enterprise_export_pending(SINK_A, new)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .pending_enterprise_export_page(SINK_A, None, 256)
+            .unwrap()[0]
+            .execution_id,
+        new
+    );
     store.mark_enterprise_export_spooled(SINK_A, new).unwrap();
-    assert!(store.pending_enterprise_exports(SINK_A).unwrap().is_empty());
+    assert!(
+        store
+            .pending_enterprise_export_page(SINK_A, None, 256)
+            .unwrap()
+            .is_empty()
+    );
 
     drop(store);
     let reopened = stella_store::Store::open(&workspace).unwrap();
     assert!(
         reopened
-            .pending_enterprise_exports(SINK_A)
+            .pending_enterprise_export_page(SINK_A, None, 256)
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn pending_export_backfill_is_hard_paged_across_a_ten_thousand_row_outage() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store = Store::open(&workspace).unwrap();
+    store.begin_enterprise_enrollment(SINK_A).unwrap();
+    for index in 0..10_050 {
+        let execution = store
+            .begin_execution("run", &format!("outage-{index}"), "anthropic", "model")
+            .unwrap();
+        store.finish_execution(execution, "completed", 0.0).unwrap();
+        store
+            .mark_enterprise_export_pending(SINK_A, execution)
+            .unwrap()
+            .unwrap();
+    }
+
+    assert!(
+        store
+            .pending_enterprise_export_page(SINK_A, None, 257)
+            .is_err(),
+        "callers cannot request an unbounded startup page"
+    );
+    let first = store
+        .pending_enterprise_export_page(SINK_A, None, 256)
+        .unwrap();
+    assert_eq!(first.len(), 256);
+    let second = store
+        .pending_enterprise_export_page(SINK_A, Some(first.last().unwrap().execution_id), 256)
+        .unwrap();
+    assert_eq!(second.len(), 256);
+    assert!(second[0].execution_id > first[255].execution_id);
+}
+
+#[test]
+fn completed_export_ledger_compacts_with_a_durable_idempotency_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store = Store::open(&workspace).unwrap();
+    store.begin_enterprise_enrollment(SINK_A).unwrap();
+    let mut rows = Vec::new();
+    for index in 0..300 {
+        let execution = store
+            .begin_execution("run", &format!("done-{index}"), "anthropic", "model")
+            .unwrap();
+        store.finish_execution(execution, "completed", 0.0).unwrap();
+        let nonce = store
+            .mark_enterprise_export_pending(SINK_A, execution)
+            .unwrap()
+            .unwrap();
+        store
+            .mark_enterprise_export_spooled(SINK_A, execution)
+            .unwrap();
+        rows.push((execution, nonce));
+    }
+
+    assert_eq!(
+        store.compact_enterprise_export_ledger(SINK_A, 32).unwrap(),
+        268
+    );
+    assert!(
+        store
+            .mark_enterprise_export_pending(SINK_A, rows[0].0)
+            .unwrap()
+            .is_none(),
+        "the compacted-through boundary prevents a new nonce for old closeout"
+    );
+    assert_eq!(
+        store
+            .mark_enterprise_export_pending(SINK_A, rows[299].0)
+            .unwrap()
+            .unwrap(),
+        rows[299].1
     );
 }

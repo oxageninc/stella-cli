@@ -587,9 +587,7 @@ impl Store {
             root,
         };
         store.migrate()?;
-        store
-            .lock()
-            .execute_batch(enterprise_telemetry::STORE_EXPORT_TABLES_DDL)?;
+        enterprise_telemetry::initialize_store_export_schema(&mut store.lock())?;
         Ok(store)
     }
 

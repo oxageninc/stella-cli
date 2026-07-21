@@ -23,10 +23,14 @@ use crate::{Result, StoreError};
 const IDENTIFIER_MAX_BYTES: usize = 128;
 const DIMENSION_MAX_BYTES: usize = 160;
 const MAX_CLAIM_EVENTS: usize = 1_000;
+const MAX_EXPORT_PAGE_ROWS: usize = 256;
+const MAX_CORRUPT_SCAN_ROWS: usize = 1_000;
 const MAX_CLAIM_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LEASE_MS: i64 = 5 * 60 * 1_000;
 const RETRY_BASE_MS: i64 = 1_000;
 const RETRY_MAX_MS: i64 = 5 * 60 * 1_000;
+const RETRY_MAX_JITTER_MS: i64 = RETRY_MAX_MS / 4;
+const MAX_RETRY_HORIZON_MS: i64 = RETRY_MAX_MS + RETRY_MAX_JITTER_MS;
 const EVENT_ID_DOMAIN: &[u8] = b"stella.enterprise.operational.event-id.v1";
 const LEGACY_UNBOUND_SINK: &str =
     "sink_0000000000000000000000000000000000000000000000000000000000000000";
@@ -38,14 +42,81 @@ CREATE TABLE IF NOT EXISTS enterprise_export_identity (
 );
 CREATE TABLE IF NOT EXISTS enterprise_export_enrollment (
     sink_fingerprint TEXT PRIMARY KEY,
-    enrolled_after_execution_id INTEGER NOT NULL
+    enrolled_after_execution_id INTEGER NOT NULL,
+    compacted_through_execution_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS enterprise_export_ledger (
     sink_fingerprint TEXT NOT NULL,
     execution_id INTEGER NOT NULL,
+    export_nonce TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('pending', 'spooled')),
     PRIMARY KEY(sink_fingerprint, execution_id)
 );";
+
+pub(crate) fn initialize_store_export_schema(conn: &mut Connection) -> Result<()> {
+    conn.execute_batch(STORE_EXPORT_TABLES_DDL)?;
+    migrate_store_export_schema(conn)
+}
+
+fn migrate_store_export_schema(conn: &mut Connection) -> Result<()> {
+    let has_compaction_boundary: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('enterprise_export_enrollment')
+         WHERE name = 'compacted_through_execution_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_compaction_boundary {
+        conn.execute_batch(
+            "ALTER TABLE enterprise_export_enrollment
+             ADD COLUMN compacted_through_execution_id INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    let has_export_nonce: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('enterprise_export_ledger')
+         WHERE name = 'export_nonce')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_export_nonce {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let legacy = {
+        let mut stmt = tx.prepare(
+            "SELECT sink_fingerprint, execution_id, status
+             FROM enterprise_export_ledger ORDER BY sink_fingerprint, execution_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    tx.execute_batch(
+        "ALTER TABLE enterprise_export_ledger RENAME TO enterprise_export_ledger_legacy;
+         CREATE TABLE enterprise_export_ledger (
+             sink_fingerprint TEXT NOT NULL,
+             execution_id INTEGER NOT NULL,
+             export_nonce TEXT NOT NULL,
+             status TEXT NOT NULL CHECK(status IN ('pending', 'spooled')),
+             PRIMARY KEY(sink_fingerprint, execution_id)
+         );",
+    )?;
+    for (sink, execution_id, status) in legacy {
+        tx.execute(
+            "INSERT INTO enterprise_export_ledger
+             (sink_fingerprint, execution_id, export_nonce, status)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![sink, execution_id, random_export_nonce(), status],
+        )?;
+    }
+    tx.execute_batch("DROP TABLE enterprise_export_ledger_legacy;")?;
+    tx.commit()?;
+    Ok(())
+}
 
 impl crate::Store {
     pub fn enterprise_store_uuid(&self) -> Result<String> {
@@ -88,36 +159,80 @@ impl crate::Store {
         &self,
         sink_fingerprint: &str,
         execution_id: i64,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         validate_sink_fingerprint(sink_fingerprint)?;
-        let conn = self.lock();
-        let eligible: bool = conn.query_row(
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let eligible: bool = tx.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM executions e JOIN enterprise_export_enrollment x
                   ON x.sink_fingerprint = ?1
                 WHERE e.id = ?2 AND e.id > x.enrolled_after_execution_id
+                  AND e.id > x.compacted_through_execution_id
                   AND e.finished_at IS NOT NULL AND e.outcome IS NOT NULL)",
             params![sink_fingerprint, execution_id],
             |row| row.get(0),
         )?;
         if !eligible {
-            return Ok(false);
+            tx.commit()?;
+            return Ok(None);
         }
-        Ok(conn.execute(
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT export_nonce FROM enterprise_export_ledger
+                 WHERE sink_fingerprint = ?1 AND execution_id = ?2",
+                params![sink_fingerprint, execution_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            tx.commit()?;
+            return Ok(Some(existing));
+        }
+        let nonce = random_export_nonce();
+        tx.execute(
             "INSERT OR IGNORE INTO enterprise_export_ledger
-             (sink_fingerprint, execution_id, status) VALUES (?1, ?2, 'pending')",
+             (sink_fingerprint, execution_id, export_nonce, status)
+             VALUES (?1, ?2, ?3, 'pending')",
+            params![sink_fingerprint, execution_id, nonce],
+        )?;
+        let persisted = tx.query_row(
+            "SELECT export_nonce FROM enterprise_export_ledger
+             WHERE sink_fingerprint = ?1 AND execution_id = ?2",
             params![sink_fingerprint, execution_id],
-        )? == 1)
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(Some(persisted))
     }
 
-    pub fn pending_enterprise_exports(&self, sink_fingerprint: &str) -> Result<Vec<i64>> {
+    pub fn pending_enterprise_export_page(
+        &self,
+        sink_fingerprint: &str,
+        after_execution_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<PendingEnterpriseExport>> {
         validate_sink_fingerprint(sink_fingerprint)?;
+        if limit == 0 || limit > MAX_EXPORT_PAGE_ROWS {
+            return Err(StoreError(
+                "enterprise export page limit must be 1..=256".into(),
+            ));
+        }
+        let after = after_execution_id.unwrap_or(0);
+        let sql_limit = i64::try_from(limit)
+            .map_err(|_| StoreError("invalid enterprise export page limit".into()))?;
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT execution_id FROM enterprise_export_ledger
-             WHERE sink_fingerprint = ?1 AND status = 'pending' ORDER BY execution_id",
+            "SELECT execution_id, export_nonce FROM enterprise_export_ledger
+             WHERE sink_fingerprint = ?1 AND status = 'pending' AND execution_id > ?2
+             ORDER BY execution_id LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![sink_fingerprint], |row| row.get(0))?;
+        let rows = stmt.query_map(params![sink_fingerprint, after, sql_limit], |row| {
+            Ok(PendingEnterpriseExport {
+                execution_id: row.get(0)?,
+                export_nonce: row.get(1)?,
+            })
+        })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -135,6 +250,56 @@ impl crate::Store {
         )?;
         Ok(())
     }
+
+    pub fn compact_enterprise_export_ledger(
+        &self,
+        sink_fingerprint: &str,
+        retain_completed: usize,
+    ) -> Result<u64> {
+        validate_sink_fingerprint(sink_fingerprint)?;
+        if retain_completed == 0 || retain_completed > 10_000 {
+            return Err(StoreError(
+                "enterprise export retention must be 1..=10000 rows".into(),
+            ));
+        }
+        let offset = i64::try_from(retain_completed)
+            .map_err(|_| StoreError("invalid enterprise export retention".into()))?;
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cutoff: Option<i64> = tx
+            .query_row(
+                "SELECT execution_id FROM enterprise_export_ledger
+                 WHERE sink_fingerprint = ?1 AND status = 'spooled'
+                 ORDER BY execution_id DESC LIMIT 1 OFFSET ?2",
+                params![sink_fingerprint, offset],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(cutoff) = cutoff else {
+            tx.commit()?;
+            return Ok(0);
+        };
+        let deleted = tx.execute(
+            "DELETE FROM enterprise_export_ledger
+             WHERE sink_fingerprint = ?1 AND status = 'spooled' AND execution_id <= ?2",
+            params![sink_fingerprint, cutoff],
+        )?;
+        tx.execute(
+            "UPDATE enterprise_export_enrollment
+             SET compacted_through_execution_id = MAX(compacted_through_execution_id, ?2)
+             WHERE sink_fingerprint = ?1",
+            params![sink_fingerprint, cutoff],
+        )?;
+        tx.commit()?;
+        u64::try_from(deleted)
+            .map_err(|_| StoreError("enterprise export compaction count exceeds u64".into()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEnterpriseExport {
+    pub execution_id: i64,
+    pub export_nonce: String,
 }
 
 pub(crate) fn random_uuid_v4() -> String {
@@ -161,6 +326,16 @@ pub(crate) fn random_uuid_v4() -> String {
         bytes[14],
         bytes[15]
     )
+}
+
+fn random_export_nonce() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    let mut nonce = String::with_capacity(32);
+    for byte in bytes {
+        write!(&mut nonce, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    nonce
 }
 
 /// Load or create the owner-only random identity for this Stella installation.
@@ -485,6 +660,7 @@ pub struct OperationalEventContext {
     organization_id: BoundedIdentifier,
     workspace_id: BoundedIdentifier,
     identity: OperationalIdentity,
+    export_nonce: String,
     model_catalog: BTreeSet<ManagedModelDimension>,
 }
 
@@ -495,16 +671,25 @@ impl OperationalEventContext {
         organization_id: impl Into<String>,
         workspace_id: impl Into<String>,
         identity: OperationalIdentity,
+        export_nonce: &str,
         model_catalog: I,
     ) -> Result<Self>
     where
         I: IntoIterator<Item = ManagedModelDimension>,
     {
+        if export_nonce.len() != 32
+            || !export_nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(StoreError("invalid enterprise export nonce".into()));
+        }
         Ok(Self {
             enrollment_id: BoundedIdentifier::parse(enrollment_id)?,
             organization_id: BoundedIdentifier::parse(organization_id)?,
             workspace_id: BoundedIdentifier::parse(workspace_id)?,
             identity,
+            export_nonce: export_nonce.to_string(),
             model_catalog: model_catalog.into_iter().collect(),
         })
     }
@@ -568,6 +753,7 @@ impl StellaOperationalEventV1 {
         hash_part(&mut hash, context.workspace_id.0.as_bytes());
         hash_part(&mut hash, context.identity.installation_uuid.as_bytes());
         hash_part(&mut hash, context.identity.store_uuid.as_bytes());
+        hash_part(&mut hash, context.export_nonce.as_bytes());
         hash_part(&mut hash, &rollup.execution_id.to_be_bytes());
         let mut event_id = String::from("evt_");
         for byte in hash.finalize() {
@@ -614,7 +800,7 @@ fn nonnegative_u64(name: &str, value: i64) -> Result<u64> {
 
 fn finite_nonnegative_microusd(value: f64) -> Result<u64> {
     let scaled = value * 1_000_000.0;
-    if !scaled.is_finite() || scaled < 0.0 || scaled > u64::MAX as f64 {
+    if !scaled.is_finite() || scaled < 0.0 || scaled >= u64::MAX as f64 {
         return Err(StoreError(
             "enterprise telemetry cost must be finite and non-negative".into(),
         ));
@@ -655,6 +841,7 @@ pub struct SpoolStatus {
     pub stranded_payload_bytes: u64,
     pub dropped_rows: u64,
     pub rollover_discarded_rows: u64,
+    pub corrupt_dropped_rows: u64,
     pub physical_bytes: u64,
 }
 
@@ -708,14 +895,27 @@ impl EnterpriseTelemetrySpool {
              CREATE INDEX IF NOT EXISTS operational_spool_ready
                  ON operational_spool(sink_fingerprint, next_attempt_ms,
                                       lease_until_ms, insertion_seq);
+             CREATE TABLE IF NOT EXISTS operational_spool_clock (
+                 sink_fingerprint TEXT PRIMARY KEY,
+                 last_seen_ms INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS operational_spool_meta (
                  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                  dropped_rows INTEGER NOT NULL DEFAULT 0,
-                 rollover_discarded_rows INTEGER NOT NULL DEFAULT 0
+                 rollover_discarded_rows INTEGER NOT NULL DEFAULT 0,
+                 corrupt_dropped_rows INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS operational_spool_quarantine (
+                 quarantine_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_id TEXT NOT NULL,
+                 sink_fingerprint TEXT NOT NULL,
+                 payload_bytes INTEGER NOT NULL,
+                 dropped_at_ms INTEGER NOT NULL,
+                 reason TEXT NOT NULL
              );
              INSERT OR IGNORE INTO operational_spool_meta
-                 (singleton, dropped_rows, rollover_discarded_rows)
-                 VALUES (1, 0, 0);",
+                 (singleton, dropped_rows, rollover_discarded_rows, corrupt_dropped_rows)
+                 VALUES (1, 0, 0, 0);",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -759,7 +959,7 @@ impl EnterpriseTelemetrySpool {
             tx.commit()?;
             return Ok(EnqueueOutcome::Duplicate);
         }
-        enforce_limits(&tx, self.limits)?;
+        enforce_limits(&tx, self.limits, sink_fingerprint)?;
         let retained: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM operational_spool
              WHERE sink_fingerprint = ?1 AND event_id = ?2)",
@@ -799,39 +999,51 @@ impl EnterpriseTelemetrySpool {
                 "invalid enterprise telemetry claim limits".into(),
             ));
         }
-        let sql_limit = i64::try_from(max_events)
+        let scan_limit = max_events
+            .saturating_add(MAX_CORRUPT_SCAN_ROWS)
+            .min(MAX_CLAIM_EVENTS);
+        let sql_limit = i64::try_from(scan_limit)
             .map_err(|_| StoreError("invalid enterprise telemetry claim limits".into()))?;
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let future_deadline = now_ms.saturating_add(RETRY_MAX_MS.max(MAX_LEASE_MS));
-        let clock_rolled_back: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operational_spool
-             WHERE sink_fingerprint = ?1 AND created_at_ms > ?2)",
-            params![sink_fingerprint, now_ms],
-            |row| row.get(0),
-        )?;
-        if clock_rolled_back {
+        let last_seen: Option<i64> = tx
+            .query_row(
+                "SELECT last_seen_ms FROM operational_spool_clock
+                 WHERE sink_fingerprint = ?1",
+                params![sink_fingerprint],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let observed_baseline = match last_seen {
+            Some(value) => value,
+            None => tx.query_row(
+                "SELECT COALESCE(MAX(created_at_ms), ?2) FROM operational_spool
+                 WHERE sink_fingerprint = ?1",
+                params![sink_fingerprint, now_ms],
+                |row| row.get(0),
+            )?,
+        };
+        if now_ms < observed_baseline {
+            let delta = observed_baseline - now_ms;
             tx.execute(
-                "UPDATE operational_spool SET next_attempt_ms = ?1,
-                 leased_by = NULL, lease_until_ms = NULL
+                "UPDATE operational_spool
+                 SET created_at_ms = MAX(0, created_at_ms - ?1),
+                     next_attempt_ms = MAX(0, next_attempt_ms - ?1),
+                     lease_until_ms = CASE WHEN lease_until_ms IS NULL THEN NULL
+                                           ELSE MAX(0, lease_until_ms - ?1) END
                  WHERE sink_fingerprint = ?2",
-                params![now_ms, sink_fingerprint],
-            )?;
-        } else {
-            tx.execute(
-                "UPDATE operational_spool SET next_attempt_ms = ?1
-                 WHERE sink_fingerprint = ?2 AND next_attempt_ms > ?3",
-                params![now_ms, sink_fingerprint, future_deadline],
-            )?;
-            tx.execute(
-                "UPDATE operational_spool SET leased_by = NULL, lease_until_ms = NULL
-                 WHERE sink_fingerprint = ?1 AND lease_until_ms > ?2",
-                params![sink_fingerprint, future_deadline],
+                params![delta, sink_fingerprint],
             )?;
         }
+        tx.execute(
+            "INSERT INTO operational_spool_clock(sink_fingerprint, last_seen_ms)
+             VALUES (?1, ?2)
+             ON CONFLICT(sink_fingerprint) DO UPDATE SET last_seen_ms = excluded.last_seen_ms",
+            params![sink_fingerprint, now_ms],
+        )?;
         let selected = {
             let mut stmt = tx.prepare(
-                "SELECT event_id, payload, payload_bytes, attempts
+                "SELECT insertion_seq, event_id, payload, payload_bytes, attempts
                  FROM operational_spool
                  WHERE sink_fingerprint = ?1 AND next_attempt_ms <= ?2
                    AND (lease_until_ms IS NULL OR lease_until_ms <= ?2)
@@ -839,23 +1051,54 @@ impl EnterpriseTelemetrySpool {
             )?;
             let rows = stmt.query_map(params![sink_fingerprint, now_ms, sql_limit], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, u32>(3)?,
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, u32>(4)?,
                 ))
             })?;
             let mut selected = Vec::new();
             let mut bytes = 0usize;
-            for row in rows {
-                let (id, payload, stored_bytes, attempts) = row?;
-                let size = usize::try_from(stored_bytes)
-                    .map_err(|_| StoreError("negative spool payload size".into()))?;
+            let candidates = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            for (sequence, id, payload, stored_bytes, attempts) in candidates {
+                let decoded = serde_json::from_slice::<StellaOperationalEventV1>(&payload);
+                let malformed = usize::try_from(stored_bytes).ok() != Some(payload.len())
+                    || decoded
+                        .as_ref()
+                        .map_or(true, |event| event.event_id() != id);
+                if malformed {
+                    tx.execute(
+                        "INSERT INTO operational_spool_quarantine
+                         (event_id, sink_fingerprint, payload_bytes, dropped_at_ms, reason)
+                         VALUES (?1, ?2, ?3, ?4, 'invalid_payload')",
+                        params![id, sink_fingerprint, stored_bytes.max(0), now_ms],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM operational_spool WHERE insertion_seq = ?1",
+                        params![sequence],
+                    )?;
+                    tx.execute(
+                        "UPDATE operational_spool_meta
+                         SET corrupt_dropped_rows = corrupt_dropped_rows + 1
+                         WHERE singleton = 1",
+                        [],
+                    )?;
+                    continue;
+                }
+                let event = decoded.map_err(|error| {
+                    StoreError(format!("invalid operational event in spool: {error}"))
+                })?;
+                let size = payload.len();
                 if bytes.saturating_add(size) > max_payload_bytes {
                     break;
                 }
                 bytes += size;
-                selected.push((id, payload, attempts));
+                selected.push((id, event, attempts));
+                if selected.len() == max_events {
+                    break;
+                }
             }
             selected
         };
@@ -874,19 +1117,14 @@ impl EnterpriseTelemetrySpool {
         }
         tx.commit()?;
 
-        selected
+        Ok(selected
             .into_iter()
-            .map(|(_, payload, attempts)| {
-                let event = serde_json::from_slice(&payload).map_err(|error| {
-                    StoreError(format!("invalid operational event in spool: {error}"))
-                })?;
-                Ok(ClaimedOperationalEvent {
-                    event,
-                    sink_fingerprint: sink_fingerprint.to_string(),
-                    attempts,
-                })
+            .map(|(_, event, attempts)| ClaimedOperationalEvent {
+                event,
+                sink_fingerprint: sink_fingerprint.to_string(),
+                attempts,
             })
-            .collect()
+            .collect())
     }
 
     /// Acknowledge only records held by this lease owner.
@@ -944,13 +1182,14 @@ impl EnterpriseTelemetrySpool {
                 .saturating_mul(1_i64 << exponent)
                 .min(RETRY_MAX_MS);
             let jitter = retry_jitter(item.event.event_id(), item.attempts, delay);
+            let retry_after = delay.saturating_add(jitter).min(MAX_RETRY_HORIZON_MS);
             let changed = tx.execute(
                 "UPDATE operational_spool
                  SET attempts = attempts + 1, next_attempt_ms = ?1,
                      leased_by = NULL, lease_until_ms = NULL
                  WHERE sink_fingerprint = ?2 AND event_id = ?3 AND leased_by = ?4",
                 params![
-                    now_ms.saturating_add(delay.saturating_add(jitter)),
+                    now_ms.saturating_add(retry_after),
                     sink_fingerprint,
                     item.event.event_id(),
                     owner
@@ -1007,11 +1246,11 @@ impl EnterpriseTelemetrySpool {
         };
         let (rows, bytes) = totals(true)?;
         let (stranded_rows, stranded_bytes) = totals(false)?;
-        let (dropped, rollover_discarded): (i64, i64) = conn.query_row(
-            "SELECT dropped_rows, rollover_discarded_rows
+        let (dropped, rollover_discarded, corrupt_dropped): (i64, i64, i64) = conn.query_row(
+            "SELECT dropped_rows, rollover_discarded_rows, corrupt_dropped_rows
              FROM operational_spool_meta WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         Ok(SpoolStatus {
             pending_rows: u64::try_from(rows).unwrap_or(0),
@@ -1020,6 +1259,7 @@ impl EnterpriseTelemetrySpool {
             stranded_payload_bytes: u64::try_from(stranded_bytes).unwrap_or(0),
             dropped_rows: u64::try_from(dropped).unwrap_or(0),
             rollover_discarded_rows: u64::try_from(rollover_discarded).unwrap_or(0),
+            corrupt_dropped_rows: u64::try_from(corrupt_dropped).unwrap_or(0),
             physical_bytes: physical_size(&self.path),
         })
     }
@@ -1121,6 +1361,18 @@ fn migrate_spool_schema(conn: &mut Connection) -> Result<()> {
                  ADD COLUMN rollover_discarded_rows INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
+        let has_corrupt: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('operational_spool_meta')
+             WHERE name = 'corrupt_dropped_rows')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_corrupt {
+            conn.execute_batch(
+                "ALTER TABLE operational_spool_meta
+                 ADD COLUMN corrupt_dropped_rows INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
     }
     Ok(())
 }
@@ -1163,7 +1415,11 @@ fn physical_size(path: &Path) -> u64 {
     .sum()
 }
 
-fn enforce_limits(tx: &rusqlite::Transaction<'_>, limits: SpoolLimits) -> Result<()> {
+fn enforce_limits(
+    tx: &rusqlite::Transaction<'_>,
+    limits: SpoolLimits,
+    inserting_sink: &str,
+) -> Result<()> {
     loop {
         let (rows, bytes): (i64, i64) = tx.query_row(
             "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM operational_spool",
@@ -1177,9 +1433,10 @@ fn enforce_limits(tx: &rusqlite::Transaction<'_>, limits: SpoolLimits) -> Result
         }
         let oldest: Option<i64> = tx
             .query_row(
-                "SELECT insertion_seq FROM operational_spool WHERE leased_by IS NULL
+                "SELECT insertion_seq FROM operational_spool
+                 WHERE sink_fingerprint = ?1 AND leased_by IS NULL
                  ORDER BY insertion_seq LIMIT 1",
-                [],
+                params![inserting_sink],
                 |row| row.get(0),
             )
             .optional()?;
