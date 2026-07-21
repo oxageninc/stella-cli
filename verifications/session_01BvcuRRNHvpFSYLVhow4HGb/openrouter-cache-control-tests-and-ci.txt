@@ -1,0 +1,36 @@
+test zai::tests::other_identities_ignore_reasoning_entirely ... ok
+test zai::tests::user_attachments_widen_content_to_parts_with_data_uri_images ... ok
+test zai::tests::truncation_is_blamed_on_the_last_call_not_an_earlier_broken_one ... ok
+test zai::tests::usage_accounting_sends_the_include_field_and_takes_the_reported_cost ... ok
+test zai::tests::openrouter_identity_maps_reasoning_to_the_gateway_object ... ok
+test zai::tests::zai_identity_maps_reasoning_to_glm_thinking_object ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 159 filtered out; finished in 0.03s
+
+[1m[92m     Running[0m tests/credential_prompt_degrade.rs (target/debug/deps/credential_prompt_degrade-b5db98a86741f98b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+
+[0;31mX[0m [0;1;39mmain[0m ci · [0;36m29802497260[0m
+Triggered via push about 1 minute ago
+
+[0;1;39mJOBS[0m
+[0;31mX[0m [0;1;39mfmt + clippy + test[0m in 36s (ID [0;36m88546131626[0m)
+  [0;32m✓[0m Set up job
+  [0;32m✓[0m Run actions/checkout@v7
+  [0;32m✓[0m Install Rust stable
+  [0;32m✓[0m Run Swatinem/rust-cache@v2
+  [0;32m✓[0m cargo fmt --check
+  [0;31mX[0m file-size ratchet
+  [38;5;242m-[0m cargo clippy -D warnings
+  [38;5;242m-[0m cargo test
+  [38;5;242m-[0m cargo build (release smoke, thin LTO)
+  [38;5;242m-[0m Post Run Swatinem/rust-cache@v2
+  [0;32m✓[0m Post Run actions/checkout@v7
+  [0;32m✓[0m Complete job
+[0;32m✓[0m [0;1;39mcargo deny + cargo audit[0m in 32s (ID [0;36m88546131634[0m)
+
