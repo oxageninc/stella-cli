@@ -206,6 +206,10 @@ async fn run_pipeline_one_shot(
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
         let is_text = format == OutputFormat::Text;
+        // The exact condition lives in `approval_capability_for` so it stays
+        // directly unit-testable — inlining it here is what a prior
+        // squash-merge collapsed into a bare `is_text` check, with no test to
+        // catch the regression.
         let approval_capability = approval_capability_for(
             is_text,
             std::io::stdin().is_terminal(),
