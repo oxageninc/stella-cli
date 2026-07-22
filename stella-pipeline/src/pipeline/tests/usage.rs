@@ -126,7 +126,12 @@ async fn triage_success_emits_usage_before_budget_abort() {
     assert_eq!(serialized[usage]["role"], "triage");
     assert_eq!(serialized[usage]["provider"], "scripted");
     assert_eq!(serialized[usage]["model"], "scripted");
-    assert_eq!(serialized[usage]["complete"], false);
+    // The provider call itself succeeded with a real, trustworthy usage
+    // envelope (`text_result`'s `reported: true`) — `complete` tracks that,
+    // not the turn's outcome. The *subsequent* budget check aborting the
+    // turn is a separate concern from whether this call's own accounting
+    // record can be trusted; it can.
+    assert_eq!(serialized[usage]["complete"], true);
 }
 
 #[tokio::test]
