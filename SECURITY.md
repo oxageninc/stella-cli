@@ -31,7 +31,7 @@ Especially interesting, given what Stella promises:
 - **Prompt/tool injection with impact** — untrusted content (repo files, MCP
   frames, provider responses) escalating into actions the user didn't sanction,
   beyond what the model is already trusted to do.
-- **OCP host boundary breaks** — providers escaping quarantine: inheriting
+- **CGP host boundary breaks** — providers escaping quarantine: inheriting
   credentials, ambient filesystem access, or ungated egress.
 - **install.sh / release integrity** — checksum bypasses, tag/asset confusion.
 

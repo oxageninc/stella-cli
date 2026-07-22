@@ -15,8 +15,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ocp_types::frame::FrameEmbedding;
-use ocp_types::{ContextFrame, ContextQuery, ContextQueryResult, Provenance};
+use contextgraph_types::frame::FrameEmbedding;
+use contextgraph_types::{ContextFrame, ContextQuery, ContextQueryResult, Provenance};
 
 use crate::error::ContextError;
 use crate::store::{
@@ -92,7 +92,7 @@ impl RecallResult {
     }
 }
 
-/// The OCP wire shape of a recall — the drop report survives as
+/// The CGP wire shape of a recall — the drop report survives as
 /// `truncated`/`dropped_estimate`, so adapting a recall to the provider seam
 /// never silently discards it (`L-C5`).
 impl From<RecallResult> for ContextQueryResult {
@@ -107,7 +107,7 @@ impl From<RecallResult> for ContextQueryResult {
 
 impl ContextStore {
     /// Hybrid retrieval with no domain scope — grounding drawn from the whole
-    /// workspace. The OCP-shaped `ContextProvider::query` adapts this down to
+    /// workspace. The CGP-shaped `ContextProvider::query` adapts this down to
     /// a [`ContextQueryResult`].
     pub async fn recall(&self, q: &ContextQuery) -> Result<RecallResult, ContextError> {
         self.recall_scoped(q, &[]).await
@@ -582,7 +582,7 @@ fn lexical_search(nodes: &[NodeRow], terms: &[String], limit: usize) -> Vec<(i64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocp_types::FrameKind;
+    use contextgraph_types::FrameKind;
     use proptest::prelude::*;
 
     fn frame(id: &str, token_cost: u32) -> ContextFrame {
@@ -746,7 +746,7 @@ mod tests {
     use crate::embed::HashEmbedder;
     use crate::store::{ContextStore, NodeInput, NodeKind};
     use crate::writeback::ContextDelta;
-    use ocp_types::ContextQuery;
+    use contextgraph_types::ContextQuery;
     use std::sync::Arc;
     use tempfile::TempDir;
 

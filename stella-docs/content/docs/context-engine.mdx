@@ -70,7 +70,7 @@ expensive part never changes:
    capped by default at 5 frames / ~1,200 tokens. Nothing relevant? No block
    at all.
 
-Recall fans out through the **Open Context Protocol (OCP)** host to
+Recall fans out through the **Context Graph Protocol (CGP)** host to
 in-process providers — the workspace memory store and the code graph — fused
 by score under one token budget.
 
@@ -106,18 +106,18 @@ session runs and as a workspace ages — where per-turn-injection designs get
 more expensive with every memory they add. Cost architecture, not a cache
 trick.
 
-## The Open Context Protocol
+## The Context Graph Protocol
 
 The recall seam isn't private plumbing — it is a versioned, open wire
-protocol: the **[Open Context Protocol](https://github.com/macanderson/context-graph-protocol)**
-(`ocp/1.0-draft`), now its own project, with Stella as its reference host.
+protocol: the **[Context Graph Protocol](https://github.com/macanderson/context-graph-protocol)**
+(`contextgraph/1.0-draft`), now its own project, with Stella as its reference host.
 
 - **Zero-dependency wire types.** The protocol's types depend on nothing but
   a JSON codec — a context provider can be written in any language without
   importing a line of Stella.
-- **Machine-checked conformance.** "OCP conformant" isn't marketing — it's
+- **Machine-checked conformance.** "CGP conformant" isn't marketing — it's
   green on the public conformance suite. A conforming provider works with
-  any OCP host, checked at CI time rather than discovered at integration
+  any CGP host, checked at CI time rather than discovered at integration
   time.
 - **A trust architecture**, not just a transport: provenance (every frame
   says where it came from), budget honesty (providers respect the token
@@ -127,9 +127,9 @@ protocol: the **[Open Context Protocol](https://github.com/macanderson/context-g
 
 The consequence for you: the context engine is **extensible without forks**.
 Your company wiki, your issue tracker, your vector store — anything that
-speaks OCP can feed Stella's recall block under the same budget, scoring,
+speaks CGP can feed Stella's recall block under the same budget, scoring,
 and citation rules as the built-in providers. The full analysis lives in
-[the OCP advantages paper](https://github.com/macanderson/context-graph-protocol/blob/main/docs/protocol-advantages.md).
+[the CGP advantages paper](https://github.com/macanderson/context-graph-protocol/blob/main/docs/protocol-advantages.md).
 
 
 ## The citation loop: memories that earn their place

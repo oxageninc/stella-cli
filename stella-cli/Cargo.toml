@@ -23,8 +23,8 @@ formula = "stella"
 
 [dependencies]
 stella-protocol = { path = "../stella-protocol" }
-ocp-types = { package = "contextgraph-types", git = "https://github.com/macanderson/context-graph-protocol", rev = "58a933a2e1f894ae98adc9994bd9d0062a610ae8" }
-ocp-host = { package = "contextgraph-host", git = "https://github.com/macanderson/context-graph-protocol", rev = "58a933a2e1f894ae98adc9994bd9d0062a610ae8" }
+contextgraph-types = { git = "https://github.com/macanderson/context-graph-protocol", rev = "58a933a2e1f894ae98adc9994bd9d0062a610ae8" }
+contextgraph-host = { git = "https://github.com/macanderson/context-graph-protocol", rev = "58a933a2e1f894ae98adc9994bd9d0062a610ae8" }
 stella-core = { path = "../stella-core" }
 stella-model = { path = "../stella-model" }
 stella-tools = { path = "../stella-tools" }

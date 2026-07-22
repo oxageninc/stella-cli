@@ -2909,7 +2909,7 @@ fn memory_hit(
 /// the description its file location (the citation's parenthetical, else
 /// the frame uri), and the inserted text the bare symbol name — the title's
 /// last token.
-fn symbol_hit(frame: &ocp_types::ContextFrame) -> EntityHit {
+fn symbol_hit(frame: &contextgraph_types::ContextFrame) -> EntityHit {
     let label = frame.title.clone();
     let insert = label
         .split_whitespace()

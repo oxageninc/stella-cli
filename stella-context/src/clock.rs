@@ -3,7 +3,7 @@
 //! Bi-temporal storage needs timestamps that
 //! are **lexicographically comparable** so "what did we believe at T1" is a
 //! plain string range scan in SQLite. Rather than pull in a date-time crate
-//! (`ocp-types` is zero-dep by charter; this crate stays lean too), we format
+//! (`contextgraph-types` is zero-dep by charter; this crate stays lean too), we format
 //! RFC-3339 UTC ourselves from a Unix-seconds source. The [`Clock`] trait is
 //! the seam: production uses the wall clock; tests inject [`FixedClock`] so a
 //! T1→T2 correction is exact and never races real time.

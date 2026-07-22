@@ -23,9 +23,9 @@
 #       no cwd or command-line guessing needed.
 #
 #   (B) An orphaned OS subprocess a *now-dead* stella spawned mid-turn — the
-#       bash tool, a custom tool, the hook runner, ocp-host's stdio
+#       bash tool, a custom tool, the hook runner, contextgraph-host's stdio
 #       provider connections. Each calls setsid() before exec and carries
-#       its own Drop-based "kill_group" backstop (ocp-host/src/stdio.rs,
+#       its own Drop-based "kill_group" backstop (contextgraph-host/src/stdio.rs,
 #       stella-tools/src/bash.rs) — but that backstop is Rust destructor
 #       logic, which a SIGKILL'd parent never runs.
 #

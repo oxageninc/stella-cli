@@ -525,6 +525,7 @@ impl<'a> Pipeline<'a> {
         let authored_witness = self.config.test_command.is_none()
             && self.config.witness_writer
             && assessment.wants_witness()
+            && task_class.verifies_unconditionally()
             && self.can_author_independent_witness();
         // Single-shot (the default) runs directly over the session ports —
         // zero snapshot/adoption machinery only when the user supplied the

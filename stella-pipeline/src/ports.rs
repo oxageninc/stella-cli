@@ -50,7 +50,7 @@ pub trait ProviderResolver: Send + Sync {
 pub struct RecalledFrame {
     /// Human-readable citation, never a raw id (L-C4).
     pub citation_label: String,
-    /// The OCP provider leg that returned this frame.
+    /// The CGP provider leg that returned this frame.
     pub provider: String,
     /// The record's original source from its provenance chain. This can
     /// differ from `provider` when an adapter fronts another context store.

@@ -414,7 +414,7 @@ take effect the next session — hot-injection would invalidate the cache.
 
 Every working turn is also recorded as an **episode** (summary, files touched,
 outcome, time window) in `.stella/private/context.db`, and `stella init` writes the
-domain taxonomy as bi-temporal facts. Recall fans out through the OCP host to
+domain taxonomy as bi-temporal facts. Recall fans out through the CGP host to
 the memory store and the code graph, fused by score under one budget.
 
 ## Telemetry
@@ -526,7 +526,7 @@ flowchart TD
 
 ## Workspace layout
 
-Fourteen `stella-*` crates make up the workspace. The Open Context Protocol —
+Fourteen `stella-*` crates make up the workspace. The Context Graph Protocol —
 the retrieval abstraction Stella's recall routes through — now lives in its own
 repository and is pulled in as a pinned git dependency, not as workspace members.
 
@@ -546,7 +546,7 @@ repository and is pulled in as a pinned git dependency, not as workspace members
 | `stella-media` | Multimodal generation behind one `MediaProvider` port — `generate_svg` always on; `generate_image` and `generate_video`/`poll_video` registered when a media-capable key is set (video behind a headless cost gate) |
 | `stella-tui` | The Command Deck — a pure event-fold core + thin crossterm shell |
 | `stella-observatory` | The Observatory — `stella observe`'s loopback-only telemetry dashboard over the local SQLite stores |
-| Open Context Protocol | Its own project now: [macanderson/context-graph-protocol](https://github.com/macanderson/context-graph-protocol) — wire types, host runtime, and the public conformance suite. Stella is its reference host and depends on it via git. |
+| Context Graph Protocol | Its own project now: [macanderson/context-graph-protocol](https://github.com/macanderson/context-graph-protocol) — wire types, host runtime, and the public conformance suite. Stella is its reference host and depends on it via git. |
 
 The repo is a **monorepo**: alongside the Rust workspace, the documentation
 site ([stella.oxagen.sh](https://stella.oxagen.sh)) lives at `stella-docs/`

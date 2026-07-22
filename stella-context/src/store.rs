@@ -22,7 +22,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::embed::{Embedder, EmbedderFingerprint, HashEmbedder};
 use crate::error::ContextError;
 
-use ocp_types::FrameKind;
+use contextgraph_types::FrameKind;
 
 /// The current on-disk schema version, tracked in `PRAGMA user_version`.
 const SCHEMA_VERSION: i64 = 3;
@@ -146,7 +146,7 @@ CREATE INDEX idx_memory_kind ON memory(kind);
 /// V3 — evict the code graph's tables from `context.db`. Historically the
 /// tree-sitter index shared this one file (`stella-graph`'s original
 /// single-file design, prefixing its tables `code_graph_`); it now lives in its
-/// own `.stella/private/codegraph.db`, which every consumer (`graph_query`, the OCP
+/// own `.stella/private/codegraph.db`, which every consumer (`graph_query`, the CGP
 /// `GraphProvider`) reads. Any `code_graph_*` tables still in `context.db` are
 /// orphaned duplicates no code reads or updates — dropping them removes the
 /// "two databases hold the code graph" duplication. Children (FK to
@@ -159,7 +159,7 @@ DROP TABLE IF EXISTS code_graph_files;
 ";
 
 /// Typed node vocabulary. Stored as its
-/// `as_str` form; retrieval maps it onto an `ocp_types::FrameKind`.
+/// `as_str` form; retrieval maps it onto an `contextgraph_types::FrameKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
@@ -208,7 +208,7 @@ impl NodeKind {
         })
     }
 
-    /// Map onto the OCP frame kind a retrieved node surfaces as.
+    /// Map onto the CGP frame kind a retrieved node surfaces as.
     pub fn to_frame_kind(self) -> FrameKind {
         match self {
             NodeKind::File => FrameKind::Snippet,
@@ -1520,7 +1520,7 @@ mod tests {
             .await
             .unwrap();
         let before = embedder.count();
-        let q = ocp_types::ContextQuery {
+        let q = contextgraph_types::ContextQuery {
             goal: "find alpha".into(),
             query_text: Some("alpha content".into()),
             embedding: None,
@@ -1575,7 +1575,7 @@ mod tests {
             "warm did real embedding work off the query path"
         );
 
-        let q = ocp_types::ContextQuery {
+        let q = contextgraph_types::ContextQuery {
             goal: "find it".into(),
             query_text: Some("content that must be re-embedded under the new fingerprint".into()),
             embedding: None,
@@ -1630,7 +1630,7 @@ mod tests {
             .await
             .unwrap();
 
-        let q = ocp_types::ContextQuery {
+        let q = contextgraph_types::ContextQuery {
             goal: "recall everything".into(),
             query_text: Some("prefer rg over grep billing retries".into()),
             embedding: None,

@@ -1,9 +1,9 @@
 //! `stella-graph` — the code-graph indexer.
 //!
 //! A tree-sitter symbol + import-edge indexer over a workspace, persisted in
-//! SQLite, exposed as a **built-in OCP provider** feeding `stella-context`
-//! ("implemented AS a built-in OCP provider … the
-//! protocol's first proof of non-triviality"). It depends only on `ocp-types`
+//! SQLite, exposed as a **built-in CGP provider** feeding `stella-context`
+//! ("implemented AS a built-in CGP provider … the
+//! protocol's first proof of non-triviality"). It depends only on `contextgraph-types`
 //! for the wire shape — never on `stella-context` — so the provider boundary
 //! stays one-directional.
 //!
@@ -91,6 +91,6 @@ pub fn load_storage_snapshot(workspace_root: &std::path::Path) -> StorageSnapsho
     manifest::merge_snapshot(rows, manifest.as_ref())
 }
 
-// Re-export the OCP wire types this provider produces so downstream callers
-// need not also depend on `ocp-types` directly for the return shapes.
-pub use ocp_types::{ContextFrame, ContextQuery, FrameKind};
+// Re-export the CGP wire types this provider produces so downstream callers
+// need not also depend on `contextgraph-types` directly for the return shapes.
+pub use contextgraph_types::{ContextFrame, ContextQuery, FrameKind};

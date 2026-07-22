@@ -1,13 +1,13 @@
-//! The session's OCP host: the in-tree context sources served through the
-//! real `ocp-host` runtime instead of ad-hoc in-process calls.
+//! The session's CGP host: the in-tree context sources served through the
+//! real `contextgraph-host` runtime instead of ad-hoc in-process calls.
 //!
 //! Until now the protocol and its conformance suite shipped, but the
 //! shipping CLI's own retrieval bypassed them — the workspace memory store
 //! was called directly and the code graph was not consulted at all. This
-//! module closes that gap: recall builds one [`ocp_host::Host`], registers
+//! module closes that gap: recall builds one [`contextgraph_host::Host`], registers
 //! two in-process providers, and fans every query out through
 //! [`Host::query_all`] — the same consent gate, per-provider timeout,
-//! crash isolation, and budget-honesty audit any external OCP provider
+//! crash isolation, and budget-honesty audit any external CGP provider
 //! gets. "Code is a graph, not text" is now the runtime path, not just a
 //! wire spec.
 //!
@@ -26,8 +26,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ocp_host::{ContextProvider, Host, HostError, ProviderResult};
-use ocp_types::{
+use contextgraph_host::{ContextProvider, Host, HostError, ProviderResult};
+use contextgraph_types::{
     Capabilities, ContextFrame, ContextQuery, ContextQueryResult, DataFlow, ProviderInfo,
 };
 use stella_context::{
@@ -53,7 +53,7 @@ fn local_info(name: &str) -> ProviderInfo {
 
 /// The built-in store registered at the context-plane seam, with the
 /// session's domain scope applied. Domain scoping is provider-internal:
-/// OCP's `ContextQuery` is workspace-agnostic, and which taxonomy applies is
+/// CGP's `ContextQuery` is workspace-agnostic, and which taxonomy applies is
 /// exactly the kind of local knowledge a provider owns. Identity and
 /// capabilities are the store's own provider declarations.
 struct ScopedStore {
@@ -77,7 +77,7 @@ impl PlaneProvider for ScopedStore {
 /// The context-plane registry behind `workspace-memory`: the seam every
 /// in-plane source registers through (issue #103's wire decision). Today
 /// that is the built-in store, domain-scoped; a further plane source (a
-/// git-history provider, an adapted external OCP provider) lands by
+/// git-history provider, an adapted external CGP provider) lands by
 /// registering here, not by editing the host adapter.
 fn memory_plane(store: Arc<ContextStore>, domains: Vec<String>) -> ProviderRegistry {
     let mut plane = ProviderRegistry::new();
@@ -85,7 +85,7 @@ fn memory_plane(store: Arc<ContextStore>, domains: Vec<String>) -> ProviderRegis
     plane
 }
 
-/// The workspace context plane behind the OCP provider trait: recall fans
+/// The workspace context plane behind the CGP provider trait: recall fans
 /// through the plane's [`ProviderRegistry`] instead of hitting the store
 /// directly, so the registry's capability routing, id-dedup, and aggregated
 /// truncation report are the production path.
@@ -136,7 +136,7 @@ impl ContextProvider for MemoryProvider {
     }
 }
 
-/// The code graph behind the OCP provider trait: open → query → shutdown
+/// The code graph behind the CGP provider trait: open → query → shutdown
 /// per call, on the blocking pool (SQLite reads are synchronous I/O, #64).
 /// An absent index is an empty answer, not an error — a workspace that
 /// never ran `stella init` still recalls memories normally.
@@ -210,7 +210,7 @@ pub fn session_host(
         plane: memory_plane(store, domains),
         info: local_info("workspace-memory"),
         caps: Capabilities {
-            query: ocp_types::capability::QueryCapability {
+            query: contextgraph_types::capability::QueryCapability {
                 kinds: ["memory", "episode", "fact", "snippet", "symbol", "doc"]
                     .map(String::from)
                     .to_vec(),
@@ -224,7 +224,7 @@ pub fn session_host(
         info: local_info("code-graph"),
         caps: Capabilities {
             graph: true,
-            query: ocp_types::capability::QueryCapability {
+            query: contextgraph_types::capability::QueryCapability {
                 kinds: ["symbol", "snippet", "graph"].map(String::from).to_vec(),
                 filters: Vec::new(),
             },
@@ -234,7 +234,7 @@ pub fn session_host(
     host
 }
 
-/// A frame paired with the OCP provider leg that returned it. Provider
+/// A frame paired with the CGP provider leg that returned it. Provider
 /// identity is host-owned metadata rather than frame content, so flattening a
 /// fan-out to bare frames would irreversibly misattribute graph hits as
 /// workspace memory at the pipeline/event boundary.
@@ -298,7 +298,7 @@ mod tests {
     fn frame(id: &str, score: f32, token_cost: u32) -> ContextFrame {
         ContextFrame {
             id: id.to_string(),
-            kind: ocp_types::FrameKind::Memory,
+            kind: contextgraph_types::FrameKind::Memory,
             title: id.to_string(),
             content: format!("content of {id}"),
             uri: None,
@@ -484,7 +484,7 @@ mod tests {
         }
         fn capabilities(&self) -> Capabilities {
             Capabilities {
-                query: ocp_types::capability::QueryCapability {
+                query: contextgraph_types::capability::QueryCapability {
                     kinds: self.kinds.clone(),
                     filters: Vec::new(),
                 },
@@ -505,7 +505,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut plane = memory_plane(seeded_store(&dir).await, vec![]);
         let mut graph_frame = frame("plane-graph", 0.9, 10);
-        graph_frame.kind = ocp_types::FrameKind::Graph;
+        graph_frame.kind = contextgraph_types::FrameKind::Graph;
         plane.register(Arc::new(PlaneScripted {
             kinds: vec!["graph".to_string()],
             frames: vec![graph_frame],
@@ -530,7 +530,7 @@ mod tests {
         // Kind-filtered to `graph`: the registry routes the store away (it
         // never serves graph frames) and only the second provider answers.
         let mut q = query(10, 4_000);
-        q.kinds = vec![ocp_types::FrameKind::Graph];
+        q.kinds = vec![contextgraph_types::FrameKind::Graph];
         let result = provider.query(&q).await.expect("kind routing");
         let ids: Vec<&str> = result.frames.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, vec!["plane-graph"]);

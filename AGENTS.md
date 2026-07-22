@@ -208,7 +208,7 @@ Fourteen crates. The one-sentence rule of thumb:
 | Multimodal generation | `stella-media` | |
 | Multi-agent fan-out, worktree isolation | `stella-fleet` | |
 | The Observatory telemetry dashboard (`stella observe`) | `stella-observatory` | Loopback-only, read-only, embedded HTML. |
-| Open Context Protocol (wire types / host / conformance) | external repo: [`context-graph-protocol`](https://github.com/macanderson/context-graph-protocol) | Split out of this workspace; Stella depends on it via git as `ocp-types`/`ocp-host` (package-renamed from `contextgraph-types`/`contextgraph-host`). Stays dependency-light by contract. |
+| Context Graph Protocol (wire types / host / conformance) | external repo: [`context-graph-protocol`](https://github.com/macanderson/context-graph-protocol) | Split out of this workspace; Stella depends on it directly via git as `contextgraph-types`/`contextgraph-host` at a pinned rev. Stays dependency-light by contract. |
 
 **Status — what ships.** The live runtime path is
 `stella-cli` → `stella-core` → `stella-model` / `stella-tools` / `stella-store` /
@@ -217,7 +217,7 @@ Fourteen crates. The one-sentence rule of thumb:
 `stella-tui` (the Command Deck, the default interactive shell on a TTY), and
 `stella-media` (image generation via the `generate_image` tool). The fuller
 `stella-graph` retrieval + context plane (`stella init` builds the code-graph
-index; recall fans out through the OCP host) is also wired.
+index; recall fans out through the CGP host) is also wired.
 
 ---
 

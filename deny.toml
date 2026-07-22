@@ -35,7 +35,7 @@ wildcards = "warn"
 # unknown registry or an unvetted git source fails the build.
 unknown-registry = "deny"
 unknown-git = "deny"
-# Vetted git sources. The OCP crates (ocp-types, ocp-host, aliased to the
-# contextgraph-types/contextgraph-host packages) live in their own repo and
-# are consumed at a pinned rev until they are published to crates.io.
+# Vetted git sources. The Context Graph Protocol crates (contextgraph-types,
+# contextgraph-host) live in their own repo and are consumed directly at a
+# pinned rev until they are published to crates.io.
 allow-git = ["https://github.com/macanderson/context-graph-protocol"]
