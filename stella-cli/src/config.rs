@@ -46,6 +46,7 @@ fn trusted_engine_config_shape_is_strict(value: &serde_json::Value) -> bool {
         "auto_mode",
         "effort_auto",
         "reasoning_auto",
+        "headless_scope_bypass",
         "agents",
     ];
     const AGENT_NAMES: &[&str] = &["default", "worker", "judge", "triage"];

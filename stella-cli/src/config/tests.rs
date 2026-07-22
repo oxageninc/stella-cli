@@ -645,3 +645,40 @@ fn local_provider_requires_base_url_and_defaults_its_key() {
     // sends a bearer token).
     assert_eq!(cfg.api_key.reveal(), "local");
 }
+
+/// The trusted seam rejects the WHOLE override on one unknown key — that is
+/// its point ("a misspelled benchmark control must fail closed"). The cost is
+/// that adding a field to `AgentEngineConfig` without also allowing it here
+/// stops the benchmark booting, with a message that deliberately does not
+/// echo the value, so the offending key is invisible. That happened once:
+/// `headless_scope_bypass` shipped in the struct and the posture, and every
+/// trial died at startup with a single line of output.
+///
+/// So: the exact shape the harbor adapter emits must survive the seam.
+#[test]
+fn the_benchmark_engine_posture_survives_the_trusted_launcher_seam() {
+    let posture = serde_json::json!({
+        "default_model": "openrouter/z-ai/glm-5.2",
+        "allowed_models": ["openrouter/z-ai/glm-5.2"],
+        "auto_mode": "off",
+        "effort_auto": "off",
+        "reasoning_auto": "off",
+        "headless_scope_bypass": "on",
+        "agents": {
+            "default": {"effort": "high", "reasoning": "on"},
+            "worker": {"effort": "high", "reasoning": "on"},
+            "judge": {"effort": "high", "reasoning": "on"},
+            "triage": {"effort": "low", "reasoning": "off"},
+        },
+    });
+    assert!(
+        super::trusted_engine_config_shape_is_strict(&posture),
+        "bench/harbor_adapter's posture must pass the strict seam"
+    );
+    let parsed: crate::settings::AgentEngineConfig =
+        serde_json::from_value(posture).expect("and deserialize into the settings type");
+    assert!(
+        parsed.headless_scope_bypass_on(),
+        "the flag must survive the round trip, not just be tolerated"
+    );
+}
