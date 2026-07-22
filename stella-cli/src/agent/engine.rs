@@ -134,12 +134,13 @@ pub(crate) fn approval_capability_for(
 
 /// Build the one-shot pipeline config from the host's approval capability.
 /// Rendering remains a separate concern owned by the event renderer.
-/// `worker_model` is [`EngineWiring::worker_model`] — see
-/// `pipeline_engine_config_for`'s doc for why the worker's own clamps must
-/// key off it rather than `cfg` directly.
+/// `worker_model` is [`EngineWiring::worker_model`], threaded through to
+/// `pipeline_engine_config_for` so the worker's clamps key off the model the
+/// role actually resolves to (issue #276).
 pub(crate) fn pipeline_config_for_approval_capability(
     cfg: &Config,
     approval: PipelineApprovalCapability,
+    worker_model: &ModelRef,
     test_command: Option<&str>,
     worker_model: &ModelRef,
 ) -> PipelineConfig {
