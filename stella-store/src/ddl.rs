@@ -52,7 +52,10 @@ pub(crate) const EXECUTIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS executions (
        finished_at TEXT,
        outcome TEXT,
        cost_usd REAL NOT NULL DEFAULT 0,
-       session_id TEXT
+       session_id TEXT,
+       usage_complete INTEGER NOT NULL DEFAULT 0 CHECK(usage_complete IN (0, 1)),
+       usage_status TEXT NOT NULL DEFAULT 'pending'
+         CHECK(usage_status IN ('pending', 'complete', 'incomplete'))
      );
      CREATE INDEX IF NOT EXISTS executions_by_session
        ON executions(session_id, id);";
@@ -137,6 +140,7 @@ pub(crate) fn telemetry_ddl(table: &str) -> String {
            step INTEGER NOT NULL,
            ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            provider TEXT NOT NULL,
+           call_role TEXT NOT NULL DEFAULT 'unknown',
            model TEXT NOT NULL,
            input_tokens INTEGER NOT NULL,
            estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -148,6 +152,7 @@ pub(crate) fn telemetry_ddl(table: &str) -> String {
            duration_ms INTEGER NOT NULL,
            retries INTEGER NOT NULL,
            tool_calls INTEGER NOT NULL,
+           usage_complete INTEGER NOT NULL DEFAULT 0 CHECK(usage_complete IN (0, 1)),
            UNIQUE (execution_id, step)
          );"
     )

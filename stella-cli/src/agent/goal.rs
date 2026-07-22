@@ -48,7 +48,7 @@ pub(crate) async fn run_raw_one_shot(
         .await?
     };
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = if process_free {
@@ -129,18 +129,28 @@ pub(crate) async fn run_raw_one_shot(
     // `succeeded=false`). Gated on `turn_warrants_reflection` so a tool-free
     // turn (nothing to mine, failure almost certainly external) never spends a
     // model call. The report is surfaced so a model-call error is never silent.
-    if one_shot_reflection_enabled(format)
+    // The raw one-shot closes its execution inside `run_turn`; unlike the
+    // staged pipeline it has no post-turn event phase before that terminal
+    // barrier. Keep machine streams strict by not dispatching an unframed
+    // reflection call after `Complete` (text retains the best-effort loop).
+    // `one_shot_reflection_enabled` additionally honors the benchmark
+    // adapter's `STELLA_DISABLE_REFLECTION` opt-out.
+    if format == OutputFormat::Text
+        && one_shot_reflection_enabled(format)
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
-        let report = m
+        let mut report = m
             .reflect_and_record(
                 &*provider,
+                &cfg.model_id,
                 &messages,
                 format != OutputFormat::Text,
                 outcome.is_ok(),
+                crate::agent::remaining_budget(&budget),
             )
             .await;
+        settle_reflection_budget(&mut report, &mut budget);
         surface_reflection(&report, format);
     }
     if let Some(set) = &mcp {
@@ -213,7 +223,7 @@ pub async fn run_goal_cmd(
     )
     .await?;
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = discover_custom_tools(cfg, true).await;
@@ -255,6 +265,7 @@ pub async fn run_goal_cmd(
             Some(presence.id()),
             registry_options.clone(),
             active_rules.clone(),
+            mcp.clone(),
         )
         .await
     } else {
@@ -289,8 +300,18 @@ pub async fn run_goal_cmd(
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
-        m.reflect_and_record(&*provider, &messages, false, true)
+        let mut report = m
+            .reflect_and_record(
+                &*provider,
+                &cfg.model_id,
+                &messages,
+                false,
+                true,
+                crate::agent::remaining_budget(&budget),
+            )
             .await;
+        settle_reflection_budget(&mut report, &mut budget);
+        surface_reflection(&report, OutputFormat::Text);
     }
     if let Some(set) = &mcp {
         set.close_all().await;
@@ -393,7 +414,7 @@ pub(crate) async fn run_goal_turn(
             .await
     };
     drop(tx);
-    let _ = renderer.await;
+    let persistence_complete = renderer.await.unwrap_or_default().persistence_complete;
 
     let files = registry.files_touched();
     if let Some((store, id)) = &execution {
@@ -401,7 +422,14 @@ pub(crate) async fn run_goal_turn(
             GoalOutcome::Met { cost_usd, .. } => ("goal_met", *cost_usd),
             GoalOutcome::Unmet { cost_usd, .. } => ("goal_unmet", *cost_usd),
         };
-        if !record_execution_end(store, *id, registry, outcome_label, cost) {
+        if !record_execution_end(
+            store,
+            *id,
+            registry,
+            outcome_label,
+            cost,
+            persistence_complete,
+        ) {
             warn_store_write_failed(
                 "the audit record (files touched / memory citations / outcome)",
             );
@@ -470,6 +498,7 @@ async fn run_goal_pipeline_turn(
     session: Option<&str>,
     registry_options: stella_tools::RegistryOptions,
     active_rules: crate::rules::ResolvedRules,
+    mcp: Option<Arc<stella_mcp::McpToolSet>>,
 ) -> Result<(), String> {
     let turn_start = Instant::now();
     let execution = begin_execution(store, "goal", goal, cfg, session);
@@ -552,6 +581,7 @@ async fn run_goal_pipeline_turn(
             cfg,
             registry_options,
             active_rules.clone(),
+            mcp,
         )?;
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = &no_recall;
@@ -598,6 +628,10 @@ async fn run_goal_pipeline_turn(
                     .as_ref()
                     .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
                 candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+                mcp_prefetch: ws_ports
+                    .mcp_prefetch
+                    .as_ref()
+                    .map(|p| p as &dyn McpPrefetchPort),
                 // Goal pipeline rounds run without an interactive steer tap.
                 steering: None,
             };
@@ -704,7 +738,7 @@ async fn run_goal_pipeline_turn(
     };
 
     drop(tx);
-    let _ = renderer.await;
+    let persistence_complete = renderer.await.unwrap_or_default().persistence_complete;
     // The shared guard is the settled ledger, including a judge turn that
     // aborted after spending and therefore returned no `judge_cost` value.
     let total_cost_usd = budget.session_spent_usd();
@@ -714,7 +748,14 @@ async fn run_goal_pipeline_turn(
             Ok(()) => "goal_met",
             Err(_) => "goal_unmet",
         };
-        if !record_execution_end(store, *id, registry, outcome_label, total_cost_usd) {
+        if !record_execution_end(
+            store,
+            *id,
+            registry,
+            outcome_label,
+            total_cost_usd,
+            persistence_complete,
+        ) {
             warn_store_write_failed(
                 "the audit record (files touched / memory citations / outcome)",
             );

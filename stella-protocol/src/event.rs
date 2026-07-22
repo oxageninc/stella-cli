@@ -55,6 +55,39 @@ pub enum BudgetMode {
     Enforced,
 }
 
+/// Concrete purpose of one provider call. This is more precise than the
+/// router's tier role: repair and guidance calls must remain distinguishable
+/// in the paid-call ledger even when they share a provider/model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCallRole {
+    /// Legacy events written before call-role attribution existed.
+    #[default]
+    Unknown,
+    Triage,
+    Plan,
+    PlanRepair,
+    WitnessAuthor,
+    WitnessRepair,
+    Worker,
+    DistressGuidance,
+    Judge,
+    AgentAuthor,
+    SkillAuthor,
+    DomainInference,
+    Reflection,
+    Summarization,
+}
+
+/// Content-free reason a provider attempt cannot contribute a truthful usage
+/// envelope. Error bodies and prompts are deliberately unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageIncompleteReason {
+    ProviderError,
+    Timeout,
+}
+
 /// One event in the turn's stream. Every stage boundary emits an event;
 /// nothing user-visible is derived from internal state that isn't also in
 /// this stream.
@@ -143,12 +176,14 @@ pub enum AgentEvent {
     /// call; aggregate a turn by summing its `StepUsage` events.
     StepUsage {
         step: usize,
-        /// Why this completion was made (`execute`, `triage`, `plan`,
-        /// `plan_repair`, `judge`, `guidance`, or `compaction`). Optional for
-        /// additive wire compatibility with journals written before call
-        /// purposes shipped.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        purpose: Option<String>,
+        /// Exact call purpose. Missing legacy values deserialize as
+        /// [`ModelCallRole::Unknown`].
+        #[serde(default)]
+        role: ModelCallRole,
+        /// Provider which actually served this call, never the session's
+        /// configured default. Empty only on legacy events.
+        #[serde(default)]
+        provider: String,
         /// Authoritative model output for calls that do not emit a separate
         /// [`AgentEvent::Text`] (pipeline management and compaction calls).
         /// Execute calls leave this `None`, avoiding duplicate transcript
@@ -181,6 +216,21 @@ pub enum AgentEvent {
         duration_ms: u64,
         retries: u32,
         tool_calls: usize,
+        /// Whether the provider supplied a truthful usage envelope. Missing
+        /// legacy values fail closed to `false`.
+        #[serde(default)]
+        complete: bool,
+    },
+    /// A provider call failed or timed out after dispatch, so local accounting
+    /// cannot prove that no billable work occurred. Content-free by design.
+    UsageIncomplete {
+        role: ModelCallRole,
+        provider: String,
+        model: String,
+        reason: UsageIncompleteReason,
+        duration_ms: u64,
+        /// Number of retries completed before the failure, when known.
+        retries: Option<u32>,
     },
     /// A judge model's assessment of a goal-driven loop after one working
     /// round. `met == true` ends the loop; `met == false` feeds `reasoning`
@@ -874,7 +924,8 @@ mod tests {
     fn step_usage_roundtrips_as_a_complete_metering_record() {
         let event = AgentEvent::StepUsage {
             step: 3,
-            purpose: Some("plan".into()),
+            role: ModelCallRole::Plan,
+            provider: "zai".into(),
             output_text: Some(r#"["inspect", "patch"]"#.into()),
             model: "glm-5.2".into(),
             input_tokens: 12_000,
@@ -886,16 +937,17 @@ mod tests {
             duration_ms: 1_830,
             retries: 1,
             tool_calls: 4,
+            complete: true,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"step_usage\""), "{json}");
-        assert!(json.contains("\"purpose\":\"plan\""), "{json}");
+        assert!(json.contains("\"role\":\"plan\""), "{json}");
         assert!(json.contains("\"cache_write_tokens\":2500"), "{json}");
         let back: AgentEvent = serde_json::from_str(&json).unwrap();
         match back {
             AgentEvent::StepUsage {
                 step,
-                purpose,
+                role,
                 output_text,
                 cached_input_tokens,
                 cache_write_tokens,
@@ -905,7 +957,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(step, 3);
-                assert_eq!(purpose.as_deref(), Some("plan"));
+                assert_eq!(role, ModelCallRole::Plan);
                 assert_eq!(output_text.as_deref(), Some(r#"["inspect", "patch"]"#));
                 assert_eq!(cached_input_tokens, 9_000);
                 assert_eq!(cache_write_tokens, 2_500);
@@ -929,14 +981,14 @@ mod tests {
         let back: AgentEvent = serde_json::from_str(legacy).unwrap();
         match back {
             AgentEvent::StepUsage {
-                purpose,
+                role,
                 output_text,
                 estimated_input_tokens,
                 input_tokens,
                 ..
             } => {
                 assert_eq!(estimated_input_tokens, 0);
-                assert_eq!(purpose, None);
+                assert_eq!(role, ModelCallRole::Unknown);
                 assert_eq!(output_text, None);
                 assert_eq!(input_tokens, 12_000);
             }
@@ -989,5 +1041,33 @@ mod tests {
                 other => panic!("unexpected variant: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn step_usage_preserves_call_identity_and_completeness() {
+        let json = r#"{"type":"step_usage","step":3,"role":"plan_repair","provider":"anthropic","model":"claude-sonnet-4-5","input_tokens":12000,"output_tokens":300,"cached_input_tokens":9000,"cache_write_tokens":12,"estimated_input_tokens":11000,"cost_usd":0.09,"duration_ms":1400,"retries":1,"tool_calls":0,"complete":true}"#;
+        let event: AgentEvent = serde_json::from_str(json).unwrap();
+        let roundtrip = serde_json::to_value(event).unwrap();
+        assert_eq!(roundtrip["role"], "plan_repair");
+        assert_eq!(roundtrip["provider"], "anthropic");
+        assert_eq!(roundtrip["complete"], true);
+    }
+
+    #[test]
+    fn legacy_step_usage_without_completeness_fails_closed() {
+        let legacy = r#"{"type":"step_usage","step":1,"model":"old","input_tokens":10,"output_tokens":2,"cached_input_tokens":0,"cost_usd":0.01,"duration_ms":10,"retries":0,"tool_calls":0}"#;
+        let event: AgentEvent = serde_json::from_str(legacy).unwrap();
+        let roundtrip = serde_json::to_value(event).unwrap();
+        assert_eq!(roundtrip["complete"], false);
+    }
+
+    #[test]
+    fn usage_incomplete_is_a_closed_content_free_signal() {
+        let json = r#"{"type":"usage_incomplete","role":"judge","provider":"anthropic","model":"claude-sonnet-4-5","reason":"timeout","duration_ms":2500,"retries":null}"#;
+        let event: AgentEvent = serde_json::from_str(json).unwrap();
+        let roundtrip = serde_json::to_value(event).unwrap();
+        assert_eq!(roundtrip["type"], "usage_incomplete");
+        assert_eq!(roundtrip["reason"], "timeout");
+        assert_eq!(roundtrip.as_object().unwrap().len(), 7);
     }
 }

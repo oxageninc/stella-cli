@@ -25,13 +25,13 @@ use stella_mcp::{McpConfig, McpServerConfig, McpToolSet};
 use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
 use stella_pipeline::{
-    AlwaysAbortGate, CmdOutcome, ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig,
-    PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort, RepoStructurePort,
-    StdioApprovalGate,
+    AlwaysAbortGate, CmdOutcome, ContextRecallPort, McpPrefetchPort, NoContextRecall, Pipeline,
+    PipelineConfig, PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort,
+    RepoStructurePort, StdioApprovalGate,
 };
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{AgentEvent, CompletionMessage, ModelRef, Role, ToolOutput};
-use stella_store::Store;
+use stella_store::{Store, TelemetryRow};
 use stella_tools::ToolRegistry;
 use stella_tools::custom::{self, CustomTool, CustomToolSet};
 use stella_tools::hook_runner::ShellHookRunner;
@@ -42,7 +42,9 @@ use crate::OutputFormat;
 use crate::config::Config;
 use crate::domains::{Domains, heuristic_domains, infer_domains};
 use crate::interactive::{InteractiveToolSet, SkillRegistry, default_ask_io};
-use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
+use crate::memory::{
+    ReflectionReport, SessionMemory, inject_recall_block, turn_warrants_reflection,
+};
 use crate::runtime::{SystemClock, TokioSleeper};
 use crate::tui;
 use stella_context::EpisodeOutcome;
@@ -52,8 +54,8 @@ mod goal;
 mod graph;
 mod outcome;
 mod output;
+mod persistence;
 mod prompt;
-mod telemetry;
 mod tools;
 
 pub(crate) use engine::*;
@@ -68,8 +70,10 @@ use outcome::{
 };
 pub(crate) use outcome::{pipeline_execution_closeout, settled_cost_since};
 use output::*;
+pub(crate) use persistence::{
+    persist_event, record_execution_end, spawn_renderer, warn_store_write_failed,
+};
 pub(crate) use prompt::*;
-pub(crate) use telemetry::{persist_event, record_execution_end, warn_store_write_failed};
 pub(crate) use tools::*;
 
 /// Construct the native tool registry without consulting optional host/user backends when the
@@ -151,7 +155,7 @@ async fn run_pipeline_one_shot(
     )
     .await?;
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = discover_custom_tools(cfg, format == OutputFormat::Text).await;
@@ -234,30 +238,26 @@ async fn run_pipeline_one_shot(
             cfg,
             registry_options,
             active_rules.clone(),
+            mcp.clone(),
         )?;
 
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
         let is_text = format == OutputFormat::Text;
-        // Stdio approval requires a text-safe renderer plus two terminal
-        // handles: stdin must accept the decision and stdout must present the
-        // prompt. Redirected text is still rendered as text, but is headless
-        // and fails closed at scope review.
-        let approval_capability =
-            if is_text && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                PipelineApprovalCapability::Stdio
-            } else {
-                PipelineApprovalCapability::Unavailable
-            };
+        let approval_capability = approval_capability_for(
+            is_text,
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        );
         // `--test-command` arms the deterministic verify ladder: the
         // fail→pass flip oracle and SubmitFast/Revise decisions all key off
         // it. Left unset, every verification escalates to the model judge.
         let mut pipeline_config = pipeline_config_for_approval_capability(
             cfg,
             approval_capability,
-            &wiring.worker_model,
             test_command,
+            &wiring.worker_model,
         );
         pipeline_config.role_overrides = wiring.role_overrides.clone();
 
@@ -291,6 +291,10 @@ async fn run_pipeline_one_shot(
                 .as_ref()
                 .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
             candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+            mcp_prefetch: ws_ports
+                .mcp_prefetch
+                .as_ref()
+                .map(|p| p as &dyn McpPrefetchPort),
             // Headless / fleet: no concurrent input channel to steer from.
             steering: None,
         };
@@ -299,18 +303,7 @@ async fn run_pipeline_one_shot(
         pipeline.run(prompt, &mut messages, &mut budget).await
     };
 
-    drop(tx);
-    let collected = renderer.await.unwrap_or_default();
-
     let files = registry.files_touched();
-    if let Some((store, id)) = &execution {
-        let (outcome_label, cost) = pipeline_execution_closeout(&result);
-        if !record_execution_end(store, *id, &registry, outcome_label, cost) {
-            warn_store_write_failed(
-                "the audit record (files touched / memory citations / outcome)",
-            );
-        }
-    }
 
     // Episodic memory: a run that did work (tools or file changes) becomes a
     // retrievable Episode node — outcome, files touched, time window.
@@ -343,10 +336,16 @@ async fn run_pipeline_one_shot(
     // explicitly opt out with `STELLA_DISABLE_REFLECTION` when it must avoid a
     // post-turn provider call (for example, a benchmark adapter that meters
     // only the task-solving envelope).
+    let mut reflection_report = ReflectionReport::default();
     if one_shot_reflection_enabled(format)
         && (turn_warrants_reflection(&messages) || !files.is_empty())
         && let Some(m) = &mut memory
     {
+        if format == OutputFormat::StreamJson {
+            let _ = tx.send(AgentEvent::Stage {
+                name: stella_protocol::StageKind::Reflect,
+            });
+        }
         let mut reflect_transcript = messages.clone();
         if let Ok(outcome) = &result
             && !outcome.final_text.trim().is_empty()
@@ -363,18 +362,60 @@ async fn run_pipeline_one_shot(
                 "(files changed this turn: {changed})"
             )));
         }
-        let report = m
+        let mut report = m
             .reflect_and_record(
                 &*provider,
+                &cfg.model_id,
                 &reflect_transcript,
                 format != OutputFormat::Text,
                 matches!(
                     &result,
                     Ok(outcome) if matches!(outcome.status, PipelineStatus::Completed)
                 ),
+                remaining_budget(&budget),
             )
             .await;
-        surface_reflection(&report, format);
+        settle_reflection_budget(&mut report, &mut budget);
+        if format == OutputFormat::StreamJson {
+            for event in &report.events {
+                let _ = tx.send(event.clone());
+            }
+        } else {
+            surface_reflection(&report, format);
+        }
+        reflection_report = report;
+    }
+
+    if format == OutputFormat::StreamJson
+        && let Ok(outcome) = &result
+    {
+        // Replace the pipeline's earlier terminal frame with the true
+        // all-calls total. The renderer retains only the latest Complete and
+        // releases it after every queued reflection/accounting event.
+        let _ = tx.send(AgentEvent::Complete {
+            model: format!("{}/{}", cfg.provider.id, cfg.model_id),
+            cost_usd: outcome.total_cost_usd + reflection_report.cost_usd,
+        });
+    }
+    drop(tx);
+    let rendered = renderer.await.unwrap_or_default();
+    let persistence_complete = rendered.persistence_complete;
+    let collected = rendered.events;
+
+    if let Some((store, id)) = &execution {
+        let (outcome_label, cost) = pipeline_execution_closeout(&result);
+        if !record_execution_end(
+            store,
+            *id,
+            &registry,
+            outcome_label,
+            cost + reflection_report.cost_usd,
+            persistence_complete,
+        ) {
+            warn_store_write_failed(
+                "the audit record (files touched / memory citations / outcome)",
+            );
+        }
     }
 
     if let Some(set) = &mcp {
@@ -410,7 +451,7 @@ async fn run_pipeline_one_shot(
                 let summary = serde_json::json!({
                     "status": status_str,
                     "text": outcome.final_text,
-                    "cost_usd": outcome.total_cost_usd,
+                    "cost_usd": outcome.total_cost_usd + reflection_report.cost_usd,
                     "reason": reason_str,
                     "task_class": format!("{:?}", outcome.task_class),
                     "verdict": outcome.verdict.as_ref().map(|v| serde_json::json!({
@@ -422,6 +463,7 @@ async fn run_pipeline_one_shot(
                     "candidates_run": outcome.candidates_run,
                     "model": format!("{}/{}", cfg.provider.id, cfg.model_id),
                     "events": collected,
+                    "reflection": reflection_json(&reflection_report),
                 });
                 println!(
                     "{}",
@@ -434,7 +476,7 @@ async fn run_pipeline_one_shot(
             if format == OutputFormat::Text {
                 tui::files_touched_panel(&files);
                 tui::cost_summary(
-                    outcome.total_cost_usd,
+                    outcome.total_cost_usd + reflection_report.cost_usd,
                     &format!("{}/{}", cfg.provider.id, cfg.model_id),
                     turn_start.elapsed(),
                 );
@@ -490,7 +532,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         Box::new(|| {}),
     );
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = discover_custom_tools(cfg, true).await;
@@ -605,8 +647,16 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         if input == "/init" {
             println!();
             let mut emit = |line: String| println!("  {line}");
-            match init_workspace(Some(&*provider), &cfg.workspace_root, &mut emit).await {
-                Ok(_) => {
+            match init_workspace(
+                Some(&*provider),
+                &cfg.workspace_root,
+                Some(&cfg.model_id),
+                remaining_budget(&budget),
+                &mut emit,
+            )
+            .await
+            {
+                Ok((_domains, _cost_usd)) => {
                     // A fresh index may name tables/types the schema gate
                     // should know about this session, not just the next one.
                     if let Err(error) = populate_schema_index(&registry, &cfg.workspace_root) {
@@ -726,8 +776,18 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             } else if turn_warrants_reflection(&messages[turn_start..])
                 && let Some(m) = &mut memory
             {
-                m.reflect_and_record(&*provider, &messages, false, true)
+                let mut report = m
+                    .reflect_and_record(
+                        &*provider,
+                        &cfg.model_id,
+                        &messages,
+                        false,
+                        true,
+                        remaining_budget(&budget),
+                    )
                     .await;
+                settle_reflection_budget(&mut report, &mut budget);
+                surface_reflection(&report, OutputFormat::Text);
             }
             continue;
         }
@@ -795,8 +855,18 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         } else if turn_warrants_reflection(&messages[turn_start..])
             && let Some(m) = &mut memory
         {
-            m.reflect_and_record(&*provider, &messages, false, true)
+            let mut report = m
+                .reflect_and_record(
+                    &*provider,
+                    &cfg.model_id,
+                    &messages,
+                    false,
+                    true,
+                    remaining_budget(&budget),
+                )
                 .await;
+            settle_reflection_budget(&mut report, &mut budget);
+            surface_reflection(&report, OutputFormat::Text);
         }
     }
 
@@ -852,237 +922,45 @@ pub(crate) async fn record_turn_episode(
     .await;
 }
 
-/// Build the workspace code-graph index into `.stella/private/codegraph.db` (the
-/// `stella-graph` tree-sitter indexer). This is the data side of `init`: the
-/// domain taxonomy tags graph nodes/edges, and the index makes the symbols +
-/// import edges queryable as `ContextFrame`s by the context plane.
-///
-/// Idempotent and best-effort: a failure degrades to a warning (init still
-/// succeeds, offline included) — the graph can always be rebuilt on a later
-/// `init` once a toolchain/parser is available. Progress goes to `emit`
-/// (plain text, no ANSI) so both the CLI and the deck transcript can show it.
-async fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut(String)) {
-    emit("◈ indexing code graph…".to_string());
-    // A full-tree tree-sitter index is seconds-to-minutes of blocking file
-    // reads + parsing + SQLite on a large repo. Run it on the blocking pool
-    // so it never pins a runtime worker — the deck driver awaits `/init`
-    // inline and must stay responsive to queue edits and cancels meanwhile
-    // (the incremental watcher path already does this, stella-graph
-    // watch.rs). `emit` stays on this side of the boundary: the only
-    // pre-completion line is the one above.
-    let root = workspace_root.to_path_buf();
-    let outcome = tokio::task::spawn_blocking(move || index_workspace_graph_blocking(&root)).await;
-    match outcome {
-        Ok(Ok(stats)) => emit(format_graph_stats(&stats)),
-        Ok(Err(warning)) => emit(warning),
-        Err(e) => emit(format!(
-            "! code-graph indexing task failed: {e} — run `stella init` again to retry"
-        )),
-    }
-}
-
-/// Blocking: create `.stella/`, open the store, run one full incremental index
-/// pass (sha-skip makes byte-identical files free, L-C2), and shut down.
-/// Returns the stats or a ready-to-emit human warning. Emits nothing itself —
-/// so it is `Send` and callable from any spawned task; both `stella init`'s
-/// [`build_code_graph`] and the session auto-builder [`spawn_session_graph`]
-/// drive it, then narrate the result on their own side of the async boundary.
-fn index_workspace_graph_blocking(
-    workspace_root: &std::path::Path,
-) -> Result<GraphSummary, String> {
-    let db_path = stella_store::workspace_private_sqlite_path(workspace_root, "codegraph.db")
-        .map_err(|e| format!("! could not prepare private code graph state: {e} — skipped"))?;
-    let graph = stella_graph::CodeGraph::open(workspace_root, &db_path)
-        .map_err(|e| format!("! code-graph store unavailable: {e} — skipped"))?;
-    let stats = graph.index_all().map_err(|e| {
-        format!("! code-graph indexing failed: {e} — run `stella init` again to retry")
-    })?;
-    // Report the whole-index TOTALS (what the model can actually query), not
-    // this pass's parse delta: an incremental pass over an unchanged tree
-    // re-parses nothing, so `stats.symbols`/`stats.imports` are 0 even though
-    // the graph is fully populated — the misleading "0 symbols" line users saw.
-    let summary = GraphSummary {
-        total_symbols: graph.symbol_count().unwrap_or(0),
-        total_imports: graph.import_count().unwrap_or(0),
-        total_files: graph
-            .file_count()
-            .unwrap_or(stats.files_parsed + stats.files_skipped_unchanged),
-        files_parsed: stats.files_parsed,
-        files_unchanged: stats.files_skipped_unchanged,
-        files_skipped_generated: stats.files_skipped_generated,
-    };
-    graph.shutdown();
-    Ok(summary)
-}
-
-/// Whole-index totals plus this pass's parse/skip split, for the startup line.
-struct GraphSummary {
-    total_symbols: usize,
-    total_imports: usize,
-    total_files: usize,
-    files_parsed: usize,
-    files_unchanged: usize,
-    /// Files this pass excluded as generated/minified (issue #272:
-    /// `.gitattributes` `linguist-generated=true`, `*.min.*`, or the
-    /// minified-content heuristic — see `stella_graph::generated`). Reported
-    /// separately from `total_files` so the exclusion is visible, not just
-    /// silently absent from the count.
-    files_skipped_generated: usize,
-}
-
-/// The `✓ code graph: N symbols, M imports…` summary line, shared by `stella
-/// init` and the session auto-builder so both surfaces read identically.
-/// Reports index totals; the parenthetical is this pass's parse/skip split.
-/// When this pass excluded any generated/minified files, an explicit
-/// "skipped N generated files" clause makes that visible rather than letting
-/// them silently vanish from the file count (issue #272).
-fn format_graph_stats(summary: &GraphSummary) -> String {
-    let base = format!(
-        "✓ code graph: {} symbols, {} imports across {} file{} ({} re-parsed, {} unchanged this pass)",
-        summary.total_symbols,
-        summary.total_imports,
-        summary.total_files,
-        if summary.total_files == 1 { "" } else { "s" },
-        summary.files_parsed,
-        summary.files_unchanged,
-    );
-    if summary.files_skipped_generated == 0 {
-        return base;
-    }
-    format!(
-        "{base} — skipped {} generated file{}",
-        summary.files_skipped_generated,
-        if summary.files_skipped_generated == 1 {
-            ""
-        } else {
-            "s"
-        }
-    )
-}
-
-/// A session-lifetime holder for the live code graph. It keeps the in-process
-/// `notify` watcher (and its debounce task) alive so file changes — the
-/// agent's own edits and external ones — incrementally re-index into
-/// `.stella/private/codegraph.db` for the rest of the session. Dropping it (or calling
-/// [`SessionGraph::shutdown`]) tears the watcher down cleanly. The mounted
-/// graph is installed only once the background build finishes, so an early
-/// session exit simply leaves the slot empty (and the never-installed watcher
-/// never armed).
-pub(crate) struct SessionGraph {
-    graph: Arc<std::sync::Mutex<Option<stella_graph::CodeGraph>>>,
-}
-
-impl SessionGraph {
-    /// Stop the watcher and its background tasks. Idempotent; also runs on drop.
-    pub(crate) fn shutdown(&self) {
-        if let Some(graph) = self.graph.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            graph.shutdown();
-        }
-    }
-}
-
-impl Drop for SessionGraph {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-/// Ensure the workspace code-graph index exists and stays fresh for the life of
-/// a session — WITHOUT blocking startup and WITHOUT re-running the full,
-/// LLM-driven [`init_workspace`]. This is the *data* side of init only:
-///
-/// 1. If there is no index yet it is built in the background
-///    ([`index_workspace_graph_blocking`], the same index step `stella init`
-///    runs); if one already exists it is a cheap incremental catch-up
-///    (byte-identical files are skipped, L-C2).
-/// 2. The moment the index is ready the `graph_query` tool is enabled for the
-///    rest of the session ([`ToolRegistry::enable_code_graph_if_available`])
-///    and the schema gate learns any new table/type names — so a session that
-///    launched in a repo with no `.stella/private/codegraph.db` gains the tool
-///    mid-session, no restart, no manual `stella init`.
-/// 3. The live `notify` watcher is then armed via
-///    [`stella_graph::CodeGraph::mount`] so subsequent edits incrementally
-///    re-index. mount's own catch-up sha-skips everything just indexed in
-///    step 1 — the watcher is the point of the second open.
-///
-/// Non-blocking: returns immediately with a [`SessionGraph`] the caller keeps
-/// alive for the session (dropping it stops the watcher) and the setup task's
-/// `JoinHandle`, which completes once the tool has been enabled — a
-/// deterministic "index ready" signal for tests. `status` receives the same
-/// `◈ indexing code graph…` / `✓ …` lines `stella init` prints (route it to
-/// stderr or the deck transcript, never to a machine-readable stdout);
-/// `on_ready` fires once after the tool is enabled (the deck refreshes its
-/// Graph tab there; other callers pass a no-op).
-pub(crate) fn spawn_session_graph(
-    workspace_root: &std::path::Path,
-    registry: Arc<ToolRegistry>,
-    mut status: Box<dyn FnMut(String) + Send>,
-    on_ready: Box<dyn FnOnce() + Send>,
-) -> (SessionGraph, tokio::task::JoinHandle<()>) {
-    let slot: Arc<std::sync::Mutex<Option<stella_graph::CodeGraph>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let slot_task = slot.clone();
-    let root = workspace_root.to_path_buf();
-    let handle = tokio::spawn(async move {
-        // 1) Build (fresh) or incrementally refresh (existing) the index to
-        //    completion, on the blocking pool. `status` (a `Send` box) is
-        //    called between awaits, never held across one — so this task stays
-        //    `Send`. (We drive the shared blocking helper directly rather than
-        //    `build_code_graph`, whose `&mut dyn FnMut` emit is not `Send`.)
-        status("◈ indexing code graph…".to_string());
-        let build_root = root.clone();
-        let outcome =
-            tokio::task::spawn_blocking(move || index_workspace_graph_blocking(&build_root)).await;
-        match outcome {
-            Ok(Ok(stats)) => status(format_graph_stats(&stats)),
-            Ok(Err(warning)) => status(warning),
-            Err(e) => status(format!(
-                "! code-graph indexing task failed: {e} — the graph tool stays off this session"
-            )),
-        }
-        // 2) Expose `graph_query` for the rest of the session and teach the
-        //    schema gate any table/type names the fresh index now carries.
-        if let Err(error) = registry.enable_code_graph_if_available(&root) {
-            status(format!("! graph tool unavailable: {error}"));
-        }
-        if let Err(error) = populate_schema_index(&registry, &root) {
-            status(format!("! schema governance unavailable: {error}"));
-        }
-        on_ready();
-        // 3) Arm the live watcher on a mounted graph kept alive for the
-        //    session. Best-effort: a mount failure only loses live refresh, it
-        //    never loses the index built in step 1.
-        let db_path = stella_tools::graph::graph_db_path(&root);
-        match stella_graph::CodeGraph::mount(&root, &db_path).await {
-            Ok(graph) => {
-                *slot_task.lock().unwrap_or_else(|p| p.into_inner()) = Some(graph);
+/// Surface a post-turn [`ReflectionReport`] for human text output. Machine
+/// streams route reflection events through their execution renderer so
+/// `Complete` remains the unique final frame; this helper never writes a
+/// second, unframed stdout sequence after that terminal barrier.
+pub(crate) fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
+    if format == OutputFormat::Text {
+        for event in &report.events {
+            match event {
+                AgentEvent::StepUsage {
+                    role,
+                    provider,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    retries,
+                    complete,
+                    ..
+                } => eprintln!(
+                    "  {} {:?} {provider}/{model}: {input_tokens} in, {output_tokens} out, \
+                     ${cost_usd:.4}, {retries} retries, complete={complete}",
+                    "✦".magenta(),
+                    role
+                ),
+                AgentEvent::UsageIncomplete {
+                    role,
+                    provider,
+                    model,
+                    reason,
+                    retries,
+                    ..
+                } => eprintln!(
+                    "  {} {:?} {provider}/{model}: usage incomplete ({reason:?}, retries={retries:?})",
+                    "!".yellow(),
+                    role
+                ),
+                _ => {}
             }
-            Err(e) => status(format!(
-                "! code-graph watcher unavailable: {e} — the index will refresh on the next launch"
-            )),
         }
-    });
-    (SessionGraph { graph: slot }, handle)
-}
-
-/// Surface a post-turn [`ReflectionReport`] for a headless / line-based
-/// format — the reflection outcome must never vanish (the silent-reflection
-/// blind spot this closes). `stream-json` gets one machine event line so a
-/// metering/CI consumer sees that reflection ran and whether it errored;
-/// `text` and `json` get a one-line stderr warning ONLY when the reflection
-/// model call actually failed — a clean empty reflection is the common,
-/// correct case and stays quiet. Never writes stdout in `json` mode, so that
-/// format's single-object contract is untouched. Best-effort: a `None` model
-/// error in `text`/`json` prints nothing.
-fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
-    if format == OutputFormat::StreamJson {
-        let line = serde_json::json!({
-            "type": "reflect",
-            "recorded": report.recorded,
-            "error": report.model_error,
-        });
-        println!("{line}");
-        return;
     }
     if let Some(err) = &report.model_error {
         eprintln!(
@@ -1092,6 +970,14 @@ fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
     }
 }
 
+fn reflection_json(report: &ReflectionReport) -> serde_json::Value {
+    serde_json::json!({
+        "recorded": report.recorded,
+        "error": report.model_error,
+        "cost_usd": report.cost_usd,
+        "events": report.events,
+    })
+}
 /// The shared init flow behind `stella init` and the `/init` chat command:
 /// infer the domain taxonomy (model-assisted when a provider is available,
 /// directory heuristic otherwise), build the code-graph index, persist
@@ -1101,11 +987,21 @@ fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
 pub(crate) async fn init_workspace(
     provider: Option<&dyn Provider>,
     workspace_root: &std::path::Path,
+    model_hint: Option<&str>,
+    budget_limit: Option<f64>,
     emit: &mut dyn FnMut(String),
-) -> Result<Domains, String> {
-    let domains = match provider {
-        Some(p) => infer_domains(p, workspace_root).await,
-        None => heuristic_domains(workspace_root),
+) -> Result<(Domains, f64), String> {
+    let (domains, inference_cost_usd) = match provider {
+        Some(p) => {
+            infer_domains(
+                p,
+                workspace_root,
+                model_hint.unwrap_or("unknown"),
+                budget_limit,
+            )
+            .await
+        }
+        None => (heuristic_domains(workspace_root), 0.0),
     };
 
     // The code graph needs no provider — build it regardless of how the
@@ -1133,7 +1029,12 @@ pub(crate) async fn init_workspace(
         domains.inferred_by,
         path.display()
     ));
-    Ok(domains)
+    if inference_cost_usd > 0.0 {
+        emit(format!(
+            "domain inference model cost: ${inference_cost_usd:.6}"
+        ));
+    }
+    Ok((domains, inference_cost_usd))
 }
 
 /// Query the code graph (if `stella init` has built it) for the
@@ -1256,26 +1157,27 @@ pub async fn run_init(
 
     tui::section_header("Stella init");
 
-    let provider = match Config::load(model_override, api_key_override, base_url_override) {
-        Ok(cfg) => {
-            let provider = build_provider(&cfg)?;
-            println!(
-                "  {} inferring domains with {}/{}…",
-                "◈".bright_cyan(),
-                cfg.provider.id,
-                cfg.model_id
-            );
-            Some(provider)
-        }
-        Err(_) => {
-            println!(
-                "  {} no provider configured — using the directory heuristic \
+    let (provider, model_hint) =
+        match Config::load(model_override, api_key_override, base_url_override) {
+            Ok(cfg) => {
+                let provider = build_provider(&cfg)?;
+                println!(
+                    "  {} inferring domains with {}/{}…",
+                    "◈".bright_cyan(),
+                    cfg.provider.id,
+                    cfg.model_id
+                );
+                (Some(provider), Some(cfg.model_id))
+            }
+            Err(_) => {
+                println!(
+                    "  {} no provider configured — using the directory heuristic \
                  (re-run `stella init` with a key for a better taxonomy)",
-                "!".yellow()
-            );
-            None
-        }
-    };
+                    "!".yellow()
+                );
+                (None, None)
+            }
+        };
 
     // Play the launch cinematic (starfield + jetpack turtle) over the indexing
     // work. Progress lines route THROUGH it so they print above the animation
@@ -1285,7 +1187,14 @@ pub async fn run_init(
     // domain summary prints.
     let cine = crate::init_fx::InitCinematic::start(crate::init_fx::animation_enabled(no_anim));
     let mut emit = |line: String| cine.log(line);
-    let domains = init_workspace(provider.as_deref(), &workspace_root, &mut emit).await?;
+    let (domains, _inference_cost_usd) = init_workspace(
+        provider.as_deref(),
+        &workspace_root,
+        model_hint.as_deref(),
+        None,
+        &mut emit,
+    )
+    .await?;
     cine.finish().await;
 
     for domain in &domains.domains {
@@ -1402,7 +1311,7 @@ pub(crate) async fn connect_mcp(
     native: std::sync::Arc<dyn ToolExecutor>,
     usage: Option<stella_core::mcp_usage::McpUsageLedger>,
     print_diagnostics: bool,
-) -> Result<Option<McpToolSet>, String> {
+) -> Result<Option<Arc<McpToolSet>>, String> {
     let servers = match load_mcp_plan(cfg) {
         McpPlan::None => return Ok(None),
         McpPlan::Invalid(reason) => {
@@ -1431,7 +1340,10 @@ pub(crate) async fn connect_mcp(
             );
         }
     }
-    Ok(Some(set))
+    // Arc'd so a pipeline driver can share the same connected set into the
+    // Best-of-N candidate tool surface and orchestrator pre-fetch (issue
+    // #248 Phase 1) alongside its own `&dyn ToolExecutor` borrow.
+    Ok(Some(Arc::new(set)))
 }
 
 pub(crate) async fn discover_custom_tools(
@@ -1694,6 +1606,35 @@ pub(crate) fn build_budget_guard(budget_limit: Option<f64>) -> BudgetGuard {
     }
 }
 
+pub(crate) fn remaining_budget(guard: &BudgetGuard) -> Option<f64> {
+    guard
+        .turn_limit_usd()
+        .map(|limit| (limit - guard.spent_usd()).max(0.0))
+}
+
+pub(crate) fn settle_reflection_budget(report: &mut ReflectionReport, guard: &mut BudgetGuard) {
+    let had_accounting = report.events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::StepUsage { .. }
+                | AgentEvent::UsageIncomplete { .. }
+                | AgentEvent::BudgetTick { .. }
+        )
+    });
+    report
+        .events
+        .retain(|event| !matches!(event, AgentEvent::BudgetTick { .. }));
+    if report.cost_usd > 0.0 {
+        let _ = guard.record_spend(report.cost_usd);
+    }
+    if had_accounting {
+        report.events.push(AgentEvent::BudgetTick {
+            spent_usd: guard.spent_usd(),
+            limit_usd: guard.turn_limit_usd(),
+            mode: guard.mode(),
+        });
+    }
+}
 /// Open the workspace SQLite store (`.stella/private/store.db`). Persistence is
 /// observability, not a work dependency: a store that won't open warns once
 /// and the session runs on without it — never a startup failure.
@@ -1930,7 +1871,9 @@ async fn run_turn(
     // actually printed before this function returns (no events lost to a
     // detached task racing process exit).
     drop(tx);
-    let collected = renderer.await.unwrap_or_default();
+    let rendered = renderer.await.unwrap_or_default();
+    let persistence_complete = rendered.persistence_complete;
+    let collected = rendered.events;
 
     // Persist the files-touched ledger and close the execution record. The
     // ledger lives on the concrete registry (the engine drove tool calls
@@ -1942,7 +1885,14 @@ async fn run_turn(
             TurnOutcome::Completed { cost_usd, .. } => ("completed", *cost_usd),
             TurnOutcome::Aborted { cost_usd, .. } => ("aborted", *cost_usd),
         };
-        if !record_execution_end(store, *id, registry, outcome_label, cost) {
+        if !record_execution_end(
+            store,
+            *id,
+            registry,
+            outcome_label,
+            cost,
+            persistence_complete,
+        ) {
             warn_store_write_failed(
                 "the audit record (files touched / memory citations / outcome)",
             );
@@ -1995,96 +1945,6 @@ async fn run_turn(
         }
         TurnOutcome::Aborted { reason, .. } => Err(reason),
     }
-}
-
-/// Drain, render, and persist the engine's event stream concurrently with
-/// the engine. `ToolResult` carries only `call_id`, so the tool name is
-/// tracked here to label the result card (see `tui::render_event`'s doc for
-/// why that pair is handled inline rather than in the generic dispatcher).
-/// Persistence (when a store is open) runs for every format before
-/// rendering: each event is appended to the execution's stream (chain-of-
-/// thought `Reasoning` deltas included) and each `StepUsage` becomes a
-/// telemetry row. Store failures degrade to a single warning — rendering
-/// never stops for persistence. Returns the collected events (non-empty only
-/// in Json mode, where the caller emits one final summary object).
-fn spawn_renderer(
-    mut rx: mpsc::UnboundedReceiver<AgentEvent>,
-    format: OutputFormat,
-    execution: Option<(Arc<Store>, i64)>,
-    provider_id: String,
-    durable_pre_persisted: bool,
-) -> tokio::task::JoinHandle<Vec<AgentEvent>> {
-    tokio::spawn(async move {
-        let mut tool_names: HashMap<String, String> = HashMap::new();
-        let mut collected: Vec<AgentEvent> = Vec::new();
-        let mut seq = 0u64;
-        let mut store_warned = false;
-        while let Some(event) = rx.recv().await {
-            // `TextDelta` previews never reach the store: the authoritative
-            // `Text` event carries the full step text into the audit record,
-            // and one SQLite insert per token would stall this drain loop.
-            let preview = matches!(event, AgentEvent::TextDelta { .. });
-            if let Some((store, id)) = &execution
-                && !preview
-            {
-                if !persist_event(store, *id, seq, &event, &provider_id) && !store_warned {
-                    eprintln!(
-                        "  {} store write failed — telemetry for this execution is incomplete",
-                        "⚠".yellow()
-                    );
-                    store_warned = true;
-                }
-                seq += 1;
-            }
-            match format {
-                OutputFormat::StreamJson => {
-                    // One line per event — the stable machine interface.
-                    // Serialization of a protocol enum never fails; if it
-                    // somehow does, terminate before
-                    // the provider loop can spend on a later unmetered call.
-                    match serde_json::to_string(&event) {
-                        Ok(line) if durable_pre_persisted => {
-                            emit_pre_persisted_stream_json_line_or_terminate(&line)
-                        }
-                        Ok(line) => emit_stream_json_line_or_terminate(&line),
-                        Err(error) => terminate_stream_json(&format!(
-                            "stream-json serialization failed: {error}"
-                        )),
-                    }
-                }
-                OutputFormat::Json => collected.push(event),
-                OutputFormat::Text => match &event {
-                    AgentEvent::ToolStart { call } => {
-                        tool_names.insert(call.call_id.clone(), call.name.clone());
-                        tui::tool_call_card(&call.name, &call.input, "running");
-                    }
-                    AgentEvent::ToolResult {
-                        call_id,
-                        output,
-                        duration_ms,
-                        ..
-                    } => {
-                        let name = tool_names
-                            .get(call_id)
-                            .map(String::as_str)
-                            .unwrap_or("tool");
-                        let content = match output {
-                            ToolOutput::Ok { content } => content.clone(),
-                            ToolOutput::Error { message } => message.clone(),
-                        };
-                        tui::tool_result_card(
-                            name,
-                            &content,
-                            output.is_error(),
-                            Duration::from_millis(*duration_ms),
-                        );
-                    }
-                    other => tui::render_event(other),
-                },
-            }
-        }
-        collected
-    })
 }
 
 fn print_help() {

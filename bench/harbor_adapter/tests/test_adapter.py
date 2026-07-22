@@ -1434,7 +1434,7 @@ class TestAtifTrajectory:
                     {
                         "type": "step_usage",
                         "step": 0,
-                        "purpose": "triage",
+                        "role": "triage",
                         "output_text": "multi",
                         "model": "provider/model",
                         "input_tokens": 10,
@@ -1444,7 +1444,7 @@ class TestAtifTrajectory:
                     {
                         "type": "step_usage",
                         "step": 0,
-                        "purpose": "plan",
+                        "role": "plan",
                         "output_text": '["inspect", "patch"]',
                         "model": "provider/model",
                         "input_tokens": 20,
@@ -1454,7 +1454,7 @@ class TestAtifTrajectory:
                     {
                         "type": "step_usage",
                         "step": 0,
-                        "purpose": "execute",
+                        "role": "worker",
                         "model": "provider/model",
                         "input_tokens": 30,
                         "output_tokens": 3,

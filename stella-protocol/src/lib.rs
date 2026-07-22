@@ -28,8 +28,8 @@ pub use completion::{
 pub use error::ProviderError;
 pub use event::{
     AgentEvent, BudgetMode, CiStatus, ContextFrameRef, FileChangeKind, JudgeEvidence,
-    MediaArtifactRef, MediaJobState, MediaKind, PrStatus, ProviderShare, ScopeProposal, StageKind,
-    TaskItem, TaskStatus,
+    MediaArtifactRef, MediaJobState, MediaKind, ModelCallRole, PrStatus, ProviderShare,
+    ScopeProposal, StageKind, TaskItem, TaskStatus, UsageIncompleteReason,
 };
 pub use provider::{Provider, ToolCallObserver};
 pub use role::{ModelRef, Role};

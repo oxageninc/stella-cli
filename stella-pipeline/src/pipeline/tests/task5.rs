@@ -27,7 +27,10 @@ fn tool_result(name: &str) -> CompletionResult {
             name: name.into(),
             input: serde_json::json!({}),
         }],
-        usage: CompletionUsage::default(),
+        usage: CompletionUsage {
+            reported: true,
+            ..CompletionUsage::default()
+        },
         model: "scripted".into(),
         cost_usd: 0.0001,
         finish_reason: None,
@@ -125,6 +128,7 @@ async fn witness_worker_and_revision_hooks_are_bound_to_the_candidate_root() {
             sleeper: &sleeper,
             hooks: Some((&hooks, &hook_runner)),
             candidate_workspaces: Some(&port),
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -203,6 +207,7 @@ async fn authored_witness_fails_closed_before_workspace_creation_when_judge_is_w
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: Some(&port),
+            mcp_prefetch: None,
             steering: None,
         },
         tx,

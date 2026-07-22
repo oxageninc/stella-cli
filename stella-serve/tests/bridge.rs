@@ -17,7 +17,10 @@ fn final_answer(text: &str) -> CompletionResult {
     CompletionResult {
         text: text.to_string(),
         tool_calls: vec![],
-        usage: CompletionUsage::default(),
+        usage: CompletionUsage {
+            reported: true,
+            ..CompletionUsage::default()
+        },
         model: "mock".to_string(),
         cost_usd: 0.0,
         finish_reason: None,
@@ -33,7 +36,10 @@ fn wants_tool(call_id: &str, name: &str, input: serde_json::Value) -> Completion
             name: name.to_string(),
             input,
         }],
-        usage: CompletionUsage::default(),
+        usage: CompletionUsage {
+            reported: true,
+            ..CompletionUsage::default()
+        },
         model: "mock".to_string(),
         cost_usd: 0.0,
         finish_reason: None,

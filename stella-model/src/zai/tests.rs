@@ -143,6 +143,7 @@ async fn complete_aggregates_text_deltas_from_a_mock_server() {
     assert_eq!(result.text, "Hello!");
     assert_eq!(result.usage.input_tokens, 8);
     assert_eq!(result.usage.output_tokens, 3);
+    assert!(result.usage.reported);
 }
 
 #[tokio::test]
@@ -724,6 +725,7 @@ async fn complete_computes_nonzero_cost_from_catalog_pricing() {
         .unwrap()
         .pricing
         .cost_usd(&CompletionUsage {
+            reported: true,
             input_tokens: 1000,
             output_tokens: 500,
             cached_input_tokens: 0,
@@ -770,6 +772,7 @@ async fn complete_surfaces_cached_tokens_and_bills_them_at_the_cached_rate() {
         .unwrap()
         .pricing
         .cost_usd(&CompletionUsage {
+            reported: true,
             input_tokens: 1000,
             output_tokens: 500,
             cached_input_tokens: 200,

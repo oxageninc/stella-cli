@@ -58,6 +58,7 @@
 //! [`CandidateWorkspacePort`]: ports::CandidateWorkspacePort
 
 pub mod candidate;
+pub(crate) mod mcp_prefetch;
 pub mod pipeline;
 pub mod plan;
 pub mod ports;
@@ -68,15 +69,16 @@ pub mod verify;
 pub mod witness;
 
 pub use pipeline::{
-    Pipeline, PipelineConfig, PipelineError, PipelineOutcome, PipelinePorts, PipelineRoleOverrides,
+    Pipeline, PipelineConfig, PipelineError, PipelineOutcome, PipelineRoleOverrides,
     PipelineRunError, PipelineStatus, RoleCallOverrides, Verdict,
 };
 pub use ports::{
     AdoptedChange, AlwaysAbortGate, ApprovalGate, ArtifactIdentity, ArtifactKind, AutoApproveGate,
     CandidateWorkspace, CandidateWorkspacePort, CmdOutcome, ContextRecallPort,
-    DiagnosticInvocation, DiagnosticRunner, NoContextRecall, NoRepoStatus, NoRepoStructure,
-    ProviderResolver, RecalledFrame, RepoStatusPort, RepoStructurePort, ScopeDecision,
-    StdioApprovalGate, TestInvocation, TestRunner, WorkspaceError,
+    DiagnosticInvocation, DiagnosticRunner, McpPrefetchPort, NoContextRecall, NoRepoStatus,
+    NoRepoStructure, PipelinePorts, ProviderResolver, RecalledFrame, RepoStatusPort,
+    RepoStructurePort, ScopeDecision, StdioApprovalGate, TestInvocation, TestRunner,
+    WorkspaceError,
 };
 pub use triage::TaskClass;
 pub use verify::{FlipOracle, FlipState, LadderDecision, LadderInputs};

@@ -45,6 +45,7 @@ use stella_fleet::{
     WatchConfig, WorkerControls, WorkerOutcome, WorktreeManager,
 };
 use stella_protocol::{AgentEvent, CompletionMessage, PrStatus};
+use stella_tools::ToolRegistry;
 use stella_tools::hook_runner::ShellHookRunner;
 use tokio::sync::{mpsc, watch};
 
@@ -479,6 +480,11 @@ async fn run_task(
     // transient build lane, coordinated across every writer in the
     // workspace. Same holder as the fleet's declared claims — re-entrant.
     let claims = crate::claims::ClaimTap::new(&registry, claims_store, claim_holder);
+    // Every fleet attempt owns the same durable event/accounting envelope as
+    // a one-shot or deck turn. The store is rooted in the task worktree so
+    // parallel workers never contend on a single SQLite writer.
+    let store = agent::open_store(root);
+    let execution = agent::begin_execution(&store, "fleet", &task.prompt, &cfg, None);
 
     let mut messages = vec![CompletionMessage::system(
         // Each worker is its own session in its own workspace, so its
@@ -500,8 +506,14 @@ async fn run_task(
     let mut budget = agent::build_budget_guard(budget_limit);
     budget.begin_turn();
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let renderer = agent::spawn_renderer(
+        rx,
+        crate::OutputFormat::Json,
+        execution.clone(),
+        cfg.provider.id.to_string(),
+        false,
+    );
 
     // The task's control lines (stella-fleet's `WorkerControls`). The stop
     // wait mirrors `subsession.rs::run_worker` exactly: a dropped sender
@@ -526,124 +538,147 @@ async fn run_task(
 
     // `success`/`summary` are set by whichever path runs, then folded into
     // the WorkerOutcome after the channel drains.
-    let (summary, success): (String, bool) = if use_pipeline {
-        use stella_core::router::{CircuitBreaker, Router};
-        use stella_pipeline::{
-            NoContextRecall, Pipeline, PipelineConfig, PipelinePorts, PipelineStatus,
-        };
-        let model_ref = stella_protocol::ModelRef::new(cfg.provider.id, cfg.model_id.clone());
-        // Role wiring from `agent_engine_config` — fleet workers honor the
-        // same worker/triage/judge pins and per-role overrides as `stella run`.
-        let configured = crate::config::discover_configured_providers();
-        let wiring = agent::resolve_engine_wiring(&cfg, &model_ref, &configured);
-        for notice in &wiring.notices {
-            eprintln!("  ! {notice}");
-        }
-        let resolver = agent::RoleProviderResolver::new(
-            &*provider,
-            model_ref.clone(),
-            &wiring.extra_providers,
-        );
-        let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
-        let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
-        // Rooted at the fleet worker's own worktree, so a candidate snapshot
-        // nests off that worktree's checkout, never the primary repo's.
-        let ws_ports = agent::workspace_ports(
-            root.to_path_buf(),
-            &cfg,
-            registry_options,
-            active_rules.clone(),
-        )?;
-        let recall = NoContextRecall;
-        let hook_runner = ShellHookRunner;
-        let ports = PipelinePorts {
-            router: &router,
-            providers: &resolver,
-            tools: &claims,
-            recall: &recall,
-            repo: &ws_ports.repo_structure,
-            repo_status: &ws_ports.repo_status,
-            diagnostics: &ws_ports.diagnostic_runner,
-            tests: &ws_ports.test_runner,
-            approvals: &agent::HEADLESS_APPROVAL_GATE,
-            sleeper: &TokioSleeper,
-            hooks: cfg
-                .hooks
-                .as_ref()
-                .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
-            candidate_workspaces: Some(&ws_ports.candidate_workspaces),
-            // Headless / fleet: no concurrent input channel to steer from.
-            steering: None,
-        };
-        let config = PipelineConfig {
-            engine: agent::pipeline_engine_config_for(&cfg, &wiring.worker_model),
-            role_overrides: wiring.role_overrides.clone(),
-            headless: true,
-            headless_bypass_scope_review: agent::HEADLESS_SCOPE_REVIEW_BYPASS,
-            ..PipelineConfig::default()
-        };
-        let pipeline = Pipeline::new(ports, tx.clone(), config);
-        // The system prompt + task prompt are already in `messages`; the
-        // pipeline appends its own volatile recall+goal message, so pass the
-        // raw task prompt as the goal (the pipeline never re-reads `messages`
-        // for its goal — it takes `task.prompt` directly).
-        // The stop line races the whole staged run — the future drops at
-        // its next await point, the same clean cancel the raw path gets.
-        // Pause is NOT honored here yet: boundary-gating individual stages
-        // needs a gate port on `PipelinePorts` (the existing named
-        // follow-up) — only the raw step-loop path below holds a TurnGate.
-        let raced = tokio::select! {
-            result = pipeline.run(&task.prompt, &mut messages, &mut budget) => {
-                Raced::Outcome(result)
+    let (summary, success, outcome_label, force_incomplete): (String, bool, &str, bool) =
+        if use_pipeline {
+            use stella_core::router::{CircuitBreaker, Router};
+            use stella_pipeline::{
+                NoContextRecall, Pipeline, PipelineConfig, PipelinePorts, PipelineStatus,
+            };
+            let model_ref = stella_protocol::ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+            // Role wiring from `agent_engine_config` — fleet workers honor the
+            // same worker/triage/judge pins and per-role overrides as `stella run`.
+            let configured = crate::config::discover_configured_providers();
+            let wiring = agent::resolve_engine_wiring(&cfg, &model_ref, &configured);
+            for notice in &wiring.notices {
+                eprintln!("  ! {notice}");
             }
-            _ = stop_wait => Raced::Stopped,
-        };
-        match raced {
-            Raced::Outcome(Ok(outcome)) => match outcome.status {
-                PipelineStatus::Completed => (truncate(&outcome.final_text), true),
-                PipelineStatus::VerificationFailed { verdict } => (
-                    truncate(&format!("verification failed: {}", verdict.summary)),
-                    false,
-                ),
-                PipelineStatus::Aborted { reason } => (truncate(&reason), false),
-            },
-            Raced::Outcome(Err(e)) => (truncate(&e.to_string()), false),
-            Raced::Stopped => (STOPPED.to_string(), false),
-        }
-    } else {
-        // The pause line gates the raw step-loop at the engine's step
-        // boundary (never mid-tool), and the stop line races the turn.
-        let raced = {
-            let gate = WatchGate(pause);
-            let hook_runner = ShellHookRunner;
-            let mut engine = Engine::with_sleeper(
+            let resolver = agent::RoleProviderResolver::new(
                 &*provider,
-                &claims,
-                agent::engine_config_for(&cfg),
-                &TokioSleeper,
-            )
-            .with_gate(&gate);
-            if let Some(hooks) = &cfg.hooks {
-                engine = engine.with_hooks(hooks, &hook_runner);
-            }
-            tokio::select! {
-                outcome = engine.run_turn(&mut messages, &mut budget, &tx) => {
-                    Raced::Outcome(outcome)
+                model_ref.clone(),
+                &wiring.extra_providers,
+            );
+            let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
+            let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
+            // Rooted at the fleet worker's own worktree, so a candidate snapshot
+            // nests off that worktree's checkout, never the primary repo's.
+            // Fleet workers don't connect MCP at all today (`tools: &claims`
+            // wraps the raw registry directly) — nothing to share, hence `None`.
+            let ws_ports = agent::workspace_ports(
+                root.to_path_buf(),
+                &cfg,
+                registry_options,
+                active_rules.clone(),
+                None,
+            )?;
+            let recall = NoContextRecall;
+            let hook_runner = ShellHookRunner;
+            let ports = PipelinePorts {
+                router: &router,
+                providers: &resolver,
+                tools: &claims,
+                recall: &recall,
+                repo: &ws_ports.repo_structure,
+                repo_status: &ws_ports.repo_status,
+                diagnostics: &ws_ports.diagnostic_runner,
+                tests: &ws_ports.test_runner,
+                approvals: &agent::HEADLESS_APPROVAL_GATE,
+                sleeper: &TokioSleeper,
+                hooks: cfg
+                    .hooks
+                    .as_ref()
+                    .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
+                candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+                mcp_prefetch: None,
+                // Headless / fleet: no concurrent input channel to steer from.
+                steering: None,
+            };
+            let config = PipelineConfig {
+                engine: agent::pipeline_engine_config_for(&cfg, &wiring.worker_model),
+                role_overrides: wiring.role_overrides.clone(),
+                headless: true,
+                headless_bypass_scope_review: agent::HEADLESS_SCOPE_REVIEW_BYPASS,
+                ..PipelineConfig::default()
+            };
+            let pipeline = Pipeline::new(ports, tx.clone(), config);
+            // The system prompt + task prompt are already in `messages`; the
+            // pipeline appends its own volatile recall+goal message, so pass the
+            // raw task prompt as the goal (the pipeline never re-reads `messages`
+            // for its goal — it takes `task.prompt` directly).
+            // The stop line races the whole staged run — the future drops at
+            // its next await point, the same clean cancel the raw path gets.
+            // Pause is NOT honored here yet: boundary-gating individual stages
+            // needs a gate port on `PipelinePorts` (the existing named
+            // follow-up) — only the raw step-loop path below holds a TurnGate.
+            let raced = tokio::select! {
+                result = pipeline.run(&task.prompt, &mut messages, &mut budget) => {
+                    Raced::Outcome(result)
                 }
                 _ = stop_wait => Raced::Stopped,
+            };
+            match raced {
+                Raced::Outcome(Ok(outcome)) => match outcome.status {
+                    PipelineStatus::Completed => {
+                        (truncate(&outcome.final_text), true, "completed", false)
+                    }
+                    PipelineStatus::VerificationFailed { verdict } => (
+                        truncate(&format!("verification failed: {}", verdict.summary)),
+                        false,
+                        "verification_failed",
+                        false,
+                    ),
+                    PipelineStatus::Aborted { reason } => {
+                        (truncate(&reason), false, "aborted", false)
+                    }
+                },
+                Raced::Outcome(Err(e)) => (truncate(&e.to_string()), false, "error", true),
+                Raced::Stopped => (STOPPED.to_string(), false, "cancelled", true),
+            }
+        } else {
+            // The pause line gates the raw step-loop at the engine's step
+            // boundary (never mid-tool), and the stop line races the turn.
+            let raced = {
+                let gate = WatchGate(pause);
+                let hook_runner = ShellHookRunner;
+                let mut engine = Engine::with_sleeper(
+                    &*provider,
+                    &claims,
+                    agent::engine_config_for(&cfg),
+                    &TokioSleeper,
+                )
+                .with_gate(&gate);
+                if let Some(hooks) = &cfg.hooks {
+                    engine = engine.with_hooks(hooks, &hook_runner);
+                }
+                tokio::select! {
+                    outcome = engine.run_turn(&mut messages, &mut budget, &tx) => {
+                        Raced::Outcome(outcome)
+                    }
+                    _ = stop_wait => Raced::Stopped,
+                }
+            };
+            match raced {
+                Raced::Outcome(TurnOutcome::Completed { text, .. }) => {
+                    (truncate(&text), true, "completed", false)
+                }
+                Raced::Outcome(TurnOutcome::Aborted { reason, .. }) => {
+                    (truncate(&reason), false, "aborted", false)
+                }
+                Raced::Stopped => (STOPPED.to_string(), false, "cancelled", true),
             }
         };
-        match raced {
-            Raced::Outcome(TurnOutcome::Completed { text, .. }) => (truncate(&text), true),
-            Raced::Outcome(TurnOutcome::Aborted { reason, .. }) => (truncate(&reason), false),
-            Raced::Stopped => (STOPPED.to_string(), false),
-        }
-    };
     drop(tx);
-    let _ = drain.await;
+    let rendered = renderer.await.unwrap_or_default();
     claims.release_all();
 
     let spent = budget.session_spent_usd();
+    let _ = finalize_fleet_execution(
+        &execution,
+        &registry,
+        outcome_label,
+        spent,
+        rendered.persistence_complete,
+        force_incomplete,
+    );
     let commits = collect_commits(root, &start_sha, &task.id).await;
     Ok(WorkerOutcome {
         cost_usd: spent,
@@ -651,6 +686,27 @@ async fn run_task(
         summary,
         success,
     })
+}
+
+fn finalize_fleet_execution(
+    execution: &Option<(std::sync::Arc<stella_store::Store>, i64)>,
+    registry: &ToolRegistry,
+    outcome_label: &str,
+    cost_usd: f64,
+    persistence_complete: bool,
+    force_incomplete: bool,
+) -> bool {
+    let Some((store, execution_id)) = execution else {
+        return false;
+    };
+    agent::record_execution_end(
+        store,
+        *execution_id,
+        registry,
+        outcome_label,
+        cost_usd,
+        persistence_complete && !force_incomplete,
+    )
 }
 
 /// The commits this workspace gained since `start_sha`, oldest first, as
@@ -866,6 +922,78 @@ mod tests {
         )
         .await
         .expect("teardown releases the gate");
+    }
+
+    #[tokio::test]
+    async fn fleet_attempt_persists_usage_before_complete_closeout() {
+        let root = tempfile::tempdir().expect("root");
+        let store = Arc::new(stella_store::Store::open(root.path()).expect("store"));
+        let id = store
+            .begin_execution("fleet", "task", "anthropic", "claude")
+            .expect("begin");
+        let execution = Some((store.clone(), id));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let renderer = agent::spawn_renderer(
+            rx,
+            crate::OutputFormat::Json,
+            execution.clone(),
+            "anthropic".into(),
+            false,
+        );
+        tx.send(AgentEvent::StepUsage {
+            output_text: None,
+            step: 0,
+            role: stella_protocol::ModelCallRole::Worker,
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            input_tokens: 10,
+            output_tokens: 2,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            estimated_input_tokens: 9,
+            cost_usd: 0.25,
+            duration_ms: 10,
+            retries: 0,
+            tool_calls: 0,
+            complete: true,
+        })
+        .expect("event");
+        drop(tx);
+        let rendered = renderer.await.expect("renderer");
+        let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
+
+        assert!(finalize_fleet_execution(
+            &execution,
+            &registry,
+            "completed",
+            0.25,
+            rendered.persistence_complete,
+            false,
+        ));
+        assert_eq!(store.count("telemetry").unwrap(), 1);
+        assert!(store.execution_usage_complete(id).unwrap());
+    }
+
+    #[test]
+    fn stopped_fleet_attempt_never_becomes_exportable() {
+        let root = tempfile::tempdir().expect("root");
+        let store = Arc::new(stella_store::Store::open(root.path()).expect("store"));
+        let id = store
+            .begin_execution("fleet", "task", "anthropic", "claude")
+            .expect("begin");
+        let execution = Some((store.clone(), id));
+        let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
+
+        assert!(!finalize_fleet_execution(
+            &execution,
+            &registry,
+            "cancelled",
+            0.0,
+            true,
+            true,
+        ));
+        assert!(!store.execution_usage_complete(id).unwrap());
+        assert!(store.execution_rollup(id, root.path()).unwrap().is_none());
     }
 
     // ---- the post-fanout PR/CI watch (--watch) --------------------------

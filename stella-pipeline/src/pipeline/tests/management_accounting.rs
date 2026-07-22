@@ -31,11 +31,12 @@ impl ProviderResolver for AnyProvider<'_> {
     }
 }
 
-/// Missing the triage decision deadline must not cancel a paid provider call.
-/// The late answer is ignored for classification, but its exact usage/cost is
-/// emitted and charged before triage returns.
+/// A triage call that misses its decision deadline must not silently vanish
+/// from the accounting record. The pipeline abandons the answer and falls back
+/// to the deterministic floor, but emits an explicit `UsageIncomplete` so the
+/// unknowable envelope is visible rather than guessed at (fail closed).
 #[tokio::test]
-async fn late_triage_is_ignored_but_awaited_and_metered() {
+async fn late_triage_is_abandoned_and_reported_incomplete() {
     let mut result = text_result("multi");
     result.cost_usd = 0.05;
     result.usage.input_tokens = 123;
@@ -68,6 +69,7 @@ async fn late_triage_is_ignored_but_awaited_and_metered() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -79,26 +81,36 @@ async fn late_triage_is_ignored_but_awaited_and_metered() {
     let mut budget = BudgetGuard::new(BudgetMode::Enforced, Some(1.0), None);
     let mut total = 0.0;
 
-    let started = std::time::Instant::now();
     let class = pipeline
         .triage("What is two plus two?", &mut budget, &mut total)
         .await
-        .expect("the late but settled triage call remains within budget");
+        .expect("a missed triage deadline is never a run-ending failure");
 
-    assert!(started.elapsed() >= Duration::from_millis(20));
-    assert_eq!(class, TaskClass::SimpleLookup);
-    assert_eq!(total, 0.05);
-    assert_eq!(budget.spent_usd(), 0.05);
+    // The abandoned answer never classifies, so triage lands on the
+    // deterministic floor rather than a guess from a call it did not await.
+    assert_eq!(class, resolve_task_class(None, "What is two plus two?"));
+    // Nothing settled, so nothing is charged — an unknowable envelope is
+    // reported as incomplete instead of being invented.
+    assert_eq!(total, 0.0);
+    assert_eq!(budget.spent_usd(), 0.0);
     let events = drain(&mut rx);
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::StepUsage {
-            purpose: Some(purpose),
-            input_tokens: 123,
-            output_tokens: 7,
-            ..
-        } if purpose == "triage"
-    )));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::UsageIncomplete {
+                role: ModelCallRole::Triage,
+                reason: stella_protocol::UsageIncompleteReason::Timeout,
+                ..
+            }
+        )),
+        "the missed deadline must surface as an explicit incomplete-usage record"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::StepUsage { .. })),
+        "an abandoned call must not emit a settled metering record"
+    );
 }
 
 /// A management call that crosses an enforced turn budget is the last paid
@@ -134,6 +146,7 @@ async fn triage_budget_crossing_aborts_before_a_second_provider_call() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,

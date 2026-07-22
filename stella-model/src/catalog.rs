@@ -496,6 +496,7 @@ mod tests {
         //                                     ------
         //                                      4.92
         let usage = CompletionUsage {
+            reported: true,
             input_tokens: 1_000_000,
             output_tokens: 200_000,
             cached_input_tokens: 400_000,
@@ -514,6 +515,7 @@ mod tests {
             cached_input_usd_per_mtok: 0.30,
         };
         let usage = CompletionUsage {
+            reported: true,
             input_tokens: 100,
             output_tokens: 0,
             cached_input_tokens: 1_000,

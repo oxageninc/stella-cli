@@ -289,6 +289,21 @@ def _tool_result_content(
     )
 
 
+# Stella's ``step_usage.role`` is the typed successor to the free-text
+# ``purpose`` field.  ATIF's public vocabulary is stable, so the worker role
+# keeps publishing as ``execute``; every other role already matches.  The
+# legacy ``unknown`` default carries no information and is omitted entirely
+# rather than published as a fabricated purpose.
+_ROLE_TO_PURPOSE = {"worker": "execute"}
+
+
+def _role_to_purpose(role: Any) -> str | None:
+    """Map a ``step_usage`` role onto the published ATIF purpose, if any."""
+    if not isinstance(role, str) or not role or role == "unknown":
+        return None
+    return _ROLE_TO_PURPOSE.get(role, role)
+
+
 def _call_to_step(call: _ModelCall, step_id: int, default_model: str | None) -> Step:
     """Convert one folded Stella call into a validated ATIF agent step."""
     usage = call.usage
@@ -408,8 +423,8 @@ def _call_to_step(call: _ModelCall, step_id: int, default_model: str | None) -> 
         stella_step = _nonnegative_int(usage.get("step"))
         if stella_step is not None:
             step_extra["stella_step"] = stella_step
-        purpose = usage.get("purpose")
-        if isinstance(purpose, str) and purpose:
+        purpose = _role_to_purpose(usage.get("role"))
+        if purpose is not None:
             step_extra["stella_purpose"] = purpose
     else:
         step_extra["usage_missing"] = True

@@ -507,6 +507,11 @@ impl StellaOperationalEventV1 {
         context: &OperationalEventContext,
         rollup: &ExecutionRollupRow,
     ) -> Result<Self> {
+        if !rollup.usage_complete {
+            return Err(StoreError(
+                "enterprise telemetry requires complete paid-call accounting".into(),
+            ));
+        }
         let outcome = OperationalOutcome::parse(&rollup.outcome)?;
         let requested = ManagedModelDimension::new(&rollup.provider, &rollup.model).ok();
         let admitted = requested

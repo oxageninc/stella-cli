@@ -189,6 +189,12 @@ pub struct CompletionRequest {
 /// caller).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompletionUsage {
+    /// The adapter observed the provider's authoritative usage-bearing
+    /// terminal response. This is explicit because a legitimate call can
+    /// report all zero counters, while a missing usage frame can accompany
+    /// non-empty streamed text. Legacy envelopes fail closed.
+    #[serde(default)]
+    pub reported: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     #[serde(default)]
@@ -204,6 +210,22 @@ pub struct CompletionUsage {
     /// still parse.
     #[serde(default)]
     pub cache_write_tokens: u64,
+}
+
+impl CompletionUsage {
+    /// A reported terminal envelope whose counters are all legitimately zero.
+    pub fn reported_zero() -> Self {
+        Self {
+            reported: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the adapter proved this accounting envelope came from the
+    /// provider's authoritative terminal usage frame.
+    pub fn is_complete(&self) -> bool {
+        self.reported
+    }
 }
 
 /// Why the model stopped generating, normalized across providers. Lets the
@@ -274,6 +296,7 @@ mod tests {
             text: "done".into(),
             tool_calls: vec![],
             usage: CompletionUsage {
+                reported: true,
                 input_tokens: 100,
                 output_tokens: 20,
                 cached_input_tokens: 0,
@@ -296,6 +319,7 @@ mod tests {
     #[test]
     fn completion_usage_roundtrips_cache_write_tokens() {
         let usage = CompletionUsage {
+            reported: true,
             input_tokens: 1_000,
             output_tokens: 50,
             cached_input_tokens: 400,
@@ -316,6 +340,19 @@ mod tests {
         let back: CompletionUsage = serde_json::from_str(legacy).expect("deserialize");
         assert_eq!(back.cached_input_tokens, 30);
         assert_eq!(back.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn completion_usage_completeness_is_explicit_not_inferred_from_token_values() {
+        let reported_zero = CompletionUsage::reported_zero();
+        assert!(reported_zero.is_complete());
+
+        let unreported_nonzero = CompletionUsage {
+            input_tokens: 10,
+            output_tokens: 1,
+            ..CompletionUsage::default()
+        };
+        assert!(!unreported_nonzero.is_complete());
     }
 
     #[test]

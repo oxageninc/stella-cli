@@ -680,6 +680,7 @@ mod tests {
                 1,
                 &TelemetryRow {
                     step: 0,
+                    call_role: "worker".into(),
                     provider: "test".into(),
                     model: "test-model".into(),
                     input_tokens: 100,
@@ -692,6 +693,7 @@ mod tests {
                     duration_ms: 500,
                     retries: 0,
                     tool_calls: 1,
+                    usage_complete: true,
                 },
             )
             .unwrap();
@@ -744,6 +746,7 @@ mod tests {
                     1,
                     &TelemetryRow {
                         step: 0,
+                        call_role: "worker".into(),
                         provider: "anthropic".into(),
                         model: "claude-test".into(),
                         input_tokens: 1000,
@@ -756,6 +759,7 @@ mod tests {
                         duration_ms: 1500,
                         retries: 1,
                         tool_calls: 3,
+                        usage_complete: true,
                     },
                 )
                 .unwrap();

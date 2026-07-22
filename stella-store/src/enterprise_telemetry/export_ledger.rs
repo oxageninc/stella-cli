@@ -160,14 +160,16 @@ impl crate::Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut pending = {
             let mut stmt = tx.prepare(
-                "SELECT execution_id, export_nonce FROM enterprise_export_ledger
-                 WHERE sink_fingerprint = ?1 AND status = 'pending' AND execution_id > ?2
+                "SELECT l.execution_id, l.export_nonce FROM enterprise_export_ledger l
+                 JOIN executions e ON e.id = l.execution_id
+                 WHERE l.sink_fingerprint = ?1 AND l.status = 'pending'
+                   AND l.execution_id > ?2 AND e.usage_complete = 1
                    AND NOT EXISTS (
                        SELECT 1 FROM enterprise_export_skips s
-                       WHERE s.sink_fingerprint = enterprise_export_ledger.sink_fingerprint
-                         AND s.execution_id = enterprise_export_ledger.execution_id
+                       WHERE s.sink_fingerprint = l.sink_fingerprint
+                         AND s.execution_id = l.execution_id
                    )
-                 ORDER BY execution_id LIMIT ?3",
+                 ORDER BY l.execution_id LIMIT ?3",
             )?;
             let rows = stmt.query_map(params![sink_fingerprint, after, sql_limit], |row| {
                 Ok(PendingEnterpriseExport {

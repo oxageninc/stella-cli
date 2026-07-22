@@ -225,6 +225,7 @@ fn valid_claims() -> TestClaims {
 
 fn rollup(id: i64) -> ExecutionRollupRow {
     ExecutionRollupRow {
+        usage_complete: true,
         project_id: "local-project-id".into(),
         project_name: "private-name".into(),
         project_root: "/private/path".into(),
@@ -1231,6 +1232,7 @@ fn finalization_stays_successful_when_telemetry_host_state_is_rejected() {
         &registry,
         "completed",
         0.01,
+        true,
     ));
     assert_eq!(
         store

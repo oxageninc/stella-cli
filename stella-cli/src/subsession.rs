@@ -475,7 +475,7 @@ async fn run_worker(
         }
     };
     drop(tx);
-    let _ = forwarder.await;
+    let persistence_complete = forwarder.await.unwrap_or(false);
     // Release the worker's whole claim set — the stop path included (the
     // dropped turn future cannot release for itself).
     claims.release_all();
@@ -511,7 +511,8 @@ async fn run_worker(
         ),
     };
     if let Some((store, id)) = &execution {
-        let _ = agent::record_execution_end(store, *id, &registry, label, cost);
+        let _ =
+            agent::record_execution_end(store, *id, &registry, label, cost, persistence_complete);
         // Mirror the worker's final board (its own, session-scoped view) so
         // `tasks` queries see sub-agent boards too.
         let board = registry.task_board();

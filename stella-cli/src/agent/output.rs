@@ -3,41 +3,11 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use colored::Colorize;
 use stella_core::{EventSendError, EventSender};
 use stella_protocol::AgentEvent;
 use tokio::sync::mpsc;
 
 use crate::OutputFormat;
-use crate::memory::ReflectionReport;
-
-/// Surface a post-turn [`ReflectionReport`] for a headless / line-based
-/// format — the reflection outcome must never vanish (the silent-reflection
-/// blind spot this closes). `stream-json` gets one machine event line so a
-/// metering/CI consumer sees that reflection ran and whether it errored;
-/// `text` and `json` get a one-line stderr warning ONLY when the reflection
-/// model call actually failed — a clean empty reflection is the common,
-/// correct case and stays quiet. Never writes stdout in `json` mode, so that
-/// format's single-object contract is untouched. A configured durable sink is
-/// fail-closed: persistence failure terminates before another paid call can be
-/// made. A `None` model error in `text`/`json` prints nothing.
-pub(super) fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
-    if format == OutputFormat::StreamJson {
-        let line = serde_json::json!({
-            "type": "reflect",
-            "recorded": report.recorded,
-            "error": report.model_error,
-        });
-        emit_stream_json_line_or_terminate(&line.to_string());
-        return;
-    }
-    if let Some(err) = &report.model_error {
-        eprintln!(
-            "  {} post-turn reflection skipped — model call failed: {err}",
-            "!".yellow()
-        );
-    }
-}
 
 /// Trusted launcher-only sink for timeout-survivable stream-json telemetry.
 ///
@@ -319,7 +289,8 @@ mod durable_stream_tests {
         };
         let usage = AgentEvent::StepUsage {
             step: 0,
-            purpose: Some("execute".to_string()),
+            role: stella_protocol::ModelCallRole::Worker,
+            provider: "provider".to_string(),
             output_text: None,
             model: "provider/model".to_string(),
             input_tokens: 11,
@@ -331,6 +302,7 @@ mod durable_stream_tests {
             duration_ms: 5,
             retries: 0,
             tool_calls: 0,
+            complete: true,
         };
 
         sender.send(stage.clone()).unwrap();

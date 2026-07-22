@@ -279,15 +279,24 @@ pub(crate) struct WorkspacePorts {
     pub(crate) test_runner: TypedTestRunner,
     /// Used for best-of-N and for candidate-local authored witnesses at N=1.
     pub(crate) candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces,
+    /// The orchestrator's Best-of-N MCP pre-fetch adapter (issue #248
+    /// Phase 1), sharing the same MCP toolset threaded into
+    /// `candidate_workspaces` — `None` when the session has no MCP
+    /// servers connected. Inert unless `candidates > 1`, same as above.
+    pub(crate) mcp_prefetch: Option<crate::candidate_ws::McpPrefetchAdapter>,
 }
 
 /// Build the [`WorkspacePorts`] bundle rooted at `root` (the session
-/// workspace, or a fleet worker's own worktree).
+/// workspace, or a fleet worker's own worktree). `mcp`, when the caller has
+/// one connected, is shared into both the candidate tool surface
+/// (`candidate_safe`-filtered) and the orchestrator pre-fetch hook — the
+/// same live connections, no new subprocess (issue #248 Phase 1).
 pub(crate) fn workspace_ports(
     root: std::path::PathBuf,
     cfg: &Config,
     registry_options: stella_tools::RegistryOptions,
     active_rules: crate::rules::ResolvedRules,
+    mcp: Option<Arc<stella_mcp::McpToolSet>>,
 ) -> Result<WorkspacePorts, String> {
     crate::enterprise_telemetry::authorize_execution_surface(
         crate::enterprise_telemetry::ExecutionSurface::WorkspacePorts,
@@ -298,19 +307,29 @@ pub(crate) fn workspace_ports(
     // The candidate registry mirrors the session's custom tool surface —
     // discovered from the same root, so a candidate sees exactly the custom
     // tools the session does (re-rooted at its snapshot at create time).
-    let custom_tools =
-        custom_tool_report_for_scopes(&root, cfg.authority.project_custom_tools_allowed).tools;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let custom_tools = stella_tools::custom::discover_in_scopes(
+        &root,
+        home.as_deref(),
+        cfg.authority.project_custom_tools_allowed,
+    )
+    .tools;
+    let mut candidate_workspaces = crate::candidate_ws::GitCandidateWorkspaces::new(
+        root.clone(),
+        registry_options,
+        custom_tools,
+        active_rules,
+    );
+    if let Some(mcp) = &mcp {
+        candidate_workspaces = candidate_workspaces.with_candidate_mcp(Arc::clone(mcp));
+    }
     Ok(WorkspacePorts {
         repo_structure: GitRepoStructure { root: root.clone() },
         repo_status: GitRepoStatus { root: root.clone() },
         diagnostic_runner: GitDiagnosticRunner { root: root.clone() },
-        test_runner: TypedTestRunner { root: root.clone() },
-        candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces::new(
-            root,
-            registry_options,
-            custom_tools,
-            active_rules,
-        ),
+        test_runner: TypedTestRunner { root },
+        candidate_workspaces,
+        mcp_prefetch: mcp.map(crate::candidate_ws::McpPrefetchAdapter::new),
     })
 }
 

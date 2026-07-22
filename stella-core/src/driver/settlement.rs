@@ -1,13 +1,13 @@
 use stella_protocol::AgentEvent;
-use tokio::sync::mpsc::UnboundedSender;
 
 use super::TurnOutcome;
 use crate::budget::{BudgetGuard, BudgetOutcome};
+use crate::event_sender::EventSender;
 
 pub(super) fn record_settled_cost(
     budget: &mut BudgetGuard,
     cost_usd: f64,
-    events: &UnboundedSender<AgentEvent>,
+    events: &EventSender,
 ) -> BudgetOutcome {
     let outcome = budget.record_spend(cost_usd);
     let _ = events.send(AgentEvent::BudgetTick {
@@ -22,7 +22,7 @@ pub(super) fn record_settled_cost(
 pub(super) fn check_budget(
     budget: &BudgetGuard,
     total_cost_usd: f64,
-    events: &UnboundedSender<AgentEvent>,
+    events: &EventSender,
 ) -> Option<TurnOutcome> {
     let BudgetOutcome::AbortTurn {
         spent_usd,

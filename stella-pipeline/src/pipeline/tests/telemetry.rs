@@ -13,6 +13,7 @@ fn metered_result(
         output_tokens,
         cached_input_tokens: input_tokens / 2,
         cache_write_tokens: 0,
+        reported: true,
     };
     result
 }
@@ -72,6 +73,7 @@ async fn aborted_pipeline_totals_match_every_management_and_execute_usage_record
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -106,21 +108,21 @@ async fn aborted_pipeline_totals_match_every_management_and_execute_usage_record
         5,
         "triage + plan + three execute calls must all be machine-readable"
     );
-    let purposes: Vec<Option<&str>> = usages
+    let roles: Vec<ModelCallRole> = usages
         .iter()
         .map(|event| match event {
-            AgentEvent::StepUsage { purpose, .. } => purpose.as_deref(),
+            AgentEvent::StepUsage { role, .. } => *role,
             _ => unreachable!("filtered to StepUsage"),
         })
         .collect();
     assert_eq!(
-        purposes,
+        roles,
         [
-            Some("triage"),
-            Some("plan"),
-            Some("execute"),
-            Some("execute"),
-            Some("execute")
+            ModelCallRole::Triage,
+            ModelCallRole::Plan,
+            ModelCallRole::Worker,
+            ModelCallRole::Worker,
+            ModelCallRole::Worker,
         ]
     );
     assert!(matches!(
