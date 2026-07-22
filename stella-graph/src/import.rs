@@ -80,6 +80,11 @@ pub(crate) enum ImportSpec {
     /// A Rust `use` path — recorded unresolved (module→file resolution is
     /// out of scope, see [`crate::queries::RUST_IMPORTS`]).
     RustUse { specifier: String },
+    /// A literal file path resolved against the importing file's directory:
+    /// C's quoted `#include "x.h"`, PHP's `require`/`include`. Distinct from
+    /// [`Self::TsRelative`] only in name — the resolution is the same — so
+    /// neither language has to borrow the other's vocabulary.
+    PathRelative { specifier: String },
 }
 
 /// Resolve a file's raw import specifiers to edges. `root` must already be
@@ -96,7 +101,7 @@ pub(crate) fn resolve(specs: Vec<ImportSpec>, root: &Path, file_abs: &Path) -> V
             ImportSpec::PyAbsolute { specifier } | ImportSpec::RustUse { specifier } => {
                 edges.push(ImportEdge::unresolved(specifier, ImportKind::Absolute));
             }
-            ImportSpec::TsRelative { specifier } => {
+            ImportSpec::TsRelative { specifier } | ImportSpec::PathRelative { specifier } => {
                 let to_path = resolve_ts_relative(&specifier, file_dir, root);
                 edges.push(ImportEdge {
                     specifier,

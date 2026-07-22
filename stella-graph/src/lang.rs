@@ -19,6 +19,10 @@ pub enum Language {
     TypeScript,
     Tsx,
     Sql,
+    Go,
+    Java,
+    C,
+    Php,
 }
 
 impl Language {
@@ -33,6 +37,13 @@ impl Language {
             "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
             "ts" | "mts" | "cts" => Language::TypeScript,
             "tsx" => Language::Tsx,
+            "go" => Language::Go,
+            "java" => Language::Java,
+            // Headers index as C. A C++ project's `.h` still yields useful
+            // struct/function symbols under the C grammar, and misreading a
+            // header beats skipping every declaration in the tree.
+            "c" | "h" => Language::C,
+            "php" => Language::Php,
             "sql" => Language::Sql,
             _ => return None,
         })
@@ -48,6 +59,10 @@ impl Language {
             Language::TypeScript => "typescript",
             Language::Tsx => "tsx",
             Language::Sql => "sql",
+            Language::Go => "go",
+            Language::Java => "java",
+            Language::C => "c",
+            Language::Php => "php",
         }
     }
 
@@ -60,6 +75,13 @@ impl Language {
             Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Language::Sql => tree_sitter_sequel::LANGUAGE.into(),
+            Language::Go => tree_sitter_go::LANGUAGE.into(),
+            Language::Java => tree_sitter_java::LANGUAGE.into(),
+            Language::C => tree_sitter_c::LANGUAGE.into(),
+            // The HTML-embedding grammar, not `LANGUAGE_PHP_ONLY`: real
+            // `.php` files routinely open and close `<?php` around markup,
+            // and the PHP-only grammar cannot parse those at all.
+            Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         }
     }
 
@@ -71,6 +93,10 @@ impl Language {
             Language::JavaScript => queries::JS_SYMBOLS,
             Language::TypeScript | Language::Tsx => queries::TS_SYMBOLS,
             Language::Sql => queries::SQL_SYMBOLS,
+            Language::Go => queries::GO_SYMBOLS,
+            Language::Java => queries::JAVA_SYMBOLS,
+            Language::C => queries::C_SYMBOLS,
+            Language::Php => queries::PHP_SYMBOLS,
         }
     }
 
@@ -82,6 +108,10 @@ impl Language {
             Language::JavaScript => queries::JS_IMPORTS,
             Language::TypeScript | Language::Tsx => queries::TS_IMPORTS,
             Language::Sql => queries::SQL_IMPORTS,
+            Language::Go => queries::GO_IMPORTS,
+            Language::Java => queries::JAVA_IMPORTS,
+            Language::C => queries::C_IMPORTS,
+            Language::Php => queries::PHP_IMPORTS,
         }
     }
 }

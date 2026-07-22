@@ -137,3 +137,81 @@ pub const SQL_SYMBOLS: &str = r#"
 /// SQL has no imports — this empty string keeps the `LangPack` two-query
 /// shape uniform without introducing a conditional in `parse_file`.
 pub const SQL_IMPORTS: &str = "";
+
+// ---- Go ------------------------------------------------------------------
+
+/// Functions, methods (receiver functions), and named types. Go's grammar is
+/// regular enough that these three patterns cover the declaration surface.
+pub const GO_SYMBOLS: &str = r#"
+(function_declaration name: (_) @name) @fn
+(method_declaration name: (_) @name) @method
+(type_declaration (type_spec name: (_) @name type: (struct_type))) @struct
+(type_declaration (type_spec name: (_) @name type: (interface_type))) @interface
+"#;
+
+/// Both the grouped `import ( … )` block and the single-line form; the
+/// quoted path inside each spec is the edge target.
+pub const GO_IMPORTS: &str = r#"
+(import_declaration) @import
+"#;
+
+// ---- Java ----------------------------------------------------------------
+
+/// Classes, interfaces, enums, records, and methods. Java carries no free
+/// functions, so every callable is a method on a type.
+pub const JAVA_SYMBOLS: &str = r#"
+(class_declaration name: (_) @name) @class
+(interface_declaration name: (_) @name) @interface
+(enum_declaration name: (_) @name) @enum
+(record_declaration name: (_) @name) @class
+(method_declaration name: (_) @name) @method
+"#;
+
+/// `import a.b.C;` — a package path, which resolves to a file only under the
+/// conventional package-as-directory layout.
+pub const JAVA_IMPORTS: &str = r#"
+(import_declaration) @import
+"#;
+
+// ---- C -------------------------------------------------------------------
+
+/// Function definitions, plus the struct/union/enum and typedef surface.
+/// The declarator nesting is why functions need their own pattern rather
+/// than a bare name capture: the identifier sits under `function_declarator`.
+pub const C_SYMBOLS: &str = r#"
+(function_definition
+  declarator: (function_declarator declarator: (identifier) @name)) @fn
+(struct_specifier name: (type_identifier) @name) @struct
+(union_specifier name: (type_identifier) @name) @struct
+(enum_specifier name: (type_identifier) @name) @enum
+(type_definition declarator: (type_identifier) @name) @struct
+"#;
+
+/// `#include` in both forms. Only the quoted form reliably names a file in
+/// the tree; angle-bracket includes point at system headers and are captured
+/// but will not resolve to a workspace path.
+pub const C_IMPORTS: &str = r#"
+(preproc_include) @import
+"#;
+
+// ---- PHP -----------------------------------------------------------------
+
+/// Classes, interfaces, traits, enums, free functions, and methods.
+pub const PHP_SYMBOLS: &str = r#"
+(class_declaration name: (_) @name) @class
+(interface_declaration name: (_) @name) @interface
+(trait_declaration name: (_) @name) @trait
+(enum_declaration name: (_) @name) @enum
+(function_definition name: (_) @name) @fn
+(method_declaration name: (_) @name) @method
+"#;
+
+/// Both mechanisms, which resolve differently: `require`/`include` name a
+/// literal path and resolve like C's quoted include, while `use` names a
+/// NAMESPACE — mapping that to a file needs composer.json's PSR-4 autoload
+/// map, so those edges are captured but stay unresolved until that lands.
+pub const PHP_IMPORTS: &str = r#"
+(namespace_use_declaration) @import
+(expression_statement (include_expression)) @include
+(expression_statement (require_expression)) @require
+"#;

@@ -33,6 +33,10 @@ pub(crate) struct Grammars {
     typescript: LangPack,
     tsx: LangPack,
     sql: LangPack,
+    go: LangPack,
+    java: LangPack,
+    c: LangPack,
+    php: LangPack,
 }
 
 struct LangPack {
@@ -73,6 +77,10 @@ impl Grammars {
             rust: LangPack::load(Language::Rust)?,
             python: LangPack::load(Language::Python)?,
             javascript: LangPack::load(Language::JavaScript)?,
+            go: LangPack::load(Language::Go)?,
+            java: LangPack::load(Language::Java)?,
+            c: LangPack::load(Language::C)?,
+            php: LangPack::load(Language::Php)?,
             typescript: LangPack::load(Language::TypeScript)?,
             tsx: LangPack::load(Language::Tsx)?,
             sql: LangPack::load(Language::Sql)?,
@@ -87,6 +95,10 @@ impl Grammars {
             Language::TypeScript => &self.typescript,
             Language::Tsx => &self.tsx,
             Language::Sql => &self.sql,
+            Language::Go => &self.go,
+            Language::Java => &self.java,
+            Language::C => &self.c,
+            Language::Php => &self.php,
         }
     }
 }
@@ -148,6 +160,10 @@ pub(crate) fn parse_file(grammars: &Grammars, lang: Language, source: &str) -> O
             extract_ts_imports(&pack.imports, root, src)
         }
         Language::Sql => Vec::new(), // SQL has no imports
+        Language::Go => extract_go_imports(&pack.imports, root, src),
+        Language::Java => extract_java_imports(&pack.imports, root, src),
+        Language::C => extract_c_imports(&pack.imports, root, src),
+        Language::Php => extract_php_imports(&pack.imports, root, src),
     };
     Some(Parsed { symbols, imports })
 }
@@ -926,5 +942,332 @@ render_table! {
             "unrelated render_table! macro should not be indexed as a table: {:?}",
             parsed.symbols
         );
+    }
+}
+
+/// Pull the first double-quoted run out of a node's text.
+///
+/// Go, C, and PHP all name their target inside quotes, and the surrounding
+/// syntax differs enough (`import ( … )`, `#include "x.h"`, `require '…';`)
+/// that reading the literal is steadier than matching each grammar's
+/// internal node names — which vary across grammar releases.
+fn first_quoted(text: &str) -> Option<&str> {
+    for quote in ['"', '\''] {
+        if let Some(open) = text.find(quote) {
+            let rest = &text[open + 1..];
+            if let Some(len) = rest.find(quote) {
+                let inner = &rest[..len];
+                if !inner.is_empty() {
+                    return Some(inner);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Go: every spec inside `import ( … )` or a single-line `import "…"`. Go
+/// import paths are module-qualified and never relative, so they stay
+/// unresolved rather than being guessed at against the tree.
+fn extract_go_imports(query: &Query, root: Node, src: &[u8]) -> Vec<ImportSpec> {
+    each_import_node(query, root, src, |text| {
+        let mut out = Vec::new();
+        // A grouped block holds several quoted paths; take each in turn.
+        let mut rest = text;
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let Some(len) = after.find('"') else { break };
+            let specifier = &after[..len];
+            if !specifier.is_empty() {
+                out.push(ImportSpec::Bare {
+                    specifier: specifier.to_string(),
+                });
+            }
+            rest = &after[len + 1..];
+        }
+        out
+    })
+}
+
+/// Java: `import a.b.C;` — a package path. Resolving it to a file depends on
+/// the conventional package-as-directory layout, which is a build-system
+/// question rather than a syntactic one, so the edge is recorded unresolved.
+fn extract_java_imports(query: &Query, root: Node, src: &[u8]) -> Vec<ImportSpec> {
+    each_import_node(query, root, src, |text| {
+        let specifier = text
+            .trim()
+            .trim_start_matches("import")
+            .trim()
+            .trim_start_matches("static")
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        if specifier.is_empty() {
+            return Vec::new();
+        }
+        vec![ImportSpec::Bare {
+            specifier: specifier.to_string(),
+        }]
+    })
+}
+
+/// C: `#include "x.h"` resolves against the including file's directory;
+/// `#include <stdio.h>` names a system header that is not in the tree, so it
+/// is recorded unresolved instead of being resolved to a coincidental match.
+fn extract_c_imports(query: &Query, root: Node, src: &[u8]) -> Vec<ImportSpec> {
+    each_import_node(query, root, src, |text| {
+        if let Some(specifier) = first_quoted(text) {
+            return vec![ImportSpec::PathRelative {
+                specifier: specifier.to_string(),
+            }];
+        }
+        let angled = text.find('<').and_then(|open| {
+            let rest = &text[open + 1..];
+            rest.find('>').map(|len| &rest[..len])
+        });
+        match angled.filter(|s| !s.is_empty()) {
+            Some(specifier) => vec![ImportSpec::Bare {
+                specifier: specifier.to_string(),
+            }],
+            None => Vec::new(),
+        }
+    })
+}
+
+/// PHP: `require`/`include` name a literal path and resolve; `use` names a
+/// NAMESPACE, which maps to a file only through composer.json's PSR-4
+/// autoload map — so those are captured and left unresolved.
+fn extract_php_imports(query: &Query, root: Node, src: &[u8]) -> Vec<ImportSpec> {
+    each_import_node(query, root, src, |text| {
+        let trimmed = text.trim();
+        if trimmed.starts_with("use") {
+            let specifier = trimmed
+                .trim_start_matches("use")
+                .trim()
+                .trim_end_matches(';')
+                .trim();
+            return if specifier.is_empty() {
+                Vec::new()
+            } else {
+                vec![ImportSpec::Bare {
+                    specifier: specifier.to_string(),
+                }]
+            };
+        }
+        match first_quoted(trimmed) {
+            Some(specifier) => vec![ImportSpec::PathRelative {
+                specifier: specifier.to_string(),
+            }],
+            None => Vec::new(),
+        }
+    })
+}
+
+/// Shared driver: run the import query and hand each matched node's text to
+/// a language-specific decoder.
+fn each_import_node(
+    query: &Query,
+    root: Node,
+    src: &[u8],
+    decode: impl Fn(&str) -> Vec<ImportSpec>,
+) -> Vec<ImportSpec> {
+    let mut cursor = QueryCursor::new();
+    let mut out = Vec::new();
+    let mut matches = cursor.matches(query, root, src);
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if let Ok(text) = cap.node.utf8_text(src) {
+                out.extend(decode(text));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod added_language_tests {
+    use super::*;
+
+    fn parse(lang: Language, src: &str) -> Parsed {
+        let grammars = Grammars::load().expect("grammars load");
+        parse_file(&grammars, lang, src).expect("source parses")
+    }
+
+    fn names(parsed: &Parsed) -> Vec<&str> {
+        parsed.symbols.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    fn specifiers(parsed: &Parsed) -> Vec<String> {
+        parsed
+            .imports
+            .iter()
+            .map(|spec| match spec {
+                ImportSpec::Bare { specifier }
+                | ImportSpec::PathRelative { specifier }
+                | ImportSpec::TsRelative { specifier }
+                | ImportSpec::PyAbsolute { specifier }
+                | ImportSpec::RustUse { specifier } => specifier.clone(),
+                ImportSpec::PyRelative { text, .. } => text.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn go_symbols_and_grouped_imports() {
+        let parsed = parse(
+            Language::Go,
+            r#"
+package main
+
+import (
+    "fmt"
+    "github.com/pkg/errors"
+)
+
+type Scheduler struct{ n int }
+
+type Runner interface{ Run() error }
+
+func New() *Scheduler { return &Scheduler{} }
+
+func (s *Scheduler) Run() error { fmt.Println(s.n); return nil }
+"#,
+        );
+        let names = names(&parsed);
+        assert!(names.contains(&"Scheduler"), "struct type: {names:?}");
+        assert!(names.contains(&"New"), "func: {names:?}");
+        assert!(names.contains(&"Run"), "method: {names:?}");
+        assert!(names.contains(&"Runner"), "interface type: {names:?}");
+        // Every path in the grouped block, not just the first.
+        let specs = specifiers(&parsed);
+        assert!(specs.contains(&"fmt".to_string()), "{specs:?}");
+        assert!(
+            specs.contains(&"github.com/pkg/errors".to_string()),
+            "{specs:?}"
+        );
+    }
+
+    #[test]
+    fn java_symbols_and_imports() {
+        let parsed = parse(
+            Language::Java,
+            r#"
+package com.example.app;
+
+import java.util.List;
+import static java.util.Objects.requireNonNull;
+
+public interface Store { void put(String k); }
+
+public class KvStore implements Store {
+    public void put(String k) {}
+}
+
+enum Mode { FAST, SAFE }
+"#,
+        );
+        let names = names(&parsed);
+        for expected in ["Store", "KvStore", "put", "Mode"] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        let specs = specifiers(&parsed);
+        assert!(specs.contains(&"java.util.List".to_string()), "{specs:?}");
+        // `import static` keeps its path, minus the modifier.
+        assert!(
+            specs.contains(&"java.util.Objects.requireNonNull".to_string()),
+            "{specs:?}"
+        );
+    }
+
+    #[test]
+    fn c_symbols_and_both_include_forms() {
+        let parsed = parse(
+            Language::C,
+            r#"
+#include <stdio.h>
+#include "kvstore.h"
+
+struct Entry { int key; };
+
+typedef struct Entry Entry;
+
+int put(const char *k) { return 0; }
+"#,
+        );
+        let names = names(&parsed);
+        assert!(names.contains(&"Entry"), "struct: {names:?}");
+        assert!(names.contains(&"put"), "function: {names:?}");
+        // The quoted include resolves against the tree; the angled one is a
+        // system header and must stay unresolved rather than be guessed.
+        let quoted = parsed.imports.iter().any(
+            |s| matches!(s, ImportSpec::PathRelative { specifier } if specifier == "kvstore.h"),
+        );
+        let angled = parsed
+            .imports
+            .iter()
+            .any(|s| matches!(s, ImportSpec::Bare { specifier } if specifier == "stdio.h"));
+        assert!(quoted, "quoted include is path-relative: {:?}", parsed.imports);
+        assert!(angled, "angled include stays unresolved: {:?}", parsed.imports);
+    }
+
+    #[test]
+    fn php_symbols_and_the_two_import_mechanisms() {
+        let parsed = parse(
+            Language::Php,
+            r#"<?php
+namespace App;
+
+use App\Contracts\StoreInterface;
+
+require 'bootstrap.php';
+
+interface StoreInterface { public function put($k); }
+
+trait Loggable { public function log($m) {} }
+
+class KvStore implements StoreInterface {
+    public function put($k) {}
+}
+
+function boot() {}
+"#,
+        );
+        let names = names(&parsed);
+        for expected in ["StoreInterface", "Loggable", "KvStore", "put", "boot"] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        // `require` names a file and resolves; `use` names a namespace and
+        // cannot without composer's PSR-4 map.
+        let required = parsed.imports.iter().any(
+            |s| matches!(s, ImportSpec::PathRelative { specifier } if specifier == "bootstrap.php"),
+        );
+        let used = parsed.imports.iter().any(
+            |s| matches!(s, ImportSpec::Bare { specifier } if specifier.contains("StoreInterface")),
+        );
+        assert!(required, "require resolves as a path: {:?}", parsed.imports);
+        assert!(used, "use is captured unresolved: {:?}", parsed.imports);
+    }
+
+    /// PHP files routinely wrap markup, which the PHP-only grammar cannot
+    /// parse — the reason `LANGUAGE_PHP` is the one wired in.
+    #[test]
+    fn php_with_embedded_html_still_yields_symbols() {
+        let parsed = parse(
+            Language::Php,
+            "<html><body><?php class Page { public function render() {} } ?></body></html>",
+        );
+        let names = names(&parsed);
+        assert!(names.contains(&"Page"), "{names:?}");
+        assert!(names.contains(&"render"), "{names:?}");
+    }
+
+    #[test]
+    fn new_extensions_classify() {
+        use std::path::Path;
+        assert_eq!(Language::from_path(Path::new("m.go")), Some(Language::Go));
+        assert_eq!(Language::from_path(Path::new("A.java")), Some(Language::Java));
+        assert_eq!(Language::from_path(Path::new("k.c")), Some(Language::C));
+        assert_eq!(Language::from_path(Path::new("k.h")), Some(Language::C));
+        assert_eq!(Language::from_path(Path::new("i.php")), Some(Language::Php));
     }
 }
