@@ -484,6 +484,11 @@ fn producer_materializes_tool_calls_reflection_and_rolls_up_to_usage() {
     // Roll one turn up into the user-tier aggregate.
     let usage = crate::usage::UsageStore::in_memory().unwrap();
     let root = std::path::Path::new("/w/stella");
+    assert!(
+        !store.sync_to_usage(id, root, &usage).unwrap(),
+        "a pending execution must not escape into usage aggregates"
+    );
+    store.finish_execution(id, "completed", 0.0).unwrap();
     assert!(store.sync_to_usage(id, root, &usage).unwrap());
     let pid = crate::usage::project_id_for(root);
     assert_eq!(usage.execution_count(&pid).unwrap(), 1);
