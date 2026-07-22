@@ -13,17 +13,15 @@
 //!
 //! # Deferred-flush events (L-E10)
 //!
-//! [`crate::retry::retry_with_backoff`] already implements the contract:
-//! on success it returns the *full* retry history (so a step that failed
-//! twice then succeeded still reports two `Retry` events — the attempts
-//! were real, they just didn't fail the step); on failure it returns only
-//! the terminal error. `run_turn` emits events straight from that outcome,
-//! so a step that never commits emits nothing about its doomed attempts —
-//! there is nothing extra to build here, the discipline is inherited.
+//! [`crate::retry::retry_with_backoff_observed`] returns committed retry
+//! history while synchronously exposing each failed provider attempt to the
+//! accounting path. Ordinary retry narration stays deferred until success;
+//! content-free `UsageIncomplete` envelopes are durable immediately because
+//! a later successful attempt cannot recover the failed call's usage.
 //!
 //! # Retry never re-executes a tool call
 //!
-//! [`crate::retry::retry_with_backoff`] wraps *only* the model call
+//! [`crate::retry::retry_with_backoff_observed`] wraps *only* the model call
 //! (`Provider::complete`). Tool execution happens exactly once, after a
 //! model call has already succeeded and returned tool calls to run — it is
 //! never inside the retried closure. A retried step therefore structurally
@@ -69,8 +67,9 @@ use crate::estimator::{CalibrationMap, estimate_conversation_tokens};
 use crate::hooks::{HookPayload, HookRunner, Hooks, run_hooks};
 use crate::loop_detect::{LoopDetectionConfig, detect_loop};
 use crate::ports::ToolExecutor;
-use crate::retry::{RetryOutcome, RetryPolicy, Sleeper, retry_with_backoff};
+use crate::retry::{RetryOutcome, RetryPolicy, Sleeper, retry_with_backoff_observed};
 use crate::speculation::{SpeculationGate, SpeculationPool, SpeculativeResult};
+use crate::{AccountedCall, AccountedCallError, run_accounted_call};
 
 mod settlement;
 use settlement::{check_budget, record_settled_cost};
@@ -180,6 +179,7 @@ pub struct Engine<'a> {
     pub(crate) tools: &'a dyn ToolExecutor,
     pub(crate) sleeper: &'a dyn Sleeper,
     pub(crate) config: EngineConfig,
+    call_role: stella_protocol::ModelCallRole,
     /// Lifecycle hooks, off by default. Attached via [`Engine::with_hooks`]
     /// so `with_sleeper` keeps its existing signature. When `None`,
     /// no hook is ever consulted and the turn path adds zero work.
@@ -227,8 +227,6 @@ struct CommittedStep {
     /// attempt's pool never gets here — it is dropped with the attempt.
     speculation: SpeculationPool,
     estimated_input_tokens: u64,
-    retries: u32,
-    duration_ms: u64,
 }
 
 impl<'a> Engine<'a> {
@@ -248,11 +246,19 @@ impl<'a> Engine<'a> {
             tools,
             sleeper,
             config,
+            call_role: stella_protocol::ModelCallRole::Worker,
             hooks: None,
             calibration: None,
             gate: None,
             steering: None,
         }
+    }
+
+    /// Attribute this engine's provider calls to a concrete pipeline role.
+    /// Ordinary execution defaults to [`ModelCallRole::Worker`].
+    pub fn with_call_role(mut self, role: stella_protocol::ModelCallRole) -> Self {
+        self.call_role = role;
+        self
     }
 
     /// Attach lifecycle hooks (`crate::hooks`) to an engine, opt-in. Kept a
@@ -389,7 +395,7 @@ impl<'a> Engine<'a> {
                 return aborted;
             }
 
-            let committed = match self.run_model_call(messages, budget, events).await {
+            let committed = match self.run_model_call(step, messages, budget, events).await {
                 Ok(committed) => committed,
                 Err(reason) => {
                     return TurnOutcome::Aborted {
@@ -483,11 +489,8 @@ impl<'a> Engine<'a> {
         0.0
     }
 
-    /// Replace the oldest replaceable span of the conversation with one
-    /// model-written summary message. Best-effort by contract: any failure
-    /// (no viable span, provider error, empty summary) leaves the
-    /// conversation untouched and the turn proceeds exactly as before this
-    /// mechanism existed. Returns the summarizer call's spend.
+    /// Replace the oldest viable span with a model-written summary. Failures
+    /// leave the conversation untouched. Returns the summarizer call's spend.
     async fn summarize_overflow_span(
         &self,
         messages: &mut Vec<CompletionMessage>,
@@ -535,19 +538,28 @@ impl<'a> Engine<'a> {
             reasoning: None,
             params: None,
         };
-        let result = match self.provider.complete(request).await {
+        let estimated_input_tokens = estimate_conversation_tokens(&request.messages);
+        let result = match run_accounted_call(
+            AccountedCall {
+                provider: self.provider,
+                role: stella_protocol::ModelCallRole::Summarization,
+                model_hint: "unknown".into(),
+                request,
+                retry_policy: RetryPolicy::deterministic(),
+                timeout: None,
+                estimated_input_tokens,
+            },
+            budget,
+            events,
+            self.sleeper,
+        )
+        .await
+        {
             Ok(result) => result,
-            // Best-effort: a summarizer outage must never fail the turn.
-            Err(_) => return 0.0,
+            Err(AccountedCallError::Budget { result, .. }) => return result.cost_usd,
+            Err(AccountedCallError::Provider(_) | AccountedCallError::Timeout) => return 0.0,
         };
         let cost_usd = result.cost_usd;
-        // The call happened — meter it honestly even if the text is unusable.
-        budget.record_spend(cost_usd);
-        let _ = events.send(AgentEvent::BudgetTick {
-            spent_usd: budget.spent_usd(),
-            limit_usd: budget.turn_limit_usd(),
-            mode: budget.mode(),
-        });
         if result.text.trim().is_empty() {
             return cost_usd;
         }
@@ -610,6 +622,7 @@ impl<'a> Engine<'a> {
     /// pass.
     async fn run_model_call(
         &self,
+        step: usize,
         messages: &[CompletionMessage],
         budget: &mut BudgetGuard,
         events: &UnboundedSender<AgentEvent>,
@@ -624,8 +637,7 @@ impl<'a> Engine<'a> {
         let messages_snapshot = messages.to_vec();
         let req_config = &self.config;
         let speculation_read_only = read_only_tools.clone();
-        // The gate forwards answer-text fragments straight onto the turn's
-        // event stream as `TextDelta` previews. Deliberately NOT rolled back
+        // The gate forwards answer fragments as `TextDelta` previews. Deliberately NOT rolled back
         // on a failed attempt: a retry's deltas re-stream from the start
         // with no reset marker — the eventual `Text` event is authoritative
         // and consumers replace the preview with it (protocol docs).
@@ -669,11 +681,28 @@ impl<'a> Engine<'a> {
         });
 
         let call_started = std::time::Instant::now();
+        let incomplete_events = events.clone();
         let RetryOutcome {
             value: (result, speculation_future),
             retries,
             ..
-        } = match retry_with_backoff(&self.config.retry_policy, self.sleeper, attempt).await {
+        } = match retry_with_backoff_observed(
+            &self.config.retry_policy,
+            self.sleeper,
+            attempt,
+            |attempt, _error| {
+                let _ = incomplete_events.send(AgentEvent::UsageIncomplete {
+                    role: self.call_role,
+                    provider: self.provider.id().to_string(),
+                    model: "unknown".into(),
+                    reason: stella_protocol::UsageIncompleteReason::ProviderError,
+                    duration_ms: call_started.elapsed().as_millis() as u64,
+                    retries: Some(attempt.saturating_sub(1)),
+                });
+            },
+        )
+        .await
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 let message = error.to_string();
@@ -685,7 +714,6 @@ impl<'a> Engine<'a> {
             }
         };
         let budget_outcome = record_settled_cost(budget, result.cost_usd, events);
-        let speculation = speculation_future.await;
         let call_duration_ms = call_started.elapsed().as_millis() as u64;
 
         // Deferred-flush: these `Retry` events only reach the wire now
@@ -697,14 +725,33 @@ impl<'a> Engine<'a> {
             });
         }
 
+        // Cost and usage settle at one no-await boundary. Speculative tool
+        // work may still be draining; cancellation in that interval must not
+        // preserve spend while losing its per-call accounting envelope.
+        let _ = events.send(AgentEvent::StepUsage {
+            step,
+            role: self.call_role,
+            provider: self.provider.id().to_string(),
+            model: result.model.clone(),
+            input_tokens: result.usage.input_tokens,
+            output_tokens: result.usage.output_tokens,
+            cached_input_tokens: result.usage.cached_input_tokens,
+            cache_write_tokens: result.usage.cache_write_tokens,
+            estimated_input_tokens,
+            cost_usd: result.cost_usd,
+            duration_ms: call_duration_ms,
+            retries: retries.len() as u32,
+            tool_calls: result.tool_calls.len(),
+            complete: result.usage.is_complete(),
+        });
+        let speculation = speculation_future.await;
+
         Ok(CommittedStep {
             result,
             budget_outcome,
             read_only_tools,
             speculation,
             estimated_input_tokens,
-            retries: retries.len() as u32,
-            duration_ms: call_duration_ms,
         })
     }
 
@@ -751,7 +798,7 @@ impl<'a> Engine<'a> {
     /// (see body), never as a mid-tool kill.
     fn handle_committed_result(
         &self,
-        step: usize,
+        _step: usize,
         committed: &CommittedStep,
         total_cost_usd: f64,
         messages: &mut Vec<CompletionMessage>,
@@ -771,20 +818,6 @@ impl<'a> Engine<'a> {
                 result.usage.input_tokens,
             );
         }
-
-        let _ = events.send(AgentEvent::StepUsage {
-            step,
-            model: result.model.clone(),
-            input_tokens: result.usage.input_tokens,
-            output_tokens: result.usage.output_tokens,
-            cached_input_tokens: result.usage.cached_input_tokens,
-            cache_write_tokens: result.usage.cache_write_tokens,
-            estimated_input_tokens: committed.estimated_input_tokens,
-            cost_usd: result.cost_usd,
-            duration_ms: committed.duration_ms,
-            retries: committed.retries,
-            tool_calls: result.tool_calls.len(),
-        });
 
         let BudgetOutcome::AbortTurn {
             spent_usd,
@@ -1296,7 +1329,7 @@ mod tests {
         CompletionResultAlias {
             text: text.into(),
             tool_calls: vec![],
-            usage: CompletionUsage::default(),
+            usage: CompletionUsage::reported_zero(),
             model: "scripted".into(),
             cost_usd: 0.0001,
             finish_reason: None,
@@ -1311,7 +1344,7 @@ mod tests {
                 name: name.into(),
                 input: serde_json::json!({"cmd": "echo hi"}),
             }],
-            usage: CompletionUsage::default(),
+            usage: CompletionUsage::reported_zero(),
             model: "scripted".into(),
             cost_usd: 0.0001,
             finish_reason: None,
@@ -1365,7 +1398,7 @@ mod tests {
                 Ok(CompletionResultAlias {
                     text: String::new(),
                     tool_calls: vec![self.commit.clone()],
-                    usage: CompletionUsage::default(),
+                    usage: CompletionUsage::reported_zero(),
                     model: "speculating".into(),
                     cost_usd: 0.0001,
                     finish_reason: None,
@@ -2011,6 +2044,7 @@ mod tests {
             text: String::new(),
             tool_calls: vec![],
             usage: CompletionUsage {
+                reported: true,
                 input_tokens: 100,
                 output_tokens: 8192,
                 cached_input_tokens: 0,
@@ -2320,7 +2354,7 @@ mod tests {
                     name: "bash".into(),
                     input: serde_json::json!({"cmd": format!("step {i}")}),
                 }],
-                usage: CompletionUsage::default(),
+                usage: CompletionUsage::reported_zero(),
                 model: format!("{dialect}-model"),
                 cost_usd: 0.00001,
                 finish_reason: None,
@@ -2431,7 +2465,7 @@ mod tests {
                     input: serde_json::json!({"which": *id}),
                 })
                 .collect(),
-            usage: CompletionUsage::default(),
+            usage: CompletionUsage::reported_zero(),
             model: "scripted".into(),
             cost_usd: 0.0001,
             finish_reason: None,
@@ -2646,6 +2680,7 @@ mod tests {
                 multi_call_result(calls)
             };
             result.usage = CompletionUsage {
+                reported: true,
                 input_tokens: 1000,
                 output_tokens: 50,
                 cached_input_tokens: 800,
@@ -2656,8 +2691,7 @@ mod tests {
         let provider = ScriptedProvider {
             id: "scripted".into(),
             script: TokioMutex::new(vec![
-                // Step 0 commits only after one retryable failure — its
-                // StepUsage must say retries: 1.
+                // Step 0 commits after a retry, so StepUsage must say retries: 1.
                 Err(ProviderError::RateLimited {
                     message: "429".into(),
                     retry_after_ms: Some(1),
@@ -2821,13 +2855,13 @@ mod tests {
         let with_real_usage = |result: CompletionResultAlias| {
             let mut result = result;
             result.usage = CompletionUsage {
+                reported: true,
                 input_tokens: 4_000,
                 output_tokens: 50,
                 cached_input_tokens: 0,
                 cache_write_tokens: 0,
             };
-            // Vary each call's input: `tool_call_result` reuses one command,
-            // and three byte-identical bash calls are exactly what
+            // Vary each input: three byte-identical bash calls are exactly what
             // `loop_detect` exists to abort — this test is about the
             // calibration feed, not the loop breaker.
             if let Some(call) = result.tool_calls.first_mut() {
@@ -3161,4 +3195,5 @@ mod tests {
     }
 
     mod task4;
+    mod usage_completeness;
 }

@@ -1,4 +1,4 @@
-use stella_core::{BudgetGuard, BudgetOutcome};
+use stella_core::BudgetOutcome;
 use stella_protocol::AgentEvent;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -26,44 +26,6 @@ pub(super) fn budget_abort(outcome: BudgetOutcome) -> Option<PipelineBudgetAbort
             "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} limit"
         ),
     })
-}
-
-pub(super) fn record_and_tick(
-    budget: &mut BudgetGuard,
-    cost_usd: f64,
-    events: &UnboundedSender<AgentEvent>,
-) -> Result<(), PipelineBudgetAbort> {
-    let outcome = budget.record_spend(cost_usd);
-    let _ = events.send(AgentEvent::BudgetTick {
-        spent_usd: budget.spent_usd(),
-        limit_usd: budget.turn_limit_usd(),
-        mode: budget.mode(),
-    });
-    match outcome {
-        BudgetOutcome::AbortTurn {
-            spent_usd,
-            limit_usd,
-            ..
-        } => Err(PipelineBudgetAbort {
-            reason: format!(
-                "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} limit"
-            ),
-        }),
-        BudgetOutcome::Warn {
-            spent_usd,
-            limit_usd,
-            ..
-        } => {
-            let _ = events.send(AgentEvent::Error {
-                message: format!(
-                    "budget warning: spent ${spent_usd:.4} against a ${limit_usd:.2} observed limit; continuing"
-                ),
-                retryable: true,
-            });
-            Ok(())
-        }
-        BudgetOutcome::Continue => Ok(()),
-    }
 }
 
 pub(super) fn aborted_before_execute(

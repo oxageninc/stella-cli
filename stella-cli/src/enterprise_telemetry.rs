@@ -1235,6 +1235,11 @@ pub(crate) fn enqueue_finalized_execution(
     else {
         return Ok(FinalizationEnqueueOutcome::Ineligible);
     };
+    if !rollup.usage_complete {
+        // The pending intent remains durable. A later reconstruction/explicit
+        // completeness repair makes it eligible for startup backfill.
+        return Ok(FinalizationEnqueueOutcome::Ineligible);
+    }
     let spool_path = host_spool_path(workspace)?;
     let spool = EnterpriseTelemetrySpool::open_at(&spool_path, SpoolLimits::default())
         .map_err(|error| error.to_string())?;

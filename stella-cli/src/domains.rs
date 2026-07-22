@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use stella_protocol::{CompletionMessage, CompletionRequest, Provider};
+use stella_protocol::{CompletionMessage, CompletionRequest, ModelCallRole, Provider};
 
 /// One inferred domain: a name, a one-line description, and the path
 /// prefixes (workspace-relative, `/`-separated) that belong to it.
@@ -163,7 +163,12 @@ pub fn summarize_repo(root: &Path) -> String {
 
 /// Infer domains with the worker model; one bounded repair attempt on
 /// unparseable output; heuristic fallback on any failure.
-pub async fn infer_domains(provider: &dyn Provider, root: &Path) -> Domains {
+pub async fn infer_domains(
+    provider: &dyn Provider,
+    root: &Path,
+    model_hint: &str,
+    budget_limit: Option<f64>,
+) -> (Domains, f64) {
     let summary = summarize_repo(root);
     let prompt = format!(
         "Analyze this repository's shape and infer its semantic DOMAINS — the 4-10 major \
@@ -181,8 +186,10 @@ pub async fn infer_domains(provider: &dyn Provider, root: &Path) -> Domains {
         ),
         CompletionMessage::user(&prompt),
     ];
+    let mut total_cost_usd = 0.0;
 
     for _attempt in 0..2 {
+        let remaining_budget = budget_limit.map(|limit| (limit - total_cost_usd).max(0.0));
         let req = CompletionRequest {
             messages: messages.clone(),
             max_output_tokens: Some(2048),
@@ -192,35 +199,54 @@ pub async fn infer_domains(provider: &dyn Provider, root: &Path) -> Domains {
             reasoning: None,
             params: None,
         };
-        match provider.complete(req).await {
-            Ok(result) => match parse_domains_json(&result.text) {
-                Ok(domains) if !domains.is_empty() => {
-                    return Domains {
-                        version: 1,
-                        inferred_by: "model".into(),
-                        domains,
-                    };
-                }
-                Ok(_) | Err(_) => {
-                    // Bounded repair: feed the failure back once.
-                    messages.push(CompletionMessage {
-                        role: stella_protocol::MessageRole::Assistant,
-                        content: result.text.clone(),
-                        tool_calls: vec![],
-                        tool_results: vec![],
-                        attachments: Vec::new(),
-                    });
-                    messages.push(CompletionMessage::user(
-                        "That was not a valid non-empty JSON array of domains. Respond with \
+        match crate::accounted_call::complete_standalone(
+            root,
+            provider,
+            ModelCallRole::DomainInference,
+            "domain_inference",
+            model_hint,
+            remaining_budget,
+            req,
+        )
+        .await
+        {
+            Ok(accounted) => {
+                total_cost_usd += accounted.cost_usd;
+                match parse_domains_json(&accounted.result.text) {
+                    Ok(domains) if !domains.is_empty() => {
+                        return (
+                            Domains {
+                                version: 1,
+                                inferred_by: "model".into(),
+                                domains,
+                            },
+                            total_cost_usd,
+                        );
+                    }
+                    Ok(_) | Err(_) => {
+                        // Bounded repair: feed the failure back once.
+                        messages.push(CompletionMessage {
+                            role: stella_protocol::MessageRole::Assistant,
+                            content: accounted.result.text.clone(),
+                            tool_calls: vec![],
+                            tool_results: vec![],
+                            attachments: Vec::new(),
+                        });
+                        messages.push(CompletionMessage::user(
+                            "That was not a valid non-empty JSON array of domains. Respond with \
                          ONLY the JSON array.",
-                    ));
+                        ));
+                    }
                 }
-            },
-            Err(_) => break, // provider trouble → heuristic, don't hammer
+            }
+            Err(error) => {
+                total_cost_usd += error.cost_usd;
+                break;
+            } // provider trouble → heuristic, don't hammer
         }
     }
 
-    heuristic_domains(root)
+    (heuristic_domains(root), total_cost_usd)
 }
 
 /// Extract and parse the first JSON array in `text` (models love prose and
@@ -278,7 +304,41 @@ pub fn heuristic_domains(root: &Path) -> Domains {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use stella_protocol::{CompletionResult, CompletionUsage, ProviderError};
+
     use super::*;
+
+    struct RepairProvider {
+        responses: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for RepairProvider {
+        fn id(&self) -> &str {
+            "paid-domains"
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResult, ProviderError> {
+            let text = self.responses.lock().await.remove(0);
+            Ok(CompletionResult {
+                text,
+                tool_calls: Vec::new(),
+                usage: CompletionUsage {
+                    reported: true,
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    ..CompletionUsage::default()
+                },
+                model: "paid-domains-model".into(),
+                cost_usd: 0.006,
+                finish_reason: None,
+            })
+        }
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         let dir =
@@ -385,6 +445,30 @@ mod tests {
         assert!(summary.contains("src/routes"));
         assert!(summary.contains("Has manifest: Cargo.toml"));
         assert!(summary.contains("My project"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn repair_attempt_cannot_apply_output_after_aggregate_budget_is_exceeded() {
+        let root = temp_root("repair-budget");
+        std::fs::create_dir_all(root.join("fallback-domain")).expect("mkdir");
+        let provider = RepairProvider {
+            responses: tokio::sync::Mutex::new(vec![
+                "not json".into(),
+                r#"[{"name":"model-domain","description":"model","paths":["fallback-domain"]}]"#
+                    .into(),
+            ]),
+        };
+
+        let (domains, cost_usd) =
+            infer_domains(&provider, &root, "paid-domains-model", Some(0.01)).await;
+
+        assert_eq!(cost_usd, 0.012, "both settled calls remain attributable");
+        assert_eq!(domains.inferred_by, "heuristic");
+        assert!(
+            !domains.names().contains(&"model-domain".to_string()),
+            "over-budget repair output must not be applied"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

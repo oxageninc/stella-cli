@@ -28,7 +28,7 @@ pub(crate) type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// a file at `user_version` i to i + 1. Fresh files never run these — they
 /// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
 /// directly.
-pub(crate) const MIGRATIONS: [Migration; 8] = [
+pub(crate) const MIGRATIONS: [Migration; 9] = [
     // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
     // their write paths have always assumed.
     migrate_v0_to_v1,
@@ -55,6 +55,8 @@ pub(crate) const MIGRATIONS: [Migration; 8] = [
     // `session_id` link (+ its by-session index), plus the additive `tasks`
     // (per-session task-board snapshot) and `pull_requests` tables.
     migrate_v7_to_v8,
+    // v8 → v9: fail-closed paid-call accounting state.
+    migrate_v8_to_v9,
 ];
 
 /// The schema version this build writes — the `PRAGMA user_version` of
@@ -346,6 +348,30 @@ fn migrate_v7_to_v8(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// v8 → v9: new executions start complete but every legacy execution and
+/// telemetry row fails closed. Current writers explicitly set new execution
+/// rows to complete and downgrade monotonically on any unknown/write failure.
+fn migrate_v8_to_v9(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    if !column_exists(tx, "executions", "usage_complete")? {
+        tx.execute_batch(
+            "ALTER TABLE executions ADD COLUMN usage_complete INTEGER NOT NULL DEFAULT 0
+               CHECK(usage_complete IN (0, 1));",
+        )?;
+    }
+    if !column_exists(tx, "telemetry", "call_role")? {
+        tx.execute_batch(
+            "ALTER TABLE telemetry ADD COLUMN call_role TEXT NOT NULL DEFAULT 'unknown';",
+        )?;
+    }
+    if !column_exists(tx, "telemetry", "usage_complete")? {
+        tx.execute_batch(
+            "ALTER TABLE telemetry ADD COLUMN usage_complete INTEGER NOT NULL DEFAULT 0
+               CHECK(usage_complete IN (0, 1));",
+        )?;
+    }
+    Ok(())
+}
+
 /// Run one migration in its own transaction, stamping `user_version` before
 /// commit so version and shape can never disagree on disk. The caller has
 /// already suspended foreign-key enforcement (a no-op inside a
@@ -373,4 +399,41 @@ pub(crate) fn apply_migration(
     }
     tx.pragma_update(None, "user_version", target)?;
     tx.commit().map_err(StoreError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v9_migration_fails_legacy_usage_closed() {
+        let mut conn = Connection::open_in_memory().expect("db");
+        conn.execute_batch(
+            "CREATE TABLE executions (id INTEGER PRIMARY KEY);
+             INSERT INTO executions (id) VALUES (1);
+             CREATE TABLE telemetry (execution_id INTEGER, step INTEGER);
+             INSERT INTO telemetry (execution_id, step) VALUES (1, 0);",
+        )
+        .expect("legacy schema");
+
+        apply_migration(&mut conn, migrate_v8_to_v9, 9).expect("migrate");
+
+        let execution_complete: bool = conn
+            .query_row(
+                "SELECT usage_complete FROM executions WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("execution bit");
+        let (role, call_complete): (String, bool) = conn
+            .query_row(
+                "SELECT call_role, usage_complete FROM telemetry WHERE execution_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("telemetry defaults");
+        assert!(!execution_complete);
+        assert_eq!(role, "unknown");
+        assert!(!call_complete);
+    }
 }

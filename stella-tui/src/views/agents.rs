@@ -398,6 +398,8 @@ mod tests {
             agent: "lead".into(),
             event: AgentEvent::StepUsage {
                 step: 1,
+                role: stella_protocol::ModelCallRole::Worker,
+                provider: "zai".into(),
                 model: "glm-5.2".into(),
                 input_tokens: 62_000,
                 output_tokens: 12_400,
@@ -408,6 +410,7 @@ mod tests {
                 duration_ms: 100,
                 retries: 0,
                 tool_calls: 1,
+                complete: true,
             },
         });
         model.apply_inbound(&Inbound::Event {

@@ -1801,6 +1801,116 @@ mod tests {
         assert!(text.contains("CONTEXT"), "context meter kept:\n{text}");
     }
 
+    /// One committed model call, carrying `input`/`cached` usage — the fold
+    /// that feeds the CACHE cell.
+    fn step_usage(input: u64, cached: u64) -> AgentEvent {
+        AgentEvent::StepUsage {
+            step: 1,
+            role: stella_protocol::ModelCallRole::Worker,
+            provider: "test".into(),
+            model: "glm".into(),
+            input_tokens: input,
+            output_tokens: 0,
+            cached_input_tokens: cached,
+            cache_write_tokens: 0,
+            estimated_input_tokens: 0,
+            cost_usd: 0.0,
+            duration_ms: 1,
+            retries: 0,
+            tool_calls: 0,
+            complete: true,
+        }
+    }
+
+    /// The running model plus one metered step with the given cache usage.
+    fn model_with_cache(input: u64, cached: u64) -> WorkspaceModel {
+        let mut m = running_model_with_queue();
+        m.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: step_usage(input, cached),
+        });
+        m
+    }
+
+    #[test]
+    fn statline_cache_box_shows_hit_rate_and_compact_token_counts() {
+        // 105.3M cache-read over 211.4M input → 50% (rounded), compact `M`s.
+        let model = model_with_cache(211_400_000, 105_300_000);
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("CACHE"), "cache label present:\n{text}");
+        assert!(
+            text.contains("50% (105.3M/211.4M tokens)"),
+            "cache hit rate + compact counts:\n{text}"
+        );
+    }
+
+    #[test]
+    fn statline_cache_box_sits_after_spend_and_before_engine() {
+        let model = model_with_cache(1_000, 500);
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        let pos = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?}:\n{text}"))
+        };
+        assert!(pos("SPEND") < pos("CACHE"), "CACHE after SPEND:\n{text}");
+        assert!(pos("CACHE") < pos("ENGINE"), "CACHE before ENGINE:\n{text}");
+        assert!(
+            pos("ENGINE") < pos("PIPELINE"),
+            "PIPELINE after ENGINE:\n{text}"
+        );
+    }
+
+    #[test]
+    fn statline_cache_box_renders_zero_and_full_hit_rates() {
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+
+        // 0%: input metered, nothing served from cache.
+        let cold = model_with_cache(1_000, 0);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&cold, &ui, area, &mut buf);
+        assert!(
+            buffer_text(&buf).contains("0% (0/1.0K tokens)"),
+            "cold cache reads 0%:\n{}",
+            buffer_text(&buf)
+        );
+
+        // 100%: every input token was a cache hit.
+        let warm = model_with_cache(1_000, 1_000);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&warm, &ui, area, &mut buf);
+        assert!(
+            buffer_text(&buf).contains("100% (1.0K/1.0K tokens)"),
+            "fully warm cache reads 100%:\n{}",
+            buffer_text(&buf)
+        );
+    }
+
+    #[test]
+    fn statline_cache_box_is_a_dash_before_any_usage() {
+        // No StepUsage metered yet → the CACHE cell shows the no-data dash and
+        // never divides by zero (the render below must not panic).
+        let model = running_model_with_queue();
+        let ui = DeckUi::default();
+        let area = Rect::new(0, 0, 200, 2);
+        let mut buf = Buffer::empty(area);
+        render_status_bar(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("CACHE"), "cache label still present:\n{text}");
+        assert!(
+            !text.contains("tokens"),
+            "no token counts before any usage:\n{text}"
+        );
+    }
+
     /// One `Pr` event folded onto the running model.
     fn model_with_pr(number: Option<u64>, ci: Option<stella_protocol::CiStatus>) -> WorkspaceModel {
         let mut m = running_model_with_queue();

@@ -102,8 +102,11 @@ mod private;
 mod private_state_tests;
 #[cfg(test)]
 mod quarantine_tests;
+mod telemetry;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod usage_completeness_tests;
 
 pub mod cache_gaps;
 pub mod cache_trend;
@@ -139,6 +142,7 @@ pub(crate) use private::{
     open_private_file, open_private_sqlite, read_private_to_string, write_private_atomic,
 };
 pub use sessions::{SessionRecord, SessionRegistry, SessionStatus};
+pub use telemetry::TelemetryRow;
 
 /// FNV-1a/64 hex — a stable, dependency-free digest for prompt hashes and
 /// tool-arg fingerprints (loop detection, not security). Also the
@@ -186,28 +190,6 @@ fn validate_json_properties(properties: &str) -> Result<()> {
 
 fn sqlite_i64(name: &str, value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| StoreError(format!("{name} exceeds SQLite INTEGER range")))
-}
-
-/// One StepUsage-shaped telemetry record (mirrors the event, plus the
-/// derived cache-miss column so analytics never re-derive it).
-#[derive(Debug, Clone, PartialEq)]
-pub struct TelemetryRow {
-    pub step: u64,
-    pub provider: String,
-    pub model: String,
-    pub input_tokens: u64,
-    /// The engine's raw pre-call estimate of `input_tokens` — paired they
-    /// are one drift sample ([`Store::drift_samples`]); 0 means no estimate
-    /// was taken (rows persisted before drift correction existed).
-    pub estimated_input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_miss_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub cost_usd: f64,
-    pub duration_ms: u64,
-    pub retries: u32,
-    pub tool_calls: u64,
 }
 
 /// One session-level file-touch record, ready to persist: the normalized
@@ -688,7 +670,8 @@ impl Store {
     ) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO executions (kind, prompt, provider, model) VALUES (?, ?, ?, ?)",
+            "INSERT INTO executions (kind, prompt, provider, model, usage_complete) \
+             VALUES (?, ?, ?, ?, 1)",
             params![kind, prompt, provider, model],
         )?;
         Ok(conn.last_insert_rowid())
@@ -724,87 +707,6 @@ impl Store {
             params![execution_id, seq, event_type, payload],
         )?;
         Ok(())
-    }
-
-    /// Record one uniquely stepped model call's telemetry.
-    pub fn record_telemetry(&self, execution_id: i64, row: &TelemetryRow) -> Result<()> {
-        let step = sqlite_i64("telemetry step", row.step)?;
-        let input_tokens = sqlite_i64("telemetry input tokens", row.input_tokens)?;
-        let estimated_input_tokens = sqlite_i64(
-            "telemetry estimated input tokens",
-            row.estimated_input_tokens,
-        )?;
-        let output_tokens = sqlite_i64("telemetry output tokens", row.output_tokens)?;
-        let cache_read_tokens = sqlite_i64("telemetry cache-read tokens", row.cache_read_tokens)?;
-        let cache_miss_tokens = sqlite_i64("telemetry cache-miss tokens", row.cache_miss_tokens)?;
-        let cache_write_tokens =
-            sqlite_i64("telemetry cache-write tokens", row.cache_write_tokens)?;
-        let duration_ms = sqlite_i64("telemetry duration", row.duration_ms)?;
-        let tool_calls = sqlite_i64("telemetry tool calls", row.tool_calls)?;
-        self.lock().execute(
-            "INSERT INTO telemetry (execution_id, step, provider, model, input_tokens, \
-             estimated_input_tokens, output_tokens, cache_read_tokens, cache_miss_tokens, \
-             cache_write_tokens, cost_usd, duration_ms, retries, tool_calls) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                execution_id,
-                step,
-                row.provider,
-                row.model,
-                input_tokens,
-                estimated_input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_miss_tokens,
-                cache_write_tokens,
-                row.cost_usd,
-                duration_ms,
-                row.retries,
-                tool_calls,
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// The most recent `limit` (estimated, actual) input-token pairs for one
-    /// provider/model — the drift samples that seed a new session's
-    /// `Calibration` (`stella-core::estimator`) from prior sessions'
-    /// telemetry. Returned OLDEST FIRST, so replaying them through an EWMA
-    /// in order weights the most recent step highest. Rows without a
-    /// recorded estimate (`estimated_input_tokens` 0 or NULL: pre-drift
-    /// sessions, migrated databases) or without reported usage carry no
-    /// drift signal and are excluded. Keyed by (provider, model), never
-    /// model alone — the same slug on two providers is two tokenizers.
-    pub fn drift_samples(
-        &self,
-        provider: &str,
-        model: &str,
-        limit: usize,
-    ) -> Result<Vec<(u64, u64)>> {
-        let conn = self.lock();
-        // execution ids come from an AUTOINCREMENT counter and steps count up
-        // within one execution, so (execution_id, step) is insertion order —
-        // unlike ts, whose second-level granularity ties within a turn.
-        let mut stmt = conn.prepare(
-            "SELECT estimated_input_tokens, input_tokens FROM (
-               SELECT estimated_input_tokens, input_tokens, execution_id, step
-               FROM telemetry
-               WHERE provider = ? AND model = ?
-                 AND estimated_input_tokens > 0 AND input_tokens > 0
-               ORDER BY execution_id DESC, step DESC
-               LIMIT ?
-             ) ORDER BY execution_id ASC, step ASC",
-        )?;
-        let rows = stmt.query_map(params![provider, model, limit as i64], |row| {
-            let estimated: i64 = row.get(0)?;
-            let actual: i64 = row.get(1)?;
-            Ok((estimated as u64, actual as u64))
-        })?;
-        let mut samples = Vec::new();
-        for row in rows {
-            samples.push(row?);
-        }
-        Ok(samples)
     }
 
     /// Persist one file-touch row per normalized execution path.
@@ -1228,7 +1130,8 @@ impl Store {
         let conn = self.lock();
         let base = conn
             .query_row(
-                "SELECT kind, prompt, provider, model, COALESCE(outcome, ''), cost_usd, started_at \
+                "SELECT kind, prompt, provider, model, COALESCE(outcome, ''), cost_usd, started_at, \
+                        usage_complete \
                  FROM executions WHERE id = ?1",
                 params![execution_id],
                 |r| {
@@ -1240,11 +1143,14 @@ impl Store {
                         r.get::<_, String>(4)?,
                         r.get::<_, f64>(5)?,
                         r.get::<_, String>(6)?,
+                        r.get::<_, bool>(7)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((kind, prompt, provider, model, outcome, cost_usd, started_at)) = base else {
+        let Some((kind, prompt, provider, model, outcome, cost_usd, started_at, usage_complete)) =
+            base
+        else {
             return Ok(None);
         };
         let (input_tokens, output_tokens, duration_ms): (i64, i64, i64) = conn.query_row(
@@ -1324,6 +1230,7 @@ impl Store {
             tool_calls,
             files_written,
             produced_output,
+            usage_complete,
             self_rating,
             started_at,
             day,
@@ -1340,22 +1247,12 @@ impl Store {
         usage: &usage::UsageStore,
     ) -> Result<bool> {
         match self.execution_rollup(execution_id, workspace_root)? {
-            Some(rollup) => {
+            Some(rollup) if rollup.usage_complete => {
                 usage.sync_execution(&rollup)?;
                 Ok(true)
             }
-            None => Ok(false),
+            Some(_) | None => Ok(false),
         }
-    }
-
-    /// Close an execution record.
-    pub fn finish_execution(&self, execution_id: i64, outcome: &str, cost_usd: f64) -> Result<()> {
-        self.lock().execute(
-            "UPDATE executions SET finished_at = CURRENT_TIMESTAMP, outcome = ?, cost_usd = ? \
-             WHERE id = ?",
-            params![outcome, cost_usd, execution_id],
-        )?;
-        Ok(())
     }
 
     /// Mirror one task-board snapshot into `tasks`: every item is upserted
@@ -1798,7 +1695,7 @@ impl Store {
         {
             let mut stmt = conn.prepare(
                 "SELECT id, kind, prompt, provider, model, started_at, finished_at, outcome, \
-                 cost_usd FROM executions ORDER BY id ASC",
+                 cost_usd, usage_complete FROM executions ORDER BY id ASC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok(serde_json::json!({
@@ -1811,6 +1708,7 @@ impl Store {
                     "finished_at": row.get::<_, Option<String>>(6)?,
                     "outcome": row.get::<_, Option<String>>(7)?,
                     "cost_usd": row.get::<_, f64>(8)?,
+                    "usage_complete": row.get::<_, bool>(9)?,
                 }))
             })?;
             let mut arr = Vec::new();
@@ -1827,9 +1725,10 @@ impl Store {
         for (name, sql) in [
             (
                 "telemetry",
-                "SELECT execution_id, step, ts, provider, model, input_tokens, \
+                "SELECT execution_id, step, ts, provider, call_role, model, input_tokens, \
                  estimated_input_tokens, output_tokens, cache_read_tokens, cache_miss_tokens, \
-                 cache_write_tokens, cost_usd, duration_ms, retries, tool_calls FROM telemetry \
+                 cache_write_tokens, cost_usd, duration_ms, retries, tool_calls, usage_complete \
+                 FROM telemetry \
                  ORDER BY execution_id ASC, step ASC"
                     .to_string(),
             ),

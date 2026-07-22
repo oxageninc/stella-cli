@@ -37,7 +37,7 @@ use stella_core::skills::{
     SkillMineConfig, SkillObservation, SkillSource,
 };
 use stella_pipeline::{ContextRecallPort, RecalledFrame};
-use stella_protocol::{CompletionMessage, CompletionRequest, MessageRole, Provider};
+use stella_protocol::{CompletionMessage, MessageRole, Provider};
 
 use crate::domains::Domains;
 
@@ -66,23 +66,10 @@ pub struct ReflectionLesson {
     pub occurred_at: u64,
 }
 
-/// The outcome of a post-turn reflection, so the caller can surface it per
-/// output format instead of it vanishing. Reflection is best-effort and must
-/// never fail the turn, but "the reflection model call errored" and "the
-/// model correctly found nothing worth recording" are different facts a
-/// headless/CI consumer needs to tell apart — previously both were an
-/// indistinguishable silent zero. `model_error` is `Some` only when the
-/// reflection provider call itself failed (never for an empty-but-successful
-/// reflection).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReflectionReport {
-    /// Lessons that reached the context store this turn (0 when the model
-    /// found nothing, when the store write failed, or when the call errored).
-    pub recorded: usize,
-    /// The reflection model call's error, when it failed. Best-effort surfacing
-    /// only — the turn already succeeded/failed on its own merits.
-    pub model_error: Option<String>,
-}
+mod reflection;
+#[cfg(test)]
+use reflection::parse_lessons;
+pub use reflection::{ReflectionReport, reflect_on_turn, turn_warrants_reflection};
 
 /// Session-scoped memory state: the context store, the OCP host that
 /// routes every recall (workspace memory + code graph as in-process OCP
@@ -494,26 +481,44 @@ impl SessionMemory {
     pub async fn reflect_and_record(
         &mut self,
         provider: &dyn Provider,
+        model_hint: &str,
         transcript: &[CompletionMessage],
         quiet: bool,
         succeeded: bool,
+        budget_limit: Option<f64>,
     ) -> ReflectionReport {
-        let lessons =
-            match reflect_on_turn(provider, transcript, &self.domains.names(), succeeded).await {
-                Ok(lessons) => lessons,
-                // The single reflection model call errored. Report it up so the
-                // caller can warn (text) or emit an event (stream-json) — this
-                // is the fix for the previously-silent reflection failure. Never
-                // fatal: the turn already stands on its own.
-                Err(model_error) => {
-                    return ReflectionReport {
-                        recorded: 0,
-                        model_error: Some(model_error),
-                    };
-                }
-            };
+        let lessons = match reflect_on_turn(
+            provider,
+            model_hint,
+            &self.workspace_root,
+            transcript,
+            &self.domains.names(),
+            succeeded,
+            budget_limit,
+        )
+        .await
+        {
+            Ok((lessons, cost_usd, events)) => (lessons, cost_usd, events),
+            // The single reflection model call errored. Report it up so the
+            // caller can warn (text) or emit an event (stream-json) — this
+            // is the fix for the previously-silent reflection failure. Never
+            // fatal: the turn already stands on its own.
+            Err(model_error) => {
+                return ReflectionReport {
+                    recorded: 0,
+                    model_error: Some(model_error.message),
+                    cost_usd: model_error.cost_usd,
+                    events: model_error.events,
+                };
+            }
+        };
+        let (lessons, reflection_cost_usd, reflection_events) = lessons;
         if lessons.is_empty() {
-            return ReflectionReport::default();
+            return ReflectionReport {
+                cost_usd: reflection_cost_usd,
+                events: reflection_events,
+                ..ReflectionReport::default()
+            };
         }
 
         // 1. Store as recallable, domain-tagged reflection memories. Still
@@ -583,6 +588,8 @@ impl SessionMemory {
         ReflectionReport {
             recorded: if stored { lessons.len() } else { 0 },
             model_error: None,
+            cost_usd: reflection_cost_usd,
+            events: reflection_events,
         }
     }
 
@@ -794,154 +801,6 @@ pub(crate) fn unix_now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-/// Whether a completed turn is even worth a post-turn reflection model call.
-///
-/// Reflection ([`SessionMemory::reflect_and_record`]) mines lessons from WORK
-/// — tool calls, file edits, multi-step problem solving. A turn that invoked
-/// no tools produced no observable agent behavior to critique, and the
-/// reflection prompt itself notes that "most turns have nothing worth
-/// recording." Gating on tool use deterministically skips a model call (and
-/// its latency and dollars) that would almost always return `[]`: the biggest
-/// per-turn saving available, and the skipped turns are exactly the trivial
-/// ones (greetings, quick questions, refusals). The trade is that a durable
-/// preference revealed in pure conversation, with no tool call, is not
-/// mined — an intentional bias toward determinism and cost over a rare,
-/// speculative capture.
-///
-/// `turn_messages` must be ONLY the messages added during the turn being
-/// judged (in the accumulating REPL transcript, the slice past the pre-turn
-/// length) — otherwise a tool call from an earlier turn would keep
-/// re-triggering reflection on every later tool-free turn.
-pub fn turn_warrants_reflection(turn_messages: &[CompletionMessage]) -> bool {
-    turn_messages.iter().any(|m| !m.tool_calls.is_empty())
-}
-
-/// One cheap reflection call (triage-tier discipline: single attempt). The
-/// model critiques the completed turn and returns 0-3 short forward-looking
-/// lessons tagged with domains FROM THE SUPPLIED LIST only — invented domain
-/// names are dropped.
-///
-/// Returns `Err` only when the provider call itself fails; `Ok(vec![])` is the
-/// common, correct "nothing worth recording." Separating these two is what
-/// lets the caller warn on a real failure instead of swallowing it as a
-/// silent zero (the reflection blind spot this replaces).
-///
-/// `succeeded` selects the prompt template (Proposal 1): on failure the model
-/// is asked to identify the root cause and what to do differently — the
-/// signal that produces "don't do X because it leads to failure Y." On success
-/// it records what worked well.
-pub async fn reflect_on_turn(
-    provider: &dyn Provider,
-    transcript: &[CompletionMessage],
-    domain_names: &[String],
-    succeeded: bool,
-) -> Result<Vec<ReflectionLesson>, String> {
-    // Bounded transcript digest: last 12 messages, 300 chars each.
-    let digest: String = transcript
-        .iter()
-        .rev()
-        .take(12)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|m| {
-            let role = match m.role {
-                MessageRole::System => "system",
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-                MessageRole::Tool => "tool",
-            };
-            let content: String = m.content.chars().take(300).collect();
-            let tools = if m.tool_calls.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " [called: {}]",
-                    m.tool_calls
-                        .iter()
-                        .map(|c| c.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
-            format!("{role}: {content}{tools}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let task_frame = if succeeded {
-        "This turn SUCCEEDED. Identify durable lessons worth remembering for \
-         FUTURE similar tasks: approaches or conventions that worked well, \
-         repo conventions discovered, user style preferences revealed. Most \
-         successful turns have nothing worth recording — an empty list is the \
-         common, correct answer."
-    } else {
-        "This turn FAILED. Identify the root cause and a durable lesson: what \
-         was the most likely cause of failure — a wrong assumption, a missed \
-         file, a bad approach, a misunderstood requirement? What should change \
-         next time to avoid repeating this failure? Focus on actionable, \
-         forward-looking lessons. If the failure was clearly external (network, \
-         timeout), return an empty list."
-    };
-
-    let prompt = format!(
-        "Review this coding-agent turn transcript and reflect on the agent's \
-         performance. {task_frame}\n\n\
-         Respond with ONLY a JSON array (max 3):\n\
-         [{{\"lesson\": \"...\", \"domains\": [\"...\"]}}]\n\
-         Allowed domain tags (use only these, or []): {}\n\nTranscript:\n{digest}",
-        domain_names.join(", ")
-    );
-
-    let req = CompletionRequest {
-        messages: vec![
-            CompletionMessage::system(
-                "You are a self-reflection module. Respond with only a JSON array.",
-            ),
-            CompletionMessage::user(&prompt),
-        ],
-        max_output_tokens: Some(512),
-        temperature: Some(0.0),
-        effort: None,
-        tools: vec![],
-        reasoning: None,
-        params: None,
-    };
-
-    let result = provider.complete(req).await.map_err(|e| e.to_string())?;
-    Ok(parse_lessons(&result.text, domain_names))
-}
-
-/// Extract the first JSON array from model output; drop invented domains;
-/// cap at 3; stamp `occurred_at` with the current unix time.
-pub fn parse_lessons(text: &str, allowed_domains: &[String]) -> Vec<ReflectionLesson> {
-    let Some(start) = text.find('[') else {
-        return Vec::new();
-    };
-    let Some(end) = text.rfind(']') else {
-        return Vec::new();
-    };
-    if end <= start {
-        return Vec::new();
-    }
-    let Ok(mut lessons) = serde_json::from_str::<Vec<ReflectionLesson>>(&text[start..=end]) else {
-        return Vec::new();
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    lessons.truncate(3);
-    for lesson in &mut lessons {
-        lesson.occurred_at = now;
-        lesson
-            .domains
-            .retain(|d| allowed_domains.iter().any(|a| a.eq_ignore_ascii_case(d)));
-    }
-    lessons.retain(|l| !l.lesson.trim().is_empty());
-    lessons
 }
 
 #[cfg(test)]
@@ -1438,7 +1297,8 @@ mod tests {
     async fn reflect_and_record_writes_lessons_to_log_and_store() {
         use async_trait::async_trait;
         use stella_protocol::{
-            CompletionRequest, CompletionResult, CompletionUsage, Provider, ProviderError,
+            AgentEvent, CompletionRequest, CompletionResult, CompletionUsage, Provider,
+            ProviderError,
         };
 
         struct StubProvider;
@@ -1455,7 +1315,11 @@ mod tests {
                     text: r#"[{"lesson": "prefer withTenantDb over raw db()", "domains": []}]"#
                         .into(),
                     tool_calls: vec![],
-                    usage: CompletionUsage::default(),
+                    usage: CompletionUsage {
+                        reported: true,
+                        input_tokens: 1,
+                        ..CompletionUsage::default()
+                    },
                     model: "stub".into(),
                     cost_usd: 0.0,
                     finish_reason: None,
@@ -1473,11 +1337,18 @@ mod tests {
             msg(MessageRole::Assistant, "swapped db() for withTenantDb"),
         ];
         let report = memory
-            .reflect_and_record(&StubProvider, &transcript, true, true)
+            .reflect_and_record(&StubProvider, "stub", &transcript, true, true, None)
             .await;
 
         assert_eq!(report.recorded, 1, "the lesson was stored");
         assert!(report.model_error.is_none());
+        assert!(report.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::StepUsage {
+                role: stella_protocol::ModelCallRole::Reflection,
+                ..
+            }
+        )));
 
         // The mining log now carries the lesson, one JSON object per line.
         let log = std::fs::read_to_string(dir.path().join(".stella/private/reflections.jsonl"))
@@ -1496,5 +1367,65 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reflection_preserves_settled_cost_when_budget_rejects_model_output() {
+        use async_trait::async_trait;
+        use stella_protocol::{
+            AgentEvent, CompletionRequest, CompletionResult, CompletionUsage, Provider,
+            ProviderError,
+        };
+
+        struct PaidReflection;
+        #[async_trait]
+        impl Provider for PaidReflection {
+            fn id(&self) -> &str {
+                "paid-reflection"
+            }
+
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResult, ProviderError> {
+                Ok(CompletionResult {
+                    text: r#"[{"lesson":"must not apply","domains":[]}]"#.into(),
+                    tool_calls: Vec::new(),
+                    usage: CompletionUsage {
+                        reported: true,
+                        input_tokens: 8,
+                        output_tokens: 2,
+                        ..CompletionUsage::default()
+                    },
+                    model: "paid-reflection-model".into(),
+                    cost_usd: 0.02,
+                    finish_reason: None,
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("root");
+        let mut memory = SessionMemory::open(dir.path(), false).expect("memory");
+        let report = memory
+            .reflect_and_record(
+                &PaidReflection,
+                "paid-reflection-model",
+                &[msg(MessageRole::User, "worked")],
+                true,
+                true,
+                Some(0.001),
+            )
+            .await;
+        assert_eq!(report.recorded, 0);
+        assert_eq!(report.cost_usd, 0.02);
+        assert!(report.model_error.is_some());
+        assert!(report.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::StepUsage {
+                role: stella_protocol::ModelCallRole::Reflection,
+                cost_usd,
+                ..
+            } if (*cost_usd - 0.02).abs() < f64::EPSILON
+        )));
     }
 }
