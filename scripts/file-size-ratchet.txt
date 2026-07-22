@@ -15,8 +15,8 @@ stella-store/src/lib.rs 2035
 stella-store/src/tests.rs 1927
 stella-tools/src/registry.rs 2606
 stella-tools/src/scripts.rs 1643
-stella-tui/src/deck_render.rs 2005
+stella-tui/src/deck_render.rs 1470
 stella-tui/src/deck_ui.rs 6629
-stella-tui/src/deck.rs 1726
+stella-tui/src/deck.rs 1022
 stella-tui/src/model.rs 1528
 stella-tui/src/views/engine.rs 1692

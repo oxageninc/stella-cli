@@ -457,6 +457,8 @@ mod tests {
             agent: "lead".into(),
             event: AgentEvent::StepUsage {
                 step: 1,
+                role: stella_protocol::event::ModelCallRole::Worker,
+                provider: "anthropic".into(),
                 model: "claude".into(),
                 input_tokens: 1_000,
                 output_tokens: 100,
@@ -467,6 +469,7 @@ mod tests {
                 duration_ms: 100,
                 retries: 0,
                 tool_calls: 0,
+                complete: true,
             },
         });
         model.apply_inbound(&Inbound::CacheInsight {
