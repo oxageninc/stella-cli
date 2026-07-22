@@ -633,6 +633,7 @@ fn non_tty_text_output_is_headless_without_losing_text_rendering() {
         PipelineApprovalCapability::Unavailable,
         &worker_model,
         None,
+        &model_ref,
     );
     assert!(
         non_tty.headless,

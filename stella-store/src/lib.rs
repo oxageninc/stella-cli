@@ -712,7 +712,7 @@ impl Store {
         let seq = sqlite_i64("event sequence", seq)?;
         let payload = serde_json::to_string(event).map_err(|e| StoreError(e.to_string()))?;
         // Read the internally-tagged `type` from the parsed value rather than
-        // string-scanning for the first `"type":"` literal — the scan silently
+        // string-scanning for the first `"type":"` literal �� the scan silently
         // yields the wrong tag (or "unknown") if serialization is ever
         // pretty-printed, wrapped, or reordered.
         let event_type = serde_json::from_str::<serde_json::Value>(&payload)
