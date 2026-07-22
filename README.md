@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockups/lockup-horizontal-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="docs/brand/lockups/lockup-horizontal-light.svg">
-    <img src="docs/brand/lockups/lockup-horizontal-light.svg" alt="Stella" width="420">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/stella-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/brand/stella-logo-light.svg">
+    <img src="docs/brand/stella-logo-light.svg" alt="Stella" width="420">
   </picture>
 </p>
 
