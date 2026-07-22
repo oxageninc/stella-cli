@@ -44,7 +44,7 @@ not any individual property — constitutes the moat.
 6. [Property IV: BYOK + zero telemetry egress by default — the trust perimeter](#6-property-iv-byok--zero-telemetry-egress-by-default--the-trust-perimeter)
 7. [Property V: Prompt-cache-native memory — the cost discipline](#7-property-v-prompt-cache-native-memory--the-cost-discipline)
 8. [Property VI: Budget enforcement at safe boundaries](#8-property-vi-budget-enforcement-at-safe-boundaries)
-9. [Property VII: The Context Graph Protocol — an open standard](#9-property-vii-the-open-context-protocol--an-open-standard)
+9. [Property VII: The Context Graph Protocol — an open standard](#9-property-vii-the-context-graph-protocol--an-open-standard)
 10. [Why the combination is the moat](#10-why-the-combination-is-the-moat)
 11. [Competitive analysis](#11-competitive-analysis)
 12. [Threats to defensibility](#12-threats-to-defensibility)
