@@ -23,8 +23,16 @@ use crate::{Result, Store};
 pub struct SessionCacheTrendRow {
     pub session_id: String,
     pub started_at: String,
-    /// Executions recorded under this session (its turn count).
+    /// Executions recorded under this session (its turn count) — the real
+    /// per-session turn count `stella-cli`'s low-hit-rate diagnosis needs;
+    /// unlike `UsageStatsRow::runs` (executions summed across every session
+    /// for a provider/model pair), this never conflates "many one-shot
+    /// `stella run`s" with "one long multi-turn session".
     pub turns: i64,
+    /// The session's first recorded execution's provider — sessions
+    /// overwhelmingly stay on one provider for their lifetime, and the
+    /// diagnosis only needs one to resolve cache posture / TTL.
+    pub provider: String,
     pub input_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
@@ -48,6 +56,9 @@ impl Store {
             "SELECT e.session_id,
                     min(e.started_at) AS started_at,
                     count(*) AS turns,
+                    (SELECT ex.provider FROM executions ex
+                       WHERE ex.session_id = e.session_id
+                       ORDER BY ex.id ASC LIMIT 1) AS provider,
                     CAST(coalesce(sum(t.input_tokens), 0) AS INTEGER) AS input_tokens,
                     CAST(coalesce(sum(t.cache_read_tokens), 0) AS INTEGER) AS cache_read_tokens,
                     CAST(coalesce(sum(t.cache_write_tokens), 0) AS INTEGER) AS cache_write_tokens,
@@ -70,9 +81,10 @@ impl Store {
                 session_id: row.get(0)?,
                 started_at: row.get(1)?,
                 turns: row.get(2)?,
-                input_tokens: row.get(3)?,
-                cache_read_tokens: row.get(4)?,
-                cache_write_tokens: row.get(5)?,
+                provider: row.get(3)?,
+                input_tokens: row.get(4)?,
+                cache_read_tokens: row.get(5)?,
+                cache_write_tokens: row.get(6)?,
             })
         })?;
         let mut out = Vec::new();
@@ -115,8 +127,10 @@ mod tests {
             .unwrap();
         store.set_execution_session(e1, "s1").unwrap();
         store.record_telemetry(e1, &telemetry(0, 500)).unwrap();
+        // Second turn switches provider (a session CAN cross providers) —
+        // the representative provider must still be the FIRST turn's.
         let e2 = store
-            .begin_execution("run", "p2", "anthropic", "claude")
+            .begin_execution("run", "p2", "zai", "glm-5.2")
             .unwrap();
         store.set_execution_session(e2, "s1").unwrap();
         store.record_telemetry(e2, &telemetry(900, 0)).unwrap();
@@ -142,10 +156,15 @@ mod tests {
         );
         assert_eq!(trend[0].session_id, "s2", "most recent session sorts first");
         assert_eq!(trend[0].turns, 1);
+        assert_eq!(trend[0].provider, "anthropic");
         assert_eq!(trend[0].cache_write_tokens, 200);
 
         assert_eq!(trend[1].session_id, "s1");
         assert_eq!(trend[1].turns, 2);
+        // The session's SECOND turn switched to zai, but the representative
+        // provider is still the FIRST turn's (anthropic) — diagnosis needs a
+        // consistent posture/TTL to resolve against, not the latest one.
+        assert_eq!(trend[1].provider, "anthropic");
         // e1: telemetry(0, 500) -> input 1_000; e2: telemetry(900, 0) -> input 1_900.
         assert_eq!(trend[1].input_tokens, 1_000 + 1_900);
         assert_eq!(trend[1].cache_read_tokens, 900);

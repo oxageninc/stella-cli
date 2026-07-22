@@ -34,13 +34,18 @@
 //!   TTL-blind tax cache-aware scheduling (#269) exists to cut. `0` for a
 //!   provider with no documented TTL (nothing can expire).
 //!
-//! A row with `runs > 3` and a hit rate under [`LOW_HIT_RATE_THRESHOLD`]
-//! gets a probable-cause line below the table (`cache_diagnosis` in
-//! json/csv) — [`diagnose_cache`], the same selection logic and
-//! [`CacheCause::hint`] wording the deck would use. Table format also
-//! appends a "recent sessions" trend ([`Store::session_cache_trend`]) so a
-//! hit rate that only degraded in the last few sessions is visible without
-//! reaching for a SQLite client.
+//! Table format also appends a "recent sessions" trend
+//! ([`Store::session_cache_trend`]), each carrying a probable-cause
+//! diagnosis line when its own turn count and hit rate warrant one
+//! ([`diagnose_cache`] against [`LOW_HIT_RATE_THRESHOLD`], the same
+//! selection logic and [`CacheCause::hint`] wording the deck would use).
+//! Deliberately **per-session**, not per-(provider, model): `StatsRow::runs`
+//! aggregates executions across every session sharing a provider/model, so
+//! twenty independent one-shot `stella run`s (each turn 1 — nothing to
+//! reread yet) would read as "20 turns, 0% hit" and misfire a diagnosis a
+//! real multi-turn session never earned. `SessionCacheTrendRow::turns` is
+//! the session's own turn count, so the `> 3`-turns gate means what the
+//! acceptance criteria says: turns *within one session*.
 
 use std::collections::HashMap;
 
@@ -50,7 +55,7 @@ use stella_model::cache_economics::{
     diagnose_cache, hit_rate, is_cache_expired_rewrite, provider_cache_ttl_secs,
 };
 use stella_model::catalog::Catalog;
-use stella_protocol::{CacheCause, CompletionUsage};
+use stella_protocol::CompletionUsage;
 use stella_store::cache_trend::SessionCacheTrendRow;
 use stella_store::{CacheCallGap, Store, UsageStatsRow};
 
@@ -100,11 +105,6 @@ pub struct StatsRow {
     /// Calls whose prefix went cold past the provider TTL before this call
     /// and got rewritten instead of read back — see [`Store::cache_call_gaps`].
     pub cache_expired_rewrites: i64,
-    /// The probable cause of an abnormally low hit rate on this row
-    /// ([`diagnose_cache`]), `None` when there's nothing to diagnose (too
-    /// few runs, or a healthy hit rate) — always `None` on the TOTAL row,
-    /// which mixes causes across providers.
-    pub cache_diagnosis: Option<CacheCause>,
 }
 
 /// Look up `(provider, model)` in the running model catalog and price this
@@ -166,14 +166,6 @@ fn to_stats_rows(rows: Vec<UsageStatsRow>, gaps: &[CacheCallGap]) -> Vec<StatsRo
             let cache_savings_usd = cache_savings_for(&r);
             let key = (r.provider.clone(), r.model.clone());
             let cache_expired_rewrites = expired.get(&key).copied().unwrap_or(0);
-            let cache_diagnosis = diagnose_cache(
-                &r.provider,
-                r.runs.max(0) as u64,
-                r.input_tokens.max(0) as u64,
-                r.cache_read_tokens.max(0) as u64,
-                r.cache_write_tokens.max(0) as u64,
-                LOW_HIT_RATE_THRESHOLD,
-            );
             StatsRow {
                 provider: r.provider,
                 model: r.model,
@@ -191,21 +183,28 @@ fn to_stats_rows(rows: Vec<UsageStatsRow>, gaps: &[CacheCallGap]) -> Vec<StatsRo
                 cache_hit_rate,
                 cache_savings_usd,
                 cache_expired_rewrites,
-                cache_diagnosis,
             }
         })
         .collect()
 }
 
-/// One line per row carrying a diagnosis, `provider/model: <hint>` — the
-/// low-hit-rate section `render_table` appends and `run_stats` prints
-/// standalone for json/csv (whose `cache_diagnosis` field already carries
-/// the same information machine-readably).
-fn diagnosis_lines(rows: &[StatsRow]) -> Vec<String> {
-    rows.iter()
-        .filter_map(|r| {
-            r.cache_diagnosis
-                .map(|cause| format!("{}/{}: {}", r.provider, r.model, cause.hint()))
+/// One line per session carrying a diagnosis, `session <id>: <hint>` —
+/// [`diagnose_cache`] against the session's OWN turn count and hit rate
+/// (see the module docs for why this must be per-session, not the
+/// per-provider/model `StatsRow` aggregate).
+fn session_diagnosis_lines(sessions: &[SessionCacheTrendRow]) -> Vec<String> {
+    sessions
+        .iter()
+        .filter_map(|s| {
+            diagnose_cache(
+                &s.provider,
+                s.turns.max(0) as u64,
+                s.input_tokens.max(0) as u64,
+                s.cache_read_tokens.max(0) as u64,
+                s.cache_write_tokens.max(0) as u64,
+                LOW_HIT_RATE_THRESHOLD,
+            )
+            .map(|cause| format!("session {}: {}", s.session_id, cause.hint()))
         })
         .collect()
 }
@@ -353,9 +352,6 @@ fn totals(rows: &[StatsRow]) -> StatsRow {
         cache_hit_rate: hit_rate(input_tokens.max(0) as u64, cache_read_tokens.max(0) as u64),
         cache_savings_usd: (!known_savings.is_empty()).then(|| known_savings.iter().sum()),
         cache_expired_rewrites: rows.iter().map(|r| r.cache_expired_rewrites).sum(),
-        // Never diagnosed: the TOTAL row mixes causes across every
-        // provider/model, and a mixed cause would misname the culprit.
-        cache_diagnosis: None,
     }
 }
 
@@ -453,31 +449,24 @@ fn render_table(rows: &[StatsRow]) -> String {
     out.push('\n');
     out.push_str(&render_line(&total));
     out.push('\n');
-
-    let hints = diagnosis_lines(rows);
-    if !hints.is_empty() {
-        out.push_str("\nLow-hit-rate diagnosis:\n");
-        for hint in hints {
-            out.push_str("  ! ");
-            out.push_str(&hint);
-            out.push('\n');
-        }
-    }
     out
 }
 
 /// The "recent sessions" cache-trend block `run_stats` appends in table
 /// format — [`Store::session_cache_trend`]'s persisted per-session facts,
 /// most-recent-first, capped to `limit` rows so a long-lived workspace's
-/// receipt stays readable. Empty input renders nothing (no session has ever
-/// been registered — nothing to trend).
+/// receipt stays readable, plus a low-hit-rate diagnosis line for any of
+/// those sessions that earns one ([`session_diagnosis_lines`] — per-session,
+/// using the session's own turn count, see the module docs). Empty input
+/// renders nothing (no session has ever been registered — nothing to trend).
 fn render_session_trend(sessions: &[SessionCacheTrendRow], limit: usize) -> String {
     if sessions.is_empty() {
         return String::new();
     }
+    let shown = &sessions[..sessions.len().min(limit)];
     let mut out = String::from("\nCache trend, recent sessions (most recent first):\n");
     out.push_str("  SESSION           STARTED              TURNS  HIT%\n");
-    for s in sessions.iter().take(limit) {
+    for s in shown {
         let pct = hit_rate(
             s.input_tokens.max(0) as u64,
             s.cache_read_tokens.max(0) as u64,
@@ -489,6 +478,15 @@ fn render_session_trend(sessions: &[SessionCacheTrendRow], limit: usize) -> Stri
             s.turns,
             pct
         ));
+    }
+    let hints = session_diagnosis_lines(shown);
+    if !hints.is_empty() {
+        out.push_str("\n  Low-hit-rate diagnosis:\n");
+        for hint in hints {
+            out.push_str("    ! ");
+            out.push_str(&hint);
+            out.push('\n');
+        }
     }
     out
 }
@@ -508,7 +506,7 @@ fn truncate(s: &str, max: usize) -> String {
 fn csv_header() -> &'static str {
     "provider,model,division,runs,resolved,resolve_rate,total_cost_usd,cost_per_resolved_usd,\
      input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cache_hit_rate,\
-     cache_savings_usd,cache_expired_rewrites,avg_duration_ms,cache_diagnosis"
+     cache_savings_usd,cache_expired_rewrites,avg_duration_ms"
 }
 
 /// Quote a CSV field when it contains a comma, quote, or line break;
@@ -523,7 +521,7 @@ fn csv_escape(field: &str) -> String {
 
 fn csv_row(row: &StatsRow) -> String {
     format!(
-        "{},{},{},{},{},{:.4},{:.6},{},{},{},{},{},{:.4},{},{},{:.1},{}",
+        "{},{},{},{},{},{:.4},{:.6},{},{},{},{},{},{:.4},{},{},{:.1}",
         csv_escape(&row.provider),
         csv_escape(&row.model),
         csv_escape(&row.division),
@@ -546,7 +544,6 @@ fn csv_row(row: &StatsRow) -> String {
         },
         row.cache_expired_rewrites,
         row.avg_duration_ms,
-        row.cache_diagnosis.map(CacheCause::as_str).unwrap_or(""),
     )
 }
 
@@ -582,7 +579,6 @@ mod tests {
             cache_hit_rate: 2000.0 / 6000.0,
             cache_savings_usd: Some(0.5),
             cache_expired_rewrites: 3,
-            cache_diagnosis: None,
         }
     }
 
@@ -603,7 +599,7 @@ mod tests {
         );
         assert_eq!(
             csv_row(&r),
-            "zai,glm-5.2,-,4,2,0.5000,0.030000,0.015000,6000,600,2000,10,0.3333,0.500000,3,750.0,"
+            "zai,glm-5.2,-,4,2,0.5000,0.030000,0.015000,6000,600,2000,10,0.3333,0.500000,3,750.0"
         );
 
         // resolved = 0 → the $/resolved field is EMPTY, never 0 or NaN.
@@ -612,17 +608,12 @@ mod tests {
         r.cost_per_resolved_usd = None;
         assert_eq!(
             csv_row(&r),
-            "zai,glm-5.2,-,4,0,0.0000,0.030000,,6000,600,2000,10,0.3333,0.500000,3,750.0,"
+            "zai,glm-5.2,-,4,0,0.0000,0.030000,,6000,600,2000,10,0.3333,0.500000,3,750.0"
         );
 
         // Fields with commas round-trip quoted.
         r.model = "weird,model".into();
         assert!(csv_row(&r).starts_with("zai,\"weird,model\",-,"));
-
-        // A diagnosed row's cache_diagnosis carries the machine token, not
-        // the free-text hint — a stable csv/json value.
-        r.cache_diagnosis = Some(CacheCause::OptInNeverEngaged);
-        assert!(csv_row(&r).ends_with(",opt_in_never_engaged"));
     }
 
     #[test]
@@ -723,43 +714,34 @@ mod tests {
         );
     }
 
-    fn usage_row(
+    fn trend_row(
+        session_id: &str,
         provider: &str,
-        runs: i64,
+        turns: i64,
         input: i64,
         cache_read: i64,
         cache_write: i64,
-    ) -> UsageStatsRow {
-        UsageStatsRow {
+    ) -> SessionCacheTrendRow {
+        SessionCacheTrendRow {
+            session_id: session_id.into(),
+            started_at: "2026-07-21 12:00:00".into(),
+            turns,
             provider: provider.into(),
-            model: "claude-fable-5".into(),
-            division: UsageStatsRow::division_for_provider(provider).into(),
-            runs,
-            resolved: runs,
-            resolve_rate: 1.0,
-            total_cost_usd: 0.0,
-            cost_per_resolved_usd: None,
             input_tokens: input,
-            output_tokens: 0,
             cache_read_tokens: cache_read,
             cache_write_tokens: cache_write,
-            avg_duration_ms: 0.0,
         }
     }
 
     #[test]
     fn diagnosis_fires_on_a_synthetic_zero_hit_multi_turn_session_and_names_opt_in_absent() {
         // The acceptance case: N>3 turns, 0% hit, nothing ever written to the
-        // cache on an opt-in provider — the marker never engaged.
-        let rows = to_stats_rows(vec![usage_row("anthropic", 6, 120_000, 0, 0)], &[]);
-        assert_eq!(rows[0].cache_diagnosis, Some(CacheCause::OptInNeverEngaged));
-        let lines = diagnosis_lines(&rows);
+        // cache on an opt-in provider (a SINGLE session's own turn count,
+        // not runs aggregated across sessions) — the marker never engaged.
+        let sessions = vec![trend_row("s1", "anthropic", 6, 120_000, 0, 0)];
+        let lines = session_diagnosis_lines(&sessions);
         assert_eq!(lines.len(), 1);
-        assert!(
-            lines[0].starts_with("anthropic/claude-fable-5: "),
-            "{}",
-            lines[0]
-        );
+        assert!(lines[0].starts_with("session s1: "), "{}", lines[0]);
         assert!(
             lines[0].contains("cache opt-in never engaged"),
             "{}",
@@ -768,43 +750,42 @@ mod tests {
     }
 
     #[test]
-    fn diagnosis_is_quiet_for_a_healthy_hit_rate_and_appears_in_the_rendered_table() {
-        // Healthy hit rate: no diagnosis, no section in the rendered table.
-        let healthy = to_stats_rows(
-            vec![usage_row("anthropic", 10, 100_000, 50_000, 10_000)],
-            &[],
-        );
-        assert_eq!(healthy[0].cache_diagnosis, None);
-        assert!(!render_table(&healthy).contains("Low-hit-rate diagnosis"));
+    fn diagnosis_is_per_session_not_per_provider_model_aggregate() {
+        // The false-positive this guards against: twenty independent
+        // one-shot runs on the same (provider, model) would aggregate to
+        // "20 turns, 0% hit" at the StatsRow level (turn 1 always writes,
+        // never rereads) and wrongly earn a diagnosis no single session
+        // deserves. Each SESSION here has only 1 turn -> diagnose_cache's
+        // own MIN_TURNS gate stays quiet, correctly, per session.
+        let many_one_shots: Vec<SessionCacheTrendRow> = (0..20)
+            .map(|i| trend_row(&format!("s{i}"), "anthropic", 1, 6_000, 0, 0))
+            .collect();
+        assert!(session_diagnosis_lines(&many_one_shots).is_empty());
 
-        // A diagnosed row's hint reaches the rendered table output too.
-        let sick = to_stats_rows(vec![usage_row("anthropic", 6, 120_000, 0, 0)], &[]);
-        let out = render_table(&sick);
-        assert!(out.contains("Low-hit-rate diagnosis:"), "{out}");
-        assert!(out.contains("anthropic/claude-fable-5:"), "{out}");
+        // A genuine multi-turn session with the same symptoms DOES fire.
+        let real_session = vec![trend_row("s-real", "anthropic", 6, 120_000, 0, 0)];
+        assert_eq!(session_diagnosis_lines(&real_session).len(), 1);
     }
 
-    fn trend_row(
-        session_id: &str,
-        turns: i64,
-        input: i64,
-        cache_read: i64,
-    ) -> SessionCacheTrendRow {
-        SessionCacheTrendRow {
-            session_id: session_id.into(),
-            started_at: "2026-07-21 12:00:00".into(),
-            turns,
-            input_tokens: input,
-            cache_read_tokens: cache_read,
-            cache_write_tokens: 0,
-        }
+    #[test]
+    fn diagnosis_is_quiet_for_a_healthy_hit_rate_and_appears_in_the_trend_block() {
+        // Healthy hit rate: no diagnosis, no section in the rendered trend.
+        let healthy = vec![trend_row("s1", "anthropic", 10, 100_000, 50_000, 10_000)];
+        assert!(session_diagnosis_lines(&healthy).is_empty());
+        assert!(!render_session_trend(&healthy, 10).contains("Low-hit-rate diagnosis"));
+
+        // A diagnosed session's hint reaches the rendered trend block too.
+        let sick = vec![trend_row("s-sick", "anthropic", 6, 120_000, 0, 0)];
+        let out = render_session_trend(&sick, 10);
+        assert!(out.contains("Low-hit-rate diagnosis:"), "{out}");
+        assert!(out.contains("session s-sick:"), "{out}");
     }
 
     #[test]
     fn session_trend_renders_most_recent_first_with_hit_rate() {
         let sessions = vec![
-            trend_row("s2", 3, 1_000, 500),
-            trend_row("s1", 6, 2_000, 200),
+            trend_row("s2", "anthropic", 3, 1_000, 500, 0),
+            trend_row("s1", "anthropic", 6, 2_000, 200, 0),
         ];
         let out = render_session_trend(&sessions, 10);
         let s2_pos = out.find("s2").unwrap();
@@ -821,11 +802,11 @@ mod tests {
     fn session_trend_is_capped_and_empty_input_renders_nothing() {
         assert_eq!(render_session_trend(&[], 10), "");
         let many: Vec<SessionCacheTrendRow> = (0..15)
-            .map(|i| trend_row(&format!("s{i}"), 1, 100, 10))
+            .map(|i| trend_row(&format!("s{i}"), "anthropic", 1, 100, 10, 0))
             .collect();
         let out = render_session_trend(&many, 5);
         // Leading blank line (the block's own `\n` separator) + title +
-        // column header + 5 capped rows.
+        // column header + 5 capped rows (each 1-turn -> no diagnosis lines).
         assert_eq!(out.lines().count(), 3 + 5, "header lines + capped rows");
     }
 
