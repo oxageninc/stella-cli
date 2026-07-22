@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::envelope::{AgentMeta, Inbound};
 use ratatui::Terminal;

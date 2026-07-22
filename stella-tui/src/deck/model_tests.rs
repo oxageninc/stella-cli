@@ -1,4 +1,3 @@
-
 use super::*;
 use stella_protocol::{StageKind, ToolCall, ToolOutput};
 
