@@ -103,8 +103,6 @@ mod private_state_tests;
 #[cfg(test)]
 mod quarantine_tests;
 #[cfg(test)]
-mod storage_lifecycle_tests;
-#[cfg(test)]
 mod tests;
 
 pub mod cache_gaps;

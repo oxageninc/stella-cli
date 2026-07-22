@@ -456,6 +456,8 @@ mod tests {
             agent: "lead".into(),
             event: AgentEvent::StepUsage {
                 step: 1,
+                purpose: None,
+                output_text: None,
                 model: "claude".into(),
                 input_tokens: 1_000,
                 output_tokens: 100,

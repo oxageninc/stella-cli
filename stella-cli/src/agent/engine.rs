@@ -144,9 +144,8 @@ pub(crate) fn pipeline_config_for_approval_capability(
     test_command: Option<&str>,
     worker_model: &ModelRef,
 ) -> PipelineConfig {
-    let worker_model = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
     PipelineConfig {
-        engine: pipeline_engine_config_for(cfg, &worker_model),
+        engine: pipeline_engine_config_for(cfg, worker_model),
         headless: approval == PipelineApprovalCapability::Unavailable,
         headless_bypass_scope_review: HEADLESS_SCOPE_REVIEW_BYPASS,
         test_command: test_command.map(str::to_string),
