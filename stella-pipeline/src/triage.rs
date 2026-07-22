@@ -57,6 +57,16 @@ impl TaskClass {
     pub fn verifies_unconditionally(self) -> bool {
         !matches!(self, TaskClass::SimpleLookup)
     }
+
+    /// One step down the ceremony ladder, saturating at the cheapest class.
+    /// The bound on how far a triage classification may lower the
+    /// deterministic floor — see [`resolve_task_class`].
+    pub fn one_level_cheaper(self) -> Self {
+        match self {
+            TaskClass::MultiStep => TaskClass::SingleTask,
+            TaskClass::SingleTask | TaskClass::SimpleLookup => TaskClass::SimpleLookup,
+        }
+    }
 }
 
 /// What triage concluded about a goal: how much orchestration it needs, and
@@ -232,17 +242,23 @@ pub fn deterministic_floor(goal: &str) -> TaskClass {
 /// When the model call failed or its response didn't parse (`model_class`
 /// is `None`), the floor stands alone.
 pub fn resolve_task_class(model_class: Option<TaskClass>, goal: &str) -> TaskClass {
-    match model_class {
-        // Triage actually read the goal; the floor only pattern-matched it.
-        // Where they disagree the reader wins, or triage could never route
-        // work onto a cheaper path than the keywords guessed — which is how
-        // a one-line fix ended up buying a full plan/witness/judge pipeline
-        // because its description happened to contain "and then".
-        Some(model) => model,
-        // No usable classification: the floor is the fallback it was always
-        // meant to be, still erring toward planning.
-        None => deterministic_floor(goal),
-    }
+    let floor = deterministic_floor(goal);
+    let Some(model) = model_class else {
+        // No usable classification: the floor stands alone, erring toward
+        // planning exactly as it always has.
+        return floor;
+    };
+    // Triage read the goal; the floor only pattern-matched it, so triage may
+    // route work onto a cheaper path than the keywords guessed — otherwise a
+    // one-line fix whose description contains "and then" buys a full
+    // plan/witness/judge pipeline forever.
+    //
+    // But only one level cheaper. Triage is meant to be the weakest, fastest
+    // tier, and the floor's keyword evidence is weak rather than worthless;
+    // letting a cheap model strip planning, witness, and judge in a single
+    // step is a bigger bet than the speed is worth. Raising stays unbounded —
+    // erring toward more work was never the risk.
+    model.max(floor.one_level_cheaper())
 }
 
 /// Count enumerated list items ("1.", "2)", "- ", "* ") in the goal — a
@@ -498,19 +514,29 @@ mod tests {
     }
 
     #[test]
-    fn a_real_triage_classification_beats_the_keyword_floor_in_both_directions() {
-        // Model says simple, floor's markers say multi → the model wins. The
-        // floor only pattern-matched the text; triage actually read it, and
-        // without this a one-line fix whose description happens to contain
-        // "across the codebase" buys a full plan/witness/judge pipeline.
+    fn triage_may_lower_the_floor_by_one_level_and_raise_it_without_bound() {
+        // Floor says multi (markers present), triage says lookup → lands on
+        // single: DAG planning is skipped, verification is kept. Triage read
+        // the goal, but it is the weakest tier, so it does not get to strip
+        // planning, witness, and judge in one move.
         assert_eq!(
             resolve_task_class(
                 Some(TaskClass::SimpleLookup),
                 "refactor across the codebase"
             ),
+            TaskClass::SingleTask
+        );
+        // One level down is honored exactly.
+        assert_eq!(
+            resolve_task_class(Some(TaskClass::SingleTask), "refactor across the codebase"),
+            TaskClass::SingleTask
+        );
+        // A floor of single may be lowered all the way to lookup.
+        assert_eq!(
+            resolve_task_class(Some(TaskClass::SimpleLookup), "add the field and update it"),
             TaskClass::SimpleLookup
         );
-        // And in the other direction, unchanged: the model may still raise.
+        // Raising stays unbounded: erring toward more work was never the risk.
         assert_eq!(
             resolve_task_class(Some(TaskClass::MultiStep), "explain X"),
             TaskClass::MultiStep
