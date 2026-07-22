@@ -463,6 +463,9 @@ impl CustomExtensions {
         workspace_root: &Path,
         authority: &crate::settings::AuthorityPolicy,
     ) -> Self {
+        if crate::settings::filesystem_settings_disabled() {
+            return Self::default();
+        }
         Self::load_with_workspace_extensions(workspace_root, authority.project_prompts_allowed)
     }
 

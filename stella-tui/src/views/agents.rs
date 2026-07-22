@@ -398,8 +398,8 @@ mod tests {
             agent: "lead".into(),
             event: AgentEvent::StepUsage {
                 step: 1,
-                role: stella_protocol::ModelCallRole::Worker,
-                provider: "zai".into(),
+                purpose: None,
+                output_text: None,
                 model: "glm-5.2".into(),
                 input_tokens: 62_000,
                 output_tokens: 12_400,
@@ -457,8 +457,8 @@ mod tests {
             agent: "lead".into(),
             event: AgentEvent::StepUsage {
                 step: 1,
-                role: stella_protocol::event::ModelCallRole::Worker,
-                provider: "anthropic".into(),
+                purpose: None,
+                output_text: None,
                 model: "claude".into(),
                 input_tokens: 1_000,
                 output_tokens: 100,

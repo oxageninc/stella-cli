@@ -47,7 +47,7 @@ Rules:
 /// The pipeline-mode system prompt: encodes a reproduce, localize, minimal
 /// fix, verify methodology and rewards the fewest changed lines. Static
 /// text so it rides the prompt cache (L-E8).
-const PIPELINE_SYSTEM_PROMPT: &str = r#"You are Stella, a software engineering agent that fixes bugs and builds features with surgical precision.
+pub(crate) const PIPELINE_SYSTEM_PROMPT: &str = r#"You are Stella, a software engineering agent that fixes bugs and builds features with surgical precision.
 
 You have these tools available:
 - read_file: Read a file with line numbers (supports offset/limit for ranges)
@@ -124,6 +124,13 @@ pub(crate) fn assemble_system_prompt(
     active_rules: &crate::rules::ResolvedRules,
 ) -> String {
     let mut prompt = base.to_string();
+    // Package-manager scripts are ordinary task source and remain part of the
+    // evaluated repository. Claim-mode isolation excludes only Stella/agent
+    // state that can carry preinstalled prompt steering across trials.
+    if crate::settings::filesystem_settings_disabled() {
+        append_project_scripts(&mut prompt, workspace_root);
+        return prompt;
+    }
     if authority.project_prompts_allowed {
         append_project_scripts(&mut prompt, workspace_root);
         append_workspace_memories(&mut prompt, workspace_root);

@@ -42,7 +42,11 @@ impl Tool for CiStatus {
             .unwrap_or(120);
         let wait = input.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        if exec::run("command -v gh", root, 10).await.map(|(c, _)| c) != Ok(0) {
+        if exec::run_github("command -v gh", root, 10)
+            .await
+            .map(|(c, _)| c)
+            != Ok(0)
+        {
             return ToolOutput::Error {
                 message: "the `gh` CLI is required for ci_status and was not found on PATH".into(),
             };
@@ -70,7 +74,7 @@ impl Tool for CiStatus {
             )
         };
 
-        let (code, mut report) = match exec::run(&list_cmd, root, timeout_secs).await {
+        let (code, mut report) = match exec::run_github(&list_cmd, root, timeout_secs).await {
             Ok(pair) => pair,
             Err(e) => return ToolOutput::Error { message: e },
         };
@@ -89,7 +93,7 @@ impl Tool for CiStatus {
         // Optionally block on the newest in-progress run for THIS target,
         // then re-list.
         if wait {
-            let _ = exec::run(
+            let _ = exec::run_github(
                 &format!(
                     "id=$(gh run list {scope} --limit 1 --json databaseId --jq '.[0].databaseId'); \
                      [ -n \"$id\" ] && [ \"$id\" != \"null\" ] && \
@@ -99,13 +103,13 @@ impl Tool for CiStatus {
                 timeout_secs,
             )
             .await;
-            if let Ok((0, fresh)) = exec::run(&list_cmd, root, timeout_secs).await {
+            if let Ok((0, fresh)) = exec::run_github(&list_cmd, root, timeout_secs).await {
                 report = fresh;
             }
         }
 
         // Attach failure logs for THIS target's most recent failed run, if any.
-        let (_, failed_logs) = exec::run(
+        let (_, failed_logs) = exec::run_github(
             &format!(
                 "id=$(gh run list {scope} --limit 15 --json databaseId,conclusion \
                  --jq '[.[] | select(.conclusion==\"failure\")][0].databaseId'); \

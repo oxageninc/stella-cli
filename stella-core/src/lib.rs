@@ -15,6 +15,7 @@ pub mod compaction;
 pub mod discovery;
 pub mod driver;
 pub mod estimator;
+pub mod event_sender;
 pub mod extensions;
 mod glob;
 pub mod goal;
@@ -42,6 +43,7 @@ pub use bus::{
 pub use discovery::{Candidate, DiscoveryQuery, QueryTerm, RankedMatch, parse_query, rank};
 pub use driver::{Engine, EngineConfig, SOFT_STOP_REASON, TurnOutcome};
 pub use estimator::{Calibration, CalibrationMap};
+pub use event_sender::{EventSendError, EventSender};
 pub use extensions::{
     AgentDef, CommandDef, ExistingTargets, ExtensionDiagnostic, ExtensionKind, ExtensionProblem,
     PlannedLink, SyncEntry, SyncPlan, SyncSkip, SyncSkipReason, SyncSource, agent_from_file,

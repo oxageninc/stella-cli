@@ -165,7 +165,168 @@ fn settings_from(json: &str) -> crate::settings::Settings {
 }
 
 #[test]
+fn trusted_engine_json_replaces_adversarial_project_engine_settings() {
+    use crate::settings::EngineAgentKind;
+    use stella_protocol::ReasoningEffort;
+
+    let settings = settings_from(
+        r#"{
+            "providers": {"openrouter": {"api_key": "sk-or-test"}},
+            "agent_engine_config": {
+                "default_model": "anthropic/task-chosen-model",
+                "pipeline_worker_model": "zai/task-worker",
+                "auto_mode": "on",
+                "effort_auto": "on",
+                "reasoning_auto": "on",
+                "agents": {
+                    "default": {"provider": "anthropic", "model": "task-default"},
+                    "worker": {"provider": "zai", "model": "task-worker"},
+                    "judge": {"provider": "openai", "model": "task-judge"},
+                    "triage": {"provider": "deepseek", "model": "task-triage"}
+                }
+            }
+        }"#,
+    );
+    let trusted = r#"{
+        "default_model":"openrouter/deepseek/deepseek-v4-pro",
+        "allowed_models":["openrouter/deepseek/deepseek-v4-pro"],
+        "auto_mode":"off",
+        "effort_auto":"off",
+        "reasoning_auto":"off",
+        "agents":{
+            "default":{"effort":"high","reasoning":"on"},
+            "worker":{"effort":"high","reasoning":"on"},
+            "judge":{"effort":"high","reasoning":"on"},
+            "triage":{"effort":"low","reasoning":"off"}
+        }
+    }"#;
+
+    let _env = crate::test_env::lock();
+    // SAFETY: test-only process environment mutation serialized by test_env.
+    unsafe { std::env::set_var(TRUSTED_ENGINE_CONFIG_ENV, trusted) };
+    let cfg = Config::load_with_settings(
+        Some("openrouter/deepseek/deepseek-v4-pro"),
+        None,
+        Some("https://openrouter.ai/api/v1"),
+        &settings,
+        std::path::PathBuf::from("/tmp/ws"),
+    )
+    .expect("trusted engine posture should replace project settings");
+    unsafe { std::env::remove_var(TRUSTED_ENGINE_CONFIG_ENV) };
+
+    let engine = cfg
+        .engine_settings
+        .expect("trusted engine config is stamped");
+    assert_eq!(
+        engine.default_model.as_deref(),
+        Some("openrouter/deepseek/deepseek-v4-pro")
+    );
+    assert!(engine.pipeline_worker_model.is_none());
+    assert!(engine.pipeline_judge_model.is_none());
+    assert!(engine.pipeline_triage_model.is_none());
+    assert!(!engine.auto_mode_on());
+    assert!(!engine.effort_auto_on());
+    assert!(!engine.reasoning_auto_on());
+    for kind in EngineAgentKind::ALL {
+        let spec = crate::engine_config::model_spec_for(&engine, kind, &|id| id == "openrouter")
+            .expect("every role inherits the trusted default model");
+        assert_eq!(spec.provider, "openrouter");
+        assert_eq!(spec.model, "deepseek/deepseek-v4-pro");
+        let tuning = crate::engine_config::tuning_for(&engine, kind);
+        if kind == EngineAgentKind::Triage {
+            assert_eq!(tuning.effort, Some(ReasoningEffort::Low));
+            assert_eq!(tuning.reasoning, Some(false));
+        } else {
+            assert_eq!(tuning.effort, Some(ReasoningEffort::High));
+            assert_eq!(tuning.reasoning, Some(true));
+        }
+        let agent = engine.agent(kind).expect("all four tuning rows are pinned");
+        assert!(agent.model.is_none());
+        assert!(agent.provider.is_none());
+        assert!(agent.prompt.is_none());
+        assert!(agent.params.is_none());
+    }
+}
+
+#[test]
+fn benchmark_mode_skips_malformed_filesystem_credentials_but_keeps_engine_override() {
+    let _env = crate::test_env::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let credential_dir = dir.path().join(".config/stella");
+    std::fs::create_dir_all(&credential_dir).unwrap();
+    std::fs::write(
+        credential_dir.join("credentials.toml"),
+        "this is deliberately [not valid TOML",
+    )
+    .unwrap();
+    let trusted = r#"{
+        "default_model":"openrouter/deepseek/deepseek-v4-pro",
+        "allowed_models":["openrouter/deepseek/deepseek-v4-pro"],
+        "auto_mode":"off",
+        "effort_auto":"off",
+        "reasoning_auto":"off"
+    }"#;
+    let old_home = std::env::var_os("HOME");
+
+    // SAFETY: the binary-wide environment lock covers mutation, resolution,
+    // and restoration. STELLA_NO_SETTINGS is the adapter-pinned benchmark
+    // isolation mode; the trusted engine JSON remains a later explicit seam.
+    unsafe {
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var(TRUSTED_ENGINE_CONFIG_ENV, trusted);
+    }
+    let _isolation = crate::settings::test_filesystem_isolation(true);
+    let cfg = Config::load_with_settings(
+        Some("openrouter/deepseek/deepseek-v4-pro"),
+        Some("test-key-from-trusted-handoff-seam"),
+        Some("https://openrouter.ai/api/v1"),
+        &crate::settings::Settings::default(),
+        dir.path().join("workspace"),
+    )
+    .expect("benchmark mode must never parse the hostile credential file");
+    unsafe {
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var(TRUSTED_ENGINE_CONFIG_ENV);
+    }
+
+    assert_eq!(cfg.provider.id, "openrouter");
+    assert_eq!(
+        cfg.engine_settings
+            .and_then(|settings| settings.default_model),
+        Some("openrouter/deepseek/deepseek-v4-pro".to_string())
+    );
+}
+
+#[test]
+fn malformed_trusted_engine_json_fails_closed_without_echoing_value() {
+    let secret_marker = "DO-NOT-ECHO-BENCHMARK-CONTENT";
+    let malformed = format!(
+        r#"{{"default_model":"{secret_marker}","agents":{{"worker":{{"efort":"high"}}}}}}"#
+    );
+    let _env = crate::test_env::lock();
+    // SAFETY: test-only process environment mutation serialized by test_env.
+    unsafe { std::env::set_var(TRUSTED_ENGINE_CONFIG_ENV, &malformed) };
+    let error = Config::load_with_settings(
+        Some("openrouter/deepseek/deepseek-v4-pro"),
+        Some("test-key"),
+        Some("https://openrouter.ai/api/v1"),
+        &crate::settings::Settings::default(),
+        std::path::PathBuf::from("/tmp/ws"),
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var(TRUSTED_ENGINE_CONFIG_ENV) };
+
+    assert!(error.contains(TRUSTED_ENGINE_CONFIG_ENV));
+    assert!(!error.contains(secret_marker));
+    assert!(!error.contains("efort"));
+}
+
+#[test]
 fn a_settings_defined_provider_resolves_via_model_flag_with_its_literal_key() {
+    let _env = crate::test_env::lock();
     // The issue #44 acceptance criterion: a provider that is NOT
     // built-in, added purely via settings.json, usable via
     // --model <id>/<model> with no code change.
@@ -199,6 +360,7 @@ fn a_settings_defined_provider_resolves_via_model_flag_with_its_literal_key() {
 
 #[test]
 fn a_custom_provider_without_base_url_is_a_named_error() {
+    let _env = crate::test_env::lock();
     let settings = settings_from(r#"{"providers": {"fireworks": {"api_key": "sk-x"}}}"#);
     let err = Config::load_with_settings(
         Some("fireworks/some-model"),
@@ -214,6 +376,7 @@ fn a_custom_provider_without_base_url_is_a_named_error() {
 
 #[test]
 fn custom_providers_cannot_claim_the_vertex_or_bedrock_dialects() {
+    let _env = crate::test_env::lock();
     let settings = settings_from(
         r#"{"providers": {"myvertex": {
             "base_url": "https://example.com",
@@ -233,6 +396,7 @@ fn custom_providers_cannot_claim_the_vertex_or_bedrock_dialects() {
 
 #[test]
 fn a_settings_override_reshapes_a_builtin_without_changing_its_dialect() {
+    let _env = crate::test_env::lock();
     // The pre-#44 override use case (e.g. the Z.ai coding plan): move a
     // built-in's base URL and key out of provider-specific env vars.
     let settings = settings_from(
@@ -267,6 +431,7 @@ fn a_settings_override_reshapes_a_builtin_without_changing_its_dialect() {
 
 #[test]
 fn a_stale_default_pin_does_not_mangle_a_qualified_engine_default_model() {
+    let _env = crate::test_env::lock();
     // Regression: `agents.default.provider: "zai"` alongside the flat
     // `default_model: "openrouter/openrouter/auto"` (a provider-qualified
     // spec, the shape every TUI save writes) used to stitch the phantom
@@ -296,6 +461,7 @@ fn a_stale_default_pin_does_not_mangle_a_qualified_engine_default_model() {
 
 #[test]
 fn an_openrouter_pin_over_the_tui_qualified_default_does_not_double_the_wire_slug() {
+    let _env = crate::test_env::lock();
     // Regression: the pin naming the qualified spec's OWN provider —
     // `agents.default.provider: "openrouter"` plus the TUI-written
     // `default_model: "openrouter/openrouter/auto"`. OpenRouter is
@@ -352,6 +518,12 @@ fn env_var_outranks_the_settings_literal_key() {
     )
     .unwrap();
     assert_eq!(cfg.api_key.reveal(), "sk-from-env");
+    assert!(
+        stella_tools::subprocess_env::is_sensitive_env_name(std::ffi::OsStr::new(
+            "STELLA_TEST_ENVRANK_KEY"
+        )),
+        "trusted custom api_key_env must be registered for child-process scrubbing"
+    );
     unsafe {
         std::env::remove_var("STELLA_TEST_ENVRANK_KEY");
     }
@@ -359,6 +531,7 @@ fn env_var_outranks_the_settings_literal_key() {
 
 #[test]
 fn a_bare_slug_matches_a_custom_providers_default_model() {
+    let _env = crate::test_env::lock();
     let settings = settings_from(
         r#"{"providers": {"slugmatch": {
             "base_url": "https://slugmatch.example/v1",
@@ -380,6 +553,7 @@ fn a_bare_slug_matches_a_custom_providers_default_model() {
 
 #[test]
 fn discovery_style_resolution_accepts_the_settings_literal_key() {
+    let _env = crate::test_env::lock();
     // resolve_provider_key with a settings literal and nothing else:
     // resolves non-interactively as SettingsJson — this is what puts
     // config-defined providers into auto-detection and judge discovery.
@@ -453,6 +627,7 @@ fn derived_env_var_uppercases_and_folds_punctuation() {
 
 #[test]
 fn local_provider_requires_base_url_and_defaults_its_key() {
+    let _env = crate::test_env::lock();
     let err = Config::load(Some("local/llama3.3"), None, None).unwrap_err();
     assert!(err.contains("--base-url"), "{err}");
 

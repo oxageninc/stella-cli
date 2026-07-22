@@ -351,6 +351,10 @@ uses the staged pipeline by default; `--no-pipeline` falls back to the raw
 step-loop. In pipeline mode, `--test-command <cmd>` arms deterministic
 verification with your own test; without it an independent witness author
 writes a failing test whose fail→pass flip proves the work (`stella-docs/content/docs/inference-pipeline.mdx`).
+Post-turn reflection remains enabled for one-shot text, JSON, and stream-JSON
+runs. Ephemeral automation can suppress that additional model call explicitly
+with `STELLA_DISABLE_REFLECTION=1`; the truthy values `true`, `yes`, and `on`
+are also accepted case-insensitively.
 
 ## Built-in tools
 

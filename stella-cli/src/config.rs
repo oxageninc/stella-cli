@@ -11,6 +11,112 @@ use std::env;
 use colored::Colorize;
 use stella_model::credential::{ApiKey, CredentialError, CredentialsFile};
 
+/// Trusted-launcher override for the complete `agent_engine_config` object.
+///
+/// This is intentionally one JSON object rather than a collection of
+/// independently overridable variables: a benchmark launcher can replace the
+/// repository/user engine posture atomically after the normal settings scopes
+/// merge. The value is never included in an error message.
+const TRUSTED_ENGINE_CONFIG_ENV: &str = "STELLA_ENGINE_CONFIG_JSON";
+
+fn invalid_trusted_engine_config() -> String {
+    format!(
+        "{TRUSTED_ENGINE_CONFIG_ENV} is invalid; refusing to start with a partial engine override"
+    )
+}
+
+/// Reject unknown fields before deserializing through the normal settings
+/// type. `AgentEngineConfig` deliberately tolerates forward-compatible fields
+/// in ordinary settings files; the trusted launcher seam is stricter because
+/// a misspelled benchmark control must fail closed instead of silently using a
+/// provider default.
+fn trusted_engine_config_shape_is_strict(value: &serde_json::Value) -> bool {
+    fn object_has_only(value: &serde_json::Value, allowed: &[&str]) -> bool {
+        value
+            .as_object()
+            .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
+    }
+
+    const ROOT_FIELDS: &[&str] = &[
+        "default_model",
+        "pipeline_judge_model",
+        "pipeline_worker_model",
+        "pipeline_triage_model",
+        "allowed_models",
+        "auto_mode",
+        "effort_auto",
+        "reasoning_auto",
+        "agents",
+    ];
+    const AGENT_NAMES: &[&str] = &["default", "worker", "judge", "triage"];
+    const AGENT_FIELDS: &[&str] = &[
+        "model",
+        "provider",
+        "prompt",
+        "effort",
+        "reasoning",
+        "params",
+    ];
+    const PARAM_FIELDS: &[&str] = &[
+        "temperature",
+        "top_p",
+        "top_k",
+        "frequency_penalty",
+        "presence_penalty",
+        "repetition_penalty",
+        "max_tokens",
+        "seed",
+        "verbosity",
+        "service_tier",
+    ];
+
+    if !object_has_only(value, ROOT_FIELDS) {
+        return false;
+    }
+    let Some(agents) = value.get("agents") else {
+        return true;
+    };
+    if agents.is_null() {
+        return true;
+    }
+    if !object_has_only(agents, AGENT_NAMES) {
+        return false;
+    }
+    let Some(agent_map) = agents.as_object() else {
+        return false;
+    };
+    agent_map.values().all(|agent| {
+        if agent.is_null() {
+            return true;
+        }
+        if !object_has_only(agent, AGENT_FIELDS) {
+            return false;
+        }
+        match agent.get("params") {
+            None => true,
+            Some(params) if params.is_null() => true,
+            Some(params) => object_has_only(params, PARAM_FIELDS),
+        }
+    })
+}
+
+fn trusted_engine_config_override() -> Result<Option<crate::settings::AgentEngineConfig>, String> {
+    let Some(raw) = env::var_os(TRUSTED_ENGINE_CONFIG_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| invalid_trusted_engine_config())?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|_| invalid_trusted_engine_config())?;
+    if !trusted_engine_config_shape_is_strict(&value) {
+        return Err(invalid_trusted_engine_config());
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|_| invalid_trusted_engine_config())
+}
+
 /// One provider's config: id, env var name, display name, default model.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
@@ -450,6 +556,36 @@ impl Config {
         settings: &crate::settings::Settings,
         workspace_root: std::path::PathBuf,
     ) -> Result<Self, String> {
+        // A trusted launcher may atomically replace the merged engine settings.
+        // This happens before provider/model resolution, so both the default
+        // provider and every pipeline role see the same authoritative object.
+        // Invalid or non-Unicode JSON aborts without echoing its contents.
+        let mut settings = settings.clone();
+        if let Some(engine) = trusted_engine_config_override()? {
+            settings.agent_engine_config = Some(engine);
+        }
+        let settings = &settings;
+
+        // Arbitrary child processes are scrubbed by stella-tools. Register
+        // provider credential names that cannot be inferred from a suffix
+        // (for example a trusted custom provider using `CORP_AUTH`) before
+        // any tool, hook, git, shell, or integration process can spawn.
+        let mut credential_env_names: Vec<String> = PROVIDERS
+            .iter()
+            .chain(std::iter::once(&LOCAL_PROVIDER))
+            .flat_map(|provider| {
+                std::iter::once(provider.env_var).chain(provider.env_var_aliases.iter().copied())
+            })
+            .map(str::to_string)
+            .collect();
+        credential_env_names.extend(settings.providers.iter().map(|(id, entry)| {
+            entry
+                .api_key_env
+                .clone()
+                .unwrap_or_else(|| derived_env_var(id))
+        }));
+        stella_tools::subprocess_env::register_sensitive_env_names(credential_env_names);
+
         // The default agent's configured model sits BETWEEN the --model
         // flag and auto-detect: an explicit flag always wins, but a
         // settings-configured default beats "first provider with a key".
@@ -507,9 +643,20 @@ impl Config {
         settings: &crate::settings::Settings,
         workspace_root: std::path::PathBuf,
     ) -> Result<Self, String> {
-        let mut credentials_file = CredentialsFile::load_default().map_err(|e| {
-            format!("~/.config/stella/credentials.toml exists but could not be read: {e}")
-        })?;
+        // A trusted anonymous handoff is the complete credential authority.
+        // Benchmark no-settings mode makes the same filesystem-isolation
+        // promise. In either case, do not even parse a task-image/user
+        // credentials.toml before the in-memory key can win; use a genuinely
+        // in-memory empty store so malformed or hostile files are inert.
+        let credentials_sealed = crate::credential_handoff::is_present()
+            || crate::settings::filesystem_settings_disabled();
+        let mut credentials_file = if credentials_sealed {
+            CredentialsFile::empty()
+        } else {
+            CredentialsFile::load_default().map_err(|e| {
+                format!("~/.config/stella/credentials.toml exists but could not be read: {e}")
+            })?
+        };
 
         // If --model provider/model_id was given, resolve that provider —
         // interactively prompting if nothing else resolves it, since the
@@ -1095,6 +1242,21 @@ pub(crate) fn resolve_provider_key(
 ) -> Result<(ApiKey, stella_model::credential::CredentialSource), CredentialError> {
     use stella_model::credential::CredentialSource;
 
+    // The CLI flag remains the highest-precedence credential. Immediately
+    // after it, consult the anonymous-FD handoff consumed during process
+    // startup. This has env-var semantics without ever placing the raw value
+    // in `/proc/self/environ` or any child environment.
+    if api_key_override.is_none_or(str::is_empty) {
+        if let Some(key) = crate::credential_handoff::key_for(provider.env_var) {
+            return Ok((key, CredentialSource::EnvVar));
+        }
+        for alias in provider.env_var_aliases {
+            if let Some(key) = crate::credential_handoff::key_for(alias) {
+                return Ok((key, CredentialSource::EnvVar));
+            }
+        }
+    }
+
     let first_pass = ApiKey::resolve(
         provider.id,
         provider.env_var,
@@ -1164,21 +1326,26 @@ pub struct ConfiguredProvider {
 /// the SAME credential chain [`Config::load`] uses ([`resolve_provider_key`],
 /// non-interactively — env var / alias / credentials file, never a prompt),
 /// so a provider is "configured" here iff `Config` could have auto-selected
-/// it. Never fails: an unreadable credentials file degrades to whatever the
-/// environment alone provides.
+/// it. Never fails: an unreadable credentials file yields no discovered
+/// providers. Under trusted handoff/no-settings isolation the filesystem store
+/// is not read at all and discovery uses an empty in-memory store.
 ///
 /// The goal loop calls this to build a role Router that can pick a
 /// cross-family JUDGE; with one configured family
 /// it returns a single entry and the judge stays the worker provider.
 pub fn discover_configured_providers() -> Vec<ConfiguredProvider> {
-    // A corrupt/unreadable credentials file must not break judge routing —
-    // degrade to env-only discovery via an empty in-memory file (an empty
-    // path reads as "no file"). If even that fails, discover nothing: the
-    // goal loop then simply keeps the worker as judge.
-    let Ok(credentials_file) = CredentialsFile::load_default()
-        .or_else(|_| CredentialsFile::load(std::path::PathBuf::new()))
-    else {
-        return Vec::new();
+    // A trusted handoff/no-settings process must never inspect a task-image
+    // credential store. Outside that boundary, a corrupt/unreadable file
+    // yields no discovery: the goal loop simply keeps the worker as judge.
+    let credentials_sealed =
+        crate::credential_handoff::is_present() || crate::settings::filesystem_settings_disabled();
+    let credentials_file = if credentials_sealed {
+        CredentialsFile::empty()
+    } else {
+        let Ok(credentials_file) = CredentialsFile::load_default() else {
+            return Vec::new();
+        };
+        credentials_file
     };
     // Same degradation posture for settings: judge routing is best-effort,
     // so an unreadable settings.json costs the config-defined providers,

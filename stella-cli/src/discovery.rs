@@ -221,29 +221,36 @@ impl<'a> DiscoveryToolSet<'a> {
         } else {
             ""
         };
-        vec![
-            ToolSchema {
-                name: TOOL_SEARCH.into(),
-                description: format!(
-                    "Search every tool available in this session — built-ins, MCP server tools \
+        let mut schemas = vec![ToolSchema {
+            name: TOOL_SEARCH.into(),
+            description: format!(
+                "Search every tool available in this session — built-ins, MCP server tools \
                      (mcp__<server>__<tool>), custom workspace tools — ranked by fit. Query \
                      forms: keywords ('issue tracking'), +required terms ('+github pr'), or \
                      select:name1,name2 for exact lookup. Use it when you need a capability you \
                      don't see advertised, before concluding it doesn't exist.{lean_note}"
-                ),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Keywords, '+required terms', or 'select:name1,name2'."
-                        },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": TOOL_SEARCH_MAX_LIMIT }
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords, '+required terms', or 'select:name1,name2'."
                     },
-                    "required": ["query"]
-                }),
-                read_only: true,
-            },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": TOOL_SEARCH_MAX_LIMIT }
+                },
+                "required": ["query"]
+            }),
+            read_only: true,
+        }];
+        // Skills and MCP are extension-discovery surfaces backed by workspace,
+        // user, or registry state outside the benchmark's frozen engine
+        // posture. Keep native tool_search, but do not advertise either source
+        // when the trusted launcher enables filesystem isolation.
+        if crate::settings::filesystem_settings_disabled() {
+            return schemas;
+        }
+        schemas.extend([
             ToolSchema {
                 name: SKILL_SEARCH.into(),
                 description: "Search user-global skills plus authority-permitted workspace \
@@ -286,7 +293,8 @@ impl<'a> DiscoveryToolSet<'a> {
                 }),
                 read_only: true,
             },
-        ]
+        ]);
+        schemas
     }
 
     // ── tool_search ─────────────────────────────────────────────────────────
@@ -385,6 +393,11 @@ impl<'a> DiscoveryToolSet<'a> {
     // ── skill_search ────────────────────────────────────────────────────────
 
     async fn execute_skill_search(&self, input: &Value) -> ToolOutput {
+        if crate::settings::filesystem_settings_disabled() {
+            return ToolOutput::Error {
+                message: "skill_search is disabled by benchmark filesystem isolation".into(),
+            };
+        }
         let Some(query) = input.get("query").and_then(Value::as_str).map(str::trim) else {
             return ToolOutput::Error {
                 message: "skill_search: missing required string field `query`".into(),
@@ -474,6 +487,11 @@ impl<'a> DiscoveryToolSet<'a> {
     // ── mcp_search ──────────────────────────────────────────────────────────
 
     async fn execute_mcp_search(&self, input: &Value) -> ToolOutput {
+        if crate::settings::filesystem_settings_disabled() {
+            return ToolOutput::Error {
+                message: "mcp_search is disabled by benchmark filesystem isolation".into(),
+            };
+        }
         let Some(query) = input.get("query").and_then(Value::as_str).map(str::trim) else {
             return ToolOutput::Error {
                 message: "mcp_search: missing required string field `query`".into(),

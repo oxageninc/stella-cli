@@ -286,8 +286,8 @@ async fn mini_run(tx: &mpsc::UnboundedSender<Inbound>, id: &str) {
         }),
         ev(AgentEvent::StepUsage {
             step: 1,
-            role: ModelCallRole::Worker,
-            provider: "zai".into(),
+            purpose: None,
+            output_text: None,
             model: "glm-5.2".into(),
             input_tokens: 4_000,
             output_tokens: 260,

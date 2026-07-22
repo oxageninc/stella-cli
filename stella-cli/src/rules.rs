@@ -158,12 +158,11 @@ pub(crate) fn load_workspace_rules(
     workspace_root: &Path,
     authority: &crate::settings::AuthorityPolicy,
 ) -> ResolvedRules {
-    let user_rules_dir = std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("stella")
-            .join("rules")
-    });
+    if crate::settings::filesystem_settings_disabled() {
+        return ResolvedRules::default();
+    }
+    let user_rules_dir = crate::settings::user_home_dir()
+        .map(|home| home.join(".config").join("stella").join("rules"));
     ResolvedRules(
         load_rules_from_with_authority(
             workspace_root,

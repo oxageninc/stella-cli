@@ -34,7 +34,7 @@ impl HookRunner for ShellHookRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        crate::exec::scrub_sensitive_env(&mut command);
+        crate::subprocess_env::scrub_sensitive_env(&mut command);
         let mut child = command.spawn().map_err(|e| HookExecError::SpawnFailed {
             command: action.command.clone(),
             message: e.to_string(),
@@ -118,6 +118,21 @@ mod tests {
             .await
             .expect("hook runs");
         assert!(out.stdout.contains("PreToolUse"));
+    }
+
+    #[tokio::test]
+    async fn hook_scrubs_inherited_credentials_but_keeps_benign_env() {
+        let _fixture = crate::subprocess_env::test_support::InheritedCredentialFixture::install();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = ShellHookRunner
+            .run(
+                &action(crate::subprocess_env::test_support::PROBE_COMMAND),
+                "{}",
+                &dir.path().display().to_string(),
+            )
+            .await
+            .expect("hook runs");
+        crate::subprocess_env::test_support::assert_scrubbed(&out.stdout);
     }
 
     #[tokio::test]

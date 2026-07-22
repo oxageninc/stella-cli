@@ -111,6 +111,9 @@ use crate::subsession::{self, SubSessions, SupervisorMsg};
 use authoring::handle_agent_create;
 pub(crate) use forwarder::spawn_forwarder;
 
+mod forwarder;
+pub(crate) use forwarder::spawn_forwarder;
+
 /// The lead agent's id — the one conversation this driver runs.
 const LEAD: &str = "lead";
 
@@ -288,7 +291,7 @@ pub async fn run_deck_session(
     let provider = agent::build_provider(cfg)?;
     let registry_options = agent::registry_options(cfg);
     let registry: Arc<ToolRegistry> = Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
+        agent::new_tool_registry(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
     agent::populate_schema_index(&registry, &cfg.workspace_root)?;
     let active_rules =
@@ -2607,15 +2610,17 @@ fn ci_status_token(ci: CiStatus) -> &'static str {
 
 async fn gh_json(root: &std::path::Path, args: &[&str]) -> Option<Value> {
     let mut command = tokio::process::Command::new("gh");
-    stella_tools::exec::scrub_sensitive_env(&mut command);
-    let output = command
-        .args(args)
-        .current_dir(root)
-        .kill_on_drop(true)
-        .output()
-        .await
-        .ok()?;
+    command.args(args).current_dir(root).kill_on_drop(true);
+    scrub_gh_command(&mut command);
+    let output = command.output().await.ok()?;
     serde_json::from_slice(&output.stdout).ok()
+}
+
+fn scrub_gh_command(command: &mut tokio::process::Command) {
+    stella_tools::subprocess_env::scrub_sensitive_env_except(
+        command,
+        stella_tools::subprocess_env::GITHUB_CLI_AUTH_ENV_VARS,
+    );
 }
 
 /// Reconcile the workspace's current-branch PR: `gh pr view` for identity

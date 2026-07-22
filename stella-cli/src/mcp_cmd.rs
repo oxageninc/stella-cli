@@ -221,11 +221,13 @@ fn open_in_browser(url: &str) {
     let launcher = ("cmd", vec!["/C".into(), "start".into(), url.to_string()]);
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let launcher = ("xdg-open", vec![url.to_string()]);
-    let _ = std::process::Command::new(launcher.0)
+    let mut command = std::process::Command::new(launcher.0);
+    command
         .args(&launcher.1)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    stella_tools::subprocess_env::scrub_sensitive_std_env(&mut command);
+    let _ = command.spawn();
 }
 
 /// Per-(server, tool) usage aggregates from local telemetry

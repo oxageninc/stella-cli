@@ -23,9 +23,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use colored::Colorize;
 use serde_json::Value;
+use stella_core::EventSender;
 use stella_core::ports::ToolExecutor;
 use stella_protocol::{AgentEvent, ToolOutput, ToolSchema};
-use tokio::sync::mpsc::UnboundedSender;
 
 /// The label the runtime appends as the always-present free-text option.
 pub const FREE_TEXT_LABEL: &str = "Type your own answer";
@@ -175,14 +175,19 @@ impl SkillRegistry {
         // install keeps running (and downloading) long after the tool
         // reported failure.
         let mut command = tokio::process::Command::new(program);
-        stella_tools::exec::scrub_sensitive_env(&mut command);
-        let child = command
+        command
             .args(args)
             .current_dir(&self.workspace_root)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // Search/install/use commands are model-triggerable in headless
+        // one-shot runs and their executable/template is environment
+        // configurable. They get ordinary PATH/build configuration, never
+        // provider, repository, cloud, or tracker credentials.
+        scrub_skill_registry_command(&mut command);
+        let child = command
             .spawn()
             .map_err(|e| format!("failed to run `{program}`: {e} (is Node/npx installed?)"))?;
         let output = tokio::time::timeout(
@@ -214,11 +219,15 @@ impl SkillRegistry {
     }
 }
 
+fn scrub_skill_registry_command(command: &mut tokio::process::Command) {
+    stella_tools::subprocess_env::scrub_sensitive_env(command);
+}
+
 /// A `ToolExecutor` that adds `ask_user` (plus the skills-registry tools
 /// when configured) on top of an inner executor.
 pub struct InteractiveToolSet<'a> {
     inner: &'a dyn ToolExecutor,
-    events: UnboundedSender<AgentEvent>,
+    events: EventSender,
     io: Box<dyn AskUserIo>,
     skills: Option<SkillRegistry>,
 }
@@ -226,12 +235,12 @@ pub struct InteractiveToolSet<'a> {
 impl<'a> InteractiveToolSet<'a> {
     pub fn new(
         inner: &'a dyn ToolExecutor,
-        events: UnboundedSender<AgentEvent>,
+        events: impl Into<EventSender>,
         io: Box<dyn AskUserIo>,
     ) -> Self {
         Self {
             inner,
-            events,
+            events: events.into(),
             io,
             skills: None,
         }
@@ -517,6 +526,28 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    #[tokio::test]
+    async fn skill_registry_child_cannot_receive_explicit_credentials() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "printf '%s|%s|%s|%s' \"${OPENROUTER_API_KEY-unset}\" \"${GITHUB_TOKEN-unset}\" \"${AWS_SECRET_ACCESS_KEY-unset}\" \"${STELLA_TEST_BENIGN-unset}\"",
+            ])
+            .env("OPENROUTER_API_KEY", "provider-secret")
+            .env("GITHUB_TOKEN", "repository-secret")
+            .env("AWS_SECRET_ACCESS_KEY", "cloud-secret")
+            .env("STELLA_TEST_BENIGN", "visible");
+        scrub_skill_registry_command(&mut command);
+
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "unset|unset|unset|visible"
+        );
+    }
 
     /// Scripted io: records every prompt it was shown, pops answers from a
     /// queue.

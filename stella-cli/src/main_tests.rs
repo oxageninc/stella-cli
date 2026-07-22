@@ -7,7 +7,28 @@
 
 use clap::{CommandFactory, Parser};
 
-use super::{AuthCmd, Cli, Command, ConnectCmd, OutputFormat, TelemetryCmd};
+use super::{
+    AuthCmd, BUILD_VERSION_IDENTITY, Cli, Command, ConnectCmd, OutputFormat, TelemetryCmd,
+    version_static, version_string,
+};
+
+/// The build script owns version stamping so both CLI surfaces consume the
+/// exact same compile-time literal. In particular, main must not reconstruct
+/// `-dev.<sha>` at runtime: the benchmark launcher attests those contiguous
+/// bytes in the executable before it permits a paid claim run.
+#[test]
+fn cli_versions_use_the_build_script_literal() {
+    assert!(BUILD_VERSION_IDENTITY.starts_with('\0'));
+    assert!(BUILD_VERSION_IDENTITY.ends_with('\0'));
+    assert_eq!(version_string(), env!("STELLA_BUILD_VERSION"));
+    assert_eq!(version_static(), env!("STELLA_BUILD_VERSION"));
+
+    let expected = match option_env!("STELLA_BUILD_GIT_SHA") {
+        Some(sha) if !sha.is_empty() => format!("{}-dev.{sha}", env!("CARGO_PKG_VERSION")),
+        _ => env!("CARGO_PKG_VERSION").to_string(),
+    };
+    assert_eq!(version_string(), expected);
+}
 
 #[cfg(unix)]
 fn legacy_codegraph_workspace(mode: u32) -> tempfile::TempDir {

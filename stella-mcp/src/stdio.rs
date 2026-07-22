@@ -3,11 +3,12 @@
 //!
 //! Two properties are load-bearing:
 //!
-//! 1. **Scrubbed environment.** The child is spawned
-//!    with [`Command::env_clear`] and receives only the keys explicitly
-//!    listed in the server's config `env`, plus `PATH`. No parent-shell
-//!    credential (`ANTHROPIC_API_KEY`, `AWS_*`, …) is ever inherited by an
-//!    MCP subprocess. `PATH` is the sole exception — it is not a secret and
+//! 1. **Explicit environment.** The child is spawned
+//!    with [`Command::env_clear`] and receives only keys explicitly listed in
+//!    the server's config `env`, plus `PATH`. No parent-shell credential
+//!    (`ANTHROPIC_API_KEY`, `AWS_*`, …) is inherited. Explicit config values
+//!    remain available because they are MCP servers' documented auth channel;
+//!    `PATH` is the sole inherited exception — it is not a secret and
 //!    a bare runner command (`npx`, `uvx`, `docker`, …) cannot resolve
 //!    without it — and a config `env` may still override it.
 //! 2. **Concurrent in-flight requests.** Each request gets a monotonically
@@ -95,7 +96,6 @@ impl StdioTransport {
         for (key, value) in env {
             command.env(key, value);
         }
-
         let mut child = command
             .spawn()
             .map_err(|e| McpError::Transport(format!("failed to spawn `{cmd}`: {e}")))?;

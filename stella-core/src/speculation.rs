@@ -50,6 +50,8 @@ use serde_json::Value;
 use stella_protocol::{AgentEvent, ToolCall, ToolCallObserver, ToolOutput};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::event_sender::EventSender;
+
 /// One speculatively-executed call's outcome, held until dispatch decides
 /// whether to harvest it.
 pub(crate) struct SpeculativeResult {
@@ -86,20 +88,20 @@ pub(crate) struct SpeculationGate {
     /// an attempt that later fails have already been emitted by design —
     /// no reset marker exists; consumers replace the preview when the
     /// authoritative `Text` lands.
-    events: UnboundedSender<AgentEvent>,
+    events: EventSender,
 }
 
 impl SpeculationGate {
     pub(crate) fn new(
         read_only_tools: HashSet<String>,
         tx: UnboundedSender<ToolCall>,
-        events: UnboundedSender<AgentEvent>,
+        events: impl Into<EventSender>,
     ) -> Self {
         Self {
             read_only_tools,
             fenced: AtomicBool::new(false),
             tx,
-            events,
+            events: events.into(),
         }
     }
 }

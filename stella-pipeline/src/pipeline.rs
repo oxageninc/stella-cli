@@ -46,12 +46,12 @@ use std::time::Duration;
 use stella_core::hooks::{HookRunner, Hooks};
 use stella_core::retry::{RetryPolicy, Sleeper};
 use stella_core::router::FallbackInfo;
-use stella_core::{BudgetGuard, Engine, EngineConfig, Router, TurnOutcome};
+use stella_core::{BudgetGuard, Engine, EngineConfig, EventSender, Router, TurnOutcome};
 use stella_protocol::{
-    AgentEvent, CompletionMessage, ContextFrameRef, JudgeEvidence, ModelCallRole, ModelRef,
-    Provider, ProviderShare, Role, StageKind,
+    AgentEvent, CompletionMessage, ContextFrameRef, JudgeEvidence, ModelRef, Provider,
+    ProviderShare, Role, StageKind,
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::time::timeout;
 
 use crate::candidate::{
     CandidateScore, CandidateSummary, score_from_verification, select_best_candidate,
@@ -75,14 +75,14 @@ use crate::witness::{
     validate_witness_identity, validate_witness_invocation, witness_identity_matches,
     witness_prompt, witness_repair_prompt,
 };
-mod raw_usage;
+mod accounting;
 mod run_error;
 mod stage_budget;
 mod task5;
 use raw_usage::{RawCall, RawCallError};
 use run_error::RoleResolveError;
 pub use run_error::{PipelineError, PipelineRunError};
-use stage_budget::{PipelineBudgetAbort, aborted_before_execute, budget_abort};
+use stage_budget::{PipelineBudgetAbort, budget_abort};
 use task5::BoundHookRunner;
 /// Minimal fallback when the caller supplies no stable system prefix.
 const DEFAULT_SYSTEM_PROMPT: &str =
@@ -128,8 +128,10 @@ pub struct PipelineConfig {
     /// Per-role request overrides (`agent_engine_config`) for the raw
     /// triage/judge completion calls.
     pub role_overrides: PipelineRoleOverrides,
-    /// Hard latency ceiling on the triage classification call (L-M4): if it
-    /// doesn't answer within this, triage falls through to the full path.
+    /// Decision latency ceiling on the triage classification call (L-M4): if
+    /// it doesn't answer within this, its eventual response is ignored and
+    /// triage falls through to the full path. The paid call is still awaited
+    /// so usage cannot disappear from accounting through cancellation.
     pub triage_latency_ceiling: Duration,
     /// Thresholds above which a plan triggers interactive scope review (L-E5).
     pub scope_thresholds: crate::scope::ScopeThresholds,
@@ -375,7 +377,7 @@ pub struct Pipeline<'a> {
     candidate_workspaces: Option<&'a dyn CandidateWorkspacePort>,
     mcp_prefetch: Option<&'a dyn McpPrefetchPort>,
     steering: Option<&'a dyn stella_core::ports::TurnSteering>,
-    events: UnboundedSender<AgentEvent>,
+    events: EventSender,
     config: PipelineConfig,
     configured_test: Result<Option<TestInvocation>, crate::witness::TestInvocationError>,
 }
@@ -384,7 +386,7 @@ impl<'a> Pipeline<'a> {
     /// Construct a pipeline over the given ports, event sink, and config.
     pub fn new(
         ports: PipelinePorts<'a>,
-        events: UnboundedSender<AgentEvent>,
+        events: impl Into<EventSender>,
         config: PipelineConfig,
     ) -> Self {
         let configured_test = config
@@ -407,10 +409,18 @@ impl<'a> Pipeline<'a> {
             candidate_workspaces: ports.candidate_workspaces,
             mcp_prefetch: ports.mcp_prefetch,
             steering: ports.steering,
-            events,
+            events: events.into(),
             config,
             configured_test,
         }
+    }
+
+    /// Replace the ordinary channel wrapper with a caller-supplied ordered
+    /// sender. Benchmark mode uses this to journal+flush every event before
+    /// the same event enters the renderer queue.
+    pub fn with_event_sender(mut self, events: EventSender) -> Self {
+        self.events = events;
+        self
     }
 
     /// Drive one prompt through the full staged flow. `messages` is the
@@ -455,8 +465,7 @@ impl<'a> Pipeline<'a> {
         let task_class = match task_class {
             Ok(task_class) => task_class,
             Err(abort) => {
-                return Ok(aborted_before_execute(
-                    &self.events,
+                return Ok(self.aborted_before_execute(
                     resolve_task_class(None, goal),
                     total_cost,
                     &abort.reason,
@@ -478,26 +487,19 @@ impl<'a> Pipeline<'a> {
             {
                 Ok(plan) => Some(plan),
                 Err(abort) => {
-                    return Ok(aborted_before_execute(
-                        &self.events,
-                        task_class,
-                        total_cost,
-                        &abort.reason,
-                    ));
+                    return Ok(self.aborted_before_execute(task_class, total_cost, &abort.reason));
                 }
             }
         } else {
             None
         };
-
         // --- 4. Scope review (only for planned work above thresholds). -----
         let plan = match plan {
             Some(steps) => match self.scope_review(goal, steps).await {
                 Ok(Some(steps)) => Some(steps),
                 Ok(None) => {
                     // User aborted (or trimmed to nothing) at the gate.
-                    return Ok(aborted_before_execute(
-                        &self.events,
+                    return Ok(self.aborted_before_execute(
                         task_class,
                         total_cost,
                         "aborted at scope review",
@@ -650,24 +652,36 @@ impl<'a> Pipeline<'a> {
             self.emit_fallback(fb);
         }
 
-        let model_class = match self
-            .metered_raw_call(
-                RawCall {
-                    role: ModelCallRole::Triage,
-                    resolved: &resolved,
-                    messages: vec![CompletionMessage::user(triage_prompt(goal))],
-                    policy: RetryPolicy::deterministic(),
-                    overrides: &self.config.role_overrides.triage,
-                    timeout: Some(self.config.triage_latency_ceiling),
-                },
-                budget,
-                total,
-            )
-            .await
-        {
-            Ok(result) => classify_triage_response(&result.text),
-            Err(RawCallError::Budget(abort)) => return Err(abort),
-            Err(RawCallError::Provider | RawCallError::Timeout) => None,
+        let messages = vec![CompletionMessage::user(triage_prompt(goal))];
+        // Deterministic policy (L-M4: max_retries = 0). The latency ceiling is
+        // a classification deadline, not a billing cancellation: a late paid
+        // call is awaited and metered, but its answer is ignored. This avoids
+        // undercounting a request canceled after it began generating.
+        let call = self.complete_once(
+            resolved.provider,
+            "triage",
+            messages,
+            RetryPolicy::deterministic(),
+            &self.config.role_overrides.triage,
+        );
+        tokio::pin!(call);
+        let model_class = match timeout(self.config.triage_latency_ceiling, &mut call).await {
+            Ok(Ok(result)) => {
+                *total += result.cost_usd;
+                let model_class = classify_triage_response(&result.text);
+                self.record_and_tick(budget, result.cost_usd)?;
+                model_class
+            }
+            Ok(Err(_)) => None,
+            Err(_) => {
+                // Preserve exact usage but deliberately ignore a response that
+                // missed the decision deadline.
+                if let Ok(result) = call.await {
+                    *total += result.cost_usd;
+                    self.record_and_tick(budget, result.cost_usd)?;
+                }
+                None
+            }
         };
         Ok(resolve_task_class(model_class, goal))
     }
@@ -701,17 +715,12 @@ impl<'a> Pipeline<'a> {
         // Plan rides the worker's settings (same router tier, same tuning).
         let worker_overrides = RoleCallOverrides::default();
         let result = match self
-            .metered_raw_call(
-                RawCall {
-                    role: ModelCallRole::Plan,
-                    resolved: &resolved,
-                    messages: vec![CompletionMessage::user(prompt)],
-                    policy: RetryPolicy::standard(),
-                    overrides: &worker_overrides,
-                    timeout: None,
-                },
-                budget,
-                total,
+            .complete_once(
+                resolved.provider,
+                "plan",
+                vec![CompletionMessage::user(prompt)],
+                RetryPolicy::standard(),
+                &worker_overrides,
             )
             .await
         {
@@ -719,31 +728,28 @@ impl<'a> Pipeline<'a> {
             Err(RawCallError::Budget(abort)) => return Err(abort),
             Err(RawCallError::Provider | RawCallError::Timeout) => return Ok(fallback_plan()),
         };
+        *total += result.cost_usd;
+        self.record_and_tick(budget, result.cost_usd)?;
 
         if let Some(steps) = parse_plan(&result.text) {
             return Ok(steps);
         }
 
         // One bounded JSON-repair retry (L-V2), deterministic (no retry-hang).
-        match self
-            .metered_raw_call(
-                RawCall {
-                    role: ModelCallRole::PlanRepair,
-                    resolved: &resolved,
-                    messages: vec![CompletionMessage::user(plan_repair_prompt(&result.text))],
-                    policy: RetryPolicy::deterministic(),
-                    overrides: &worker_overrides,
-                    timeout: None,
-                },
-                budget,
-                total,
+        if let Ok(repair) = self
+            .complete_once(
+                resolved.provider,
+                "plan_repair",
+                vec![CompletionMessage::user(plan_repair_prompt(&result.text))],
+                RetryPolicy::deterministic(),
+                &worker_overrides,
             )
             .await
         {
-            Ok(repair) => {
-                if let Some(steps) = parse_plan(&repair.text) {
-                    return Ok(steps);
-                }
+            *total += repair.cost_usd;
+            self.record_and_tick(budget, repair.cost_usd)?;
+            if let Some(steps) = parse_plan(&repair.text) {
+                return Ok(steps);
             }
             Err(RawCallError::Budget(abort)) => return Err(abort),
             Err(RawCallError::Provider | RawCallError::Timeout) => {}
@@ -1583,21 +1589,18 @@ impl<'a> Pipeline<'a> {
         });
         let prompt = guidance_prompt(goal, diff, evidence_summary);
         match self
-            .metered_raw_call(
-                RawCall {
-                    role: ModelCallRole::DistressGuidance,
-                    resolved: &resolved,
-                    messages: vec![CompletionMessage::user(prompt)],
-                    policy: RetryPolicy::deterministic(),
-                    overrides: &self.config.role_overrides.judge,
-                    timeout: None,
-                },
-                budget,
-                total,
+            .complete_once(
+                resolved.provider,
+                "guidance",
+                vec![CompletionMessage::user(prompt)],
+                RetryPolicy::deterministic(),
+                &self.config.role_overrides.judge,
             )
             .await
         {
             Ok(result) => {
+                *total += result.cost_usd;
+                self.record_and_tick(budget, result.cost_usd)?;
                 let text = result.text.trim().to_string();
                 if text.is_empty() {
                     Ok(None)
@@ -1635,23 +1638,19 @@ impl<'a> Pipeline<'a> {
         // Deterministic policy: a judge call that fails must not hang; it falls
         // back to the heuristic verdict rather than retrying.
         match self
-            .metered_raw_call(
-                RawCall {
-                    role: ModelCallRole::Judge,
-                    resolved: &resolved,
-                    messages: vec![CompletionMessage::user(prompt)],
-                    policy: RetryPolicy::deterministic(),
-                    overrides: &self.config.role_overrides.judge,
-                    timeout: None,
-                },
-                budget,
-                total,
+            .complete_once(
+                resolved.provider,
+                "judge",
+                vec![CompletionMessage::user(prompt)],
+                RetryPolicy::deterministic(),
+                &self.config.role_overrides.judge,
             )
             .await
         {
             Ok(result) => {
                 let verdict = parse_judge_response(&result.text)
                     .unwrap_or_else(|| heuristic_fallback(inputs));
+                self.record_and_tick(budget, result.cost_usd)?;
                 Ok(verdict)
             }
             Err(RawCallError::Budget(abort)) => Err(abort),
@@ -1681,52 +1680,6 @@ impl<'a> Pipeline<'a> {
             provider,
             fallback: decision.fallback,
         })
-    }
-
-    /// Run one engine turn, forwarding every event to the consumer **live**
-    /// (a concurrent drain task, not a post-hoc flush — an execute turn can
-    /// run tool loops for minutes, and buffering froze the renderer for the
-    /// whole turn) **except** the engine's `Stage`/`Complete` (the pipeline
-    /// owns those), tallying `FileChange`s into `file_changes` for the
-    /// zero-diff guard.
-    async fn run_engine_turn(
-        &self,
-        engine: &Engine<'_>,
-        messages: &mut Vec<CompletionMessage>,
-        budget: &mut BudgetGuard,
-        file_changes: &mut u32,
-    ) -> TurnOutcome {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let consumer = self.events.clone();
-        let forwarder = tokio::spawn(async move {
-            let mut seen_file_changes: u32 = 0;
-            while let Some(event) = rx.recv().await {
-                let forward = match &event {
-                    // The pipeline is the sole authority for stage boundaries
-                    // and the terminal event of an outcome-producing run —
-                    // drop the engine's per-turn copies.
-                    AgentEvent::Stage { .. } | AgentEvent::Complete { .. } => false,
-                    AgentEvent::FileChange { kind, .. } => {
-                        // Reads ride the same event for the files panel but
-                        // are not changes — counting them would defeat the
-                        // zero-diff guard on read-only turns.
-                        if kind.is_mutation() {
-                            seen_file_changes += 1;
-                        }
-                        true
-                    }
-                    _ => true,
-                };
-                if forward {
-                    let _ = consumer.send(event);
-                }
-            }
-            seen_file_changes
-        });
-        let outcome = engine.run_turn(messages, budget, &tx).await;
-        drop(tx); // close the channel so the forwarder terminates
-        *file_changes += forwarder.await.unwrap_or(0);
-        outcome
     }
 
     /// The real added-line count of an untracked file, via a no-index diff
@@ -1844,6 +1797,38 @@ impl<'a> Pipeline<'a> {
             message,
             retryable: true,
         });
+    }
+
+    /// Adapt mainline's stage-budget helper to the ordered EventSender seam.
+    /// The helper remains the single policy implementation; draining its
+    /// short-lived channel synchronously preserves event order and durability.
+    fn record_and_tick(
+        &self,
+        budget: &mut BudgetGuard,
+        cost_usd: f64,
+    ) -> Result<(), PipelineBudgetAbort> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = stage_budget::record_and_tick(budget, cost_usd, &tx);
+        drop(tx);
+        while let Ok(event) = rx.try_recv() {
+            self.emit(event);
+        }
+        outcome
+    }
+
+    fn aborted_before_execute(
+        &self,
+        task_class: TaskClass,
+        total_cost: f64,
+        reason: &str,
+    ) -> PipelineOutcome {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = stage_budget::aborted_before_execute(&tx, task_class, total_cost, reason);
+        drop(tx);
+        while let Ok(event) = rx.try_recv() {
+            self.emit(event);
+        }
+        outcome
     }
 
     fn emit(&self, event: AgentEvent) {

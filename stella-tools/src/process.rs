@@ -223,7 +223,7 @@ impl Tool for StartProcess {
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         cmd.current_dir(root);
-        crate::exec::scrub_sensitive_env(&mut cmd);
+        crate::subprocess_env::scrub_sensitive_env(&mut cmd);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -716,5 +716,38 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("`true` never reported exit");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_running_process_scrubs_inherited_credentials() {
+        let _fixture = crate::subprocess_env::test_support::InheritedCredentialFixture::install();
+        let (table, root) = tools();
+        let command = format!(
+            "{}; sleep 30",
+            crate::subprocess_env::test_support::PROBE_COMMAND
+        );
+        let handle = start(&table, &root, &["sh", "-c", &command]).await;
+
+        let mut observed = String::new();
+        for _ in 0..50 {
+            let out = ReadOutput(table.clone())
+                .execute(&serde_json::json!({"handle": handle}), &root)
+                .await;
+            let ToolOutput::Ok { content } = out else {
+                panic!("read_output failed");
+            };
+            if let Some(line) = content.lines().find(|line| *line == "|||visible|present") {
+                observed = line.to_string();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        crate::subprocess_env::test_support::assert_scrubbed(&observed);
+
+        let stopped = StopProcess(table)
+            .execute(&serde_json::json!({"handle": handle}), &root)
+            .await;
+        assert!(!stopped.is_error(), "{stopped:?}");
     }
 }

@@ -132,14 +132,14 @@ pub fn detect_issue_backend() -> Option<IssueBackend> {
         return Some(github);
     }
     let mut gh = std::process::Command::new("gh");
-    crate::exec::scrub_sensitive_std_env(&mut gh);
-    let gh_authed = gh
-        .args(["auth", "status"])
+    gh.args(["auth", "status"])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .stderr(std::process::Stdio::null());
+    crate::subprocess_env::scrub_sensitive_std_env_except(
+        &mut gh,
+        crate::subprocess_env::GITHUB_CLI_AUTH_ENV_VARS,
+    );
+    let gh_authed = gh.status().map(|s| s.success()).unwrap_or(false);
     if gh_authed {
         return Some(IssueBackend::GitHub);
     }
@@ -574,7 +574,7 @@ impl Tool for StartWorkOnIssue {
                 if let Some(branch) = input.get("branch").and_then(|v| v.as_str()) {
                     cmd.push_str(&format!(" --name {}", quote(branch)));
                 }
-                match exec::run(&cmd, root, 60).await {
+                match exec::run_github(&cmd, root, 60).await {
                     Ok((0, output)) => ToolOutput::Ok { content: output },
                     Ok((code, output)) => ToolOutput::Error {
                         message: format!("gh failed (exit {code}): {output}"),

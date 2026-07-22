@@ -844,8 +844,8 @@ mod tests {
                 agent: "lead".into(),
                 event: AgentEvent::StepUsage {
                     step: 1,
-                    role: stella_protocol::ModelCallRole::Worker,
-                    provider: "z".into(),
+                    purpose: None,
+                    output_text: None,
                     model: "z/glm".into(),
                     input_tokens: 900,
                     output_tokens: 60,

@@ -1,0 +1,18 @@
+{
+  "agent_engine_config": {
+    "default_model": "openrouter/openai/gpt-4o-mini",
+    "auto_mode": "on",
+    "agents": {
+      "worker": {
+        "effort": "low",
+        "reasoning": "off"
+      }
+    }
+  },
+  "providers": {
+    "openrouter": {
+      "base_url": "http://127.0.0.1:9/v1",
+      "api_key": "inert_task_local_canary_not_a_credential"
+    }
+  }
+}

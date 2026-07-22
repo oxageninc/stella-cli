@@ -233,7 +233,7 @@ impl Tool for Bash {
         let mut cmd = Command::new(program);
         cmd.args(args);
         cmd.current_dir(root);
-        crate::exec::scrub_sensitive_env(&mut cmd);
+        crate::subprocess_env::scrub_sensitive_env(&mut cmd);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         // New process group so we can kill the whole tree on timeout.
@@ -343,6 +343,26 @@ mod tests {
             .await;
         match result {
             ToolOutput::Ok { content } => assert!(content.contains("hello_stella")),
+            ToolOutput::Error { message } => panic!("expected ok, got: {message}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_tool_scrubs_inherited_credentials() {
+        let _fixture = crate::subprocess_env::test_support::InheritedCredentialFixture::install();
+        let result = Bash
+            .execute(
+                &serde_json::json!({
+                    "command": crate::subprocess_env::test_support::PROBE_COMMAND
+                }),
+                &std::env::temp_dir(),
+            )
+            .await;
+        match result {
+            ToolOutput::Ok { content } => {
+                let output = content.lines().next().unwrap_or_default();
+                crate::subprocess_env::test_support::assert_scrubbed(output);
+            }
             ToolOutput::Error { message } => panic!("expected ok, got: {message}"),
         }
     }

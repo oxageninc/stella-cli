@@ -26,7 +26,7 @@
 //!
 //! # What a candidate's engine can reach
 //!
-//! Candidates drive the built-in [`ToolRegistry`] PLUS the session's custom
+//! Candidates drive the built-in [`stella_tools::ToolRegistry`] PLUS the session's custom
 //! script tools, both rooted at the snapshot (with the session's workspace
 //! rules and schema gate applied) — a [`CustomToolSet`] owning the registry
 //! by `Arc`. Custom tools spawn subprocesses with the snapshot as cwd
@@ -86,8 +86,8 @@ use stella_pipeline::ports::{
 };
 use stella_protocol::FileChangeKind;
 
+use stella_tools::RegistryOptions;
 use stella_tools::custom::{CustomTool, CustomToolSet};
-use stella_tools::{RegistryOptions, ToolRegistry};
 
 use crate::agent::{
     GitDiagnosticRunner, GitRepoStatus, TypedTestRunner, fs_artifact_identity, fs_fingerprint,
@@ -136,12 +136,12 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 /// env, no prompt.
 async fn git_stdout_to_file(repo: &Path, args: &[&str], out: &Path) -> Result<(), String> {
     let mut cmd = tokio::process::Command::new("git");
-    stella_tools::exec::scrub_sensitive_env(&mut cmd);
     cmd.arg("-C").arg(repo).args(args);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     for var in stella_tools::exec::GIT_REPO_ENV_VARS {
         cmd.env_remove(var);
     }
+    stella_tools::subprocess_env::scrub_sensitive_env(&mut cmd);
     cmd.kill_on_drop(true);
     let output = cmd
         .output()
@@ -320,7 +320,7 @@ impl GitCandidateWorkspaces {
             Ok((overlay_untracked, baseline)) => {
                 let ws_root = dir.join(&root_rel);
                 let registry =
-                    ToolRegistry::new_detected(ws_root.clone(), self.options.clone()).await;
+                    crate::agent::new_tool_registry(ws_root.clone(), self.options.clone()).await;
                 // Same governance as the session registry: workspace rules
                 // and the schema gate travel with the tree — best-of-N must
                 // not be a way around them. Applied while `registry` is still

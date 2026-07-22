@@ -71,8 +71,8 @@ mod tests {
     fn step_usage(model: &str, input: u64, cached: u64, write: u64) -> AgentEvent {
         AgentEvent::StepUsage {
             step: 1,
-            role: stella_protocol::event::ModelCallRole::Worker,
-            provider: "test".into(),
+            purpose: None,
+            output_text: None,
             model: model.to_string(),
             input_tokens: input,
             output_tokens: 0,

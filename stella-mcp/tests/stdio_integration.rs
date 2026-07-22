@@ -75,6 +75,10 @@ async fn environment_is_scrubbed_but_configured_vars_and_path_pass_through() {
 
     let mut env = BTreeMap::new();
     env.insert("ALLOWED".to_string(), "yes".to_string());
+    env.insert(
+        "OPENROUTER_API_KEY".to_string(),
+        "manifest-must-not-reintroduce-secret".to_string(),
+    );
     let cfg = stdio_config("fx", &[], env);
     let client = McpClient::connect(&cfg, Duration::from_secs(5))
         .await
@@ -106,6 +110,21 @@ async fn environment_is_scrubbed_but_configured_vars_and_path_pass_through() {
             content: "unset".into()
         },
         "ambient non-PATH env must stay scrubbed"
+    );
+
+    let configured_secret = client
+        .call_tool(
+            "env_probe",
+            serde_json::json!({ "var": "OPENROUTER_API_KEY" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        configured_secret,
+        ToolOutput::Ok {
+            content: "manifest-must-not-reintroduce-secret".into()
+        },
+        "explicit MCP auth env must survive the ambient env_clear boundary"
     );
 
     // …but PATH IS inherited — it is the one non-secret exception, without

@@ -45,7 +45,6 @@ use stella_fleet::{
     WatchConfig, WorkerControls, WorkerOutcome, WorktreeManager,
 };
 use stella_protocol::{AgentEvent, CompletionMessage, PrStatus};
-use stella_tools::ToolRegistry;
 use stella_tools::hook_runner::ShellHookRunner;
 use tokio::sync::{mpsc, watch};
 
@@ -474,7 +473,7 @@ async fn run_task(
     cfg.workspace_root = root.to_path_buf();
     let provider = agent::build_provider(&cfg)?;
     let registry_options = agent::registry_options(&cfg);
-    let registry = ToolRegistry::new_detected(root.to_path_buf(), registry_options.clone()).await;
+    let registry = agent::new_tool_registry(root.to_path_buf(), registry_options.clone()).await;
     let active_rules = crate::rules::enforce_workspace_rules(&registry, root, &cfg.authority);
     // Claim-on-first-write (crate::claims): tool-level write claims + the
     // transient build lane, coordinated across every writer in the

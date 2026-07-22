@@ -21,7 +21,7 @@ pub(crate) async fn run_raw_one_shot(
     // files-touched ledger is reachable after the turn — the trait object
     // hides it. It still coerces to `&dyn ToolExecutor` for the engine.
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
+        new_tool_registry(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root)?;
     let active_rules =
@@ -129,11 +129,7 @@ pub(crate) async fn run_raw_one_shot(
     // `succeeded=false`). Gated on `turn_warrants_reflection` so a tool-free
     // turn (nothing to mine, failure almost certainly external) never spends a
     // model call. The report is surfaced so a model-call error is never silent.
-    // The raw one-shot closes its execution inside `run_turn`; unlike the
-    // staged pipeline it has no post-turn event phase before that terminal
-    // barrier. Keep machine streams strict by not dispatching an unframed
-    // reflection call after `Complete` (text retains the best-effort loop).
-    if format == OutputFormat::Text
+    if one_shot_reflection_enabled(format)
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
@@ -198,7 +194,7 @@ pub async fn run_goal_cmd(
     let provider = build_provider(cfg)?;
     let registry_options = registry_options(cfg);
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
+        new_tool_registry(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root)?;
     let active_rules =
@@ -385,6 +381,7 @@ pub(crate) async fn run_goal_turn(
         OutputFormat::Text,
         execution.clone(),
         cfg.provider.id.to_string(),
+        false,
     );
 
     let outcome = {
@@ -552,6 +549,7 @@ async fn run_goal_pipeline_turn(
         OutputFormat::Text,
         execution.clone(),
         cfg.provider.id.to_string(),
+        false,
     );
 
     // Run the loop; the result is folded into `goal_result` so there is exactly

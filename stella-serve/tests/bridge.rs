@@ -4,7 +4,7 @@
 //! this holds, wrapping a socket around it is transport plumbing.
 
 use serde_json::json;
-use stella_core::{BudgetGuard, EngineConfig};
+use stella_core::{BudgetGuard, EngineConfig, TurnOutcome};
 use stella_protocol::{
     BudgetMode, CompletionMessage, CompletionResult, CompletionUsage, ToolCall, ToolOutput,
     ToolSchema,
@@ -63,6 +63,30 @@ fn spec_for(prompt: &str) -> SessionSpec {
         config: EngineConfig::default(),
         budget: BudgetGuard::new(BudgetMode::Off, None, None),
     }
+}
+
+#[test]
+fn aborted_outcome_preserves_incurred_cost_on_wire() {
+    let wire = TurnOutcomeWire::from(TurnOutcome::Aborted {
+        reason: "budget exhausted".to_string(),
+        cost_usd: 1.25,
+    });
+
+    assert_eq!(
+        wire,
+        TurnOutcomeWire::Aborted {
+            reason: "budget exhausted".to_string(),
+            cost_usd: 1.25,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(wire).unwrap(),
+        json!({
+            "status": "aborted",
+            "reason": "budget exhausted",
+            "cost_usd": 1.25,
+        })
+    );
 }
 
 /// The full loop: model asks for a tool, the host runs it and answers, the model

@@ -3,6 +3,9 @@
 //! private surface (`CandidateSurface`, `Pipeline::gather_diff`, ...)
 //! stays reachable via `super::*`.
 
+mod management_accounting;
+mod telemetry;
+
 use super::*;
 use std::collections::VecDeque;
 use std::sync::Arc;

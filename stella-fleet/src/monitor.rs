@@ -82,15 +82,16 @@ pub struct SystemGhCli;
 #[async_trait]
 impl GhCli for SystemGhCli {
     async fn run(&self, args: &[&str]) -> Result<GhOutput, GhError> {
-        let output = tokio::process::Command::new("gh")
-            .args(args)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| GhError::Spawn {
-                command: args.join(" "),
-                reason: e.to_string(),
-            })?;
+        let mut command = tokio::process::Command::new("gh");
+        command.args(args).kill_on_drop(true);
+        stella_tools::subprocess_env::scrub_sensitive_env_except(
+            &mut command,
+            stella_tools::subprocess_env::GITHUB_CLI_AUTH_ENV_VARS,
+        );
+        let output = command.output().await.map_err(|e| GhError::Spawn {
+            command: args.join(" "),
+            reason: e.to_string(),
+        })?;
         Ok(GhOutput {
             success: output.status.success(),
             code: output.status.code(),

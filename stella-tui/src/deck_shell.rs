@@ -123,12 +123,17 @@ fn spawn_shell_command(
 
     tokio::spawn(async move {
         let started = std::time::Instant::now();
-        let spawned = tokio::process::Command::new("sh")
+        let mut command = tokio::process::Command::new("sh");
+        command
             .arg("-c")
             .arg(&cmd)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+            .stderr(Stdio::piped());
+        // `!` commands execute user/repository-controlled shell text. Keep
+        // normal task configuration but never inherit Stella/provider,
+        // repository, cloud, or tracker credentials.
+        scrub_shell_command(&mut command);
+        let spawned = command.spawn();
 
         let (ok, content) = match spawned {
             Ok(mut child) => {
@@ -191,6 +196,10 @@ fn spawn_shell_command(
             });
         }
     });
+}
+
+fn scrub_shell_command(command: &mut tokio::process::Command) {
+    stella_tools::subprocess_env::scrub_sensitive_env(command);
 }
 
 /// Streams a piped child stream into `buf`, chunk by chunk, so output is
@@ -478,6 +487,28 @@ pub async fn run_deck(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shell_child_cannot_receive_explicit_credentials() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "printf '%s|%s|%s|%s' \"${OPENROUTER_API_KEY-unset}\" \"${GITHUB_TOKEN-unset}\" \"${AWS_SECRET_ACCESS_KEY-unset}\" \"${STELLA_TEST_BENIGN-unset}\"",
+            ])
+            .env("OPENROUTER_API_KEY", "provider-secret")
+            .env("GITHUB_TOKEN", "repository-secret")
+            .env("AWS_SECRET_ACCESS_KEY", "cloud-secret")
+            .env("STELLA_TEST_BENIGN", "visible");
+        scrub_shell_command(&mut command);
+
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "unset|unset|unset|visible"
+        );
+    }
 
     #[test]
     fn capped_output_passes_short_text_through_unchanged() {

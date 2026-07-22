@@ -157,7 +157,6 @@ impl Tool for Grep {
 
         // Try ripgrep first — it's the fast path.
         let mut rg = Command::new("rg");
-        crate::exec::scrub_sensitive_env(&mut rg);
         rg.arg("--line-number")
             .arg("--no-heading")
             .arg("--color")
@@ -170,6 +169,7 @@ impl Tool for Grep {
         // with `-` — the everyday `->`, `--flag`, `-n` — is treated as the
         // search string, not parsed as an rg option.
         rg.arg("-e").arg(pattern).arg(&search_dir);
+        crate::subprocess_env::scrub_sensitive_env(&mut rg);
         rg.stdout(std::process::Stdio::piped());
         rg.stderr(std::process::Stdio::piped());
 
@@ -209,13 +209,13 @@ impl Tool for Grep {
             Err(_) => {
                 // rg not installed — fall back to grep
                 let mut grep = Command::new("grep");
-                crate::exec::scrub_sensitive_env(&mut grep);
                 grep.arg("-rn").arg("--color=never");
                 if let Some(g) = glob_filter {
                     grep.arg("--include").arg(g);
                 }
                 // `-e <pattern>` for the same leading-`-` safety as rg above.
                 grep.arg("-e").arg(pattern).arg(&search_dir);
+                crate::subprocess_env::scrub_sensitive_env(&mut grep);
                 grep.stdout(std::process::Stdio::piped());
                 grep.stderr(std::process::Stdio::piped());
 

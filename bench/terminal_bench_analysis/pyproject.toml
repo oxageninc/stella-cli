@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stella-terminal-bench-analysis"
+version = "0.1.0"
+description = "Reproducible audit and bootstrap analysis for Stella Terminal-Bench jobs"
+requires-python = ">=3.12"
+dependencies = ["harbor==0.6.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.6"]
+
+[project.scripts]
+stella-tb21-analyze = "tb21_analysis:main"
+stella-tb21-freeze-study-seed = "freeze_tb21_study_seed:main"
+stella-tb21-secret-scan = "artifact_secret_scan:main"
+stella-tb21-github-public-timing = "github_public_timing:main"
+
+[tool.setuptools]
+py-modules = [
+    "artifact_secret_scan",
+    "freeze_tb21_study_seed",
+    "github_public_timing",
+    "tb21_analysis",
+    "tb21_evidence_contract",
+    "tb21_hybrid_analysis",
+    "tb21_study_seed",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

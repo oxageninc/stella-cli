@@ -2,8 +2,8 @@
 
 Adapters for running the `stella` CLI on public coding benchmarks — head-to-head
 with other agents, and standalone. Everything here is **BYOK** (bring your own
-key), makes **no phone-home**, and never hard-codes a secret: credentials are
-read from the environment at run time.
+key), makes **no phone-home**, and never hard-codes a secret. Claim runs use a
+secure launcher that consumes the selected credential before Harbor starts.
 
 Three entry points:
 
@@ -13,16 +13,21 @@ Three entry points:
 | [`run_swebench.py`](run_swebench.py) | A standalone SWE-bench *prediction* harness — clone each instance, run Stella, emit the official predictions JSONL. No Harbor. | `git`, a provider key (Docker only for the official scoring step) |
 | [`smoke/smoke_test.py`](smoke/smoke_test.py) | An **offline, zero-cost** self-test of the adapter wiring for CI. | just the built `stella` binary |
 
-First, build the binary the adapters install:
+For development and the offline smoke test, build the native binary:
 
 ```bash
 cargo build --release -p stella-cli   # produces ./target/release/stella
 ```
 
+This ordinary build is not claim-eligible. A Harbor claim run requires the
+clean/pushed commit, full `STELLA_BUILD_GIT_SHA`, and the
+`x86_64-unknown-linux-gnu` glibc 2.17 artifact; use the exact
+[claim build procedure](harbor_adapter/README.md#install).
+
 ## Smoke test (no API key, no cost)
 
 Proves the CLI contract the adapters depend on — `--version`, `--help`,
-`models`, and the exact one-shot invocation shape — without spending a cent. A
+`models`, and the exact non-interactive invocation shape — without spending a cent. A
 missing provider key is treated as an **expected** condition (Stella exits
 cleanly with a credential error); only a real crash or a broken CLI contract
 fails the check. This is what CI runs.
@@ -38,20 +43,33 @@ python3 bench/smoke/smoke_test.py --stella-bin ./target/release/stella
 Terminal-Bench 2.x. The adapter is a *third-party* agent loaded by import path.
 
 ```bash
-pip install -e bench/harbor_adapter        # installs `harbor` + the adapter
-export ANTHROPIC_API_KEY=...               # or any provider Stella supports
-
-harbor run \
-  --dataset terminal-bench/terminal-bench-2-1 \
-  --agent-import-path stella_harbor:StellaAgent \
-  --model anthropic/claude-fable-5 \
-  --n-concurrent 4
+cd bench/harbor_adapter
+uv sync --locked --extra dev
 ```
 
-The adapter uploads the host's `stella` binary into each task container,
-installs it on `PATH`, provisions `rg`/`fd` when the host has them, runs Stella
-one-shot in JSON mode, and reports cost/tokens/model back to Harbor's result
-context. Model selection flows from Harbor's `--model` (or `STELLA_MODEL`).
+Use the single canonical, fail-closed claim command in the adapter's
+[Run section](harbor_adapter/README.md#run). It includes the frozen dataset
+digest, fully qualified Harbor task IDs, Docker environment, exact cross-built
+binary/source stamp, `$0.17` per-trial target, reflection opt-out, and venv
+interpreter. This overview deliberately does not duplicate that executable
+template.
+
+The secure launcher is mandatory for claim-eligible paid runs. It removes the
+credential from Harbor's environment before Compose interpolation and rejects
+config/env/custom-agent/custom-environment and run-time upload flags. Plain
+`harbor run` is development-only and cannot produce claim-eligible evidence.
+It also atomically reserves a never-before-used job directory and writes the
+launch receipt the analyzer gates; an existing job name is never resumed.
+Run locally, secret-scan the complete job tree with the active key, and only
+then publish it in a separate key-free command.
+
+The adapter uploads only the host's frozen `stella` binary into each task
+container and installs it on `PATH`; it never adds host utilities such as
+`rg` or `fd`, so the canonical task image remains the utility authority. It
+runs Stella non-interactively in `stream-json` mode and reports
+cost/tokens/model back to Harbor's result context. For claim runs, model
+selection comes only from each literal Harbor `--model provider/model_id`
+argument; ambient `STELLA_MODEL` is not accepted by the secure launcher.
 
 **Z.ai (GLM) coding plans:** set
 `STELLA_BASE_URL=https://api.z.ai/api/coding/paas/v4` — the endpoint must

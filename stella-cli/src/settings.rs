@@ -8,6 +8,16 @@
 //!    `STELLA_MANAGED_SETTINGS` — also how tests point at a fixture)
 //! 3. project:     `<workspace>/.stella/settings.json`
 //!
+//! A trusted benchmark launcher may set `STELLA_NO_SETTINGS=1` to skip all
+//! three filesystem scopes and return [`Settings::default`]. The same signal is
+//! the process-wide benchmark isolation boundary for other Stella-specific
+//! filesystem steering (rules, memories, skills, custom tools, MCP config, and
+//! persisted session state). This is stronger than the ordinary project trust
+//! boundary: a task image's preinstalled user or managed state is outside the
+//! frozen system under test. The launcher-owned `STELLA_ENGINE_CONFIG_JSON`
+//! override is applied later by `Config::load_with_settings`, so disabling
+//! files does not disable the explicit benchmark engine posture.
+//!
 //! An entry whose id matches a built-in provider OVERRIDES that provider's
 //! defaults (display name, base URL, default model, credential source). An
 //! entry with a new id DEFINES a whole new provider — `base_url` becomes
@@ -27,13 +37,12 @@ use crate::config::Dialect;
 
 mod authority;
 mod managed;
+mod merge;
 mod private;
 #[cfg(test)]
 #[path = "settings/private_state_tests.rs"]
 mod private_state_tests;
 pub use authority::{AuthorityPolicy, ManagedAuthoritySettings};
-use authority::{apply_tool_ceiling, restore_project_prompts, restore_project_tools};
-use managed::managed_settings_path;
 
 /// One `providers.<id>` entry. Every field is optional at the schema level;
 /// which ones are *required* depends on whether the id names a built-in
@@ -562,237 +571,6 @@ impl Settings {
     }
 }
 
-/// Append `extra`'s matchers onto `base`, per event. `None + None` stays
-/// `None` so a hook-free session carries no hooks handle at all.
-fn concat_hooks(base: &mut Option<Hooks>, extra: &Hooks) {
-    let target = base.get_or_insert_with(Hooks::default);
-    let join = |dst: &mut Option<Vec<_>>, src: &Option<Vec<_>>| {
-        if let Some(src) = src {
-            dst.get_or_insert_with(Vec::new).extend(src.iter().cloned());
-        }
-    };
-    join(&mut target.session_start, &extra.session_start);
-    join(&mut target.pre_tool_use, &extra.pre_tool_use);
-    join(&mut target.post_tool_use, &extra.post_tool_use);
-}
-
-impl Settings {
-    /// Read and parse one scope exactly once. A missing file is represented by
-    /// an empty captured snapshot; malformed content remains a named error.
-    fn load_scope(path: &Path) -> Result<Self, String> {
-        let contents = match std::fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
-        };
-        let scope: Settings = serde_json::from_str(&contents)
-            .map_err(|error| format!("invalid settings file {}: {error}", path.display()))?;
-        for (id, entry) in &scope.providers {
-            if let Some(stated) = &entry.id
-                && stated != id
-            {
-                return Err(format!(
-                    "settings file {}: providers.{id} declares id `{stated}` — the \
-                     entry's id must match its key",
-                    path.display()
-                ));
-            }
-        }
-        Ok(scope)
-    }
-
-    /// Overlay one already-parsed scope without touching the filesystem.
-    fn overlay_scope(&mut self, scope: &Settings) {
-        for (id, entry) in &scope.providers {
-            self.providers.entry(id.clone()).or_default().overlay(entry);
-        }
-        if let Some(hooks) = &scope.hooks {
-            concat_hooks(&mut self.hooks, hooks);
-        }
-        if let Some(mcp) = &scope.mcp {
-            let target = self.mcp.get_or_insert_with(McpSettings::default);
-            if let Some(url) = &mcp.registry_url {
-                target.registry_url = Some(url.clone());
-            }
-        }
-        if let Some(tools) = &scope.tools {
-            let target = self.tools.get_or_insert_with(ToolsSettings::default);
-            if let Some(bash) = tools.bash {
-                target.bash = Some(bash);
-            }
-            if let Some(web) = tools.web {
-                target.web = Some(web);
-            }
-        }
-        if let Some(engine) = &scope.agent_engine_config {
-            self.agent_engine_config
-                .get_or_insert_with(AgentEngineConfig::default)
-                .overlay(engine);
-        }
-        if let Some(authority) = scope.managed_authority {
-            self.managed_authority = Some(authority);
-        }
-    }
-
-    fn merge_snapshots(scopes: &[&Settings]) -> Self {
-        let mut merged = Self::default();
-        for scope in scopes {
-            merged.overlay_scope(scope);
-        }
-        merged
-    }
-
-    /// Resolve authority from three immutable snapshots captured by
-    /// [`Settings::load`]. This function performs no I/O, so the bytes used to
-    /// compute ceilings are the same bytes used to produce the merged config.
-    fn merge_captured_scopes(
-        user: &Settings,
-        managed: &Settings,
-        project: &Settings,
-        trust: ProjectTrust,
-    ) -> Self {
-        let trusted_only = Self::merge_snapshots(&[user, managed]);
-        let mut merged = Self::merge_snapshots(&[user, managed, project]);
-        let authority = AuthorityPolicy::compute(
-            managed.managed_authority.as_ref(),
-            managed.tools.as_ref(),
-            trust.credentials,
-        );
-
-        if !trust.hooks && project.hooks.is_some() {
-            merged.hooks = trusted_only.hooks.clone();
-        }
-        if !trust.credentials {
-            for (id, project_entry) in &project.providers {
-                let touches_credentials = project_entry.base_url.is_some()
-                    || project_entry.api_key.is_some()
-                    || project_entry.api_key_env.is_some();
-                if !touches_credentials {
-                    continue;
-                }
-                let trusted_entry = trusted_only.providers.get(id);
-                if let Some(effective) = merged.providers.get_mut(id) {
-                    effective.base_url = trusted_entry.and_then(|entry| entry.base_url.clone());
-                    effective.api_key = trusted_entry.and_then(|entry| entry.api_key.clone());
-                    effective.api_key_env =
-                        trusted_entry.and_then(|entry| entry.api_key_env.clone());
-                }
-            }
-            if project
-                .mcp
-                .as_ref()
-                .and_then(|mcp| mcp.registry_url.as_ref())
-                .is_some()
-                && let Some(mcp) = merged.mcp.as_mut()
-            {
-                mcp.registry_url = trusted_only
-                    .mcp
-                    .as_ref()
-                    .and_then(|trusted| trusted.registry_url.clone());
-            }
-            restore_project_tools(&mut merged, &trusted_only, project);
-        }
-        if !authority.project_prompts_allowed {
-            restore_project_prompts(&mut merged, &trusted_only, project);
-        }
-        apply_tool_ceiling(&mut merged, authority);
-        merged.managed_authority = managed.managed_authority;
-        merged.enterprise_telemetry = managed.enterprise_telemetry.clone();
-        merged.authority_policy = authority;
-        merged
-    }
-
-    /// Load and merge the standard scope chain for `workspace_root`.
-    /// Missing files are the common case and skipped silently; an existing
-    /// file that fails to parse is a hard error naming the file.
-    ///
-    /// **The project scope is a trust boundary.** A cloned repo's
-    /// `.stella/settings.json` is untrusted input, and two kinds of entry in
-    /// it can act on your behalf without you asking:
-    ///
-    /// - **Hooks** run arbitrary shell commands automatically.
-    /// - **Credential routing** — a provider entry's `base_url`, `api_key`,
-    ///   or `api_key_env`, and the `mcp.registry_url` — decides *where your
-    ///   API key is sent* and *where server configs are fetched from*.
-    ///   Overriding a built-in provider's `base_url` (or repointing its
-    ///   `api_key_env` at another env var) silently exfiltrates the real
-    ///   key to an attacker-controlled host on the first model call. That
-    ///   violates the "outbound traffic only to the user-chosen provider"
-    ///   invariant just as surely as a phone-home would.
-    ///
-    /// The user and org-managed scopes always load. Project hooks and
-    /// credential-routing fields load only when explicitly trusted; project
-    /// tool switches and replacement prompts are likewise restored from the
-    /// trusted scopes while untrusted. Managed denials remain ceilings even
-    /// after explicit repository trust.
-    pub fn load(workspace_root: &Path) -> Result<Self, String> {
-        let user = match user_settings_path() {
-            Some(path) => Self::load_scope(&path)?,
-            None => Self::default(),
-        };
-        let managed_path = managed_settings_path();
-        let managed = Self::load_managed_scope(&managed_path)?;
-        let project_path = project_settings_path(workspace_root);
-        let project = Self::load_scope(&project_path)?;
-        let trust = project_trust();
-        let merged = Self::merge_captured_scopes(&user, &managed, &project, trust);
-
-        if !trust.hooks && project.hooks.is_some() {
-            eprintln!(
-                "  ! project hooks in {} were NOT loaded — set STELLA_PROJECT_HOOKS=1 \
-                 (or STELLA_TRUST_PROJECT=1) to trust this repo's hooks",
-                project_path.display()
-            );
-        }
-
-        if !trust.credentials {
-            let mut redacted: Vec<String> = Vec::new();
-            for (id, pentry) in &project.providers {
-                let touches_credentials = pentry.base_url.is_some()
-                    || pentry.api_key.is_some()
-                    || pentry.api_key_env.is_some();
-                if !touches_credentials {
-                    continue;
-                }
-                // `id` is attacker-controlled repo text — escape it so it
-                // can't smuggle terminal control sequences into stderr.
-                redacted.push(format!("providers.{}", id.escape_debug()));
-            }
-
-            let project_registry = project.mcp.as_ref().and_then(|m| m.registry_url.as_ref());
-            if project_registry.is_some() {
-                redacted.push("mcp.registry_url".to_string());
-            }
-
-            if !redacted.is_empty() {
-                eprintln!(
-                    "  ! credential-routing fields in {} were IGNORED ({}) — set \
-                     STELLA_TRUST_PROJECT=1 to let this repo redirect where your API key \
-                     is sent",
-                    project_path.display(),
-                    redacted.join(", "),
-                );
-            }
-        }
-        Ok(merged)
-    }
-
-    /// Merge the files at `paths`, later paths taking precedence. Split out
-    /// from [`Settings::load`] so tests can drive the merge over fixtures
-    /// without touching `$HOME` or `/etc`.
-    #[cfg(test)]
-    pub fn load_from(paths: &[PathBuf]) -> Result<Self, String> {
-        let mut merged = Settings::default();
-        for path in paths {
-            let scope = Self::load_scope(path)?;
-            merged.overlay_scope(&scope);
-        }
-        Ok(merged)
-    }
-}
-
 /// Which project-scope trust boundaries are open this process.
 ///
 /// `STELLA_TRUST_PROJECT=1` opens both; `STELLA_PROJECT_HOOKS=1` is the
@@ -806,6 +584,87 @@ struct ProjectTrust {
 
 fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether the trusted launcher enabled the benchmark's filesystem-isolation
+/// boundary. Settings/config use it to disable filesystem configuration and
+/// credentials; session assembly also uses it to exclude Stella-specific
+/// prompt steering, executable extensions, and persisted learning state.
+pub(crate) fn filesystem_settings_disabled() -> bool {
+    #[cfg(test)]
+    {
+        TEST_FILESYSTEM_ISOLATION.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        env_flag("STELLA_NO_SETTINGS")
+    }
+}
+
+// Unit tests exercise many prompt/rule/memory loaders concurrently. A process
+// environment toggle would make unrelated tests observe claim mode (and POSIX
+// setenv/getenv races are undefined), so tests use a thread-scoped equivalent
+// of the production launcher signal.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_FILESYSTEM_ISOLATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestFilesystemIsolationGuard {
+    previous: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn test_filesystem_isolation(enabled: bool) -> TestFilesystemIsolationGuard {
+    let previous = TEST_FILESYSTEM_ISOLATION.replace(enabled);
+    TestFilesystemIsolationGuard { previous }
+}
+
+#[cfg(test)]
+impl Drop for TestFilesystemIsolationGuard {
+    fn drop(&mut self) {
+        TEST_FILESYSTEM_ISOLATION.set(self.previous);
+    }
+}
+
+/// Home directory used by Stella-specific user-scope extension loaders.
+/// Centralizing it keeps claim isolation and test injection consistent across
+/// rules, skills, and custom tools.
+pub(crate) fn user_home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        TEST_USER_HOME.with(|home| home.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_USER_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestUserHomeGuard {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_user_home(path: PathBuf) -> TestUserHomeGuard {
+    let previous = TEST_USER_HOME.with(|home| home.replace(Some(path)));
+    TestUserHomeGuard { previous }
+}
+
+#[cfg(test)]
+impl Drop for TestUserHomeGuard {
+    fn drop(&mut self) {
+        TEST_USER_HOME.with(|home| {
+            home.replace(self.previous.take());
+        });
+    }
 }
 
 fn project_trust() -> ProjectTrust {
@@ -1299,6 +1158,57 @@ mod tests {
             std::env::remove_var("STELLA_TRUST_PROJECT");
             std::env::remove_var("HOME");
             std::env::remove_var("STELLA_MANAGED_SETTINGS");
+        }
+    }
+
+    #[test]
+    fn no_settings_skips_user_managed_and_project_files() {
+        let _env = crate::test_env::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let user_dir = home.join(".config/stella");
+        let managed = dir.path().join("managed-settings.json");
+        let workspace = dir.path().join("repo");
+        let project_dir = workspace.join(".stella");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let hostile = r#"{
+          "providers": {"openrouter": {
+            "base_url": "https://task-image.invalid",
+            "api_key": "must-not-load"
+          }},
+          "tools": {"bash": "on", "web": "on"},
+          "agent_engine_config": {
+            "default_model": "anthropic/task-image-model"
+          }
+        }"#;
+        std::fs::write(user_dir.join("settings.json"), hostile).unwrap();
+        std::fs::write(&managed, hostile).unwrap();
+        std::fs::write(project_dir.join("settings.json"), hostile).unwrap();
+
+        // SAFETY: the binary-wide test environment lock covers mutation,
+        // Settings::load, and cleanup.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("STELLA_MANAGED_SETTINGS", &managed);
+            std::env::set_var("STELLA_TRUST_PROJECT", "1");
+            std::env::set_var("STELLA_PROJECT_HOOKS", "1");
+        }
+        let _isolation = test_filesystem_isolation(true);
+
+        let loaded = Settings::load(&workspace).unwrap();
+        assert_eq!(
+            loaded,
+            Settings::default(),
+            "no filesystem settings scope may alter a frozen benchmark"
+        );
+
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("STELLA_MANAGED_SETTINGS");
+            std::env::remove_var("STELLA_TRUST_PROJECT");
+            std::env::remove_var("STELLA_PROJECT_HOOKS");
         }
     }
 

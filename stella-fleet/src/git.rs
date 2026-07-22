@@ -106,6 +106,7 @@ impl GitCli for SystemGitCli {
         ] {
             cmd.env_remove(var);
         }
+        stella_tools::subprocess_env::scrub_sensitive_env(&mut cmd);
         cmd.kill_on_drop(true);
         let output = cmd.output().await.map_err(|e| GitError::Spawn {
             command: args.join(" "),

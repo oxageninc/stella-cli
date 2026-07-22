@@ -11,6 +11,37 @@ use stella_pipeline::{
     TestRunner,
 };
 
+/// Apply the cross-crate policy shared by every model/repository-controlled
+/// subprocess. Kept as a named seam so the CLI's pipeline-only spawns have a
+/// direct regression test rather than relying only on stella-tools tests.
+fn scrub_model_subprocess(command: &mut tokio::process::Command) {
+    stella_tools::subprocess_env::scrub_sensitive_env(command);
+}
+
+/// The single filesystem-isolation seam for developer script-tool discovery.
+/// Both the session stack and candidate workspaces use this exact report.
+#[cfg(test)]
+pub(crate) fn custom_tool_report_for_workspace(
+    root: &std::path::Path,
+) -> stella_tools::custom::DiscoveryReport {
+    custom_tool_report_for_scopes(root, true)
+}
+
+/// Discover only the custom-tool scopes permitted by the current authority.
+/// Filesystem-isolated benchmark runs omit both workspace and user-global
+/// executable extensions regardless of the ordinary authority policy.
+pub(crate) fn custom_tool_report_for_scopes(
+    root: &std::path::Path,
+    include_workspace: bool,
+) -> stella_tools::custom::DiscoveryReport {
+    if crate::settings::filesystem_settings_disabled() {
+        stella_tools::custom::DiscoveryReport::default()
+    } else {
+        let home = crate::settings::user_home_dir();
+        stella_tools::custom::discover_in_scopes(root, home.as_deref(), include_workspace)
+    }
+}
+
 /// Repo-structure summary via `git ls-files` for the planner's split context.
 pub(crate) struct GitRepoStructure {
     pub(crate) root: std::path::PathBuf,
@@ -20,12 +51,12 @@ pub(crate) struct GitRepoStructure {
 impl RepoStructurePort for GitRepoStructure {
     async fn structure_summary(&self) -> String {
         let mut cmd = tokio::process::Command::new("git");
-        stella_tools::exec::scrub_sensitive_env(&mut cmd);
         cmd.args(["ls-files"]).current_dir(&self.root);
         // Hook-exported GIT_* vars must not re-target this at another repo.
         for var in stella_tools::exec::GIT_REPO_ENV_VARS {
             cmd.env_remove(var);
         }
+        scrub_model_subprocess(&mut cmd);
         let output = cmd.output().await;
         match output {
             Ok(out) if out.status.success() => {
@@ -53,7 +84,6 @@ impl RepoStatusPort for GitRepoStatus {
         // `-z` NUL-delimits paths (robust to spaces/newlines); quotePath off
         // keeps non-ASCII literal. Full stdout is read — never truncated.
         let mut cmd = tokio::process::Command::new("git");
-        stella_tools::exec::scrub_sensitive_env(&mut cmd);
         cmd.args([
             "-c",
             "core.quotePath=false",
@@ -67,6 +97,7 @@ impl RepoStatusPort for GitRepoStatus {
         for var in stella_tools::exec::GIT_REPO_ENV_VARS {
             cmd.env_remove(var);
         }
+        scrub_model_subprocess(&mut cmd);
         let output = cmd.output().await;
         let Ok(listing) = output else {
             return out;
@@ -276,22 +307,8 @@ pub(crate) fn workspace_ports(
     // The candidate registry mirrors the session's custom tool surface —
     // discovered from the same root, so a candidate sees exactly the custom
     // tools the session does (re-rooted at its snapshot at create time).
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let custom_tools = stella_tools::custom::discover_in_scopes(
-        &root,
-        home.as_deref(),
-        cfg.authority.project_custom_tools_allowed,
-    )
-    .tools;
-    let mut candidate_workspaces = crate::candidate_ws::GitCandidateWorkspaces::new(
-        root.clone(),
-        registry_options,
-        custom_tools,
-        active_rules,
-    );
-    if let Some(mcp) = &mcp {
-        candidate_workspaces = candidate_workspaces.with_candidate_mcp(Arc::clone(mcp));
-    }
+    let custom_tools =
+        custom_tool_report_for_scopes(&root, cfg.authority.project_custom_tools_allowed).tools;
     Ok(WorkspacePorts {
         repo_structure: GitRepoStructure { root: root.clone() },
         repo_status: GitRepoStatus { root: root.clone() },
@@ -323,7 +340,6 @@ impl TestRunner for TypedTestRunner {
 
 fn test_process(invocation: &TestInvocation, root: &std::path::Path) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&invocation.program);
-    stella_tools::exec::scrub_sensitive_env(&mut cmd);
     cmd.args(&invocation.args)
         .current_dir(root)
         .env("PWD", root);
@@ -922,5 +938,48 @@ mod tests {
             assert_eq!(provider, expected_calls, "provider row {name}");
             assert_eq!(is_error, !allowed, "output row {name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod benchmark_tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_test_command_uses_central_credential_scrub_policy() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .env("OPENROUTER_API_KEY", "provider-secret")
+            .env("GITHUB_TOKEN", "repo-secret")
+            .env("AWS_SECRET_ACCESS_KEY", "cloud-secret")
+            .env("STELLA_TEST_BENIGN", "visible");
+
+        scrub_model_subprocess(&mut command);
+
+        let overrides: std::collections::HashMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(std::ffi::OsStr::to_os_string),
+                )
+            })
+            .collect();
+        for secret in [
+            "OPENROUTER_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert_eq!(
+                overrides.get(secret),
+                Some(&None),
+                "{secret} was not removed"
+            );
+        }
+        assert_eq!(
+            overrides["STELLA_TEST_BENIGN"].as_deref(),
+            Some(std::ffi::OsStr::new("visible"))
+        );
     }
 }

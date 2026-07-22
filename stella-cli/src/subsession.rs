@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use stella_core::Engine;
 use stella_core::tasks::SpawnRequest;
 use stella_protocol::{AgentEvent, CompletionMessage, TaskItem};
-use stella_tools::{RegistryOptions, ToolRegistry};
+use stella_tools::RegistryOptions;
 use stella_tui::{AgentMeta, AgentStatus, Inbound};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::{oneshot, watch};
@@ -402,7 +402,7 @@ async fn run_worker(
         Ok(p) => p,
         Err(e) => return (None, 0.0, WorkerEnd::Failed(e)),
     };
-    let registry = ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options).await;
+    let registry = agent::new_tool_registry(cfg.workspace_root.clone(), registry_options).await;
     if let Err(error) = agent::populate_schema_index(&registry, &cfg.workspace_root) {
         return (None, 0.0, WorkerEnd::Failed(error));
     }

@@ -120,7 +120,14 @@ pub trait RepoBackend: Send + Sync {
 }
 
 /// The `git` CLI adapter — direct argv spawns through the shared runner
-/// (process-group kill, `GIT_*` repo-env scrubbing, output truncation).
+/// (process-group kill, `GIT_*` repo-env scrubbing, credential scrubbing,
+/// output truncation).
+///
+/// Remote operations intentionally do not preserve environment-token auth.
+/// Push can execute repository-controlled hooks and credential helpers, so an
+/// AWS/GitHub token allowlist here would expose those secrets to untrusted
+/// code. SSH agents and OS/configured credential helpers continue to work;
+/// environment-only SCM auth requires a future isolated credential broker.
 pub struct GitCli;
 
 impl GitCli {

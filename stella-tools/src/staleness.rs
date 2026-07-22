@@ -169,11 +169,11 @@ pub fn freshness_sync(
 /// Synchronous [`git_head`], same `GIT_*` hygiene.
 pub fn git_head_sync(root: &Path) -> Option<String> {
     let mut cmd = std::process::Command::new("git");
-    crate::exec::scrub_sensitive_std_env(&mut cmd);
     cmd.args(["rev-parse", "HEAD"]).current_dir(root);
     for var in crate::exec::GIT_REPO_ENV_VARS {
         cmd.env_remove(var);
     }
+    crate::subprocess_env::scrub_sensitive_std_env(&mut cmd);
     let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
@@ -184,11 +184,11 @@ pub fn git_head_sync(root: &Path) -> Option<String> {
 
 fn worktree_clean_sync(root: &Path) -> bool {
     let mut cmd = std::process::Command::new("git");
-    crate::exec::scrub_sensitive_std_env(&mut cmd);
     cmd.args(["status", "--porcelain"]).current_dir(root);
     for var in crate::exec::GIT_REPO_ENV_VARS {
         cmd.env_remove(var);
     }
+    crate::subprocess_env::scrub_sensitive_std_env(&mut cmd);
     match cmd.output() {
         Ok(out) => out.status.success() && out.stdout.iter().all(|b| b.is_ascii_whitespace()),
         Err(_) => false,
@@ -200,11 +200,11 @@ fn worktree_clean_sync(root: &Path) -> bool {
 /// [`crate::exploration`], now shared).
 pub async fn git_head(root: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new("git");
-    crate::exec::scrub_sensitive_env(&mut cmd);
     cmd.args(["rev-parse", "HEAD"]).current_dir(root);
     for var in crate::exec::GIT_REPO_ENV_VARS {
         cmd.env_remove(var);
     }
+    crate::subprocess_env::scrub_sensitive_env(&mut cmd);
     let output = cmd.output().await.ok()?;
     if !output.status.success() {
         return None;
@@ -217,11 +217,11 @@ pub async fn git_head(root: &Path) -> Option<String> {
 /// the head-match short-circuit. Any failure to ask counts as dirty.
 async fn worktree_clean(root: &Path) -> bool {
     let mut cmd = tokio::process::Command::new("git");
-    crate::exec::scrub_sensitive_env(&mut cmd);
     cmd.args(["status", "--porcelain"]).current_dir(root);
     for var in crate::exec::GIT_REPO_ENV_VARS {
         cmd.env_remove(var);
     }
+    crate::subprocess_env::scrub_sensitive_env(&mut cmd);
     match cmd.output().await {
         Ok(out) => out.status.success() && out.stdout.iter().all(|b| b.is_ascii_whitespace()),
         Err(_) => false,

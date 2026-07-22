@@ -36,6 +36,10 @@ pub mod schema_gate;
 pub mod screenshot;
 pub mod scripts;
 pub mod staleness;
+/// Shared environment policy for every subprocess that can execute model- or
+/// repository-controlled code. Downstream Stella crates must use this rather
+/// than maintaining a second, drifting credential deny-list.
+pub mod subprocess_env;
 pub mod tasks;
 pub mod tracker_auth;
 pub mod validate;

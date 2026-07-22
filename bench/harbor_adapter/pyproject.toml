@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stella-harbor"
-version = "0.3.0"
+version = "0.6.0"
 description = "Harbor installed-agent adapter for the Stella coding CLI"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Oxagen", email = "dev@oxagen.sh" }]
 keywords = ["benchmark", "harbor", "stella", "terminal-bench", "swe-bench"]
@@ -17,18 +17,16 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Testing",
 ]
 
-# Harbor is the runtime that loads this adapter. It is intentionally NOT
-# pinned to a narrow range: the adapter targets the stable BaseInstalledAgent
-# surface and degrades defensively across versions. Install it yourself
-# (`pip install harbor`) or let this dependency pull it.
-dependencies = ["harbor>=0.6"]
+# The secure anonymous-FD runner mirrors Harbor 0.6.1's Docker Compose exec
+# internals because that release's public BaseEnvironment API cannot accept
+# stdin bytes. Pin the benchmark runtime rather than silently falling back to
+# an environment-variable credential on a drifting implementation.
+dependencies = ["harbor==0.6.1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "ruff>=0.6"]
@@ -36,6 +34,9 @@ dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "ruff>=0.6"]
 [project.urls]
 Homepage = "https://github.com/macanderson/stella"
 Repository = "https://github.com/macanderson/stella"
+
+[project.scripts]
+stella-harbor-secure = "stella_harbor.secure_launcher:main"
 
 [tool.setuptools]
 packages = ["stella_harbor"]

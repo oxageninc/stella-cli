@@ -3,6 +3,43 @@ use crate::config::{ConfiguredProvider, PROVIDERS, ProviderConfig};
 use stella_model::credential::ApiKey;
 use stella_pipeline::CandidateWorkspacePort;
 
+#[test]
+fn one_shot_reflection_defaults_on_for_every_output_format() {
+    let _env = crate::test_env::lock();
+    // SAFETY: the shared test env lock serializes every Stella test that
+    // mutates or reads process environment state.
+    unsafe { std::env::remove_var(DISABLE_REFLECTION_ENV) };
+
+    assert!(one_shot_reflection_enabled(OutputFormat::Text));
+    assert!(one_shot_reflection_enabled(OutputFormat::Json));
+    assert!(one_shot_reflection_enabled(OutputFormat::StreamJson));
+}
+
+#[test]
+fn explicit_reflection_opt_out_suppresses_every_one_shot_format() {
+    let _env = crate::test_env::lock();
+    // SAFETY: the shared test env lock serializes every Stella test that
+    // mutates or reads process environment state.
+    unsafe { std::env::set_var(DISABLE_REFLECTION_ENV, "  YeS  ") };
+
+    assert!(!one_shot_reflection_enabled(OutputFormat::Text));
+    assert!(!one_shot_reflection_enabled(OutputFormat::Json));
+    assert!(!one_shot_reflection_enabled(OutputFormat::StreamJson));
+
+    // SAFETY: still inside the shared test env critical section.
+    unsafe { std::env::remove_var(DISABLE_REFLECTION_ENV) };
+}
+
+#[test]
+fn reflection_opt_out_uses_explicit_truthy_values() {
+    for value in ["1", "true", "TRUE", " yes ", "On"] {
+        assert!(is_truthy_env_value(value), "{value:?} should be truthy");
+    }
+    for value in ["", "0", "false", "no", "off", "disabled", "2"] {
+        assert!(!is_truthy_env_value(value), "{value:?} should be falsey");
+    }
+}
+
 /// The store write path for `StepUsage`: every token field on the event
 /// — cache writes included — lands in the telemetry row verbatim.
 /// Regression for issue #97, where `cache_write_tokens` was hard-coded
@@ -16,8 +53,8 @@ fn persist_event_records_cache_write_tokens_from_step_usage() {
         .expect("begin execution");
     let event = AgentEvent::StepUsage {
         step: 0,
-        role: stella_protocol::ModelCallRole::Worker,
-        provider: "anthropic".into(),
+        purpose: None,
+        output_text: None,
         model: "claude-fable-5".into(),
         input_tokens: 1_000,
         output_tokens: 50,
@@ -386,6 +423,159 @@ fn system_prompt_carries_the_workspace_maps_index() {
     assert!(!empty.contains("## Workspace maps"));
 }
 
+#[test]
+fn benchmark_gate_excludes_hostile_filesystem_steering_and_extensions() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let home = tempfile::tempdir().expect("home");
+    let root = workspace.path();
+    let dot_stella = root.join(".stella");
+
+    for (path, body) in [
+        (
+            dot_stella.join("memories/hostile.md"),
+            "HOSTILE_WORKSPACE_MEMORY",
+        ),
+        (dot_stella.join("rules/hostile.md"), "HOSTILE_STELLA_RULE"),
+        (
+            root.join(".claude/rules/hostile-claude.md"),
+            "HOSTILE_CLAUDE_RULE",
+        ),
+        (
+            dot_stella.join("skills/hostile/SKILL.md"),
+            "---\nname: hostile-workspace-skill\ndescription: hostile workspace skill\n---\nHOSTILE_WORKSPACE_SKILL",
+        ),
+        (
+            home.path().join(".config/stella/rules/hostile-user.md"),
+            "HOSTILE_USER_RULE",
+        ),
+        (
+            home.path()
+                .join(".config/stella/skills/hostile-user/SKILL.md"),
+            "---\nname: hostile-user-skill\ndescription: hostile user skill\n---\nHOSTILE_USER_SKILL",
+        ),
+    ] {
+        std::fs::create_dir_all(path.parent().expect("fixture parent")).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    for (path, name) in [
+        (
+            dot_stella.join("tools/hostile.toml"),
+            "hostile_workspace_tool",
+        ),
+        (
+            home.path().join(".config/stella/tools/hostile.toml"),
+            "hostile_user_tool",
+        ),
+    ] {
+        std::fs::create_dir_all(path.parent().expect("tool fixture parent")).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "name = \"{name}\"\ndescription = \"must not load\"\ncommand = [\"sh\", \"-c\", \"exit 99\"]\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    std::fs::write(
+        dot_stella.join("mcp.toml"),
+        "[servers.hostile]\ntransport = \"stdio\"\ncmd = \"sh\"\nargs = [\"-c\", \"exit 98\"]\n",
+    )
+    .unwrap();
+    let context_bytes = b"HOSTILE_CONTEXT_DB";
+    let store_bytes = b"HOSTILE_STORE_DB";
+    std::fs::write(dot_stella.join("context.db"), context_bytes).unwrap();
+    std::fs::write(dot_stella.join("store.db"), store_bytes).unwrap();
+
+    let _home = crate::settings::test_user_home(home.path().to_path_buf());
+    let isolation = crate::settings::test_filesystem_isolation(true);
+
+    let mut cfg = cfg_for("zai");
+    cfg.workspace_root = root.to_path_buf();
+    cfg.authority.project_prompts_allowed = true;
+
+    let rules = crate::rules::load_workspace_rules(root, &cfg.authority);
+    let prompt = build_pipeline_system_prompt(&cfg, root, &rules);
+    let skills = crate::memory::load_workspace_skills(root);
+    let custom_tools = custom_tool_report_for_workspace(root).tools;
+    let memory = SessionMemory::open(root, false);
+    let store = open_store(root);
+    let mcp = load_mcp_plan(&cfg);
+
+    let registry = ToolRegistry::with_backends_and_options(
+        root.to_path_buf(),
+        None,
+        None,
+        registry_options(&cfg),
+    );
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let interactive = InteractiveToolSet::new(&registry, event_tx, default_ask_io(false));
+    let interactive = match skill_registry_for_run(root.to_path_buf()) {
+        Some(registry) => interactive.with_skill_registry(registry),
+        None => interactive,
+    };
+    let discovery = crate::discovery::DiscoveryToolSet::new(&interactive, root.to_path_buf());
+    let schema_names: Vec<String> = discovery
+        .schemas()
+        .into_iter()
+        .map(|schema| schema.name)
+        .collect();
+
+    assert_eq!(prompt, PIPELINE_SYSTEM_PROMPT);
+    assert!(rules.is_empty(), "rules loaded under benchmark isolation");
+    assert!(skills.is_empty(), "skills loaded under benchmark isolation");
+    assert!(
+        custom_tools.is_empty(),
+        "custom tools loaded under benchmark isolation"
+    );
+    assert!(memory.is_none(), "context memory opened under isolation");
+    assert!(
+        store.is_none(),
+        "workspace telemetry store opened under isolation"
+    );
+    assert!(matches!(mcp, McpPlan::None));
+    assert!(schema_names.iter().any(|name| name == "tool_search"));
+    for forbidden in [
+        "skill_search",
+        "mcp_search",
+        "search_skills",
+        "install_skill",
+        "hostile_workspace_tool",
+        "hostile_user_tool",
+    ] {
+        assert!(
+            !schema_names.iter().any(|name| name == forbidden),
+            "{forbidden} leaked into the isolated tool schema: {schema_names:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(dot_stella.join("context.db")).unwrap(),
+        context_bytes
+    );
+    assert_eq!(
+        std::fs::read(dot_stella.join("store.db")).unwrap(),
+        store_bytes
+    );
+
+    // Dropping only the isolation signal proves normal product behavior is
+    // unchanged against the exact same workspace/user fixtures.
+    drop(isolation);
+    let normal_rules = crate::rules::load_workspace_rules(root, &cfg.authority);
+    let normal_prompt = build_pipeline_system_prompt(&cfg, root, &normal_rules);
+    let normal_skills = crate::memory::load_workspace_skills(root);
+    let normal_custom_tools = custom_tool_report_for_workspace(root).tools;
+    assert!(normal_prompt.contains("HOSTILE_WORKSPACE_MEMORY"));
+    assert!(normal_prompt.contains("HOSTILE_STELLA_RULE"));
+    assert!(normal_prompt.contains("HOSTILE_CLAUDE_RULE"));
+    assert!(normal_prompt.contains("HOSTILE_USER_RULE"));
+    assert!(!normal_rules.is_empty());
+    assert_eq!(normal_skills.len(), 2);
+    assert_eq!(normal_custom_tools.len(), 2);
+    assert!(skill_registry_for_run(root.to_path_buf()).is_some());
+    assert!(matches!(load_mcp_plan(&cfg), McpPlan::Invalid(_)));
+}
+
 /// A `Config` selecting `provider_id` at its default model, with a dummy
 /// key. `build_provider` only constructs the adapter (no network call),
 /// so the key is never used.
@@ -540,7 +730,7 @@ fn non_tty_text_run_wiring_stays_headless_and_json_run_wiring_never_bypasses_sco
     // config must stay headless.
     let text_capability = approval_capability_for(true, false, false);
     let text_config =
-        pipeline_config_for_approval_capability(&cfg, text_capability, None, &model_ref);
+        pipeline_config_for_approval_capability(&cfg, text_capability, &model_ref, None);
     assert_ne!(
         text_capability,
         PipelineApprovalCapability::Stdio,
@@ -556,7 +746,7 @@ fn non_tty_text_run_wiring_stays_headless_and_json_run_wiring_never_bypasses_sco
     // review; JSON has nowhere to render a prompt regardless of TTY state.
     let json_capability = approval_capability_for(false, true, true);
     let json_config =
-        pipeline_config_for_approval_capability(&cfg, json_capability, None, &model_ref);
+        pipeline_config_for_approval_capability(&cfg, json_capability, &model_ref, None);
     assert!(json_config.headless);
     assert!(
         !json_config.headless_bypass_scope_review,

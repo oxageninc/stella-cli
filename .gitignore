@@ -49,6 +49,13 @@ Thumbs.db
 .stella/
 .oxagen/
 
+# The paid-readiness fixture intentionally contains inert hostile values. Keep
+# these two canaries tracked so the public witness actually exercises project
+# env/settings isolation; neither value is a credential.
+!bench/readiness/synthetic-adapter-sentinel/environment/app/.env
+!bench/readiness/synthetic-adapter-sentinel/environment/app/.stella/
+!bench/readiness/synthetic-adapter-sentinel/environment/app/.stella/settings.json
+
 # Claude/Agents
 .claude/
 .agents/

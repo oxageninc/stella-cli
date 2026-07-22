@@ -5,8 +5,6 @@
 //! [`run_argv`] execs an argv vector directly with NO shell anywhere
 //! (`run_script`, `run_lint`, `format_code`).
 
-use std::collections::BTreeSet;
-use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -58,75 +56,29 @@ pub const GIT_REPO_ENV_VARS: [&str; 8] = [
 /// pipe detection; tools stay colorless on pipes, as they'd be anywhere.
 pub const FORCED_COLOR_ENV_VARS: [&str; 3] = ["CLICOLOR_FORCE", "FORCE_COLOR", "GH_FORCE_TTY"];
 
-const DEFAULT_SENSITIVE_ENV_VARS: [&str; 15] = [
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "ZAI_API_KEY",
-    "XAI_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
-    "OPENROUTER_API_KEY",
-    "LOCAL_API_KEY",
-    "BRAVE_API_KEY",
-    "TAVILY_API_KEY",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_SECURITY_TOKEN",
-];
-
-fn sensitive_env_names() -> &'static RwLock<BTreeSet<String>> {
-    static NAMES: OnceLock<RwLock<BTreeSet<String>>> = OnceLock::new();
-    NAMES.get_or_init(|| {
-        RwLock::new(
-            DEFAULT_SENSITIVE_ENV_VARS
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-        )
-    })
-}
-
-/// Add host-owned credential references that model-controlled subprocesses
-/// must never inherit. Names are process-global and only become stricter.
+/// Compatibility facade for callers added on `main`; the canonical policy
+/// lives in `subprocess_env` so every subprocess shares one monotonic registry.
 pub fn register_sensitive_env_names<I, S>(names: I)
 where
     I: IntoIterator<Item = S>,
-    S: Into<String>,
+    S: AsRef<std::ffi::OsStr>,
 {
-    let mut registered = sensitive_env_names()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    registered.extend(names.into_iter().map(Into::into));
+    crate::subprocess_env::register_sensitive_env_names(names);
 }
 
 /// Whether a name is currently classified as a host credential.
 pub fn is_sensitive_env_name(name: &str) -> bool {
-    sensitive_env_names()
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(name)
+    crate::subprocess_env::is_sensitive_env_name(std::ffi::OsStr::new(name))
 }
 
 /// Remove every registered host credential from a model-controlled child.
 pub fn scrub_sensitive_env(cmd: &mut Command) {
-    let registered = sensitive_env_names()
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for name in registered.iter() {
-        cmd.env_remove(name);
-    }
+    crate::subprocess_env::scrub_sensitive_env(cmd);
 }
 
 /// Synchronous-command counterpart used by fixed helper probes.
 pub fn scrub_sensitive_std_env(cmd: &mut std::process::Command) {
-    let registered = sensitive_env_names()
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for name in registered.iter() {
-        cmd.env_remove(name);
-    }
+    crate::subprocess_env::scrub_sensitive_std_env(cmd);
 }
 
 /// Run `command` via `bash -c` in `dir`. Returns `(exit_code, combined
@@ -139,7 +91,28 @@ pub(crate) async fn run(
 ) -> Result<(i32, String), String> {
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(command);
-    drive(cmd, command, dir, timeout_secs).await
+    drive(cmd, command, dir, timeout_secs, &[]).await
+}
+
+/// Run a repository-owned GitHub CLI command while preserving only GitHub
+/// CLI's exact documented authentication variables. The command text must be
+/// constructed by Stella code with user values shell-quoted; model-authored
+/// arbitrary shell commands must use [`run`] and receive no credential.
+pub(crate) async fn run_github(
+    command: &str,
+    dir: &std::path::Path,
+    timeout_secs: u64,
+) -> Result<(i32, String), String> {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(command);
+    drive(
+        cmd,
+        command,
+        dir,
+        timeout_secs,
+        crate::subprocess_env::GITHUB_CLI_AUTH_ENV_VARS,
+    )
+    .await
 }
 
 /// Run `program` with `args` DIRECTLY — argv exec, no shell anywhere — in
@@ -159,7 +132,7 @@ pub(crate) async fn run_argv(
         .chain(args.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join(" ");
-    drive(cmd, &display, dir, timeout_secs).await
+    drive(cmd, &display, dir, timeout_secs, &[]).await
 }
 
 /// SIGKILLs `pid`'s process group on drop unless disarmed — the
@@ -193,6 +166,7 @@ async fn drive(
     command: &str,
     dir: &std::path::Path,
     timeout_secs: u64,
+    preserved_sensitive_env: &[&str],
 ) -> Result<(i32, String), String> {
     cmd.current_dir(dir);
     for var in GIT_REPO_ENV_VARS {
@@ -201,7 +175,7 @@ async fn drive(
     for var in FORCED_COLOR_ENV_VARS {
         cmd.env_remove(var);
     }
-    scrub_sensitive_env(&mut cmd);
+    crate::subprocess_env::scrub_sensitive_env_except(&mut cmd, preserved_sensitive_env);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     #[cfg(unix)]
@@ -332,6 +306,41 @@ mod tests {
         .unwrap();
         assert_eq!(code, 0);
         assert!(out.contains("$(id); `id`; && ||"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn shell_and_direct_argv_scrub_inherited_credentials() {
+        let _fixture = crate::subprocess_env::test_support::InheritedCredentialFixture::install();
+        let probe = crate::subprocess_env::test_support::PROBE_COMMAND;
+
+        let (shell_code, shell_out) = run(probe, std::path::Path::new("/tmp"), 30)
+            .await
+            .expect("shell runner");
+        assert_eq!(shell_code, 0);
+        crate::subprocess_env::test_support::assert_scrubbed(&shell_out);
+
+        let (argv_code, argv_out) = run_argv(
+            "sh",
+            &["-c".to_string(), probe.to_string()],
+            std::path::Path::new("/tmp"),
+            30,
+        )
+        .await
+        .expect("direct argv runner");
+        assert_eq!(argv_code, 0);
+        crate::subprocess_env::test_support::assert_scrubbed(&argv_out);
+    }
+
+    #[tokio::test]
+    async fn github_runner_preserves_only_github_cli_auth() {
+        let _fixture = crate::subprocess_env::test_support::InheritedCredentialFixture::install();
+        let probe = crate::subprocess_env::test_support::PROBE_COMMAND;
+
+        let (code, output) = run_github(probe, std::path::Path::new("/tmp"), 30)
+            .await
+            .expect("GitHub runner");
+        assert_eq!(code, 0);
+        assert_eq!(output, "|leaked||visible|present");
     }
 
     #[tokio::test]

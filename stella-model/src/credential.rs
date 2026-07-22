@@ -247,10 +247,7 @@ impl CredentialsFile {
     pub fn load_default() -> Result<Self, CredentialError> {
         match Self::default_path() {
             Some(path) => Self::load(path),
-            None => Ok(Self {
-                path: PathBuf::new(),
-                data: CredentialsFileData::default(),
-            }),
+            None => Ok(Self::empty()),
         }
     }
 
