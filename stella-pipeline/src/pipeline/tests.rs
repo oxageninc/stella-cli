@@ -1,5 +1,5 @@
 //! Unit tests for [`super`] — split out of `pipeline.rs` to keep the
-//! orchestrator under the file-size ratchet; a child module, so the
+//! orchestrator a manageable size; a child module, so the
 //! private surface (`CandidateSurface`, `Pipeline::gather_diff`, ...)
 //! stays reachable via `super::*`.
 
@@ -1473,7 +1473,7 @@ fn isolated_config(n: u32) -> PipelineConfig {
 /// the shared infra (`run_isolated`, `isolated_config`, ...) stays here.
 mod best_of_n;
 /// The orchestrator MCP pre-fetch hook (issue #248 Phase 1) — split out for
-/// the same file-size-ratchet reason `tests.rs` itself was split from
+/// the same file-size reason `tests.rs` itself was split from
 /// `pipeline.rs`; a child module, so it reaches the fakes above via
 /// `super::*`.
 mod mcp_prefetch;

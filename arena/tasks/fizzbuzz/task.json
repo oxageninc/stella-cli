@@ -1,5 +1,0 @@
-{
-  "title": "Implement fizzbuzz(n) in fizzbuzz.mjs",
-  "prompt": "Implement the `fizzbuzz(n)` function in fizzbuzz.mjs. It must return an array of n entries for the integers 1..n: the number itself, except multiples of 3 become \"Fizz\", multiples of 5 become \"Buzz\", and multiples of both become \"FizzBuzz\". Numbers stay numbers (not strings). For n <= 0 return an empty array.",
-  "timeoutSec": 600
-}

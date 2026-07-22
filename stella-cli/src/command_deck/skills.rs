@@ -1,6 +1,5 @@
 //! SKILLS-tab helper cluster split out of `command_deck.rs` to keep that
-//! file under the file-size ratchet (see `scripts/file-size-ratchet.txt`).
-//! Pure relocation — no behavior change.
+//! file a manageable size. Pure relocation — no behavior change.
 use super::*;
 
 /// The deck's slash vocabulary: the productized commands (🔒) followed by

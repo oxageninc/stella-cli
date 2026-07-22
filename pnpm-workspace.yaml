@@ -3,7 +3,6 @@
 # (see the root package.json's rust:* scripts for the pnpm-side bridge).
 packages:
   - stella-docs
-  - arena
 
 # pnpm 11 reads build-script approvals from here. Both deps ship prebuilt
 # platform binaries via optional deps, so approving their build scripts just

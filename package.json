@@ -13,8 +13,6 @@
     "typecheck": "pnpm --filter stella-cli-docs typecheck",
     "docs:dev": "pnpm --filter stella-cli-docs dev",
     "docs:build": "pnpm --filter stella-cli-docs build",
-    "arena": "node arena/src/cli.mjs",
-    "arena:dev": "node arena/src/cli.mjs dev",
     "rust:build": "cargo build --workspace",
     "rust:test": "cargo test --workspace",
     "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",

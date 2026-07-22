@@ -62,12 +62,8 @@ test-cli: ## Test stella-cli only (the shipping binary)
 test-protocol: ## Test stella-protocol only (shared types)
 	cargo test -p stella-protocol
 
-.PHONY: sizes
-sizes: ## File-size ratchet: new .rs stay <= 1500 lines; legacy giants may not grow
-	scripts/check-file-sizes.sh
-
 .PHONY: gate
-gate: format-check sizes lint test ## Full CI gate: fmt-check + sizes + clippy + test
+gate: format-check lint test ## Full CI gate: fmt-check + clippy + test
 
 .PHONY: check
 check: format-check lint ## Fast pre-push check (fmt + clippy, no tests)

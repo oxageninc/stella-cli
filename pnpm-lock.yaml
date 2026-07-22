@@ -8,8 +8,6 @@ importers:
 
   .: {}
 
-  arena: {}
-
   stella-docs:
     dependencies:
       fumadocs-core:

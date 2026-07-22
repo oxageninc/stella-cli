@@ -48,6 +48,7 @@ Thumbs.db
 # Stella-specific
 .stella/
 .oxagen/
+.memories/
 
 # The paid-readiness fixture intentionally contains inert hostile values. Keep
 # these two canaries tracked so the public witness actually exercises project
@@ -102,7 +103,6 @@ venv/
 # Benchmark results
 bench/results*/
 bench/warm-memory/
-arena/results/
 
 # Release artifacts
 *.tar.gz
@@ -127,7 +127,11 @@ arena/results/
 
 # Rust analyzer
 rust-project.json
+# Generated deck render dump (written by stella-tui/tests/deck_snapshot.rs)
 deck-snapshots.txt
+# macOS custom-folder-icon marker
 Icon
-Icon
-Iconverifications
+
+# Local verification / audit artifacts — never tracked
+verifications/
+

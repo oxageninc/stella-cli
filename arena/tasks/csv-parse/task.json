@@ -1,5 +1,0 @@
-{
-  "title": "Implement an RFC-4180-ish CSV parser in csv.mjs",
-  "prompt": "Implement `parseCsv(text)` in csv.mjs. It must split CSV text into an array of rows (arrays of string fields), supporting: comma separators; double-quoted fields; commas and newlines inside quoted fields; escaped double quotes inside quoted fields written as \"\" (two double quotes); both \\n and \\r\\n line endings. A trailing final newline does not produce an extra empty row. Empty input returns [].",
-  "timeoutSec": 600
-}

@@ -1,6 +1,5 @@
-//! Code-graph build cluster split out of `agent.rs` to keep that file
-//! under the file-size ratchet (see `scripts/file-size-ratchet.txt`).
-//! Pure relocation — no behavior change.
+//! Code-graph build cluster split out of `agent.rs` to keep that file a
+//! manageable size. Pure relocation — no behavior change.
 use super::*;
 
 /// Build the workspace code-graph index into `.stella/private/codegraph.db` (the
