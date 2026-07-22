@@ -1,7 +1,7 @@
 # Context Pull Requests — Feature Specification
 
-**Status:** Proposed  
-**Owner:** Stella Platform  
+**Status:** Proposed
+**Owner:** Stella Platform
 **Primary principle:** Git is the authoritative, human-governed policy ledger. The context graph is a derived runtime index.
 
 ## 1. Problem

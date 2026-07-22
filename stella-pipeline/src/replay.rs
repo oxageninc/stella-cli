@@ -244,6 +244,9 @@ pub fn event_signature(event: &AgentEvent) -> String {
         // Step usage is pure magnitude (tokens/cost/duration) — only its
         // occurrence is structural, like a budget tick.
         AgentEvent::StepUsage { .. } => "step_usage".to_string(),
+        AgentEvent::UsageIncomplete { reason, .. } => {
+            format!("usage_incomplete:{reason:?}")
+        }
         // A goal verdict's structural identity is whether the goal was met
         // (mirrors `judge_verdict`); the reasoning text and cost are volatile.
         AgentEvent::GoalVerdict { met, .. } => format!("goal_verdict:met={met}"),

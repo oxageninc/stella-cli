@@ -631,6 +631,7 @@ pub(crate) async fn aggregate_gemini_stream(
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     // Reported on the final chunk's candidate; last assignment wins.
     let mut finish_raw: Option<String> = None;
+    let mut usage_seen = false;
     let mut stream = response.bytes_stream();
 
     // `next_with_timeout` bounds each read by `STREAM_IDLE_TIMEOUT` (a silent
@@ -655,6 +656,7 @@ pub(crate) async fn aggregate_gemini_stream(
                 return Err(err.into_provider_error(label));
             }
             if let Some(u) = parsed.usage_metadata {
+                usage_seen = true;
                 usage.input_tokens = u.prompt_token_count;
                 usage.output_tokens = u.candidates_token_count + u.thoughts_token_count;
                 usage.cached_input_tokens = u.cached_content_token_count;
@@ -701,6 +703,7 @@ pub(crate) async fn aggregate_gemini_stream(
     }
 
     let finish_reason = map_gemini_finish_reason(finish_raw.as_deref(), !tool_calls.is_empty());
+    usage.reported = usage_seen && finish_raw.is_some();
     Ok((text, tool_calls, usage, finish_reason))
 }
 
@@ -883,7 +886,7 @@ mod tests {
         let sse_body = concat!(
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"planning...\",\"thought\":true}]}}]}\n\n",
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}]}\n\n",
-            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo!\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":3,\"thoughtsTokenCount\":5,\"cachedContentTokenCount\":2}}\n\n",
+            "data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"lo!\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":3,\"thoughtsTokenCount\":5,\"cachedContentTokenCount\":2}}\n\n",
         );
         Mock::given(method("POST"))
             .and(path("/models/gemini-3-pro:streamGenerateContent"))
@@ -918,6 +921,7 @@ mod tests {
         // candidates (3) + thoughts (5): thinking tokens are billed output.
         assert_eq!(result.usage.output_tokens, 8);
         assert_eq!(result.usage.cached_input_tokens, 2);
+        assert!(result.usage.reported);
         assert_eq!(result.model, "gemini-3-pro");
     }
 

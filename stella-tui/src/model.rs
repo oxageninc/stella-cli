@@ -577,7 +577,9 @@ impl SessionModel {
             // `cost_usd` is likewise already accounted against the budget when
             // it fires. Neither mutates TUI state today (a goal-verdict
             // transcript row is a display enhancement, tracked as follow-up).
-            AgentEvent::StepUsage { .. } | AgentEvent::GoalVerdict { .. } => {}
+            AgentEvent::StepUsage { .. }
+            | AgentEvent::UsageIncomplete { .. }
+            | AgentEvent::GoalVerdict { .. } => {}
             AgentEvent::Error { message, retryable } => {
                 self.pending_scope_review = None;
                 self.pending_ask_user = None;

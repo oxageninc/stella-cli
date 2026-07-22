@@ -16,6 +16,8 @@ fn persist_event_records_cache_write_tokens_from_step_usage() {
         .expect("begin execution");
     let event = AgentEvent::StepUsage {
         step: 0,
+        role: stella_protocol::ModelCallRole::Worker,
+        provider: "anthropic".into(),
         model: "claude-fable-5".into(),
         input_tokens: 1_000,
         output_tokens: 50,
@@ -26,6 +28,7 @@ fn persist_event_records_cache_write_tokens_from_step_usage() {
         duration_ms: 1_830,
         retries: 0,
         tool_calls: 1,
+        complete: true,
     };
 
     assert!(persist_event(&store, execution_id, 0, &event, "anthropic"));
@@ -435,12 +438,13 @@ async fn untrusted_project_custom_tools_are_absent_from_the_runtime_surface() {
 fn non_tty_text_output_is_headless_without_losing_text_rendering() {
     let cfg = cfg_for("zai");
     let format = OutputFormat::Text;
-    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+    let worker_model = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
     let non_tty = pipeline_config_for_approval_capability(
         &cfg,
         PipelineApprovalCapability::Unavailable,
+        &worker_model,
         None,
-        &model_ref,
+        &worker_model,
     );
     assert!(
         non_tty.headless,
@@ -455,8 +459,9 @@ fn non_tty_text_output_is_headless_without_losing_text_rendering() {
     let interactive = pipeline_config_for_approval_capability(
         &cfg,
         PipelineApprovalCapability::Stdio,
+        &worker_model,
         None,
-        &model_ref,
+        &worker_model,
     );
     assert!(
         !interactive.headless,
@@ -515,6 +520,49 @@ fn approval_capability_for_full_tty_text_is_stdio() {
     assert_eq!(
         approval_capability_for(true, true, true),
         PipelineApprovalCapability::Stdio
+    );
+}
+
+/// The composition gap the incident actually exploited: `approval_capability_for`
+/// and `pipeline_config_for_approval_capability` were each covered above in
+/// isolation, but nothing pinned them wired together the way
+/// `run_pipeline_one_shot` actually wires them (agent.rs, around the
+/// `pipeline_config` construction) — feeding one straight into the other. A
+/// regression that breaks *that* composition (e.g. hardcoding
+/// `PipelineApprovalCapability::Stdio` at the call site instead of using the
+/// computed value) would pass every test above while still shipping the
+/// scope-review bypass this incident (#284 x #297, fixed in #305) shipped.
+#[test]
+fn non_tty_text_run_wiring_stays_headless_and_json_run_wiring_never_bypasses_scope_review() {
+    let cfg = cfg_for("zai");
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+
+    // A non-TTY text-format run (e.g. `stella run` piped in a script or CI)
+    // must not select the interactive stdio approval gate, and its wired
+    // config must stay headless.
+    let text_capability = approval_capability_for(true, false, false);
+    let text_config =
+        pipeline_config_for_approval_capability(&cfg, text_capability, None, &model_ref);
+    assert_ne!(
+        text_capability,
+        PipelineApprovalCapability::Stdio,
+        "a non-tty text run must not select the interactive stdio approval gate"
+    );
+    assert!(
+        text_config.headless,
+        "a non-tty text run's wired config must stay headless"
+    );
+
+    // A JSON-format one-shot run is headless by construction — and even with
+    // both terminal handles real, its wired config must never bypass scope
+    // review; JSON has nowhere to render a prompt regardless of TTY state.
+    let json_capability = approval_capability_for(false, true, true);
+    let json_config =
+        pipeline_config_for_approval_capability(&cfg, json_capability, None, &model_ref);
+    assert!(json_config.headless);
+    assert!(
+        !json_config.headless_bypass_scope_review,
+        "a JSON-format run's wired config must never bypass scope review"
     );
 }
 
@@ -767,6 +815,77 @@ fn judge_build_failure_falls_back_to_the_worker() {
         "a judge adapter that fails to build must fall back to the worker provider"
     );
 }
+
+#[test]
+fn reflection_json_preserves_full_paid_call_envelope_and_cost() {
+    let report = ReflectionReport {
+        recorded: 1,
+        model_error: None,
+        cost_usd: 0.0042,
+        events: vec![AgentEvent::StepUsage {
+            step: 0,
+            role: stella_protocol::ModelCallRole::Reflection,
+            provider: "anthropic".into(),
+            model: "claude-reflect".into(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_input_tokens: 5,
+            cache_write_tokens: 3,
+            estimated_input_tokens: 90,
+            cost_usd: 0.0042,
+            duration_ms: 12,
+            retries: 1,
+            tool_calls: 0,
+            complete: true,
+        }],
+    };
+
+    let value = reflection_json(&report);
+    assert_eq!(value["cost_usd"], 0.0042);
+    assert_eq!(value["events"][0]["type"], "step_usage");
+    assert_eq!(value["events"][0]["role"], "reflection");
+    assert_eq!(value["events"][0]["provider"], "anthropic");
+    assert_eq!(value["events"][0]["model"], "claude-reflect");
+    assert_eq!(value["events"][0]["complete"], true);
+}
+
+#[test]
+fn reflection_budget_tick_is_rebased_to_the_caller_session() {
+    let mut guard = BudgetGuard::new(BudgetMode::Enforced, Some(1.0), None);
+    let _ = guard.record_spend(0.8);
+    let mut report = ReflectionReport {
+        recorded: 0,
+        model_error: None,
+        cost_usd: 0.02,
+        events: vec![AgentEvent::BudgetTick {
+            spent_usd: 0.02,
+            limit_usd: Some(0.2),
+            mode: BudgetMode::Enforced,
+        }],
+    };
+
+    settle_reflection_budget(&mut report, &mut guard);
+
+    assert!((guard.spent_usd() - 0.82).abs() < f64::EPSILON);
+    let ticks = report
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::BudgetTick {
+                spent_usd,
+                limit_usd,
+                ..
+            } => Some((*spent_usd, *limit_usd)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ticks.len(), 1);
+    assert!((ticks[0].0 - 0.82).abs() < f64::EPSILON);
+    assert_eq!(ticks[0].1, Some(1.0));
+}
+
+#[path = "agent_tests/usage_completeness.rs"]
+mod usage_completeness;
 
 /// A `Config` selecting `provider_id` at its default model, carrying
 /// `engine_settings` — the `agent_engine_config` variant of [`cfg_for`] for

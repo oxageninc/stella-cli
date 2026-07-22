@@ -53,6 +53,7 @@ mod engine;
 mod goal;
 mod graph;
 mod outcome;
+mod persistence;
 mod prompt;
 mod tools;
 
@@ -67,6 +68,9 @@ use outcome::{
     pipeline_status_result,
 };
 pub(crate) use outcome::{pipeline_execution_closeout, settled_cost_since};
+pub(crate) use persistence::{
+    persist_event, record_execution_end, spawn_renderer, warn_store_write_failed,
+};
 pub(crate) use prompt::*;
 pub(crate) use tools::*;
 
@@ -202,16 +206,24 @@ async fn run_pipeline_one_shot(
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
         let is_text = format == OutputFormat::Text;
-        let approval_capability = approval_capability_for(
-            is_text,
-            std::io::stdin().is_terminal(),
-            std::io::stdout().is_terminal(),
-        );
+        // Stdio approval requires a text-safe renderer plus two terminal
+        // handles: stdin must accept the decision and stdout must present the
+        // prompt. Redirected text is still rendered as text, but is headless
+        // and fails closed at scope review.
+        let approval_capability =
+            if is_text && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                PipelineApprovalCapability::Stdio
+            } else {
+                PipelineApprovalCapability::Unavailable
+            };
+        // `--test-command` arms the deterministic verify ladder: the
+        // fail→pass flip oracle and SubmitFast/Revise decisions all key off
+        // it. Left unset, every verification escalates to the model judge.
         let mut pipeline_config = pipeline_config_for_approval_capability(
             cfg,
             approval_capability,
-            test_command,
             &wiring.worker_model,
+            test_command,
         );
         pipeline_config.role_overrides = wiring.role_overrides.clone();
 
@@ -258,12 +270,21 @@ async fn run_pipeline_one_shot(
     };
 
     drop(tx);
-    let collected = renderer.await.unwrap_or_default();
+    let rendered = renderer.await.unwrap_or_default();
+    let persistence_complete = rendered.persistence_complete;
+    let collected = rendered.events;
 
     let files = registry.files_touched();
     if let Some((store, id)) = &execution {
         let (outcome_label, cost) = pipeline_execution_closeout(&result);
-        if !record_execution_end(store, *id, &registry, outcome_label, cost) {
+        if !record_execution_end(
+            store,
+            *id,
+            &registry,
+            outcome_label,
+            cost,
+            persistence_complete,
+        ) {
             warn_store_write_failed(
                 "the audit record (files touched / memory citations / outcome)",
             );
@@ -296,6 +317,7 @@ async fn run_pipeline_one_shot(
     // — is what makes the primary surface actually learn. The reflector is
     // then handed an enriched transcript (final answer + a note of what
     // changed) so it has signal even when the tool turns aren't in `messages`.
+    let mut reflection_report = ReflectionReport::default();
     if (turn_warrants_reflection(&messages) || !files.is_empty())
         && let Some(m) = &mut memory
     {
@@ -315,18 +337,22 @@ async fn run_pipeline_one_shot(
                 "(files changed this turn: {changed})"
             )));
         }
-        let report = m
+        let mut report = m
             .reflect_and_record(
                 &*provider,
+                &cfg.model_id,
                 &reflect_transcript,
                 format != OutputFormat::Text,
                 matches!(
                     &result,
                     Ok(outcome) if matches!(outcome.status, PipelineStatus::Completed)
                 ),
+                remaining_budget(&budget),
             )
             .await;
+        settle_reflection_budget(&mut report, &mut budget);
         surface_reflection(&report, format);
+        reflection_report = report;
     }
 
     if let Some(set) = &mcp {
@@ -362,7 +388,7 @@ async fn run_pipeline_one_shot(
                 let summary = serde_json::json!({
                     "status": status_str,
                     "text": outcome.final_text,
-                    "cost_usd": outcome.total_cost_usd,
+                    "cost_usd": outcome.total_cost_usd + reflection_report.cost_usd,
                     "reason": reason_str,
                     "task_class": format!("{:?}", outcome.task_class),
                     "verdict": outcome.verdict.as_ref().map(|v| serde_json::json!({
@@ -374,6 +400,7 @@ async fn run_pipeline_one_shot(
                     "candidates_run": outcome.candidates_run,
                     "model": format!("{}/{}", cfg.provider.id, cfg.model_id),
                     "events": collected,
+                    "reflection": reflection_json(&reflection_report),
                 });
                 println!(
                     "{}",
@@ -386,7 +413,7 @@ async fn run_pipeline_one_shot(
             if format == OutputFormat::Text {
                 tui::files_touched_panel(&files);
                 tui::cost_summary(
-                    outcome.total_cost_usd,
+                    outcome.total_cost_usd + reflection_report.cost_usd,
                     &format!("{}/{}", cfg.provider.id, cfg.model_id),
                     turn_start.elapsed(),
                 );
@@ -557,8 +584,16 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         if input == "/init" {
             println!();
             let mut emit = |line: String| println!("  {line}");
-            match init_workspace(Some(&*provider), &cfg.workspace_root, &mut emit).await {
-                Ok(_) => {
+            match init_workspace(
+                Some(&*provider),
+                &cfg.workspace_root,
+                Some(&cfg.model_id),
+                remaining_budget(&budget),
+                &mut emit,
+            )
+            .await
+            {
+                Ok((_domains, _cost_usd)) => {
                     // A fresh index may name tables/types the schema gate
                     // should know about this session, not just the next one.
                     if let Err(error) = populate_schema_index(&registry, &cfg.workspace_root) {
@@ -678,8 +713,18 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             } else if turn_warrants_reflection(&messages[turn_start..])
                 && let Some(m) = &mut memory
             {
-                m.reflect_and_record(&*provider, &messages, false, true)
+                let mut report = m
+                    .reflect_and_record(
+                        &*provider,
+                        &cfg.model_id,
+                        &messages,
+                        false,
+                        true,
+                        remaining_budget(&budget),
+                    )
                     .await;
+                settle_reflection_budget(&mut report, &mut budget);
+                surface_reflection(&report, OutputFormat::Text);
             }
             continue;
         }
@@ -747,8 +792,18 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         } else if turn_warrants_reflection(&messages[turn_start..])
             && let Some(m) = &mut memory
         {
-            m.reflect_and_record(&*provider, &messages, false, true)
+            let mut report = m
+                .reflect_and_record(
+                    &*provider,
+                    &cfg.model_id,
+                    &messages,
+                    false,
+                    true,
+                    remaining_budget(&budget),
+                )
                 .await;
+            settle_reflection_budget(&mut report, &mut budget);
+            surface_reflection(&report, OutputFormat::Text);
         }
     }
 
@@ -813,15 +868,56 @@ pub(crate) async fn record_turn_episode(
 /// correct case and stays quiet. Never writes stdout in `json` mode, so that
 /// format's single-object contract is untouched. Best-effort: a `None` model
 /// error in `text`/`json` prints nothing.
-fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
+pub(crate) fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
     if format == OutputFormat::StreamJson {
+        for event in &report.events {
+            if let Ok(line) = serde_json::to_string(event) {
+                println!("{line}");
+            }
+        }
         let line = serde_json::json!({
             "type": "reflect",
             "recorded": report.recorded,
             "error": report.model_error,
+            "cost_usd": report.cost_usd,
         });
         println!("{line}");
         return;
+    }
+    if format == OutputFormat::Text {
+        for event in &report.events {
+            match event {
+                AgentEvent::StepUsage {
+                    role,
+                    provider,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    retries,
+                    complete,
+                    ..
+                } => eprintln!(
+                    "  {} {:?} {provider}/{model}: {input_tokens} in, {output_tokens} out, \
+                     ${cost_usd:.4}, {retries} retries, complete={complete}",
+                    "✦".magenta(),
+                    role
+                ),
+                AgentEvent::UsageIncomplete {
+                    role,
+                    provider,
+                    model,
+                    reason,
+                    retries,
+                    ..
+                } => eprintln!(
+                    "  {} {:?} {provider}/{model}: usage incomplete ({reason:?}, retries={retries:?})",
+                    "!".yellow(),
+                    role
+                ),
+                _ => {}
+            }
+        }
     }
     if let Some(err) = &report.model_error {
         eprintln!(
@@ -831,6 +927,14 @@ fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
     }
 }
 
+fn reflection_json(report: &ReflectionReport) -> serde_json::Value {
+    serde_json::json!({
+        "recorded": report.recorded,
+        "error": report.model_error,
+        "cost_usd": report.cost_usd,
+        "events": report.events,
+    })
+}
 /// The shared init flow behind `stella init` and the `/init` chat command:
 /// infer the domain taxonomy (model-assisted when a provider is available,
 /// directory heuristic otherwise), build the code-graph index, persist
@@ -840,11 +944,21 @@ fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
 pub(crate) async fn init_workspace(
     provider: Option<&dyn Provider>,
     workspace_root: &std::path::Path,
+    model_hint: Option<&str>,
+    budget_limit: Option<f64>,
     emit: &mut dyn FnMut(String),
-) -> Result<Domains, String> {
-    let domains = match provider {
-        Some(p) => infer_domains(p, workspace_root).await,
-        None => heuristic_domains(workspace_root),
+) -> Result<(Domains, f64), String> {
+    let (domains, inference_cost_usd) = match provider {
+        Some(p) => {
+            infer_domains(
+                p,
+                workspace_root,
+                model_hint.unwrap_or("unknown"),
+                budget_limit,
+            )
+            .await
+        }
+        None => (heuristic_domains(workspace_root), 0.0),
     };
 
     // The code graph needs no provider — build it regardless of how the
@@ -872,7 +986,12 @@ pub(crate) async fn init_workspace(
         domains.inferred_by,
         path.display()
     ));
-    Ok(domains)
+    if inference_cost_usd > 0.0 {
+        emit(format!(
+            "domain inference model cost: ${inference_cost_usd:.6}"
+        ));
+    }
+    Ok((domains, inference_cost_usd))
 }
 
 /// Query the code graph (if `stella init` has built it) for the
@@ -995,26 +1114,27 @@ pub async fn run_init(
 
     tui::section_header("Stella init");
 
-    let provider = match Config::load(model_override, api_key_override, base_url_override) {
-        Ok(cfg) => {
-            let provider = build_provider(&cfg)?;
-            println!(
-                "  {} inferring domains with {}/{}…",
-                "◈".bright_cyan(),
-                cfg.provider.id,
-                cfg.model_id
-            );
-            Some(provider)
-        }
-        Err(_) => {
-            println!(
-                "  {} no provider configured — using the directory heuristic \
+    let (provider, model_hint) =
+        match Config::load(model_override, api_key_override, base_url_override) {
+            Ok(cfg) => {
+                let provider = build_provider(&cfg)?;
+                println!(
+                    "  {} inferring domains with {}/{}…",
+                    "◈".bright_cyan(),
+                    cfg.provider.id,
+                    cfg.model_id
+                );
+                (Some(provider), Some(cfg.model_id))
+            }
+            Err(_) => {
+                println!(
+                    "  {} no provider configured — using the directory heuristic \
                  (re-run `stella init` with a key for a better taxonomy)",
-                "!".yellow()
-            );
-            None
-        }
-    };
+                    "!".yellow()
+                );
+                (None, None)
+            }
+        };
 
     // Play the launch cinematic (starfield + jetpack turtle) over the indexing
     // work. Progress lines route THROUGH it so they print above the animation
@@ -1024,7 +1144,14 @@ pub async fn run_init(
     // domain summary prints.
     let cine = crate::init_fx::InitCinematic::start(crate::init_fx::animation_enabled(no_anim));
     let mut emit = |line: String| cine.log(line);
-    let domains = init_workspace(provider.as_deref(), &workspace_root, &mut emit).await?;
+    let (domains, _inference_cost_usd) = init_workspace(
+        provider.as_deref(),
+        &workspace_root,
+        model_hint.as_deref(),
+        None,
+        &mut emit,
+    )
+    .await?;
     cine.finish().await;
 
     for domain in &domains.domains {
@@ -1438,6 +1565,35 @@ pub(crate) fn build_budget_guard(budget_limit: Option<f64>) -> BudgetGuard {
     }
 }
 
+pub(crate) fn remaining_budget(guard: &BudgetGuard) -> Option<f64> {
+    guard
+        .turn_limit_usd()
+        .map(|limit| (limit - guard.spent_usd()).max(0.0))
+}
+
+pub(crate) fn settle_reflection_budget(report: &mut ReflectionReport, guard: &mut BudgetGuard) {
+    let had_accounting = report.events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::StepUsage { .. }
+                | AgentEvent::UsageIncomplete { .. }
+                | AgentEvent::BudgetTick { .. }
+        )
+    });
+    report
+        .events
+        .retain(|event| !matches!(event, AgentEvent::BudgetTick { .. }));
+    if report.cost_usd > 0.0 {
+        let _ = guard.record_spend(report.cost_usd);
+    }
+    if had_accounting {
+        report.events.push(AgentEvent::BudgetTick {
+            spent_usd: guard.spent_usd(),
+            limit_usd: guard.turn_limit_usd(),
+            mode: guard.mode(),
+        });
+    }
+}
 /// Open the workspace SQLite store (`.stella/private/store.db`). Persistence is
 /// observability, not a work dependency: a store that won't open warns once
 /// and the session runs on without it — never a startup failure.
@@ -1656,7 +1812,9 @@ async fn run_turn(
     // actually printed before this function returns (no events lost to a
     // detached task racing process exit).
     drop(tx);
-    let collected = renderer.await.unwrap_or_default();
+    let rendered = renderer.await.unwrap_or_default();
+    let persistence_complete = rendered.persistence_complete;
+    let collected = rendered.events;
 
     // Persist the files-touched ledger and close the execution record. The
     // ledger lives on the concrete registry (the engine drove tool calls
@@ -1668,7 +1826,14 @@ async fn run_turn(
             TurnOutcome::Completed { cost_usd, .. } => ("completed", *cost_usd),
             TurnOutcome::Aborted { cost_usd, .. } => ("aborted", *cost_usd),
         };
-        if !record_execution_end(store, *id, registry, outcome_label, cost) {
+        if !record_execution_end(
+            store,
+            *id,
+            registry,
+            outcome_label,
+            cost,
+            persistence_complete,
+        ) {
             warn_store_write_failed(
                 "the audit record (files touched / memory citations / outcome)",
             );
@@ -1721,268 +1886,6 @@ async fn run_turn(
         }
         TurnOutcome::Aborted { reason, .. } => Err(reason),
     }
-}
-
-/// Drain, render, and persist the engine's event stream concurrently with
-/// the engine. `ToolResult` carries only `call_id`, so the tool name is
-/// tracked here to label the result card (see `tui::render_event`'s doc for
-/// why that pair is handled inline rather than in the generic dispatcher).
-/// Persistence (when a store is open) runs for every format before
-/// rendering: each event is appended to the execution's stream (chain-of-
-/// thought `Reasoning` deltas included) and each `StepUsage` becomes a
-/// telemetry row. Store failures degrade to a single warning — rendering
-/// never stops for persistence. Returns the collected events (non-empty only
-/// in Json mode, where the caller emits one final summary object).
-fn spawn_renderer(
-    mut rx: mpsc::UnboundedReceiver<AgentEvent>,
-    format: OutputFormat,
-    execution: Option<(Arc<Store>, i64)>,
-    provider_id: String,
-) -> tokio::task::JoinHandle<Vec<AgentEvent>> {
-    tokio::spawn(async move {
-        let mut tool_names: HashMap<String, String> = HashMap::new();
-        let mut collected: Vec<AgentEvent> = Vec::new();
-        let mut seq = 0u64;
-        let mut store_warned = false;
-        while let Some(event) = rx.recv().await {
-            // `TextDelta` previews never reach the store: the authoritative
-            // `Text` event carries the full step text into the audit record,
-            // and one SQLite insert per token would stall this drain loop.
-            let preview = matches!(event, AgentEvent::TextDelta { .. });
-            if let Some((store, id)) = &execution
-                && !preview
-            {
-                if !persist_event(store, *id, seq, &event, &provider_id) && !store_warned {
-                    eprintln!(
-                        "  {} store write failed — telemetry for this execution is incomplete",
-                        "⚠".yellow()
-                    );
-                    store_warned = true;
-                }
-                seq += 1;
-            }
-            match format {
-                OutputFormat::StreamJson => {
-                    // One line per event — the stable machine interface
-                    //. Serialization of a protocol
-                    // enum never fails; if it somehow does, surface it on
-                    // stderr rather than silently dropping the event.
-                    match serde_json::to_string(&event) {
-                        Ok(line) => println!("{line}"),
-                        Err(e) => {
-                            eprintln!("{{\"type\":\"error\",\"message\":\"serialize: {e}\"}}")
-                        }
-                    }
-                }
-                OutputFormat::Json => collected.push(event),
-                OutputFormat::Text => match &event {
-                    AgentEvent::ToolStart { call } => {
-                        tool_names.insert(call.call_id.clone(), call.name.clone());
-                        tui::tool_call_card(&call.name, &call.input, "running");
-                    }
-                    AgentEvent::ToolResult {
-                        call_id,
-                        output,
-                        duration_ms,
-                        ..
-                    } => {
-                        let name = tool_names
-                            .get(call_id)
-                            .map(String::as_str)
-                            .unwrap_or("tool");
-                        let content = match output {
-                            ToolOutput::Ok { content } => content.clone(),
-                            ToolOutput::Error { message } => message.clone(),
-                        };
-                        tui::tool_result_card(
-                            name,
-                            &content,
-                            output.is_error(),
-                            Duration::from_millis(*duration_ms),
-                        );
-                    }
-                    other => tui::render_event(other),
-                },
-            }
-        }
-        collected
-    })
-}
-
-/// Best-effort end-of-execution records: the session's file-touch telemetry
-/// (read straight off the registry's ledger), the memory citations the
-/// `cite_memory` tool collected this turn (drained, so each lands under
-/// exactly one execution — the promotion gate counts them), the
-/// agent-invocation log (also drained — each invocation is attributed to
-/// exactly the execution it happened under), and how the run ended. A
-/// failure must not abort the turn, but it must not vanish either — the
-/// store is the durable audit record of what the agent did. Returns `false`
-/// when any write failed so the caller can surface a warning on its own
-/// channel (stderr for the CLI surfaces, a deck event for the TUI, where
-/// stderr belongs to the alternate screen).
-pub(crate) fn record_execution_end(
-    store: &Store,
-    execution_id: i64,
-    registry: &ToolRegistry,
-    outcome_label: &str,
-    cost_usd: f64,
-) -> bool {
-    let files = file_touch_rows(registry);
-    let files_ok = store.record_files_touched(execution_id, &files).is_ok();
-    let citations = memory_citation_rows(registry);
-    let citations_ok = store
-        .record_memory_citations(execution_id, &citations)
-        .is_ok();
-    let uses: Vec<stella_store::AgentUseRow> = registry
-        .drain_agent_uses()
-        .into_iter()
-        .map(|u| stella_store::AgentUseRow {
-            agent: u.agent,
-            version: u.version,
-            reason: u.reason,
-        })
-        .collect();
-    let uses_ok = uses.is_empty() || store.record_agent_uses(execution_id, &uses).is_ok();
-    let mcp_usage = mcp_usage_rows(registry);
-    let mcp_usage_ok = store.record_mcp_usage(execution_id, &mcp_usage).is_ok();
-    let finish_ok = store
-        .finish_execution(execution_id, outcome_label, cost_usd)
-        .is_ok();
-    // Data plane (all best-effort — aggregation must never fail a turn, so
-    // these are NOT folded into the returned success flag): normalize the
-    // turn's tool calls from its event stream, record the objective
-    // self-reflection (prompt + produced_output/wrote_files/truncated), and —
-    // after `finish_execution` set the outcome — roll the turn up into the
-    // user-tier usage.db for cross-project stats.
-    let _ = store.materialize_tool_calls(execution_id);
-    let _ = store.finalize_execution_reflection(execution_id);
-    let _ = store.sync_to_usage_default(execution_id);
-    let _ = crate::enterprise_telemetry::enqueue_finalized_execution(store, execution_id);
-    files_ok && citations_ok && uses_ok && mcp_usage_ok && finish_ok
-}
-/// The registry's MCP tool-usage ledger as store rows. This DRAINS the ledger
-/// (like memory citations) so each call persists under exactly one execution —
-/// re-persisting under later turns would inflate the per-tool call counts.
-fn mcp_usage_rows(registry: &ToolRegistry) -> Vec<stella_store::McpUsageRow> {
-    registry
-        .take_mcp_usage()
-        .into_iter()
-        .map(|u| stella_store::McpUsageRow {
-            server: u.server,
-            tool: u.tool,
-            reason: u.reason,
-            called_at_ms: u.called_at_ms as i64,
-        })
-        .collect()
-}
-
-/// The registry's session file-touch telemetry as store rows: one per
-/// normalized path, `ops` as the deduplicated CRUD letters in
-/// first-occurrence order, and the ordered audit log serialized to JSON.
-fn file_touch_rows(registry: &ToolRegistry) -> Vec<stella_store::FileTouchRow> {
-    registry
-        .file_touch_telemetry()
-        .files_touched
-        .into_iter()
-        .map(|record| stella_store::FileTouchRow {
-            ops: record.crud_events.iter().map(|op| op.letter()).collect(),
-            lines_added: record.lines_added,
-            lines_removed: record.lines_removed,
-            events_json: serde_json::to_string(&record.events).unwrap_or_else(|_| "[]".into()),
-            path: record.path,
-        })
-        .collect()
-}
-
-/// The registry's memory citations as store rows. This DRAINS the ledger
-/// (unlike the cumulative file-touch snapshot) so each citation persists
-/// under exactly one execution — the >10 promotion count must never be
-/// inflated by re-persisting a citation under later turns.
-fn memory_citation_rows(registry: &ToolRegistry) -> Vec<stella_store::MemoryCitationRow> {
-    registry
-        .take_memory_citations()
-        .into_iter()
-        .map(|c| stella_store::MemoryCitationRow {
-            memory_id: c.memory_id,
-            useful_score: c.useful_score,
-            truthful: c.truthful,
-            remark: c.remark,
-        })
-        .collect()
-}
-
-/// The stderr form of the store-write warning, for the non-deck surfaces.
-pub(crate) fn warn_store_write_failed(what: &str) {
-    eprintln!(
-        "  {} store write failed — {what} for this execution is incomplete",
-        "⚠".yellow()
-    );
-}
-
-/// Persist one drained event to an open execution record: append it to the
-/// event stream and, for `StepUsage`, add a telemetry row. Shared by
-/// [`spawn_renderer`] (one-shot/REPL rendering) and the command deck's event
-/// forwarder (`crate::command_deck`), so the store's write path lives in
-/// exactly one place. Returns `false` when the event-stream append failed OR
-/// (for `StepUsage`) the telemetry insert failed, so the caller's once-only
-/// "telemetry for this execution is incomplete" warning actually covers the
-/// telemetry row too — a telemetry-only failure must not stay silent.
-pub(crate) fn persist_event(
-    store: &Store,
-    execution_id: i64,
-    seq: u64,
-    event: &AgentEvent,
-    provider_id: &str,
-) -> bool {
-    let recorded = store.record_event(execution_id, seq, event).is_ok();
-    // True when the event carried no StepUsage or the insert succeeded.
-    let mut telemetry_ok = true;
-    if let AgentEvent::StepUsage {
-        step,
-        model,
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        cache_write_tokens,
-        estimated_input_tokens,
-        cost_usd,
-        duration_ms,
-        retries,
-        tool_calls,
-    } = event
-    {
-        telemetry_ok = store
-            .record_telemetry(
-                execution_id,
-                &TelemetryRow {
-                    step: *step as u64,
-                    provider: provider_id.to_string(),
-                    model: model.clone(),
-                    input_tokens: *input_tokens,
-                    estimated_input_tokens: *estimated_input_tokens,
-                    output_tokens: *output_tokens,
-                    cache_read_tokens: *cached_input_tokens,
-                    cache_miss_tokens: input_tokens.saturating_sub(*cached_input_tokens),
-                    // Straight from the provider's usage envelope (Anthropic
-                    // `cache_creation_input_tokens`, Bedrock
-                    // `cacheWriteInputTokens`); 0 for providers that never
-                    // report cache writes.
-                    cache_write_tokens: *cache_write_tokens,
-                    cost_usd: *cost_usd,
-                    duration_ms: *duration_ms,
-                    retries: *retries,
-                    tool_calls: *tool_calls as u64,
-                },
-            )
-            .is_ok();
-        // Telemetry stores the wire string verbatim (above); this makes
-        // that string JOINABLE: an echoed form the catalog doesn't know
-        // yet (dated snapshot, region prefix, gateway-routed id) gets
-        // matched to its model card and registered as a learned alias.
-        // Best-effort and deduped in-process — never slows the write path.
-        crate::model_catalog::note_wire_model(provider_id, model);
-    }
-    recorded && telemetry_ok
 }
 
 fn print_help() {

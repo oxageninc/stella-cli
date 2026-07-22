@@ -8,6 +8,7 @@
 //! `serde_json` byte-for-byte (see the `roundtrip` tests in each module).
 
 pub mod attachment;
+pub mod cache;
 pub mod completion;
 pub mod error;
 pub mod event;
@@ -19,6 +20,7 @@ pub use attachment::{
     Attachment, AttachmentKind, AttachmentSource, classify_media_type, human_bytes,
     media_type_for_path,
 };
+pub use cache::CacheCause;
 pub use completion::{
     CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, FinishReason,
     GenerationParams, MessageRole, ReasoningEffort, ServiceTier, Verbosity,
@@ -26,8 +28,8 @@ pub use completion::{
 pub use error::ProviderError;
 pub use event::{
     AgentEvent, BudgetMode, CiStatus, ContextFrameRef, FileChangeKind, JudgeEvidence,
-    MediaArtifactRef, MediaJobState, MediaKind, PrStatus, ProviderShare, ScopeProposal, StageKind,
-    TaskItem, TaskStatus,
+    MediaArtifactRef, MediaJobState, MediaKind, ModelCallRole, PrStatus, ProviderShare,
+    ScopeProposal, StageKind, TaskItem, TaskStatus, UsageIncompleteReason,
 };
 pub use provider::{Provider, ToolCallObserver};
 pub use role::{ModelRef, Role};

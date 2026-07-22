@@ -17,10 +17,12 @@
 //!   for scripting (the interactive `chat`/`goal`/`monitor` modes render
 //!   human-readable output).
 
+mod accounted_call;
 mod agent;
 mod agents_installed;
 mod attachments;
 mod auth_cmd;
+mod cache_insight;
 mod candidate_ws;
 mod claims;
 mod command_deck;

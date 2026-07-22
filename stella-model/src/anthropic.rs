@@ -889,6 +889,7 @@ async fn aggregate_anthropic_stream(
                         stop_reason = Some(reason);
                     }
                     if let Some(u) = u {
+                        usage.reported = true;
                         if u.input_tokens > 0 {
                             usage.input_tokens = u.input_tokens + u.cache_read_input_tokens;
                         }

@@ -41,12 +41,14 @@
 //! [`WorkerControls`]: fleet::WorkerControls
 //! [`FleetWorker`]: fleet::FleetWorker
 
+pub mod cache_schedule;
 pub mod fleet;
 pub mod git;
 pub mod ledger;
 pub mod monitor;
 pub mod plan;
 
+pub use cache_schedule::{RunnableSession, warmest_first};
 pub use fleet::{
     Fleet, FleetConfig, FleetError, FleetRunReport, FleetWorker, TaskHandle, WorkerControls,
     WorkerOutcome,

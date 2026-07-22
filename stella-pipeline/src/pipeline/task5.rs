@@ -57,7 +57,8 @@ impl<'a> Pipeline<'a> {
             witness_tools,
             self.engine_config_for(surface),
             self.sleeper,
-        );
+        )
+        .with_call_role(stella_protocol::ModelCallRole::WitnessAuthor);
 
         let mut messages = vec![
             CompletionMessage::system(WITNESS_SYSTEM_PROMPT),
@@ -91,8 +92,15 @@ impl<'a> Pipeline<'a> {
         };
         if surface.tests.run_test(&invocation).await.passed() {
             messages.push(CompletionMessage::user(witness_repair_prompt(&command)));
+            let repair_engine = Engine::with_sleeper(
+                author.provider,
+                witness_tools,
+                self.engine_config_for(surface),
+                self.sleeper,
+            )
+            .with_call_role(stella_protocol::ModelCallRole::WitnessRepair);
             let repaired = match self
-                .run_engine_turn(&engine, &mut messages, budget, &mut file_changes)
+                .run_engine_turn(&repair_engine, &mut messages, budget, &mut file_changes)
                 .await
             {
                 TurnOutcome::Completed { text, cost_usd } => {

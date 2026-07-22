@@ -27,7 +27,10 @@ fn tool_result(name: &str) -> CompletionResult {
             name: name.into(),
             input: serde_json::json!({}),
         }],
-        usage: CompletionUsage::default(),
+        usage: CompletionUsage {
+            reported: true,
+            ..CompletionUsage::default()
+        },
         model: "scripted".into(),
         cost_usd: 0.0001,
         finish_reason: None,

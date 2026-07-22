@@ -8,6 +8,7 @@
 //! synchronous functions over owned data — easy to property-test
 //!
 
+pub mod accounted_call;
 pub mod budget;
 pub mod bus;
 pub mod compaction;
@@ -34,6 +35,7 @@ pub use budget::{BudgetGuard, BudgetOutcome};
 // `bus::HookEvent` (the extension-bus envelope) stays module-qualified: the
 // crate root already exports `hooks::HookEvent` (the shell-hook lifecycle
 // enum) and the two must never be confused at a glance.
+pub use accounted_call::{AccountedCall, AccountedCallError, run_accounted_call};
 pub use bus::{
     ExtensionFailure, HookBus, HookDecision, HookEventDraft, HookSubscription, PolicyOutcome,
 };
@@ -53,8 +55,9 @@ pub use ports::{Clock, ToolExecutor};
 pub use retry::{RetryOutcome, RetryPolicy, retry_with_backoff};
 pub use router::{RoleTable, Router};
 pub use rules::{
-    GuardCheck, LoadRulesOptions, ProposedAction, Rule, RuleGuard, RuleSource, evaluate_guards,
-    load_rules,
+    GuardCheck, LoadRulesOptions, ProposedAction, Rule, RuleEnforcement, RuleGuard, RuleMetadata,
+    RuleMetadataError, RuleOrigin, RuleRecordKind, RuleSource, evaluate_guards, load_rules,
+    render_rule_metadata,
 };
 pub use skills::{
     AutoCreateConfig, AutoCreateDecision, AutoCreateSkip, InstallDecision, LoadSkillsOptions,

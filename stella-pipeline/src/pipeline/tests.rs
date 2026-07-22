@@ -13,8 +13,8 @@ use stella_core::router::{CircuitBreaker, ProviderProfile, RoleTable};
 use stella_core::{Clock, ToolExecutor};
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{
-    CompletionRequest, CompletionUsage, FileChangeKind, MessageRole, ProviderError, ScopeProposal,
-    ToolOutput, ToolSchema,
+    CompletionRequest, CompletionResult, CompletionUsage, FileChangeKind, MessageRole,
+    ProviderError, ScopeProposal, ToolOutput, ToolSchema,
 };
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
@@ -477,7 +477,10 @@ fn text_result(text: &str) -> CompletionResult {
     CompletionResult {
         text: text.into(),
         tool_calls: vec![],
-        usage: CompletionUsage::default(),
+        usage: CompletionUsage {
+            reported: true,
+            ..CompletionUsage::default()
+        },
         model: "scripted".into(),
         cost_usd: 0.0001,
         finish_reason: None,
@@ -1297,3 +1300,4 @@ mod best_of_n;
 mod mcp_prefetch;
 mod task4;
 mod task5;
+mod usage;

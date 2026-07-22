@@ -97,6 +97,8 @@ pub struct ExecutionRollupRow {
     pub tool_calls: i64,
     pub files_written: i64,
     pub produced_output: bool,
+    /// False when any paid-call envelope or persistence boundary is unknown.
+    pub usage_complete: bool,
     pub self_rating: Option<i64>,
     pub started_at: String,
     /// The turn's day bucket (`YYYY-MM-DD`, from `started_at`) for the rollups.
@@ -297,6 +299,7 @@ mod tests {
 
     fn rollup(execution_id: i64, tools: Vec<ToolBucket>) -> ExecutionRollupRow {
         ExecutionRollupRow {
+            usage_complete: true,
             project_id: "proj_a".into(),
             project_name: "stella".into(),
             project_root: "/w/stella".into(),

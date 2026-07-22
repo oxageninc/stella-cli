@@ -43,6 +43,7 @@ pub mod ui;
 // Extends the single-session REPL above into a tabbed deck (Session · Agents ·
 // Traces · Graph · Files) while preserving the pure-core / thin-shell design.
 // See `COMMAND_DECK_DESIGN.md`.
+pub mod cache_panel;
 pub mod deck;
 pub mod deck_render;
 pub mod deck_shell;

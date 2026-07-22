@@ -99,12 +99,18 @@ use stella_tui::{
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::agent;
+use crate::cache_insight::cache_insight_for;
 use crate::claims::ClaimTap;
 use crate::config::Config;
 use crate::interactive::{AskUserIo, FREE_TEXT_LABEL, InteractiveToolSet, SkillRegistry};
-use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
+
+mod authoring;
+mod forwarder;
+use crate::memory::{SessionMemory, inject_recall_block};
 use crate::runtime::{SystemClock, TokioSleeper};
 use crate::subsession::{self, SubSessions, SupervisorMsg};
+use authoring::handle_agent_create;
+pub(crate) use forwarder::spawn_forwarder;
 
 /// The lead agent's id — the one conversation this driver runs.
 const LEAD: &str = "lead";
@@ -826,13 +832,27 @@ pub async fn run_deck_session(
                     // SKILLS-tab ops work whether or not a turn is running — handled
                     // at both recv sites so the manager is live mid-turn too.
                     Some(WorkspaceInput::Skill(op)) => {
-                        handle_skills_input(&op, cfg, &in_tx, &skill_registry);
+                        handle_skills_input(
+                            &op,
+                            cfg,
+                            &in_tx,
+                            &skill_registry,
+                            agent::remaining_budget(&budget),
+                        );
                         continue 'session;
                     }
                     // LLM-assisted agent creation needs the provider, which is
                     // free here (no turn in flight) — draft, install, refresh.
                     Some(WorkspaceInput::AgentCreate { description, scope }) => {
-                        handle_agent_create(&description, scope, cfg, &*provider, &in_tx).await;
+                        handle_agent_create(
+                            &description,
+                            scope,
+                            cfg,
+                            &*provider,
+                            agent::remaining_budget(&budget),
+                            &in_tx,
+                        )
+                        .await;
                         continue 'session;
                     }
                     // ⏎ on a resumable row in the SESSIONS overlay: navigate into
@@ -1072,6 +1092,7 @@ pub async fn run_deck_session(
             cfg,
             &custom,
             &mut pipeline_on,
+            agent::remaining_budget(&budget),
         )
         .await;
         if matches!(command, DeckCommand::Handled | DeckCommand::InitCompleted) {
@@ -1455,7 +1476,13 @@ pub async fn run_deck_session(
                         // usable while an agent is working. Create spawns its own
                         // provider, so unlike AgentCreate it needs no parking.
                         Some(WorkspaceInput::Skill(op)) => {
-                            handle_skills_input(&op, cfg, &in_tx, &skill_registry);
+                            handle_skills_input(
+                                &op,
+                                cfg,
+                                &in_tx,
+                                &skill_registry,
+                                budget_limit,
+                            );
                         }
                         // MCP tab: a live enable/disable toggle mid-turn is
                         // honored immediately — it only flips the shared set the
@@ -1578,28 +1605,21 @@ pub async fn run_deck_session(
                         });
                     }
                 }
-                agent::record_turn_episode(
-                    &memory,
+                authoring::record_and_reflect_turn(
+                    &mut memory,
                     &prompt,
                     &outcome,
                     &registry,
                     files_before,
                     started_unix,
-                    &messages[reflect_start..],
+                    &messages,
+                    reflect_start,
+                    &*provider,
+                    cfg,
+                    &mut budget,
+                    &in_tx,
                 )
                 .await;
-                if outcome.is_ok()
-                    && turn_warrants_reflection(&messages[reflect_start..])
-                    && let Some(m) = &mut memory
-                {
-                    m.reflect_and_record(&*provider, &messages, true, true)
-                        .await;
-                }
-                // Registry + inbox: the turn settled, so the session now
-                // waits on the user (Needs Input, machine-wide). Failed work
-                // always lands a persist-until-read notification; successful
-                // work does too when it ran long enough that the user has
-                // plausibly looked away.
                 session_exit = if outcome.is_err() {
                     stella_store::SessionStatus::Error
                 } else {
@@ -1685,6 +1705,7 @@ pub async fn run_deck_session(
                         registry.as_ref(),
                         "cancelled",
                         cancelled_cost,
+                        false,
                     )
                 {
                     let _ = in_tx.send(Inbound::Event {
@@ -1745,7 +1766,15 @@ pub async fn run_deck_session(
         // A creation request parked during the turn: the provider is free
         // again, so draft + install it before the next dispatch.
         if let Some((description, scope)) = pending_create.take() {
-            handle_agent_create(&description, scope, cfg, &*provider, &in_tx).await;
+            handle_agent_create(
+                &description,
+                scope,
+                cfg,
+                &*provider,
+                agent::remaining_budget(&budget),
+                &in_tx,
+            )
+            .await;
         }
     }
 
@@ -3457,54 +3486,6 @@ fn pin_agent(root: &std::path::Path, name: &str, scope: AgentScope, version: u32
     }
 }
 
-/// LLM-assisted create-from-prompt: draft the definition through the
-/// session's provider (the same one-shot `Provider::complete` path the
-/// reflection module uses — no hand-rolled HTTP), validate it with the real
-/// loader parser, install it at `scope`, and answer with a fresh list.
-async fn handle_agent_create(
-    description: &str,
-    scope: AgentScope,
-    cfg: &Config,
-    provider: &dyn Provider,
-    in_tx: &UnboundedSender<Inbound>,
-) {
-    let status = match create_agent(description, scope, cfg, provider).await {
-        Ok(status) => status,
-        Err(e) => format!("agent creation failed: {e}"),
-    };
-    let _ = in_tx.send(agents_list_inbound(&cfg.workspace_root, Some(status)));
-}
-
-async fn create_agent(
-    description: &str,
-    scope: AgentScope,
-    cfg: &Config,
-    provider: &dyn Provider,
-) -> Result<String, String> {
-    let req = CompletionRequest {
-        messages: crate::agents_installed::creation_messages(description),
-        max_output_tokens: Some(1200),
-        temperature: Some(0.2),
-        effort: None,
-        tools: vec![],
-        reasoning: None,
-        params: None,
-    };
-    let result = provider
-        .complete(req)
-        .await
-        .map_err(|e| format!("draft call failed: {e}"))?;
-    let agent = crate::agents_installed::parse_generated_agent(&result.text)?;
-    let dir = crate::agents_installed::agents_dir_for(scope, &cfg.workspace_root)?;
-    let path = crate::agents_installed::install_new_agent(&dir, &agent)?;
-    Ok(format!(
-        "created {} ({} scope) at {} — v1 pinned",
-        agent.name,
-        scope.label(),
-        path.display()
-    ))
-}
-
 /// Cap on the free-text `reason` stamped on an agent-use telemetry row.
 const AGENT_USE_REASON_MAX: usize = 120;
 
@@ -3555,6 +3536,7 @@ async fn run_deck_command(
     cfg: &Config,
     custom: &crate::extensions::CustomExtensions,
     pipeline_on: &mut bool,
+    budget_limit: Option<f64>,
 ) -> DeckCommand {
     let trimmed = prompt.trim();
     if !trimmed.starts_with('/') {
@@ -3614,11 +3596,17 @@ async fn run_deck_command(
             // strand a held splash.
             let _ = in_tx.send(Inbound::Splash(SplashCue::Replay));
             let mut emit = |line: String| say(line);
-            let outcome =
-                agent::init_workspace(Some(provider), &cfg.workspace_root, &mut emit).await;
+            let outcome = agent::init_workspace(
+                Some(provider),
+                &cfg.workspace_root,
+                Some(&cfg.model_id),
+                budget_limit,
+                &mut emit,
+            )
+            .await;
             let _ = in_tx.send(Inbound::Splash(SplashCue::Release));
             match outcome {
-                Ok(_) => {
+                Ok((_domains, _cost_usd)) => {
                     // A fresh index may name tables/types the schema gate
                     // should know about this session, not just the next one.
                     if let Err(error) = agent::populate_schema_index(registry, &cfg.workspace_root)
@@ -3811,7 +3799,7 @@ async fn run_lead_turn(
         engine.run_turn(messages, budget, &tx).await
     };
     drop(tx);
-    let _ = forwarder.await;
+    let persistence_complete = forwarder.await.unwrap_or(false);
     claims.release_all();
 
     if let Some((store, id)) = &execution {
@@ -3819,7 +3807,14 @@ async fn run_lead_turn(
             TurnOutcome::Completed { cost_usd, .. } => ("completed", *cost_usd),
             TurnOutcome::Aborted { cost_usd, .. } => ("aborted", *cost_usd),
         };
-        if !agent::record_execution_end(store, *id, registry, outcome_label, cost) {
+        if !agent::record_execution_end(
+            store,
+            *id,
+            registry,
+            outcome_label,
+            cost,
+            persistence_complete,
+        ) {
             let _ = in_tx.send(Inbound::Event {
                 agent: LEAD.to_string(),
                 event: AgentEvent::Error {
@@ -3993,12 +3988,19 @@ async fn run_lead_pipeline_turn(
         pipeline.run(prompt, messages, budget).await
     };
     drop(tx);
-    let _ = forwarder.await;
+    let persistence_complete = forwarder.await.unwrap_or(false);
     claims.release_all();
 
     if let Some((store, id)) = &execution {
         let (outcome_label, cost) = agent::pipeline_execution_closeout(&result);
-        if !agent::record_execution_end(store, *id, registry, outcome_label, cost) {
+        if !agent::record_execution_end(
+            store,
+            *id,
+            registry,
+            outcome_label,
+            cost,
+            persistence_complete,
+        ) {
             let _ = in_tx.send(Inbound::Event {
                 agent: LEAD.to_string(),
                 event: AgentEvent::Error {
@@ -4068,10 +4070,15 @@ pub(crate) fn spawn_forwarder(
                 }
                 seq += 1;
             }
+            // Sent AFTER StepUsage below so the lane is already registered.
+            let cache_insight = cache_insight_for(&provider_id, &lane, &event);
             let _ = inbound.send(Inbound::Event {
                 agent: lane.clone(),
                 event,
             });
+            if let Some(insight) = cache_insight {
+                let _ = inbound.send(insight);
+            }
         }
     })
 }

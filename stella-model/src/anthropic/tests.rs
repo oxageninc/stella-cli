@@ -685,6 +685,7 @@ async fn complete_streams_and_aggregates_text_deltas_from_a_mock_server() {
         .complete(req)
         .await
         .expect("completion should succeed");
+    assert!(result.usage.reported);
     assert_eq!(result.text, "Hello!");
     assert_eq!(result.usage.input_tokens, 12);
     assert_eq!(result.usage.output_tokens, 2);
@@ -1156,6 +1157,7 @@ async fn complete_computes_nonzero_cost_from_catalog_pricing() {
         .unwrap()
         .pricing
         .cost_usd(&CompletionUsage {
+            reported: true,
             input_tokens: 1000,
             output_tokens: 500,
             cached_input_tokens: 0,

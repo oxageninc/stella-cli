@@ -115,6 +115,32 @@ pub struct AgentEntry {
     /// contract (`cached_input_tokens ⊆ input_tokens`), so the session
     /// cache-hit rate `cache_read_tokens / tokens_in` is always in `[0, 1]`.
     pub cache_read_tokens: u64,
+    /// Cumulative prompt-cache *write* tokens — the `cache_write_tokens` sum
+    /// from `StepUsage`. NOT a subset of `tokens_in` (writes bill separately),
+    /// so this is the raw write volume the cache panel shows next to the reads.
+    pub cache_write_tokens: u64,
+    /// Cumulative estimated USD saved by prompt caching, summed from the signed
+    /// per-call [`crate::envelope::Inbound::CacheInsight`] deltas the
+    /// pricing-aware producer computes. Signed: negative when the write premium
+    /// outran the reads (the low-hit incident worth surfacing).
+    pub cache_savings_usd: f64,
+    /// The agent provider's prompt-cache TTL in seconds, from the latest
+    /// `CacheInsight` (`0` = no prompt cache / no TTL). Paired with
+    /// [`Self::last_provider_call_ms`] for the deck's warmth countdown.
+    pub cache_ttl_secs: u64,
+    /// Whether the agent's current provider only caches behind an explicit
+    /// opt-in marker, from the latest `CacheInsight` — see
+    /// [`crate::envelope::Inbound::CacheInsight`]. Feeds
+    /// [`Self::cache_diagnosis`]'s `OptInNeverEngaged` case.
+    pub cache_is_opt_in_provider: bool,
+    /// Metered model calls this agent has made (`StepUsage` count) — the
+    /// `turns` a low-hit-rate diagnosis needs enough of before a 0% hit rate
+    /// is meaningful (turn 1 always writes, never reads).
+    pub cache_call_count: u64,
+    /// Wall-clock ms of the agent's most recent metered model call (a
+    /// `StepUsage`) — the anchor the cache-warmth countdown measures idle from.
+    /// `None` before any call has landed.
+    pub last_provider_call_ms: Option<u64>,
     /// The **current** context-window occupancy: the `input_tokens` of the most
     /// recent `StepUsage` (the prompt size the last call actually sent), NOT the
     /// running sum. This is what the Ctx% gauge divides by the window — using
@@ -156,6 +182,12 @@ impl AgentEntry {
             tokens_in: 0,
             tokens_out: 0,
             cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cache_savings_usd: 0.0,
+            cache_ttl_secs: 0,
+            cache_is_opt_in_provider: false,
+            cache_call_count: 0,
+            last_provider_call_ms: None,
             context_tokens: 0,
             cost_usd: 0.0,
             budget_ticked: false,
@@ -394,6 +426,12 @@ impl WorkspaceModel {
                     entry.tokens_in = 0;
                     entry.tokens_out = 0;
                     entry.cache_read_tokens = 0;
+                    entry.cache_write_tokens = 0;
+                    entry.cache_savings_usd = 0.0;
+                    entry.cache_ttl_secs = 0;
+                    entry.cache_is_opt_in_provider = false;
+                    entry.cache_call_count = 0;
+                    entry.last_provider_call_ms = None;
                     entry.context_tokens = 0;
                     entry.cost_usd = 0.0;
                     entry.budget_ticked = false;
@@ -404,6 +442,23 @@ impl WorkspaceModel {
             // The driver flipped staged-pipeline routing (`/pipeline`) — the
             // PIPELINE stat box tracks it live.
             Inbound::Pipeline(on) => self.pipeline = *on,
+            // Derived cache economics for the agent's latest call: accumulate
+            // the signed savings and adopt the provider's TTL. Follows the
+            // paired `StepUsage` (which auto-registers the lane), so an unknown
+            // id here is a stale/out-of-order envelope — a safe no-op.
+            Inbound::CacheInsight {
+                agent,
+                savings_usd_delta,
+                ttl_secs,
+                is_opt_in_provider,
+            } => {
+                if let Some(idx) = self.index_of(agent) {
+                    let entry = &mut self.agents[idx];
+                    entry.cache_savings_usd += *savings_usd_delta;
+                    entry.cache_ttl_secs = *ttl_secs;
+                    entry.cache_is_opt_in_provider = *is_opt_in_provider;
+                }
+            }
             // The graph snapshot, the slash vocabulary, the installed-agents
             // list, and the MCP snapshots are out-of-band read-models, not part
             // of the event-log fold — the view state owns them, applied in
@@ -470,6 +525,7 @@ impl WorkspaceModel {
                     input_tokens,
                     output_tokens,
                     cached_input_tokens,
+                    cache_write_tokens,
                     model,
                     cost_usd,
                     ..
@@ -477,6 +533,11 @@ impl WorkspaceModel {
                     entry.tokens_in += input_tokens;
                     entry.tokens_out += output_tokens;
                     entry.cache_read_tokens += cached_input_tokens;
+                    entry.cache_write_tokens += cache_write_tokens;
+                    entry.cache_call_count += 1;
+                    // A metered call just landed — anchor the cache-warmth
+                    // countdown here (the prefix is warmest right now).
+                    entry.last_provider_call_ms = Some(now);
                     // Occupancy is the LATEST call's prompt size, not the sum.
                     entry.context_tokens = *input_tokens;
                     entry.meta.model = Some(model.clone());
@@ -932,6 +993,9 @@ fn trace_of(ev: &AgentEvent) -> (TraceKind, String) {
             TraceKind::Other,
             format!("compact {before_tokens}→{after_tokens}"),
         ),
+        AgentEvent::UsageIncomplete { reason, .. } => {
+            (TraceKind::Other, format!("usage incomplete: {reason:?}"))
+        }
         AgentEvent::ScopeReview { proposal } => (TraceKind::Stage, snip(&proposal.summary)),
         AgentEvent::AskUser { question, .. } => (TraceKind::Other, snip(question)),
         AgentEvent::Error { message, .. } => (TraceKind::Error, snip(message)),
@@ -1277,6 +1341,8 @@ mod tests {
             "lead",
             AgentEvent::StepUsage {
                 step: 1,
+                role: stella_protocol::ModelCallRole::Worker,
+                provider: "zai".into(),
                 model: "glm-5.2".into(),
                 input_tokens: 1200,
                 output_tokens: 300,
@@ -1287,6 +1353,7 @@ mod tests {
                 duration_ms: 100,
                 retries: 0,
                 tool_calls: 1,
+                complete: true,
             },
         ));
         w.apply_inbound(&ev(
@@ -1357,6 +1424,8 @@ mod tests {
         w.apply_inbound(&reg("lead"));
         let step = |input: u64| AgentEvent::StepUsage {
             step: 1,
+            role: stella_protocol::ModelCallRole::Worker,
+            provider: "zai".into(),
             model: "glm-5.2".into(),
             input_tokens: input,
             output_tokens: 10,
@@ -1367,6 +1436,7 @@ mod tests {
             duration_ms: 1,
             retries: 0,
             tool_calls: 0,
+            complete: true,
         };
         // Three calls of 150k each: cumulative 450k dwarfs the 200k window, but
         // the window was only 150k full on the LAST call.
@@ -1385,6 +1455,8 @@ mod tests {
     fn budget_tick_sets_live_spend_without_double_counting_step_usage() {
         let step = |cost_usd: f64| AgentEvent::StepUsage {
             step: 1,
+            role: stella_protocol::ModelCallRole::Worker,
+            provider: "test".into(),
             model: "m".into(),
             input_tokens: 1,
             output_tokens: 1,
@@ -1395,6 +1467,7 @@ mod tests {
             duration_ms: 1,
             retries: 0,
             tool_calls: 0,
+            complete: true,
         };
         let mut w = WorkspaceModel::new();
         w.apply_inbound(&reg("lead"));
