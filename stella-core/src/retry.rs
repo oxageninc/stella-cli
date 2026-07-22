@@ -12,13 +12,11 @@
 //! - **L-M7**: retry classification is never re-derived here. Every decision
 //!   defers to [`stella_protocol::ProviderError::is_retryable`], which
 //!   providers set at the source.
-//! - **L-E10**: a step's side-effect events flush only when the step
-//!   commits. Applied to retries: [`retry_with_backoff`] returns the retry
-//!   history *with* a successful outcome (so the caller can emit
-//!   `AgentEvent::Retry` for a call that ultimately worked), but a call that
-//!   exhausts every attempt returns only the terminal
-//!   [`stella_protocol::ProviderError`] — the doomed attempts leading up to
-//!   a total failure never get their own wire events.
+//! - **L-E10**: speculative side-effect events flush only when the step
+//!   commits. Retry history follows that rule, while paid-call accounting is
+//!   intentionally stricter: [`retry_with_backoff_observed`] synchronously
+//!   exposes every failed dispatched attempt so unknown provider usage can be
+//!   persisted even when a later attempt succeeds.
 //!
 //! Jitter and per-call timeouts (L-E4) are a caller concern layered on top
 //! of `attempt_fn`; this module only owns "should we try again, and if so
@@ -180,11 +178,31 @@ pub fn compute_backoff_delay_ms(policy: &RetryPolicy, attempt: u32, rng: &mut im
 pub async fn retry_with_backoff<F, Fut, T>(
     policy: &RetryPolicy,
     sleeper: &dyn Sleeper,
-    mut attempt_fn: F,
+    attempt_fn: F,
 ) -> Result<RetryOutcome<T>, ProviderError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, ProviderError>>,
+{
+    retry_with_backoff_observed(policy, sleeper, attempt_fn, |_, _| {}).await
+}
+
+/// Retry while synchronously observing every failed dispatched attempt.
+///
+/// Accounting callers use this hook to emit a durable, content-free usage
+/// incompleteness envelope before any later attempt can succeed. A successful
+/// retry can report its own usage, but can never make an earlier provider
+/// attempt's unknown usage knowable after the fact.
+pub(crate) async fn retry_with_backoff_observed<F, Fut, T, O>(
+    policy: &RetryPolicy,
+    sleeper: &dyn Sleeper,
+    mut attempt_fn: F,
+    mut observe_failure: O,
+) -> Result<RetryOutcome<T>, ProviderError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ProviderError>>,
+    O: FnMut(u32, &ProviderError),
 {
     let mut retries = Vec::new();
     let mut attempt: u32 = 0;
@@ -198,6 +216,7 @@ where
                 });
             }
             Err(error) => {
+                observe_failure(attempt + 1, &error);
                 if !error.is_retryable() || attempt >= policy.max_retries {
                     return Err(error);
                 }

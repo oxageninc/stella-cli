@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
 use crate::budget::{BudgetGuard, BudgetOutcome};
-use crate::retry::{RetryPolicy, Sleeper, retry_with_backoff};
+use crate::retry::{RetryPolicy, Sleeper, retry_with_backoff_observed};
 
 pub struct AccountedCall<'a> {
     pub provider: &'a dyn Provider,
@@ -38,19 +38,23 @@ pub async fn run_accounted_call(
     sleeper: &dyn Sleeper,
 ) -> Result<CompletionResult, AccountedCallError> {
     let started = Instant::now();
-    let future = retry_with_backoff(&call.retry_policy, sleeper, || {
-        call.provider.complete(call.request.clone())
-    });
+    let future = retry_with_backoff_observed(
+        &call.retry_policy,
+        sleeper,
+        || call.provider.complete(call.request.clone()),
+        |attempt, _error| {
+            emit_incomplete(
+                &call,
+                events,
+                started.elapsed(),
+                Some(attempt.saturating_sub(1)),
+            );
+        },
+    );
     let outcome = match call.timeout {
         Some(limit) => match timeout(limit, future).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(error)) => {
-                emit_incomplete(
-                    &call,
-                    events,
-                    started.elapsed(),
-                    Some(retry_count(&call, &error)),
-                );
                 return Err(AccountedCallError::Provider(error));
             }
             Err(_) => {
@@ -60,15 +64,7 @@ pub async fn run_accounted_call(
         },
         None => match future.await {
             Ok(outcome) => outcome,
-            Err(error) => {
-                emit_incomplete(
-                    &call,
-                    events,
-                    started.elapsed(),
-                    Some(retry_count(&call, &error)),
-                );
-                return Err(AccountedCallError::Provider(error));
-            }
+            Err(error) => return Err(AccountedCallError::Provider(error)),
         },
     };
     for attempt in &outcome.retries {
@@ -123,14 +119,6 @@ pub async fn run_accounted_call(
     Ok(result)
 }
 
-fn retry_count(call: &AccountedCall<'_>, error: &ProviderError) -> u32 {
-    if error.is_retryable() {
-        call.retry_policy.max_retries
-    } else {
-        0
-    }
-}
-
 fn emit_incomplete(
     call: &AccountedCall<'_>,
     events: &UnboundedSender<AgentEvent>,
@@ -149,4 +137,119 @@ fn emit_incomplete(
         duration_ms: duration.as_millis() as u64,
         retries,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use stella_protocol::{BudgetMode, CompletionMessage, CompletionUsage};
+
+    use super::*;
+
+    struct NoopSleeper;
+
+    #[async_trait]
+    impl Sleeper for NoopSleeper {
+        async fn sleep(&self, _duration_ms: u64) {}
+    }
+
+    struct RetryThenSuccess {
+        attempts: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl Provider for RetryThenSuccess {
+        fn id(&self) -> &str {
+            "scripted"
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResult, ProviderError> {
+            let mut attempts = self.attempts.lock().expect("attempt lock");
+            *attempts += 1;
+            if *attempts == 1 {
+                return Err(ProviderError::Transport("private failed body".into()));
+            }
+            Ok(CompletionResult {
+                text: "done".into(),
+                tool_calls: Vec::new(),
+                usage: CompletionUsage::reported_zero(),
+                model: "scripted-model".into(),
+                cost_usd: 0.25,
+                finish_reason: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_retry_preserves_failed_attempt_incompleteness_and_known_cost() {
+        let provider = RetryThenSuccess {
+            attempts: Mutex::new(0),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let result = match run_accounted_call(
+            AccountedCall {
+                provider: &provider,
+                role: ModelCallRole::SkillAuthor,
+                model_hint: "configured-model".into(),
+                request: CompletionRequest {
+                    messages: vec![CompletionMessage::user("work")],
+                    max_output_tokens: None,
+                    temperature: None,
+                    effort: None,
+                    tools: Vec::new(),
+                    reasoning: None,
+                    params: None,
+                },
+                retry_policy: RetryPolicy::new(1, 0, 0),
+                timeout: None,
+                estimated_input_tokens: 1,
+            },
+            &mut budget,
+            &tx,
+            &NoopSleeper,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => panic!("retry should succeed"),
+        };
+
+        assert_eq!(result.cost_usd, 0.25);
+        assert_eq!(budget.spent_usd(), 0.25);
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let incomplete: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::UsageIncomplete { .. }))
+            .collect();
+        assert_eq!(incomplete.len(), 1);
+        assert!(matches!(
+            incomplete[0],
+            AgentEvent::UsageIncomplete {
+                role: ModelCallRole::SkillAuthor,
+                retries: Some(0),
+                ..
+            }
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::StepUsage {
+                role: ModelCallRole::SkillAuthor,
+                cost_usd,
+                retries: 1,
+                complete: true,
+                ..
+            } if (*cost_usd - 0.25).abs() < f64::EPSILON
+        )));
+        assert!(
+            !serde_json::to_string(&incomplete)
+                .expect("wire")
+                .contains("private failed body")
+        );
+    }
 }

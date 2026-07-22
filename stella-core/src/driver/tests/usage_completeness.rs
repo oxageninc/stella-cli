@@ -46,6 +46,60 @@ async fn exhausted_worker_call_emits_one_content_free_incompleteness_event() {
     assert!(!wire.contains("private upstream body"));
 }
 
+#[tokio::test]
+async fn successful_retry_keeps_the_failed_attempt_usage_incomplete() {
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(vec![
+            Err(ProviderError::Transport("private failed attempt".into())),
+            Ok(text_result("done")),
+        ]),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tools = CountingTools {
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let sleeper = NoopSleeper;
+    let config = EngineConfig {
+        retry_policy: RetryPolicy::new(1, 0, 0),
+        ..EngineConfig::default()
+    };
+    let engine = Engine::with_sleeper(&provider, &tools, config, &sleeper);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("work"),
+    ];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    let events = drain_events(&mut rx);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::UsageIncomplete { .. }))
+            .count(),
+        1,
+        "the first dispatched attempt has unknowable usage even though its retry succeeded"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::StepUsage {
+            retries: 1,
+            complete: true,
+            ..
+        }
+    )));
+    let incomplete: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::UsageIncomplete { .. }))
+        .collect();
+    let wire = serde_json::to_string(&incomplete).expect("wire");
+    assert!(!wire.contains("private failed attempt"));
+}
+
 fn overflow_messages() -> Vec<CompletionMessage> {
     let mut messages = vec![
         CompletionMessage::system("sys"),

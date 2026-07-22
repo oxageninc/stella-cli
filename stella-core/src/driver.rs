@@ -13,17 +13,15 @@
 //!
 //! # Deferred-flush events (L-E10)
 //!
-//! [`crate::retry::retry_with_backoff`] already implements the contract:
-//! on success it returns the *full* retry history (so a step that failed
-//! twice then succeeded still reports two `Retry` events — the attempts
-//! were real, they just didn't fail the step); on failure it returns only
-//! the terminal error. `run_turn` emits events straight from that outcome,
-//! so a step that never commits emits nothing about its doomed attempts —
-//! there is nothing extra to build here, the discipline is inherited.
+//! [`crate::retry::retry_with_backoff_observed`] returns committed retry
+//! history while synchronously exposing each failed provider attempt to the
+//! accounting path. Ordinary retry narration stays deferred until success;
+//! content-free `UsageIncomplete` envelopes are durable immediately because
+//! a later successful attempt cannot recover the failed call's usage.
 //!
 //! # Retry never re-executes a tool call
 //!
-//! [`crate::retry::retry_with_backoff`] wraps *only* the model call
+//! [`crate::retry::retry_with_backoff_observed`] wraps *only* the model call
 //! (`Provider::complete`). Tool execution happens exactly once, after a
 //! model call has already succeeded and returned tool calls to run — it is
 //! never inside the retried closure. A retried step therefore structurally
@@ -69,7 +67,7 @@ use crate::estimator::{CalibrationMap, estimate_conversation_tokens};
 use crate::hooks::{HookPayload, HookRunner, Hooks, run_hooks};
 use crate::loop_detect::{LoopDetectionConfig, detect_loop};
 use crate::ports::ToolExecutor;
-use crate::retry::{RetryOutcome, RetryPolicy, Sleeper, retry_with_backoff};
+use crate::retry::{RetryOutcome, RetryPolicy, Sleeper, retry_with_backoff_observed};
 use crate::speculation::{SpeculationGate, SpeculationPool, SpeculativeResult};
 use crate::{AccountedCall, AccountedCallError, run_accounted_call};
 
@@ -639,8 +637,7 @@ impl<'a> Engine<'a> {
         let messages_snapshot = messages.to_vec();
         let req_config = &self.config;
         let speculation_read_only = read_only_tools.clone();
-        // The gate forwards answer-text fragments straight onto the turn's
-        // event stream as `TextDelta` previews. Deliberately NOT rolled back
+        // The gate forwards answer fragments as `TextDelta` previews. Deliberately NOT rolled back
         // on a failed attempt: a retry's deltas re-stream from the start
         // with no reset marker — the eventual `Text` event is authoritative
         // and consumers replace the preview with it (protocol docs).
@@ -684,27 +681,30 @@ impl<'a> Engine<'a> {
         });
 
         let call_started = std::time::Instant::now();
+        let incomplete_events = events.clone();
         let RetryOutcome {
             value: (result, speculation_future),
             retries,
             ..
-        } = match retry_with_backoff(&self.config.retry_policy, self.sleeper, attempt).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let duration_ms = call_started.elapsed().as_millis() as u64;
-                let retries = if error.is_retryable() {
-                    self.config.retry_policy.max_retries
-                } else {
-                    0
-                };
-                let _ = events.send(AgentEvent::UsageIncomplete {
+        } = match retry_with_backoff_observed(
+            &self.config.retry_policy,
+            self.sleeper,
+            attempt,
+            |attempt, _error| {
+                let _ = incomplete_events.send(AgentEvent::UsageIncomplete {
                     role: self.call_role,
                     provider: self.provider.id().to_string(),
                     model: "unknown".into(),
                     reason: stella_protocol::UsageIncompleteReason::ProviderError,
-                    duration_ms,
-                    retries: Some(retries),
+                    duration_ms: call_started.elapsed().as_millis() as u64,
+                    retries: Some(attempt.saturating_sub(1)),
                 });
+            },
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
                 let message = error.to_string();
                 let _ = events.send(AgentEvent::Error {
                     message: message.clone(),
