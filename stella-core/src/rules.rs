@@ -66,6 +66,14 @@ use std::collections::HashMap;
 
 use crate::glob::match_glob;
 
+mod metadata;
+
+use metadata::metadata_from_frontmatter;
+pub use metadata::{
+    RuleEnforcement, RuleMetadata, RuleMetadataError, RuleOrigin, RuleRecordKind,
+    render_rule_metadata,
+};
+
 // ============================================================================
 // Types (ports `rules/types.ts`)
 // ============================================================================
@@ -111,6 +119,13 @@ pub struct Rule {
     /// Where the rule came from (a file path, or any opaque source label —
     /// TS: `source: string`).
     pub source: String,
+    /// Optional, Git-reviewable context-as-code metadata. Metadata-free rules
+    /// remain first-class rules during the staged migration.
+    pub metadata: Option<RuleMetadata>,
+    /// Metadata issues retained alongside a still-loadable rule. Keeping
+    /// these separate lets a future read-only linter explain invalid metadata
+    /// without changing legacy prompt or guard behavior.
+    pub metadata_errors: Vec<RuleMetadataError>,
 }
 
 impl Rule {
@@ -156,6 +171,10 @@ pub trait RuleSource: Send + Sync {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Frontmatter {
     pub data: HashMap<String, String>,
+    /// Keys which appeared more than once, in first-duplicate order. The
+    /// last scalar still wins in `data` for legacy compatibility; consumers
+    /// that need schema validation can reject the ambiguity explicitly.
+    pub duplicate_keys: Vec<String>,
     pub body: String,
 }
 
@@ -183,12 +202,14 @@ pub fn parse_frontmatter(raw: &str) -> Frontmatter {
     if !text.starts_with("---") {
         return Frontmatter {
             data: HashMap::new(),
+            duplicate_keys: Vec::new(),
             body: text.trim().to_string(),
         };
     }
     let Some(rel_end) = text.get(3..).and_then(|rest| rest.find("\n---")) else {
         return Frontmatter {
             data: HashMap::new(),
+            duplicate_keys: Vec::new(),
             body: text.trim().to_string(),
         };
     };
@@ -203,6 +224,7 @@ pub fn parse_frontmatter(raw: &str) -> Frontmatter {
         .to_string();
 
     let mut data = HashMap::new();
+    let mut duplicate_keys = Vec::new();
     // The key whose scalar value was empty on its own line — the head of a
     // possible YAML block sequence (`tools:` followed by `- Read` lines).
     let mut pending_list_key: Option<String> = None;
@@ -234,11 +256,18 @@ pub fn parse_frontmatter(raw: &str) -> Frontmatter {
         let key = trimmed[..colon].trim();
         let value = strip_matched_quotes(trimmed[colon + 1..].trim());
         if !key.is_empty() {
+            if data.contains_key(key) && !duplicate_keys.iter().any(|seen| seen == key) {
+                duplicate_keys.push(key.to_string());
+            }
             data.insert(key.to_string(), value.to_string());
             pending_list_key = value.is_empty().then(|| key.to_string());
         }
     }
-    Frontmatter { data, body }
+    Frontmatter {
+        data,
+        duplicate_keys,
+        body,
+    }
 }
 
 fn file_stem(path: &str) -> String {
@@ -247,9 +276,18 @@ fn file_stem(path: &str) -> String {
 }
 
 fn guard_from(data: &HashMap<String, String>) -> Option<RuleGuard> {
-    let tool = data.get("guard-tool").cloned();
-    let deny_path_glob = data.get("guard-deny-path").cloned();
-    let deny_command_glob = data.get("guard-deny-command").cloned();
+    let tool = data
+        .get("guard_tool")
+        .or_else(|| data.get("guard-tool"))
+        .cloned();
+    let deny_path_glob = data
+        .get("guard_deny_path")
+        .or_else(|| data.get("guard-deny-path"))
+        .cloned();
+    let deny_command_glob = data
+        .get("guard_deny_command")
+        .or_else(|| data.get("guard-deny-command"))
+        .cloned();
     if tool.is_none() && deny_path_glob.is_none() && deny_command_glob.is_none() {
         return None;
     }
@@ -273,12 +311,18 @@ pub fn rule_from_file(path: &str, raw: &str) -> Option<Rule> {
     if id.is_empty() || fm.body.trim().is_empty() {
         return None;
     }
+    let (metadata, metadata_errors) = match metadata_from_frontmatter(&fm) {
+        Ok(metadata) => (metadata, Vec::new()),
+        Err(errors) => (None, errors),
+    };
     Some(Rule {
         id,
         description: fm.data.get("description").cloned().unwrap_or_default(),
         text: fm.body.trim().to_string(),
         guard: guard_from(&fm.data),
         source: path.to_string(),
+        metadata,
+        metadata_errors,
     })
 }
 
@@ -906,6 +950,8 @@ mod tests {
                 deny_command_glob: Some("git push --force*".to_string()),
             })
         );
+        assert!(r.metadata.is_none());
+        assert!(r.metadata_errors.is_empty());
     }
 
     #[test]
@@ -917,6 +963,8 @@ mod tests {
         .unwrap();
         assert!(r.guard.is_none());
         assert_eq!(r.tier(), RuleTier::Prompt);
+        assert!(r.metadata.is_none());
+        assert!(r.metadata_errors.is_empty());
     }
 
     #[test]
@@ -1051,6 +1099,8 @@ mod tests {
             text: text.to_string(),
             guard,
             source: "test".to_string(),
+            metadata: None,
+            metadata_errors: Vec::new(),
         }
     }
 

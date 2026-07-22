@@ -53,8 +53,9 @@ pub use ports::{Clock, ToolExecutor};
 pub use retry::{RetryOutcome, RetryPolicy, retry_with_backoff};
 pub use router::{RoleTable, Router};
 pub use rules::{
-    GuardCheck, LoadRulesOptions, ProposedAction, Rule, RuleGuard, RuleSource, evaluate_guards,
-    load_rules,
+    GuardCheck, LoadRulesOptions, ProposedAction, Rule, RuleEnforcement, RuleGuard, RuleMetadata,
+    RuleMetadataError, RuleOrigin, RuleRecordKind, RuleSource, evaluate_guards, load_rules,
+    render_rule_metadata,
 };
 pub use skills::{
     AutoCreateConfig, AutoCreateDecision, AutoCreateSkip, InstallDecision, LoadSkillsOptions,
