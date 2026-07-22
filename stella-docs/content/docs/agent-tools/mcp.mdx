@@ -47,3 +47,48 @@ A stdio MCP subprocess runs with a **scrubbed environment** — ambient shell va
 <Callout type="info">
 MCP tools are treated like any other tool once merged in: they follow the [per-tool permission model](/docs/agent-tools/permissions) and their calls can be gated or blocked with a [`PreToolUse` hook](/docs/agent-tools/hooks).
 </Callout>
+
+## MCP in Best-of-N candidates
+
+A Best-of-N run (the pipeline's `candidates` setting) executes multiple
+candidates in isolated git shadow worktrees, so a candidate's edits never
+leak into another's, or into your real tree, until a winner is adopted. MCP
+servers stay **withheld by default** in that isolation, because most
+configured servers are either filesystem-rooted (redundant with the
+snapshot-rooted built-in read/write/edit tools) or side-effecting (harmful
+to run once per candidate — a deploy, an issue creation, a DB write).
+
+The servers worth sharing — read-only, external context that doesn't depend
+on which tree it's called from (docs/web search, a code graph, GitHub/Linear
+reads) — opt in explicitly per server:
+
+```toml
+# .stella/mcp.toml
+
+[servers.docs]
+transport = "http"
+url = "https://docs.example.com/mcp"
+candidate_safe = true
+```
+
+`candidate_safe` defaults to `false` and is never inferred from a server's
+own `read_only_hint` — that hint can't tell "reads an external system" (safe
+to share) from "reads the local tree" (would return your REAL tree's bytes
+inside a candidate's isolated snapshot, which is exactly the correctness
+hazard the isolation exists to prevent). Flip it on only for servers you've
+checked are genuinely read-only and cwd-independent.
+
+Two things follow from a server being `candidate_safe`:
+
+- Every candidate's engine can call that server's tools live, mid-turn,
+  through the same already-connected session client (no extra subprocess
+  per candidate).
+- Before the fan-out starts, Stella calls that server's zero-argument tools
+  **once** and folds the results into every candidate's starting context —
+  covering the common case where every candidate would otherwise ask the
+  same read-only question (a schema listing, say) N times over. A tool that
+  requires input is never called this way; its arguments are never guessed.
+
+`ask_user` stays withheld from candidates regardless: a fan-out of N
+candidates has no single owner for an interactive prompt, so candidates
+always run non-interactively.

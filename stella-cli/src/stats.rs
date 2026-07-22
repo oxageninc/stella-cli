@@ -119,6 +119,7 @@ fn cache_savings_for(row: &UsageStatsRow) -> Option<f64> {
     let catalog = Catalog::current();
     let entry = catalog.resolve_for(&row.provider, &row.model).ok()?;
     let usage = CompletionUsage {
+        reported: true,
         input_tokens: row.input_tokens.max(0) as u64,
         output_tokens: row.output_tokens.max(0) as u64,
         cached_input_tokens: row.cache_read_tokens.max(0) as u64,

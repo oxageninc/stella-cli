@@ -44,15 +44,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use stella_core::hooks::{HookRunner, Hooks};
-use stella_core::retry::{RetryPolicy, Sleeper, retry_with_backoff};
+use stella_core::retry::{RetryPolicy, Sleeper};
 use stella_core::router::FallbackInfo;
 use stella_core::{BudgetGuard, Engine, EngineConfig, Router, TurnOutcome};
 use stella_protocol::{
-    AgentEvent, CompletionMessage, CompletionRequest, CompletionResult, ContextFrameRef,
-    JudgeEvidence, ModelRef, Provider, ProviderShare, Role, StageKind,
+    AgentEvent, CompletionMessage, ContextFrameRef, JudgeEvidence, ModelCallRole, ModelRef,
+    Provider, ProviderShare, Role, StageKind,
 };
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::time::timeout;
 
 use crate::candidate::{
     CandidateScore, CandidateSummary, score_from_verification, select_best_candidate,
@@ -60,8 +59,9 @@ use crate::candidate::{
 use crate::plan::{PlanStep, build_planner_prompt, parse_plan, plan_repair_prompt};
 use crate::ports::{
     ApprovalGate, CandidateWorkspace, CandidateWorkspacePort, ContextRecallPort,
-    DiagnosticInvocation, DiagnosticRunner, ProviderResolver, RecalledFrame, RepoStatusPort,
-    RepoStructurePort, ScopeDecision, TestInvocation, TestRunner, WorkspaceError,
+    DiagnosticInvocation, DiagnosticRunner, McpPrefetchPort, PipelinePorts, ProviderResolver,
+    RecalledFrame, RepoStatusPort, RepoStructurePort, ScopeDecision, TestInvocation, TestRunner,
+    WorkspaceError,
 };
 use crate::scope::{ScopeEstimate, apply_trim, build_proposal, needs_scope_review};
 use crate::triage::{TaskClass, classify_triage_response, resolve_task_class, triage_prompt};
@@ -75,12 +75,14 @@ use crate::witness::{
     validate_witness_identity, validate_witness_invocation, witness_identity_matches,
     witness_prompt, witness_repair_prompt,
 };
+mod raw_usage;
 mod run_error;
 mod stage_budget;
 mod task5;
+use raw_usage::{RawCall, RawCallError};
 use run_error::RoleResolveError;
 pub use run_error::{PipelineError, PipelineRunError};
-use stage_budget::{PipelineBudgetAbort, aborted_before_execute, budget_abort, record_and_tick};
+use stage_budget::{PipelineBudgetAbort, aborted_before_execute, budget_abort};
 use task5::BoundHookRunner;
 /// Minimal fallback when the caller supplies no stable system prefix.
 const DEFAULT_SYSTEM_PROMPT: &str =
@@ -89,54 +91,6 @@ const DEFAULT_SYSTEM_PROMPT: &str =
 /// Small fixed system prompt for the independent witness author.
 const WITNESS_SYSTEM_PROMPT: &str = "You are a precise test author. You write minimal failing tests that pin down intended \
      behavior. You never modify production code and never fix the problem yourself.";
-
-/// The ports the pipeline orchestrates over. The `stella-cli` glue fills this
-/// with real subsystem adapters; tests fill it with scripted doubles. Grouped
-/// into one struct so [`Pipeline::new`] stays a two-argument constructor
-/// rather than a nine-parameter one.
-pub struct PipelinePorts<'a> {
-    /// Role → model resolution (`stella-core`). Held immutably; see the
-    /// module's "breaker feedback boundary" note.
-    pub router: &'a Router,
-    /// Maps a resolved [`ModelRef`] to its concrete provider adapter.
-    pub providers: &'a dyn ProviderResolver,
-    /// The tool registry the execute engine drives.
-    pub tools: &'a dyn stella_core::ToolExecutor,
-    /// Context recall at turn start (L-E8).
-    pub recall: &'a dyn ContextRecallPort,
-    /// Repo-structure summary for the planner's split context (L-E6).
-    pub repo: &'a dyn RepoStructurePort,
-    /// Untracked-file snapshots for the zero-diff guard (`git diff` can't see
-    /// untracked files; this makes new/modified untracked files visible).
-    pub repo_status: &'a dyn RepoStatusPort,
-    /// Runs closed, typed diagnostic invocations.
-    pub diagnostics: &'a dyn DiagnosticRunner,
-    /// Runs validated test invocations directly, without a shell.
-    pub tests: &'a dyn TestRunner,
-    /// The interactive scope-review gate (L-E5).
-    pub approvals: &'a dyn ApprovalGate,
-    /// The delay port for retry backoff — the same testability seam
-    /// `stella-core` uses; production passes the CLI's tokio-backed
-    /// sleeper, tests a no-op.
-    pub sleeper: &'a dyn Sleeper,
-    /// Lifecycle hooks for the execute engine — the parsed config plus the
-    /// runner that spawns hook commands (`stella_core::hooks`). `None` runs
-    /// the exact pre-hooks pipeline; the CLI passes its settings-chain hooks
-    /// so `PreToolUse` gating also covers the default `stella run` path.
-    pub hooks: Option<(&'a Hooks, &'a dyn HookRunner)>,
-    /// Candidate isolation (L-E7): one snapshot per candidate and passing-only
-    /// adoption. Also required for authored witnesses at `candidates = 1`.
-    pub candidate_workspaces: Option<&'a dyn CandidateWorkspacePort>,
-    /// Step-boundary steering for the EXECUTE engine only — mid-turn user
-    /// messages injected as the model's next observation (`stella_core`'s
-    /// `TurnSteering`). `None` on non-interactive paths (headless `run`,
-    /// fleet). Attached to execute turns alone: triage, planning, the
-    /// witness author, and the judge are autonomous sub-steps with no
-    /// user-facing "steer this" moment. The pipeline's stop remains the
-    /// caller's hard cancel — a pipeline is triage→…→judge, so a
-    /// mid-execute soft stop has no single obvious continuation.
-    pub steering: Option<&'a dyn stella_core::ports::TurnSteering>,
-}
 
 /// Per-role request overrides for the pipeline's raw completion calls
 /// (triage / judge / guidance), resolved by the caller from
@@ -419,6 +373,7 @@ pub struct Pipeline<'a> {
     sleeper: &'a dyn Sleeper,
     hooks: Option<(&'a Hooks, &'a dyn HookRunner)>,
     candidate_workspaces: Option<&'a dyn CandidateWorkspacePort>,
+    mcp_prefetch: Option<&'a dyn McpPrefetchPort>,
     steering: Option<&'a dyn stella_core::ports::TurnSteering>,
     events: UnboundedSender<AgentEvent>,
     config: PipelineConfig,
@@ -450,6 +405,7 @@ impl<'a> Pipeline<'a> {
             sleeper: ports.sleeper,
             hooks: ports.hooks,
             candidate_workspaces: ports.candidate_workspaces,
+            mcp_prefetch: ports.mcp_prefetch,
             steering: ports.steering,
             events,
             config,
@@ -694,24 +650,24 @@ impl<'a> Pipeline<'a> {
             self.emit_fallback(fb);
         }
 
-        let messages = vec![CompletionMessage::user(triage_prompt(goal))];
-        // Deterministic policy (L-M4: max_retries = 0) under a hard latency
-        // ceiling: on provider error OR timeout, fall through — never hang,
-        // never retry.
-        let call = self.complete_once(
-            resolved.provider,
-            messages,
-            RetryPolicy::deterministic(),
-            &self.config.role_overrides.triage,
-        );
-        let model_class = match timeout(self.config.triage_latency_ceiling, call).await {
-            Ok(Ok(result)) => {
-                *total += result.cost_usd;
-                let model_class = classify_triage_response(&result.text);
-                record_and_tick(budget, result.cost_usd, &self.events)?;
-                model_class
-            }
-            Ok(Err(_)) | Err(_) => None,
+        let model_class = match self
+            .metered_raw_call(
+                RawCall {
+                    role: ModelCallRole::Triage,
+                    resolved: &resolved,
+                    messages: vec![CompletionMessage::user(triage_prompt(goal))],
+                    policy: RetryPolicy::deterministic(),
+                    overrides: &self.config.role_overrides.triage,
+                    timeout: Some(self.config.triage_latency_ceiling),
+                },
+                budget,
+                total,
+            )
+            .await
+        {
+            Ok(result) => classify_triage_response(&result.text),
+            Err(RawCallError::Budget(abort)) => return Err(abort),
+            Err(RawCallError::Provider | RawCallError::Timeout) => None,
         };
         Ok(resolve_task_class(model_class, goal))
     }
@@ -745,39 +701,52 @@ impl<'a> Pipeline<'a> {
         // Plan rides the worker's settings (same router tier, same tuning).
         let worker_overrides = RoleCallOverrides::default();
         let result = match self
-            .complete_once(
-                resolved.provider,
-                vec![CompletionMessage::user(prompt)],
-                RetryPolicy::standard(),
-                &worker_overrides,
+            .metered_raw_call(
+                RawCall {
+                    role: ModelCallRole::Plan,
+                    resolved: &resolved,
+                    messages: vec![CompletionMessage::user(prompt)],
+                    policy: RetryPolicy::standard(),
+                    overrides: &worker_overrides,
+                    timeout: None,
+                },
+                budget,
+                total,
             )
             .await
         {
             Ok(r) => r,
-            Err(_) => return Ok(fallback_plan()),
+            Err(RawCallError::Budget(abort)) => return Err(abort),
+            Err(RawCallError::Provider | RawCallError::Timeout) => return Ok(fallback_plan()),
         };
-        *total += result.cost_usd;
-        record_and_tick(budget, result.cost_usd, &self.events)?;
 
         if let Some(steps) = parse_plan(&result.text) {
             return Ok(steps);
         }
 
         // One bounded JSON-repair retry (L-V2), deterministic (no retry-hang).
-        if let Ok(repair) = self
-            .complete_once(
-                resolved.provider,
-                vec![CompletionMessage::user(plan_repair_prompt(&result.text))],
-                RetryPolicy::deterministic(),
-                &worker_overrides,
+        match self
+            .metered_raw_call(
+                RawCall {
+                    role: ModelCallRole::PlanRepair,
+                    resolved: &resolved,
+                    messages: vec![CompletionMessage::user(plan_repair_prompt(&result.text))],
+                    policy: RetryPolicy::deterministic(),
+                    overrides: &worker_overrides,
+                    timeout: None,
+                },
+                budget,
+                total,
             )
             .await
         {
-            *total += repair.cost_usd;
-            record_and_tick(budget, repair.cost_usd, &self.events)?;
-            if let Some(steps) = parse_plan(&repair.text) {
-                return Ok(steps);
+            Ok(repair) => {
+                if let Some(steps) = parse_plan(&repair.text) {
+                    return Ok(steps);
+                }
             }
+            Err(RawCallError::Budget(abort)) => return Err(abort),
+            Err(RawCallError::Provider | RawCallError::Timeout) => {}
         }
 
         // Degrade to a single-step plan rather than failing — a planner that
@@ -913,6 +882,9 @@ impl<'a> Pipeline<'a> {
         budget: &mut BudgetGuard,
         total: &mut f64,
     ) -> Result<(CandidateResult, Option<String>), PipelineError> {
+        // Orchestrator pre-fetch (issue #248 Phase 1) — see `crate::mcp_prefetch::fold`.
+        let prefetched = crate::mcp_prefetch::fold(self.mcp_prefetch, goal, n, base_messages).await;
+        let base_messages: &[CompletionMessage] = prefetched.as_deref().unwrap_or(base_messages);
         let Some(port) = self.candidate_workspaces else {
             if author_witness {
                 return Ok((
@@ -1611,17 +1583,21 @@ impl<'a> Pipeline<'a> {
         });
         let prompt = guidance_prompt(goal, diff, evidence_summary);
         match self
-            .complete_once(
-                resolved.provider,
-                vec![CompletionMessage::user(prompt)],
-                RetryPolicy::deterministic(),
-                &self.config.role_overrides.judge,
+            .metered_raw_call(
+                RawCall {
+                    role: ModelCallRole::DistressGuidance,
+                    resolved: &resolved,
+                    messages: vec![CompletionMessage::user(prompt)],
+                    policy: RetryPolicy::deterministic(),
+                    overrides: &self.config.role_overrides.judge,
+                    timeout: None,
+                },
+                budget,
+                total,
             )
             .await
         {
             Ok(result) => {
-                *total += result.cost_usd;
-                record_and_tick(budget, result.cost_usd, &self.events)?;
                 let text = result.text.trim().to_string();
                 if text.is_empty() {
                     Ok(None)
@@ -1629,7 +1605,8 @@ impl<'a> Pipeline<'a> {
                     Ok(Some(text))
                 }
             }
-            Err(_) => Ok(None),
+            Err(RawCallError::Budget(abort)) => Err(abort),
+            Err(RawCallError::Provider | RawCallError::Timeout) => Ok(None),
         }
     }
 
@@ -1658,22 +1635,27 @@ impl<'a> Pipeline<'a> {
         // Deterministic policy: a judge call that fails must not hang; it falls
         // back to the heuristic verdict rather than retrying.
         match self
-            .complete_once(
-                resolved.provider,
-                vec![CompletionMessage::user(prompt)],
-                RetryPolicy::deterministic(),
-                &self.config.role_overrides.judge,
+            .metered_raw_call(
+                RawCall {
+                    role: ModelCallRole::Judge,
+                    resolved: &resolved,
+                    messages: vec![CompletionMessage::user(prompt)],
+                    policy: RetryPolicy::deterministic(),
+                    overrides: &self.config.role_overrides.judge,
+                    timeout: None,
+                },
+                budget,
+                total,
             )
             .await
         {
             Ok(result) => {
-                *total += result.cost_usd;
                 let verdict = parse_judge_response(&result.text)
                     .unwrap_or_else(|| heuristic_fallback(inputs));
-                record_and_tick(budget, result.cost_usd, &self.events)?;
                 Ok(verdict)
             }
-            Err(_) => Ok(heuristic_fallback(inputs)),
+            Err(RawCallError::Budget(abort)) => Err(abort),
+            Err(RawCallError::Provider | RawCallError::Timeout) => Ok(heuristic_fallback(inputs)),
         }
     }
 
@@ -1699,50 +1681,6 @@ impl<'a> Pipeline<'a> {
             provider,
             fallback: decision.fallback,
         })
-    }
-
-    /// One raw provider completion (triage/plan/judge — not the execute engine)
-    /// under `policy`, emitting a `Retry` event per committed retry (L-E10).
-    /// `overrides` refines the engine config per role — pass
-    /// `&RoleCallOverrides::default()` for calls that ride the worker's
-    /// settings (plan, repair). A custom role prompt is prepended as a
-    /// system message here, one place, so every call site composes it the
-    /// same way.
-    async fn complete_once(
-        &self,
-        provider: &dyn Provider,
-        messages: Vec<CompletionMessage>,
-        policy: RetryPolicy,
-        overrides: &RoleCallOverrides,
-    ) -> Result<CompletionResult, stella_protocol::ProviderError> {
-        let messages = match &overrides.prompt {
-            Some(prompt) => {
-                let mut with_system = Vec::with_capacity(messages.len() + 1);
-                with_system.push(CompletionMessage::system(prompt.clone()));
-                with_system.extend(messages);
-                with_system
-            }
-            None => messages,
-        };
-        let engine = &self.config.engine;
-        let req = CompletionRequest {
-            messages,
-            max_output_tokens: overrides.max_output_tokens.or(engine.max_output_tokens),
-            temperature: overrides.temperature.or(engine.temperature),
-            effort: overrides.effort.or(engine.effort),
-            reasoning: overrides.reasoning.or(engine.reasoning),
-            params: overrides.params.or(engine.params),
-            tools: Vec::new(),
-        };
-        let outcome =
-            retry_with_backoff(&policy, self.sleeper, || provider.complete(req.clone())).await?;
-        for attempt in &outcome.retries {
-            self.emit(AgentEvent::Retry {
-                attempt: attempt.attempt,
-                reason: attempt.reason.clone(),
-            });
-        }
-        Ok(outcome.value)
     }
 
     /// Run one engine turn, forwarding every event to the consumer **live**

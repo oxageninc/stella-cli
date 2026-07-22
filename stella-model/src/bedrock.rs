@@ -695,8 +695,10 @@ impl Provider for BedrockProvider {
                 }
             }
         }
+        let usage_reported = parsed.usage.is_some();
         let usage = parsed.usage.unwrap_or_default();
         let usage = CompletionUsage {
+            reported: usage_reported,
             // Converse's `inputTokens` EXCLUDES cache reads (same meter split
             // as Anthropic's native API), so reads are folded back in to keep
             // the normalized subset invariant (cached ⊆ input) that
@@ -1212,6 +1214,7 @@ mod tests {
         assert_eq!(result.usage.output_tokens, 5);
         assert_eq!(result.usage.cached_input_tokens, 3);
         assert_eq!(result.usage.cache_write_tokens, 2);
+        assert!(result.usage.reported);
     }
 
     /// Prompt caching on Converse is opt-in via `cachePoint` blocks: one

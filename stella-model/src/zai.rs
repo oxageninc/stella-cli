@@ -1020,6 +1020,8 @@ async fn aggregate_zai_stream(
     // Gateway-reported per-call cost (OpenRouter usage accounting), from the
     // final usage frame. `None` when the endpoint doesn't report one.
     let mut reported_cost_usd: Option<f64> = None;
+    let mut usage_seen = false;
+    let mut terminal_seen = false;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = http::next_with_timeout(&mut stream, http::STREAM_IDLE_TIMEOUT).await? {
@@ -1028,7 +1030,11 @@ async fn aggregate_zai_stream(
             .map_err(|e| ProviderError::Malformed(e.to_string()))?;
         for event in decoder.poll() {
             let data = event.data.trim();
-            if data.is_empty() || data == "[DONE]" {
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                terminal_seen = true;
                 continue;
             }
             let parsed: ZaiStreamChunk = match serde_json::from_str(data) {
@@ -1041,6 +1047,7 @@ async fn aggregate_zai_stream(
                 return Err(classify_zai_stream_error(err, label));
             }
             if let Some(u) = parsed.usage {
+                usage_seen = true;
                 usage.input_tokens = u.prompt_tokens;
                 usage.output_tokens = u.completion_tokens;
                 let details = u.prompt_tokens_details.unwrap_or_default();
@@ -1101,6 +1108,8 @@ async fn aggregate_zai_stream(
             }
         }
     }
+
+    usage.reported = usage_seen && terminal_seen;
 
     // OpenAI-style tool calls stream sequentially by index, so when the
     // stream reports `finish_reason: "length"` only the highest-index call

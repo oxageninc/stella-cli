@@ -80,6 +80,11 @@ pub struct McpToolSet {
     /// Server names disabled for this session. A disabled server's tools are
     /// hidden from `schemas()` and its calls error, without disconnecting it.
     disabled: Option<DisabledServers>,
+    /// Connected server names opted into the Best-of-N candidate allowlist
+    /// (`.stella/mcp.toml`'s `candidate_safe = true`, issue #248 Phase 1).
+    /// Populated from the configs at connect time; see
+    /// [`McpToolSet::for_candidates`].
+    candidate_safe: HashSet<String>,
 }
 
 impl McpToolSet {
@@ -105,6 +110,11 @@ impl McpToolSet {
         let mut clients = Vec::new();
         let mut failed = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        let candidate_safe: HashSet<String> = configs
+            .iter()
+            .filter(|c| c.candidate_safe)
+            .map(|c| c.name.clone())
+            .collect();
 
         for config in configs {
             if !is_namespaceable(&config.name) {
@@ -140,6 +150,7 @@ impl McpToolSet {
             native: None,
             usage: None,
             disabled: None,
+            candidate_safe,
         };
         set.rebuild_routes();
         set
@@ -176,6 +187,7 @@ impl McpToolSet {
             native: None,
             usage: None,
             disabled: None,
+            candidate_safe: HashSet::new(),
         };
         set.rebuild_routes();
         set
@@ -185,6 +197,20 @@ impl McpToolSet {
     /// falls through to it.
     pub fn wrapping(mut self, native: Arc<dyn ToolExecutor>) -> Self {
         self.native = Some(native);
+        self
+    }
+
+    /// Flag `names` as Best-of-N candidate-safe (issue #248 Phase 1) —
+    /// [`McpToolSet::connect_with_auth`] does this from `.stella/mcp.toml`
+    /// automatically; this is for [`McpToolSet::from_clients`] callers (tests,
+    /// or any future non-config-driven construction) that need to set it
+    /// explicitly.
+    pub fn with_candidate_safe_servers<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.candidate_safe = names.into_iter().map(Into::into).collect();
         self
     }
 
@@ -211,6 +237,72 @@ impl McpToolSet {
                 .unwrap_or_else(|p| p.into_inner())
                 .contains(server)
         })
+    }
+
+    /// Whether `namespaced` (an `mcp__server__tool` name) routes to a
+    /// currently-connected, non-disabled server flagged `candidate_safe` —
+    /// the Best-of-N allowlist check (issue #248 Phase 1). A name that
+    /// doesn't route to any server (including every plain native tool name,
+    /// which never matches an `mcp__…` route) is `false`.
+    pub fn is_candidate_safe_tool(&self, namespaced: &str) -> bool {
+        self.routes.get(namespaced).is_some_and(|(idx, _)| {
+            let name = self.clients[*idx].name();
+            self.candidate_safe.contains(name) && !self.is_disabled(name)
+        })
+    }
+
+    /// Connected, non-disabled server names flagged `candidate_safe`, in
+    /// connect order — the counterpart of [`McpToolSet::connected_names`] for
+    /// a Best-of-N status/diagnostic surface.
+    pub fn candidate_safe_server_names(&self) -> Vec<&str> {
+        self.clients
+            .iter()
+            .map(|c| c.name())
+            .filter(|name| self.candidate_safe.contains(*name) && !self.is_disabled(name))
+            .collect()
+    }
+
+    /// Build a Best-of-N candidate's tool surface (issue #248 Phase 1):
+    /// `native` (the candidate's own snapshot-rooted registry + custom
+    /// tools) composed with a READ-ONLY, filtered view over `self` — only
+    /// tools from `candidate_safe`-flagged servers are advertised or
+    /// callable; the same connected clients answer every candidate's calls,
+    /// no per-candidate subprocess. Requires `Arc<Self>` (not `&self`) so the
+    /// returned view can outlive the session's own borrow of the set — see
+    /// `stella-cli/src/candidate_ws.rs`'s module doc for the full rationale
+    /// and why every OTHER server (and `ask_user`) stays withheld.
+    pub fn for_candidates(self: &Arc<Self>, native: Arc<dyn ToolExecutor>) -> CandidateMcpView {
+        CandidateMcpView {
+            inner: Arc::clone(self),
+            native,
+        }
+    }
+
+    /// The orchestrator's Best-of-N pre-fetch (issue #248 Phase 1): call
+    /// every connected, non-disabled, `candidate_safe`-flagged server's
+    /// ZERO-required-input tools ONCE, concatenating their output as shared
+    /// context every candidate can start from — the common "candidates all
+    /// need the same DB schema" case, at the cost of one round trip instead
+    /// of N. A tool whose schema requires input is skipped outright: this
+    /// never synthesizes an argument, it only ever calls a tool with a
+    /// genuinely empty `{}`. `None` when nothing is safe to call, or every
+    /// call errored or came back empty — a prefetch miss, never a panic.
+    pub async fn prefetch_candidate_context(&self) -> Option<String> {
+        let mut sections = Vec::new();
+        for schema in self.schemas() {
+            if !self.is_candidate_safe_tool(&schema.name)
+                || !accepts_empty_input(&schema.input_schema)
+            {
+                continue;
+            }
+            let empty = Value::Object(serde_json::Map::new());
+            if let ToolOutput::Ok { content } = self.execute(&schema.name, &empty).await
+                && !content.trim().is_empty()
+            {
+                sections.push(format!("### {}\n{}", schema.name, content.trim()));
+            }
+        }
+        (!sections.is_empty()).then(|| sections.join("\n\n"))
     }
 
     /// Override the per-call timeout (default [`DEFAULT_CALL_TIMEOUT`]),
@@ -364,9 +456,65 @@ impl ToolExecutor for McpToolSet {
     }
 }
 
+/// A Best-of-N candidate's tool surface (issue #248 Phase 1): built by
+/// [`McpToolSet::for_candidates`]. `execute`/`schemas` route an `mcp__…` name
+/// through `inner` ONLY when [`McpToolSet::is_candidate_safe_tool`] allows
+/// it; every other name — including a `mcp__…` miss on a withheld server —
+/// falls to `native` or a loud, model-visible error, never to `inner`'s own
+/// (real-tree-rooted) native layer, which this view never advertises or
+/// calls.
+pub struct CandidateMcpView {
+    inner: Arc<McpToolSet>,
+    native: Arc<dyn ToolExecutor>,
+}
+
+#[async_trait]
+impl ToolExecutor for CandidateMcpView {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        let mut schemas = self.native.schemas();
+        // `inner.schemas()` also carries `inner`'s own native layer (the
+        // SESSION's real-tree tools) if it wraps one — but those never match
+        // an `mcp__…` route, so `is_candidate_safe_tool` (route lookup only)
+        // naturally excludes them here without special-casing.
+        schemas.extend(
+            self.inner
+                .schemas()
+                .into_iter()
+                .filter(|s| self.inner.is_candidate_safe_tool(&s.name)),
+        );
+        schemas
+    }
+
+    async fn execute(&self, name: &str, input: &Value) -> ToolOutput {
+        if name.starts_with(NS_PREFIX) {
+            return if self.inner.is_candidate_safe_tool(name) {
+                self.inner.execute(name, input).await
+            } else {
+                ToolOutput::Error {
+                    message: format!(
+                        "mcp tool `{name}` is withheld from Best-of-N candidates — its \
+                         server is not marked `candidate_safe` in .stella/mcp.toml"
+                    ),
+                }
+            };
+        }
+        self.native.execute(name, input).await
+    }
+}
+
 /// Compose the namespaced tool name for a server/tool pair.
 fn namespaced_name(server: &str, tool: &str) -> String {
     format!("{NS_PREFIX}{server}{NS_SEP}{tool}")
+}
+
+/// Whether `schema` can be called with an empty `{}` — no `required` array,
+/// or an empty one. Used ONLY to decide whether [`McpToolSet::prefetch_candidate_context`]
+/// may call a tool blind; never to synthesize a value for a required field.
+fn accepts_empty_input(schema: &Value) -> bool {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_none_or(|required| required.is_empty())
 }
 
 /// A server name may be used as a namespace segment only if it is non-empty
@@ -434,6 +582,17 @@ mod tests {
     }
 
     async fn connected_client(name: &str, tool: &str) -> McpClient {
+        connected_client_with_schema(name, tool, serde_json::json!({ "type": "object" })).await
+    }
+
+    /// Like [`connected_client`], with a caller-chosen `inputSchema` — for
+    /// proving [`McpToolSet::prefetch_candidate_context`]'s zero-required-input
+    /// filter against a tool that DOES require one.
+    async fn connected_client_with_schema(
+        name: &str,
+        tool: &str,
+        input_schema: Value,
+    ) -> McpClient {
         let transport = ScriptedTransport::new();
         transport.push_ok(
             "initialize",
@@ -441,7 +600,7 @@ mod tests {
         );
         transport.push_ok(
             "tools/list",
-            serde_json::json!({ "tools": [{ "name": tool, "inputSchema": { "type": "object" } }] }),
+            serde_json::json!({ "tools": [{ "name": tool, "inputSchema": input_schema }] }),
         );
         // Pre-queue a successful call for the routing test.
         transport.push_ok(
@@ -610,5 +769,128 @@ mod tests {
             set.schemas().iter().any(|s| s.name == "mcp__files__read"),
             "re-enabled server's tool must reappear"
         );
+    }
+
+    // ---- for_candidates / CandidateMcpView (issue #248 Phase 1) ----------
+
+    #[tokio::test]
+    async fn candidate_view_advertises_only_allowlisted_mcp_tools_plus_native() {
+        let docs = connected_client("docs", "search").await;
+        let fs = connected_client("fs", "write").await;
+        let set = Arc::new(
+            McpToolSet::from_clients(vec![docs, fs]).with_candidate_safe_servers(["docs"]),
+        );
+        let view = set.for_candidates(Arc::new(FakeNative));
+
+        let names: HashSet<String> = view.schemas().into_iter().map(|s| s.name).collect();
+        assert!(names.contains("mcp__docs__search"), "allowlisted server");
+        assert!(names.contains("bash"), "candidate's own native tool");
+        assert!(
+            !names.contains("mcp__fs__write"),
+            "non-candidate_safe server must not be advertised: {names:?}"
+        );
+        assert_eq!(names.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn candidate_view_executes_an_allowlisted_tool_and_falls_through_to_native() {
+        let docs = connected_client("docs", "search").await;
+        let set =
+            Arc::new(McpToolSet::from_clients(vec![docs]).with_candidate_safe_servers(["docs"]));
+        let view = set.for_candidates(Arc::new(FakeNative));
+
+        let mcp_out = view.execute("mcp__docs__search", &Value::Null).await;
+        assert_eq!(
+            mcp_out,
+            ToolOutput::Ok {
+                content: "mcp ran".into()
+            }
+        );
+        let native_out = view.execute("bash", &Value::Null).await;
+        assert_eq!(
+            native_out,
+            ToolOutput::Ok {
+                content: "native ran bash".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_view_denies_a_non_allowlisted_mcp_tool_with_a_named_error() {
+        let fs = connected_client("fs", "write").await;
+        // No `with_candidate_safe_servers` call — nothing is allowlisted.
+        let set = Arc::new(McpToolSet::from_clients(vec![fs]));
+        let view = set.for_candidates(Arc::new(FakeNative));
+
+        match view.execute("mcp__fs__write", &Value::Null).await {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("mcp__fs__write"), "{message}");
+                assert!(message.contains("candidate_safe"), "{message}");
+            }
+            other => panic!("expected a withheld error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_view_respects_the_session_disabled_set() {
+        // A server can be candidate_safe AND toggled off mid-session — the
+        // candidate view must honor the live disable, same as the main set.
+        let docs = connected_client("docs", "search").await;
+        let disabled: DisabledServers = Arc::new(Mutex::new(HashSet::new()));
+        disabled.lock().unwrap().insert("docs".to_string());
+        let set = Arc::new(
+            McpToolSet::from_clients(vec![docs])
+                .with_candidate_safe_servers(["docs"])
+                .with_disabled_servers(disabled),
+        );
+        let view = set.for_candidates(Arc::new(FakeNative));
+
+        assert!(
+            view.schemas().iter().all(|s| s.name != "mcp__docs__search"),
+            "disabled server must not be advertised even if candidate_safe"
+        );
+        assert!(
+            view.execute("mcp__docs__search", &Value::Null)
+                .await
+                .is_error()
+        );
+    }
+
+    // ---- prefetch_candidate_context (issue #248 Phase 1) ------------------
+
+    #[tokio::test]
+    async fn prefetch_calls_only_candidate_safe_zero_arg_tools() {
+        let docs = connected_client("docs", "search").await; // {} schema
+        let ticket = connected_client_with_schema(
+            "ticket",
+            "get",
+            serde_json::json!({ "type": "object", "required": ["id"] }),
+        )
+        .await;
+        let fs = connected_client("fs", "write").await; // zero-arg, but NOT allowlisted
+        let set = McpToolSet::from_clients(vec![docs, ticket, fs])
+            .with_candidate_safe_servers(["docs", "ticket"]);
+
+        let context = set
+            .prefetch_candidate_context()
+            .await
+            .expect("docs has a zero-arg candidate_safe tool");
+        assert!(context.contains("mcp__docs__search"), "{context}");
+        assert!(
+            !context.contains("mcp__ticket__get"),
+            "a tool requiring input must never be called blind: {context}"
+        );
+        assert!(
+            !context.contains("mcp__fs__write"),
+            "a non-candidate_safe server must not be prefetched: {context}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_returns_none_when_nothing_is_safe_to_call() {
+        let fs = connected_client("fs", "write").await;
+        // No `with_candidate_safe_servers` call — nothing is allowlisted.
+        let set = McpToolSet::from_clients(vec![fs]);
+        assert!(set.prefetch_candidate_context().await.is_none());
     }
 }

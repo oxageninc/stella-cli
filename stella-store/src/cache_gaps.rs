@@ -139,6 +139,7 @@ mod tests {
         crate::TelemetryRow {
             step: 0,
             provider: provider.into(),
+            call_role: "worker".into(),
             model: model.into(),
             input_tokens: cache_read + 1_000,
             estimated_input_tokens: 0,
@@ -150,6 +151,7 @@ mod tests {
             duration_ms: 0,
             retries: 0,
             tool_calls: 0,
+            usage_complete: true,
         }
     }
 }

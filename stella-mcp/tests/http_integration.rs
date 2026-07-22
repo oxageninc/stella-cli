@@ -79,6 +79,7 @@ async fn json_handshake_replays_the_session_id() {
             url: server.uri(),
             headers: BTreeMap::new(),
         },
+        candidate_safe: false,
     };
     let client = McpClient::connect(&cfg, Duration::from_secs(5))
         .await

@@ -208,6 +208,7 @@ mod tests {
 
     fn usage(input: u64, cached: u64, write: u64) -> CompletionUsage {
         CompletionUsage {
+            reported: true,
             input_tokens: input,
             output_tokens: 0,
             cached_input_tokens: cached,

@@ -17,6 +17,7 @@
 //!   for scripting (the interactive `chat`/`goal`/`monitor` modes render
 //!   human-readable output).
 
+mod accounted_call;
 mod agent;
 mod agents_installed;
 mod attachments;

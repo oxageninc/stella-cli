@@ -31,10 +31,10 @@ use crate::error::McpError;
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpConfig {
-    /// Server name -> its transport definition. A `BTreeMap` so iteration
-    /// order is stable (deterministic tool namespacing across runs).
+    /// Server name -> its entry (transport + policy). A `BTreeMap` so
+    /// iteration order is stable (deterministic tool namespacing across runs).
     #[serde(default)]
-    pub servers: BTreeMap<String, McpTransport>,
+    pub servers: BTreeMap<String, McpServerEntry>,
 }
 
 impl McpConfig {
@@ -48,7 +48,11 @@ impl McpConfig {
     pub fn into_servers(self) -> Vec<McpServerConfig> {
         self.servers
             .into_iter()
-            .map(|(name, transport)| McpServerConfig { name, transport })
+            .map(|(name, entry)| McpServerConfig {
+                name,
+                transport: entry.transport,
+                candidate_safe: entry.candidate_safe,
+            })
             .collect()
     }
 
@@ -59,25 +63,62 @@ impl McpConfig {
 
     /// Look up a configured server's transport.
     pub fn get(&self, name: &str) -> Option<&McpTransport> {
-        self.servers.get(name)
+        self.servers.get(name).map(|e| &e.transport)
     }
 
     /// Look up a configured server's transport for editing (e.g. an auth flow
     /// setting a credential in place).
     pub fn get_mut(&mut self, name: &str) -> Option<&mut McpTransport> {
-        self.servers.get_mut(name)
+        self.servers.get_mut(name).map(|e| &mut e.transport)
     }
 
     /// Insert or replace a server entry. Installing a registry server is an
     /// upsert: MCP servers are not versioned, so re-installing simply
-    /// overwrites the transport under the same alias.
+    /// overwrites the transport under the same alias — an existing entry's
+    /// `candidate_safe` flag is preserved across the reinstall (it is a
+    /// human-set policy, not part of the transport the registry publishes).
     pub fn upsert(&mut self, name: impl Into<String>, transport: McpTransport) {
-        self.servers.insert(name.into(), transport);
+        let name = name.into();
+        match self.servers.get_mut(&name) {
+            Some(entry) => entry.transport = transport,
+            None => {
+                self.servers.insert(
+                    name,
+                    McpServerEntry {
+                        transport,
+                        candidate_safe: false,
+                    },
+                );
+            }
+        }
     }
 
     /// Remove a server entry, returning whether it existed.
     pub fn remove(&mut self, name: &str) -> bool {
         self.servers.remove(name).is_some()
+    }
+
+    /// Whether `name` is configured and opted into the Best-of-N candidate
+    /// allowlist (`.stella/mcp.toml`'s `candidate_safe = true`, issue #248
+    /// Phase 1). `false` for an unconfigured name — never a silent default of
+    /// "safe".
+    pub fn is_candidate_safe(&self, name: &str) -> bool {
+        self.servers.get(name).is_some_and(|e| e.candidate_safe)
+    }
+
+    /// Set (or clear) `name`'s `candidate_safe` opt-in, returning whether the
+    /// server exists to flag. This is an explicit, human-reviewed allowlist —
+    /// read-only, cwd-independent servers only (see `stella-cli/src/
+    /// candidate_ws.rs`'s module doc); never inferred from a server's
+    /// self-reported `read_only_hint`.
+    pub fn set_candidate_safe(&mut self, name: &str, candidate_safe: bool) -> bool {
+        match self.servers.get_mut(name) {
+            Some(entry) => {
+                entry.candidate_safe = candidate_safe;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Serialize the whole document back to TOML (for writing `mcp.toml`).
@@ -89,13 +130,33 @@ impl McpConfig {
     }
 }
 
-/// One named server: its `name` (used as the tool-namespace segment) and its
-/// transport.
+/// One server's on-disk entry: its transport plus Best-of-N candidate policy
+/// (issue #248 Phase 1), which lives OUTSIDE the internally-tagged
+/// [`McpTransport`] enum since it applies identically regardless of
+/// transport kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerEntry {
+    #[serde(flatten)]
+    pub transport: McpTransport,
+    /// Explicit allowlist opt-in, default `false`. A `read_only_hint` on the
+    /// server's own tool advertisements is UNTRUSTED and can't distinguish
+    /// "reads an external system" (safe to share across candidates) from
+    /// "reads the local tree" (would read stale/wrong bytes from a
+    /// candidate's isolated snapshot) — so this is a human-reviewed opt-in,
+    /// never inferred.
+    #[serde(default)]
+    pub candidate_safe: bool,
+}
+
+/// One named server: its `name` (used as the tool-namespace segment), its
+/// transport, and its Best-of-N candidate-allowlist flag (issue #248 Phase 1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
     #[serde(flatten)]
     pub transport: McpTransport,
+    #[serde(default)]
+    pub candidate_safe: bool,
 }
 
 /// How to reach a server. `transport` is the discriminant; the remaining
@@ -273,11 +334,13 @@ mod tests {
                 url: "https://h/mcp".into(),
                 headers: BTreeMap::new(),
             },
+            candidate_safe: true,
         };
         let s = toml::to_string(&entry).unwrap();
         let back: McpServerConfig = toml::from_str(&s).unwrap();
         assert_eq!(back.name, "solo");
         assert!(matches!(back.transport, McpTransport::Http { .. }));
+        assert!(back.candidate_safe);
     }
 
     #[test]
@@ -326,6 +389,7 @@ mod tests {
         let cfg = McpServerConfig {
             name: "s".into(),
             transport: http,
+            candidate_safe: false,
         };
         assert!(!format!("{cfg:?}").contains("leak-me"));
     }
@@ -379,5 +443,87 @@ mod tests {
         };
         http.set_credential("Authorization", "Bearer v".into());
         assert_eq!(http.credential_names(), vec!["Authorization"]);
+    }
+
+    // ---- candidate_safe (issue #248 Phase 1) -----------------------------
+
+    #[test]
+    fn candidate_safe_parses_true_and_defaults_false_when_absent() {
+        let cfg = McpConfig::from_toml_str(
+            r#"
+            [servers.docs]
+            transport = "http"
+            url = "https://docs.example.com/mcp"
+            candidate_safe = true
+
+            [servers.fs]
+            transport = "stdio"
+            cmd = "mcp-fs"
+            "#,
+        )
+        .unwrap();
+        let servers = cfg.into_servers();
+        assert_eq!(servers.len(), 2);
+        assert!(servers[0].candidate_safe, "docs opted in explicitly");
+        assert!(
+            !servers[1].candidate_safe,
+            "fs must default to false, never inferred safe"
+        );
+    }
+
+    #[test]
+    fn is_candidate_safe_reads_the_configured_flag_and_false_for_unknown() {
+        let cfg = McpConfig::from_toml_str(
+            "[servers.docs]\ntransport = \"stdio\"\ncmd = \"x\"\ncandidate_safe = true\n",
+        )
+        .unwrap();
+        assert!(cfg.is_candidate_safe("docs"));
+        assert!(!cfg.is_candidate_safe("nonexistent"));
+    }
+
+    #[test]
+    fn set_candidate_safe_toggles_an_existing_server_and_reports_unknown_names() {
+        let mut cfg = McpConfig::default();
+        cfg.upsert(
+            "fs",
+            McpTransport::Stdio {
+                cmd: "mcp-fs".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+        );
+        assert!(!cfg.is_candidate_safe("fs"));
+        assert!(cfg.set_candidate_safe("fs", true));
+        assert!(cfg.is_candidate_safe("fs"));
+        assert!(!cfg.set_candidate_safe("missing", true));
+    }
+
+    #[test]
+    fn upsert_reinstall_preserves_the_candidate_safe_flag() {
+        // Re-installing a registry server (a version bump, a re-run of
+        // `stella mcp install`) must not silently revoke a human's allowlist
+        // opt-in — `candidate_safe` is policy, not part of the published
+        // transport.
+        let mut cfg = McpConfig::default();
+        cfg.upsert(
+            "docs",
+            McpTransport::Http {
+                url: "https://docs.example.com/mcp".into(),
+                headers: BTreeMap::new(),
+            },
+        );
+        assert!(cfg.set_candidate_safe("docs", true));
+        cfg.upsert(
+            "docs",
+            McpTransport::Http {
+                url: "https://docs.example.com/v2/mcp".into(),
+                headers: BTreeMap::new(),
+            },
+        );
+        assert!(cfg.is_candidate_safe("docs"), "flag survives reinstall");
+        match cfg.get("docs").unwrap() {
+            McpTransport::Http { url, .. } => assert_eq!(url, "https://docs.example.com/v2/mcp"),
+            other => panic!("expected http, got {other:?}"),
+        }
     }
 }

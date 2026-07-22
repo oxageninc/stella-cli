@@ -303,6 +303,7 @@ async fn create_skill_llm(
     scope: SkillScope,
     description: &str,
     workspace_root: &std::path::Path,
+    budget_limit: Option<f64>,
 ) -> String {
     // 1. Search existing skills for inspiration (best-effort — a registry
     //    failure just means authoring from scratch).
@@ -327,17 +328,37 @@ async fn create_skill_llm(
         reasoning: None,
         params: None,
     };
-    let content = match provider.complete(req).await {
-        Ok(r) => extract_skill_md(&r.text),
-        Err(e) => return format!("model call failed: {e}"),
+    let accounted = match crate::accounted_call::complete_standalone(
+        workspace_root,
+        &*provider,
+        stella_protocol::ModelCallRole::SkillAuthor,
+        "skill_author",
+        &cfg.model_id,
+        budget_limit,
+        req,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return format!(
+                "model call failed: {} (${:.6})",
+                error.message, error.cost_usd
+            );
+        }
     };
+    let content = extract_skill_md(&accounted.result.text);
     // 3. Validate it parses as a real skill, then write it as v1.
     let name = match stella_core::skills::skill_from_file("SKILL.md", &content) {
         Ok(s) => s.name,
         Err(_) => return "the model did not return a valid SKILL.md — try again".to_string(),
     };
     match crate::skill_manager::create(scope, &name, &content, workspace_root) {
-        Ok(n) => format!("created {n} ({}) — v1", scope.label()),
+        Ok(n) => format!(
+            "created {n} ({}) — v1 (${:.6})",
+            scope.label(),
+            accounted.cost_usd
+        ),
         Err(e) => format!("create failed: {e}"),
     }
 }
@@ -351,6 +372,7 @@ pub(super) fn handle_skills_input(
     cfg: &Config,
     in_tx: &UnboundedSender<Inbound>,
     registry: &SkillRegistry,
+    budget_limit: Option<f64>,
 ) {
     let root = cfg.workspace_root.clone();
     match op {
@@ -429,7 +451,9 @@ pub(super) fn handle_skills_input(
             let description = description.clone();
             let root = root.clone();
             tokio::spawn(async move {
-                let status = create_skill_llm(&cfg, &registry, scope, &description, &root).await;
+                let status =
+                    create_skill_llm(&cfg, &registry, scope, &description, &root, budget_limit)
+                        .await;
                 let _ = in_tx.send(skills_snapshot(&root, Some(status)));
             });
         }

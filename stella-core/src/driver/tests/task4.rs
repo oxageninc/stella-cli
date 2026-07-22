@@ -32,7 +32,10 @@ impl Provider for BilledResultWithBlockedSpeculation {
         Ok(CompletionResultAlias {
             text: String::new(),
             tool_calls: vec![call],
-            usage: CompletionUsage::default(),
+            usage: CompletionUsage {
+                reported: true,
+                ..CompletionUsage::default()
+            },
             model: self.id().into(),
             cost_usd: 0.25,
             finish_reason: None,
@@ -151,7 +154,7 @@ async fn cancellation_after_billed_completion_before_speculation_finishes_keeps_
     let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
     let mut messages = vec![CompletionMessage::user("read")];
     let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::unbounded_channel();
 
     {
         let turn = engine.run_turn(&mut messages, &mut budget, &tx);
@@ -170,6 +173,13 @@ async fn cancellation_after_billed_completion_before_speculation_finishes_keeps_
         "a settled provider result stays billed after cancellation: {}",
         budget.session_spent_usd()
     );
+    assert_eq!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| matches!(event, AgentEvent::StepUsage { .. }))
+            .count(),
+        1,
+        "the no-await billed boundary must also retain exactly one usage envelope"
+    );
 }
 
 #[tokio::test]
@@ -186,7 +196,7 @@ async fn a_normal_completion_charges_the_budget_exactly_once() {
     let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
     let mut messages = vec![CompletionMessage::user("answer")];
     let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::unbounded_channel();
 
     let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
 
@@ -195,5 +205,12 @@ async fn a_normal_completion_charges_the_budget_exactly_once() {
         (budget.session_spent_usd() - 0.0001).abs() < 1e-9,
         "normal completion must charge exactly once: {}",
         budget.session_spent_usd()
+    );
+    assert_eq!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| matches!(event, AgentEvent::StepUsage { .. }))
+            .count(),
+        1,
+        "the normal path must not re-emit the success envelope"
     );
 }

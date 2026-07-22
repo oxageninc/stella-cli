@@ -43,6 +43,7 @@ impl ClaimBatchAt for EnterpriseTelemetrySpool {
 
 fn rollup(execution_id: i64) -> ExecutionRollupRow {
     ExecutionRollupRow {
+        usage_complete: true,
         project_id: "local-project-hash-must-not-escape".into(),
         project_name: "secret-project-name".into(),
         project_root: "/secret/source/path".into(),
@@ -100,6 +101,7 @@ fn sqlite_integer_writes_reject_u64_overflow() {
     );
     let telemetry = TelemetryRow {
         step: 0,
+        call_role: "worker".into(),
         provider: "zai".into(),
         model: "glm".into(),
         input_tokens: u64::MAX,
@@ -112,6 +114,7 @@ fn sqlite_integer_writes_reject_u64_overflow() {
         duration_ms: 0,
         retries: 0,
         tool_calls: 0,
+        usage_complete: true,
     };
     assert!(store.record_telemetry(id, &telemetry).is_err());
     assert!(
@@ -184,6 +187,12 @@ fn event_rejects_unfinished_or_unbounded_rollups() {
     unfinished.outcome.clear();
     assert!(StellaOperationalEventV1::from_finalized_rollup(&context(), &unfinished).is_err());
 
+    let mut incomplete = rollup(2);
+    incomplete.usage_complete = false;
+    assert!(
+        StellaOperationalEventV1::from_finalized_rollup(&context(), &incomplete).is_err(),
+        "unknown paid-call accounting must never enter the closed export schema"
+    );
     let invalid = OperationalEventContext::new(
         "enroll 01",
         "org_01",

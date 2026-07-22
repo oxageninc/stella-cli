@@ -33,15 +33,44 @@
 //! ([`CustomToolSet::new_owned`]), so their writes land in the isolated
 //! shadow, never the real tree.
 //!
-//! MCP servers and the interactive/discovery layers are still NOT re-wired
-//! into candidates, and this is a CORRECTNESS boundary, not just a leak one:
-//! an MCP server was spawned against the REAL workspace, so even a read-only
-//! MCP tool would return the real tree's content — a candidate that edited a
-//! file then read it back via MCP would see the UNEDITED bytes, mixing a
-//! stale view into its snapshot-rooted work. Offering MCP to candidates
-//! needs per-candidate server sessions (cwd = snapshot); until then it is
-//! correctly withheld. The interactive layer (`ask_user`) is withheld
-//! because a fan-out of N candidates has no single owner for a prompt.
+//! # MCP: a phased tool surface (issue #248)
+//!
+//! A cost/benefit review found the naive "full per-candidate MCP" build
+//! low-ROI: most configured servers are filesystem-rooted (redundant with
+//! the snapshot-rooted built-ins above) or side-effecting (harmful to run N
+//! times), and only read-only, cwd-INDEPENDENT servers (docs/web search,
+//! code graph, GitHub/Linear/DB reads) have real pickup in candidates. So
+//! this is phased rather than all-or-nothing:
+//!
+//! - **Phase 1 (built here).** An explicit per-server `candidate_safe = true`
+//!   opt-in in `.stella/mcp.toml` is the trustworthy gate — a server's own
+//!   `read_only_hint` is UNTRUSTED and can't distinguish "reads an external
+//!   system" from "reads the local tree" (`stella_mcp::config`'s doc). Only
+//!   allowlisted servers' tools reach a candidate
+//!   ([`stella_mcp::McpToolSet::for_candidates`],
+//!   [`GitCandidateWorkspaces::with_candidate_mcp`]) — sharing the SAME
+//!   already-connected clients, no new subprocess. A filesystem-rooted or
+//!   otherwise unlisted server stays withheld for exactly the correctness
+//!   reason the naive build would have hit: it was spawned against the REAL
+//!   workspace, so even a read-only call on it would return the real tree's
+//!   content — a candidate that edited a file then read it back would see
+//!   the UNEDITED bytes, mixing a stale view into its snapshot-rooted work.
+//!   Additionally, an **orchestrator pre-fetch** ([`McpPrefetchAdapter`],
+//!   [`stella_mcp::McpToolSet::prefetch_candidate_context`]) calls every
+//!   allowlisted server's zero-argument tools ONCE, before the fan-out, and
+//!   folds the result into every candidate's shared starting messages — the
+//!   common "every candidate needs the same schema/ticket context" case, at
+//!   the cost of one round trip instead of N.
+//! - **Phase 2 (explicitly NOT built here).** Per-candidate stdio sessions
+//!   with `cwd` = the snapshot, which would let a filesystem-rooted server
+//!   join safely too. Deferred until measured need — Phase 1's allowlist
+//!   already covers the servers that showed real pickup.
+//!
+//! The interactive layer (`ask_user`) is withheld regardless of phase,
+//! unconditionally: a fan-out of N candidates has no single owner for a
+//! prompt, so candidates run non-interactively — there is no
+//! `InteractiveToolSet` in a candidate's stack for either MCP phase to
+//! reintroduce it through.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,8 +81,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use stella_fleet::git::{GitCli, SystemGitCli};
 use stella_pipeline::ports::{
-    AdoptedChange, CandidateWorkspace, CandidateWorkspacePort, DiagnosticRunner, RepoStatusPort,
-    TestRunner, WorkspaceError,
+    AdoptedChange, CandidateWorkspace, CandidateWorkspacePort, DiagnosticRunner, McpPrefetchPort,
+    RepoStatusPort, TestRunner, WorkspaceError,
 };
 use stella_protocol::FileChangeKind;
 
@@ -218,6 +247,12 @@ pub(crate) struct GitCandidateWorkspaces {
     /// shadow exists. Candidate discovery must never depend on which ignored
     /// or store-backed policy files happened to enter a git snapshot.
     active_rules: crate::rules::ResolvedRules,
+    /// The session's connected MCP servers, shared read-only into every
+    /// candidate (issue #248 Phase 1) — `Arc`, not a borrow, so this struct
+    /// and its candidates stay `'static` (see the module doc's "MCP: a
+    /// phased tool surface" section). `None` when the session has no MCP
+    /// servers connected, or hasn't opted any into `with_candidate_mcp`.
+    candidate_mcp: Option<Arc<stella_mcp::McpToolSet>>,
 }
 
 impl GitCandidateWorkspaces {
@@ -232,7 +267,16 @@ impl GitCandidateWorkspaces {
             options,
             custom_tools,
             active_rules,
+            candidate_mcp: None,
         }
+    }
+
+    /// Share the session's connected MCP servers into every candidate this
+    /// port creates, filtered to `candidate_safe`-flagged servers only (issue
+    /// #248 Phase 1) — see [`stella_mcp::McpToolSet::for_candidates`].
+    pub(crate) fn with_candidate_mcp(mut self, mcp: Arc<stella_mcp::McpToolSet>) -> Self {
+        self.candidate_mcp = Some(mcp);
+        self
     }
 
     /// The concrete create (the trait impl boxes its result): snapshot the
@@ -289,8 +333,16 @@ impl GitCandidateWorkspaces {
                 // to `ws_root`, so their subprocesses run in the shadow.
                 let registry: Arc<dyn stella_core::ToolExecutor> = Arc::new(registry);
                 let witness_tools = WitnessToolExecutor::new(ws_root.clone(), registry.clone());
-                let tools =
+                let native =
                     CustomToolSet::new_owned(registry, self.custom_tools.clone(), ws_root.clone());
+                // MCP: layer the candidate_safe-filtered session view on top
+                // when the session shared one (issue #248 Phase 1) — the
+                // native surface above stays the fallthrough for every
+                // non-`mcp__` name either way.
+                let tools: Box<dyn stella_core::ToolExecutor> = match &self.candidate_mcp {
+                    Some(mcp) => Box::new(mcp.for_candidates(Arc::new(native))),
+                    None => Box::new(native),
+                };
                 Ok(GitCandidateWorkspace {
                     toplevel,
                     dir: dir.clone(),
@@ -326,6 +378,26 @@ impl GitCandidateWorkspaces {
 impl CandidateWorkspacePort for GitCandidateWorkspaces {
     async fn create(&self) -> Result<Box<dyn CandidateWorkspace>, WorkspaceError> {
         Ok(Box::new(self.create_workspace().await?))
+    }
+}
+
+/// Adapts the session's shared MCP view into the pipeline's
+/// [`McpPrefetchPort`] (issue #248 Phase 1): the orchestrator calls this
+/// ONCE before a best-of-N fan-out, never per candidate — see
+/// [`stella_mcp::McpToolSet::prefetch_candidate_context`] for what actually
+/// gets called and why it is safe to call blind.
+pub(crate) struct McpPrefetchAdapter(Arc<stella_mcp::McpToolSet>);
+
+impl McpPrefetchAdapter {
+    pub(crate) fn new(mcp: Arc<stella_mcp::McpToolSet>) -> Self {
+        Self(mcp)
+    }
+}
+
+#[async_trait]
+impl McpPrefetchPort for McpPrefetchAdapter {
+    async fn prefetch(&self, _goal: &str) -> Option<String> {
+        self.0.prefetch_candidate_context().await
     }
 }
 
@@ -472,8 +544,12 @@ pub(crate) struct GitCandidateWorkspace {
     /// Latest candidate commit whose exact bytes were verified.
     sealed: Mutex<Option<String>>,
     /// The candidate's tool surface: snapshot-rooted registry + custom tools,
-    /// owned so the boxed workspace can hand out `&dyn ToolExecutor`.
-    tools: CustomToolSet<'static>,
+    /// optionally layered under the session's `candidate_safe`-filtered MCP
+    /// view (issue #248 Phase 1, see [`GitCandidateWorkspaces::with_candidate_mcp`]).
+    /// Boxed (not the concrete `CustomToolSet`) because the two cases have
+    /// different concrete types; owned so the boxed workspace can hand out
+    /// `&dyn ToolExecutor`.
+    tools: Box<dyn stella_core::ToolExecutor>,
     /// Constructed before dispatch and incapable of general mutation or egress.
     witness_tools: WitnessToolExecutor,
     diagnostics: GitDiagnosticRunner,
@@ -625,7 +701,7 @@ impl CandidateWorkspace for GitCandidateWorkspace {
     }
 
     fn tools(&self) -> &dyn stella_core::ToolExecutor {
-        &self.tools
+        &*self.tools
     }
 
     fn witness_tools(&self) -> &dyn stella_core::ToolExecutor {
@@ -989,6 +1065,83 @@ mod tests {
         assert!(
             !root.join("candidate_wrote.txt").exists(),
             "the custom tool must NOT touch the real tree"
+        );
+
+        ws.remove().await;
+        assert_no_candidate_worktrees(&root);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A minimal [`stella_mcp::Transport`] fake for the wiring test below —
+    /// no process, no socket; just enough of the MCP handshake plus one tool
+    /// to prove a schema makes it through `GitCandidateWorkspaces::create`
+    /// end to end, not just the isolated `CandidateMcpView` unit tests in
+    /// `stella-mcp`.
+    struct FakeMcpTransport;
+
+    #[async_trait]
+    impl stella_mcp::Transport for FakeMcpTransport {
+        async fn request(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, stella_mcp::McpError> {
+            Ok(match method {
+                "initialize" => serde_json::json!({
+                    "protocolVersion": stella_mcp::protocol::PREFERRED_PROTOCOL_VERSION
+                }),
+                "tools/list" => serde_json::json!({
+                    "tools": [{ "name": "search", "inputSchema": { "type": "object" } }]
+                }),
+                "tools/call" => {
+                    serde_json::json!({ "content": [{ "type": "text", "text": "docs ok" }] })
+                }
+                _ => serde_json::Value::Null,
+            })
+        }
+        async fn notify(
+            &self,
+            _method: &str,
+            _params: serde_json::Value,
+        ) -> Result<(), stella_mcp::McpError> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), stella_mcp::McpError> {
+            Ok(())
+        }
+    }
+
+    /// Issue #248 Phase 1's wiring witness: a session that shares its MCP
+    /// toolset via `.with_candidate_mcp` must have the allowlisted server's
+    /// tools actually reach a REAL candidate workspace's advertised schema —
+    /// closing the gap `stella-mcp`'s `CandidateMcpView` tests can't (they
+    /// exercise the view in isolation, never through this port).
+    #[tokio::test]
+    async fn candidate_mcp_reaches_the_candidate_when_the_session_shares_it() {
+        let root = scaffold("mcpwiring");
+        let mut docs_client = stella_mcp::McpClient::new("docs", Box::new(FakeMcpTransport));
+        docs_client.initialize().await.unwrap();
+        let mcp = Arc::new(
+            stella_mcp::McpToolSet::from_clients(vec![docs_client])
+                .with_candidate_safe_servers(["docs"]),
+        );
+        let port = GitCandidateWorkspaces::new(
+            root.clone(),
+            RegistryOptions::default(),
+            Vec::new(),
+            crate::rules::ResolvedRules::default(),
+        )
+        .with_candidate_mcp(mcp);
+        let ws = port.create_workspace().await.unwrap();
+
+        let names: Vec<String> = ws.tools().schemas().into_iter().map(|s| s.name).collect();
+        assert!(
+            names.iter().any(|n| n == "mcp__docs__search"),
+            "the allowlisted server's tool must reach the candidate: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "read_file"),
+            "the candidate must still have its snapshot-rooted built-ins: {names:?}"
         );
 
         ws.remove().await;

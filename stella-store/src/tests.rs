@@ -34,6 +34,7 @@ fn execution_lifecycle_events_and_telemetry_roundtrip() {
             &TelemetryRow {
                 step: 0,
                 provider: "zai".into(),
+                call_role: "worker".into(),
                 model: "glm-5.2".into(),
                 input_tokens: 12_000,
                 estimated_input_tokens: 11_000,
@@ -45,6 +46,7 @@ fn execution_lifecycle_events_and_telemetry_roundtrip() {
                 duration_ms: 1_830,
                 retries: 1,
                 tool_calls: 3,
+                usage_complete: true,
             },
         )
         .unwrap();
@@ -482,6 +484,11 @@ fn producer_materializes_tool_calls_reflection_and_rolls_up_to_usage() {
     // Roll one turn up into the user-tier aggregate.
     let usage = crate::usage::UsageStore::in_memory().unwrap();
     let root = std::path::Path::new("/w/stella");
+    assert!(
+        !store.sync_to_usage(id, root, &usage).unwrap(),
+        "a pending execution must not escape into usage aggregates"
+    );
+    store.finish_execution(id, "completed", 0.0).unwrap();
     assert!(store.sync_to_usage(id, root, &usage).unwrap());
     let pid = crate::usage::project_id_for(root);
     assert_eq!(usage.execution_count(&pid).unwrap(), 1);
@@ -938,8 +945,9 @@ fn skill_usage_records_per_execution_version_rows() {
     // skill_usage lands at v5; mcp_usage takes v6; the data-plane tables
     // (tool_calls / execution_reflection / reflections) take v7; the
     // session plane (executions.session_id / tasks / pull_requests)
-    // takes v8, so SCHEMA_VERSION is now 8.
-    assert_eq!(SCHEMA_VERSION, 8);
+    // takes v8; v9 adds fail-closed call-role/completeness and v10 adds lifecycle
+    // accounting for execution/telemetry rows.
+    assert_eq!(SCHEMA_VERSION, 10);
 
     let id = store
         .begin_execution("deck", "format the sql", "zai", "glm-5.2")
@@ -1012,6 +1020,7 @@ fn drift_row(step: u64, provider: &str, model: &str, estimated: u64, actual: u64
     TelemetryRow {
         step,
         provider: provider.into(),
+        call_role: "worker".into(),
         model: model.into(),
         input_tokens: actual,
         estimated_input_tokens: estimated,
@@ -1023,6 +1032,7 @@ fn drift_row(step: u64, provider: &str, model: &str, estimated: u64, actual: u64
         duration_ms: 500,
         retries: 0,
         tool_calls: 1,
+        usage_complete: true,
     }
 }
 
@@ -1399,10 +1409,28 @@ fn v1_migration_dedupes_a_v0_database_and_retrofits_the_unique_keys() {
     store
         .record_telemetry(1, &drift_row(2, "zai", "glm-5.2", 400, 500))
         .unwrap();
+    let completeness: Vec<(i64, bool)> = {
+        let conn = store.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT step, usage_complete FROM telemetry \
+                 WHERE execution_id = 1 ORDER BY step",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        completeness,
+        vec![(0, false), (1, false), (2, true)],
+        "migrated rows fail closed while a fresh telemetry row is complete"
+    );
     assert_eq!(
         store.drift_samples("zai", "glm-5.2", 10).unwrap(),
-        vec![(200, 222), (300, 333), (400, 500)],
-        "deduped history reads back newest-per-key, oldest first"
+        vec![(400, 500)],
+        "drift calibration excludes migrated rows whose usage is incomplete"
     );
     // A post-migration execution gets a fresh id, never execution 1's.
     assert_eq!(
@@ -1676,6 +1704,7 @@ fn telemetry(
     TelemetryRow {
         step,
         provider: provider.into(),
+        call_role: "worker".into(),
         model: model.into(),
         input_tokens: input,
         // This fixture predates drift correction and exercises
@@ -1690,6 +1719,7 @@ fn telemetry(
         duration_ms,
         retries: 0,
         tool_calls: 0,
+        usage_complete: true,
     }
 }
 

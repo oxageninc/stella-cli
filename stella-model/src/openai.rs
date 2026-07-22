@@ -630,6 +630,7 @@ async fn aggregate_openai_stream(
                 }
                 OpenAiStreamEvent::Completed { response } => {
                     if let Some(u) = response.usage {
+                        usage.reported = true;
                         usage.input_tokens = u.input_tokens;
                         usage.output_tokens = u.output_tokens;
                         usage.cached_input_tokens =
@@ -956,6 +957,7 @@ mod tests {
         assert_eq!(result.usage.input_tokens, 12);
         assert_eq!(result.usage.output_tokens, 2);
         assert_eq!(result.usage.cached_input_tokens, 4);
+        assert!(result.usage.reported);
         assert_eq!(result.model, "gpt-5.5");
     }
 
@@ -1186,6 +1188,7 @@ mod tests {
             .unwrap()
             .pricing
             .cost_usd(&CompletionUsage {
+                reported: true,
                 input_tokens: 1000,
                 output_tokens: 500,
                 cached_input_tokens: 200,

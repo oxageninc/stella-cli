@@ -993,6 +993,9 @@ fn trace_of(ev: &AgentEvent) -> (TraceKind, String) {
             TraceKind::Other,
             format!("compact {before_tokens}→{after_tokens}"),
         ),
+        AgentEvent::UsageIncomplete { reason, .. } => {
+            (TraceKind::Other, format!("usage incomplete: {reason:?}"))
+        }
         AgentEvent::ScopeReview { proposal } => (TraceKind::Stage, snip(&proposal.summary)),
         AgentEvent::AskUser { question, .. } => (TraceKind::Other, snip(question)),
         AgentEvent::Error { message, .. } => (TraceKind::Error, snip(message)),
@@ -1016,5 +1019,4 @@ fn snip(text: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "deck_tests.rs"]
 mod tests;
