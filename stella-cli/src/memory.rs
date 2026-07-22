@@ -10,7 +10,7 @@
 //! Data flow per turn:
 //!
 //! ```text
-//! prompt ──> recall_block(): registry-routed recall (crate::ocp) + select_skills()
+//! prompt ──> recall_block(): registry-routed recall (crate::contextgraph) + select_skills()
 //!            └─ volatile message AFTER the byte-stable system prefix (L-E8)
 //! turn runs …
 //! outcome ─> reflect_and_record(): one cheap model call -> 0-3 lessons
@@ -76,13 +76,13 @@ mod reflection;
 use reflection::parse_lessons;
 pub use reflection::{ReflectionReport, reflect_on_turn, turn_warrants_reflection};
 
-/// Session-scoped memory state: the context store, the OCP host that
-/// routes every recall (workspace memory + code graph as in-process OCP
-/// providers — see `crate::ocp`), the domain taxonomy, and the skills
+/// Session-scoped memory state: the context store, the CGP host that
+/// routes every recall (workspace memory + code graph as in-process CGP
+/// providers — see `crate::contextgraph`), the domain taxonomy, and the skills
 /// auto-creation accounting.
 pub struct SessionMemory {
     store: std::sync::Arc<ContextStore>,
-    host: ocp_host::Host,
+    host: contextgraph_host::Host,
     domains: Domains,
     workspace_root: PathBuf,
     include_workspace_skills: bool,
@@ -141,7 +141,7 @@ impl SessionMemory {
                     .flatten()
                     .unwrap_or_default();
                 let store = std::sync::Arc::new(store);
-                let host = crate::ocp::session_host(
+                let host = crate::contextgraph::session_host(
                     store.clone(),
                     domains.names(),
                     workspace_root.to_path_buf(),
@@ -619,7 +619,7 @@ impl SessionMemory {
                 return Vec::new();
             }
         };
-        crate::ocp::recall_via_host(&self.host, &query)
+        crate::contextgraph::recall_via_host(&self.host, &query)
             .await
             .into_iter()
             .filter_map(project_recalled_frame)
@@ -840,7 +840,12 @@ mod tests {
         assert_eq!(before, after, "suppressed recall leaves history untouched");
     }
 
-    fn frame(id: &str, kind: ocp_types::FrameKind, label: &str, content: &str) -> RecalledFrame {
+    fn frame(
+        id: &str,
+        kind: contextgraph_types::FrameKind,
+        label: &str,
+        content: &str,
+    ) -> RecalledFrame {
         let kind = serde_json::to_value(kind)
             .unwrap()
             .as_str()
@@ -859,13 +864,13 @@ mod tests {
         }
     }
 
-    fn ocp_frame(
+    fn contextgraph_frame(
         id: &str,
-        kind: ocp_types::FrameKind,
+        kind: contextgraph_types::FrameKind,
         label: &str,
         content: &str,
-    ) -> ocp_types::ContextFrame {
-        ocp_types::ContextFrame {
+    ) -> contextgraph_types::ContextFrame {
+        contextgraph_types::ContextFrame {
             id: id.into(),
             kind,
             title: label.into(),
@@ -888,13 +893,13 @@ mod tests {
         let frames = vec![
             frame(
                 "nod_0123456789abcdef01234567",
-                ocp_types::FrameKind::Memory,
+                contextgraph_types::FrameKind::Memory,
                 "prefer rg",
                 "prefer rg over grep here",
             ),
             frame(
                 "nod_bbb",
-                ocp_types::FrameKind::Snippet,
+                contextgraph_types::FrameKind::Snippet,
                 "src/lib.rs",
                 "fn main",
             ),
@@ -919,7 +924,7 @@ mod tests {
     fn recall_section_without_memories_never_asks_for_citations() {
         let frames = vec![frame(
             "nod_ccc",
-            ocp_types::FrameKind::Snippet,
+            contextgraph_types::FrameKind::Snippet,
             "src/lib.rs",
             "fn main",
         )];
@@ -933,15 +938,15 @@ mod tests {
 
     #[test]
     fn graph_frame_projection_preserves_provider_and_origin_provenance() {
-        let mut graph = ocp_frame(
+        let mut graph = contextgraph_frame(
             "code-graph:sym:src/lib.rs:7:run",
-            ocp_types::FrameKind::Symbol,
+            contextgraph_types::FrameKind::Symbol,
             "fn run (src/lib.rs:7)",
             "fn run() {}",
         );
         graph.uri = Some("file:///repo/src/lib.rs".into());
         graph.provenance = vec![
-            ocp_types::Provenance {
+            contextgraph_types::Provenance {
                 kind: "file".into(),
                 uri: graph.uri.clone(),
                 range: Some("L7-9".into()),
@@ -949,7 +954,7 @@ mod tests {
                 method: None,
                 by: Some("git-worktree".into()),
             },
-            ocp_types::Provenance {
+            contextgraph_types::Provenance {
                 kind: "derivation".into(),
                 uri: None,
                 range: None,
@@ -959,7 +964,7 @@ mod tests {
             },
         ];
 
-        let recalled = project_recalled_frame(crate::ocp::AttributedContextFrame {
+        let recalled = project_recalled_frame(crate::contextgraph::AttributedContextFrame {
             provider: "code-graph".into(),
             frame: graph,
         })
@@ -983,7 +988,7 @@ mod tests {
         let quarantined = std::collections::HashSet::from(["shared-id".to_string()]);
         let mut local = frame(
             "shared-id",
-            ocp_types::FrameKind::Memory,
+            contextgraph_types::FrameKind::Memory,
             "local",
             "local memory",
         );
@@ -1159,7 +1164,7 @@ mod tests {
 
         let ordinary = frame(
             "nod_context",
-            ocp_types::FrameKind::Snippet,
+            contextgraph_types::FrameKind::Snippet,
             "src/lib.rs",
             "ordinary recalled evidence",
         );

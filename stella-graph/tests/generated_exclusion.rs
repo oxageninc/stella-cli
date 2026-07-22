@@ -70,8 +70,8 @@ fn dist_standalone_bundle_produces_no_recall_frames() {
         "no reference frame should cite the minified bundle"
     );
 
-    // The OCP `query` entrypoint — the actual path `stella-cli`'s recall
-    // fans a turn's context request through (`stella-cli/src/ocp.rs`,
+    // The CGP `query` entrypoint — the actual path `stella-cli`'s recall
+    // fans a turn's context request through (`stella-cli/src/contextgraph.rs`,
     // `GraphProvider::query`).
     let frames = graph.query(&query("why did refresh regress")).unwrap();
     assert!(

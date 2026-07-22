@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use contextgraph_types::{ContextFrame, ContextQuery};
 use notify::RecommendedWatcher;
-use ocp_types::{ContextFrame, ContextQuery};
 use rusqlite::Connection;
 use tokio::task::JoinHandle;
 
@@ -263,9 +263,9 @@ impl CodeGraph {
         frames::neighbors(&self.inner.read_guard(), &self.inner.root, &rel)
     }
 
-    /// The OCP-provider query entrypoint: budgeted, provenance-carrying frames
+    /// The CGP-provider query entrypoint: budgeted, provenance-carrying frames
     ///, in-process shape. Consumed at runtime
-    /// by the CLI's OCP host (`stella-cli/src/ocp.rs`, `GraphProvider`), which
+    /// by the CLI's CGP host (`stella-cli/src/contextgraph.rs`, `GraphProvider`), which
     /// fans recall out to this alongside the memory store on every turn.
     pub fn query(&self, q: &ContextQuery) -> Result<Vec<ContextFrame>, GraphError> {
         frames::query(&self.inner.read_guard(), &self.inner.root, q)

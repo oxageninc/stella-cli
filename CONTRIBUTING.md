@@ -32,7 +32,7 @@ Every one of these is genuinely valued — pick the one that fits your energy:
 | 🧭 **Docs & examples** — fix a lie in the README before it fools someone else | Any `*.md` file, `--help` text, doc comments | Small |
 | 🔌 **A new provider adapter** — Stella is BYOK; every model provider we speak makes it more useful | `stella-model/src/` — copy the shape of an existing adapter | Medium |
 | 🛠 **A new built-in tool** | `stella-tools/src/` — implement the tool trait, register it | Medium |
-| 🌐 **An OCP provider** — implement the Open Context Protocol in your language and prove it green | [macanderson/context-graph-protocol](https://github.com/macanderson/context-graph-protocol) — its own repo, no Stella code required | Medium |
+| 🌐 **An CGP provider** — implement the Context Graph Protocol in your language and prove it green | [macanderson/context-graph-protocol](https://github.com/macanderson/context-graph-protocol) — its own repo, no Stella code required | Medium |
 | 🏗 **Core engine work** | `good first issue` / `help wanted` labels | Varies |
 
 If you're not sure where something fits, open an issue first — a ten-line
@@ -92,14 +92,14 @@ Fourteen crates sounds like a lot; the rule of thumb is one sentence each:
 | Multimodal generation | `stella-media` |
 | Multi-agent fan-out, worktree isolation | `stella-fleet` |
 | The Observatory telemetry dashboard (`stella observe`) | `stella-observatory` |
-| The Open Context Protocol (wire types / host / conformance) | external repo: [`context-graph-protocol`](https://github.com/macanderson/context-graph-protocol) |
+| The Context Graph Protocol (wire types / host / conformance) | external repo: [`context-graph-protocol`](https://github.com/macanderson/context-graph-protocol) |
 
 All of the crates ship in the CLI today: `stella-pipeline` drives the default
 `stella run` path, `stella-fleet` powers `stella fleet`, `stella-tui` is the
 Command Deck (the default interactive shell on a TTY), and `stella-media`
 provides image generation via the `generate_image` tool. The context/graph
 plane is wired too — `stella init` builds the code-graph index and recall fans
-out through the OCP host. See the **status table** in the
+out through the CGP host. See the **status table** in the
 [README](README.md#workspace-layout).
 
 ## The ground rules
@@ -162,7 +162,7 @@ rendering), explain how you verified the change instead.
 - **Doc comments on public items**, and on any function whose *why* isn't
   obvious from its body. No comments that narrate the next line.
 - **No new dependencies casually.** Every new crate in `Cargo.toml` gets a
-  sentence in the PR description justifying it. `ocp-types` stays
+  sentence in the PR description justifying it. `contextgraph-types` stays
   dependency-light as a matter of contract.
 - **Match the neighborhood.** Every crate has an established idiom — copy the
   patterns around you before inventing new ones.

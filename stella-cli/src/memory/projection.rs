@@ -1,4 +1,4 @@
-//! Lossless OCP-to-pipeline recall projection.
+//! Lossless CGP-to-pipeline recall projection.
 
 use std::collections::HashSet;
 
@@ -7,7 +7,7 @@ use stella_pipeline::RecalledFrame;
 /// Preserve host-owned provider identity and the frame's complete provenance.
 /// Source is the origin-most actor; method is the latest derivation step.
 pub(super) fn project_recalled_frame(
-    attributed: crate::ocp::AttributedContextFrame,
+    attributed: crate::contextgraph::AttributedContextFrame,
 ) -> Option<RecalledFrame> {
     let frame = attributed.frame;
     let citation_label = frame.citation_label.clone()?;

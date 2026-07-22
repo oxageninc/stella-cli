@@ -1,4 +1,4 @@
-//! Query → [`ContextFrame`] assembly: the code graph as a built-in OCP
+//! Query → [`ContextFrame`] assembly: the code graph as a built-in CGP
 //! provider.
 //!
 //! Two rules from the lessons registry are load-bearing here:
@@ -19,14 +19,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use ocp_types::{ContextFrame, ContextQuery, FrameKind, Provenance, Relation};
+use contextgraph_types::{ContextFrame, ContextQuery, FrameKind, Provenance, Relation};
 use rusqlite::Connection;
 
 use crate::error::GraphError;
 use crate::import::{self, ImportKind};
 use crate::store::{self, DefRow, ImportRow};
 
-/// The OCP provider id this crate reports in every frame's provenance.
+/// The CGP provider id this crate reports in every frame's provenance.
 pub const PROVIDER_ID: &str = "code-graph";
 
 /// Semantic version of the extractor, embedded in derivation provenance.
@@ -171,7 +171,7 @@ pub(crate) fn neighbors(
     Ok(out)
 }
 
-/// The OCP provider entrypoint: map a [`ContextQuery`] onto code-graph
+/// The CGP provider entrypoint: map a [`ContextQuery`] onto code-graph
 /// lookups, fuse + dedup, and budget-pack to the query's limits.
 pub(crate) fn query(
     conn: &Connection,

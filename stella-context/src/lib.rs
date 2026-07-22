@@ -39,7 +39,7 @@
 //! The built-in default is the offline, pure-Rust [`HashEmbedder`]. The product
 //! default — a local ONNX bge-small model — is the tracked follow-up
 //! (risk R14); [`Embedder`] is the seam that makes
-//! swapping it in trivial. Wire types are built on `ocp-types`, never
+//! swapping it in trivial. Wire types are built on `contextgraph-types`, never
 //! duplicated (principle #7 / `L-E1`).
 
 mod clock;
@@ -61,8 +61,8 @@ pub use writeback::{
     MemoryKind, UpsertReceipt,
 };
 
-// Re-export the OCP wire types callers pass in/out, so a consumer needs only
-// this crate for the common path (they remain `ocp-types`' definitions).
-pub use ocp_types::{
+// Re-export the CGP wire types callers pass in/out, so a consumer needs only
+// this crate for the common path (they remain `contextgraph-types`' definitions).
+pub use contextgraph_types::{
     Capabilities, ContextFrame, ContextQuery, ContextQueryResult, DataFlow, ProviderInfo,
 };

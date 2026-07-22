@@ -651,9 +651,9 @@ fn memory_hits_carry_the_preview_provenance_and_citation_suffixes() {
 
 #[test]
 fn symbol_hits_take_the_bare_name_and_the_file_location() {
-    let frame = ocp_types::ContextFrame {
+    let frame = contextgraph_types::ContextFrame {
         id: "code-graph:sym:src/lib.rs:12:issue_row".into(),
-        kind: ocp_types::FrameKind::Symbol,
+        kind: contextgraph_types::FrameKind::Symbol,
         title: "fn issue_row".into(),
         content: "fn issue_row(...) { ... }".into(),
         uri: Some("file:///repo/src/lib.rs".into()),

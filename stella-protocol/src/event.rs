@@ -388,7 +388,7 @@ pub struct ContextFrameRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub citation_label: String,
-    /// The OCP provider leg that returned the frame. Empty only when reading
+    /// The CGP provider leg that returned the frame. Empty only when reading
     /// a stream recorded before provider provenance was added.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,

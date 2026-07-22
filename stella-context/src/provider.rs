@@ -2,19 +2,19 @@
 //! §2). One interface — [`ContextProvider`] — behind which context sources
 //! register: the built-in [`ContextStore`] implements it (so the store is both
 //! the primary backend and a first-class provider), and the shipping CLI's
-//! session recall flows through this registry (`stella-cli/src/ocp.rs` wraps
-//! it as the `workspace-memory` OCP provider, registering the store domain-
+//! session recall flows through this registry (`stella-cli/src/contextgraph.rs` wraps
+//! it as the `workspace-memory` CGP provider, registering the store domain-
 //! scoped). Wiring further sources through this seam — a `stella-graph`
-//! code-graph provider at this layer, a git-history provider, and external OCP
-//! providers adapted from `ocp-host` — is designed here but not yet built;
-//! this crate does not depend on `ocp-host`.
+//! code-graph provider at this layer, a git-history provider, and external CGP
+//! providers adapted from `contextgraph-host` — is designed here but not yet built;
+//! this crate does not depend on `contextgraph-host`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ocp_types::capability::QueryCapability;
-use ocp_types::{Capabilities, ContextQuery, ContextQueryResult, DataFlow, ProviderInfo};
+use contextgraph_types::capability::QueryCapability;
+use contextgraph_types::{Capabilities, ContextQuery, ContextQueryResult, DataFlow, ProviderInfo};
 
 use crate::error::ContextError;
 use crate::store::{ContextStore, NodeKind};
@@ -31,7 +31,7 @@ pub trait ContextProvider: Send + Sync {
     /// What this provider can answer, for query routing.
     fn capabilities(&self) -> Capabilities;
 
-    /// Return frames relevant to the query, as the OCP wire result so a
+    /// Return frames relevant to the query, as the CGP wire result so a
     /// provider's budget drops stay visible across the seam (`L-C5` — a bare
     /// frame list would erase the truncation report). Budgeting/fusion across
     /// providers is the host's job.
@@ -97,7 +97,7 @@ impl ContextProvider for ContextStore {
     }
 
     async fn query(&self, q: &ContextQuery) -> Result<ContextQueryResult, ContextError> {
-        // The OCP-shaped adapter over the rich `recall` pipeline.
+        // The CGP-shaped adapter over the rich `recall` pipeline.
         Ok(self.recall(q).await?.into())
     }
 }
@@ -105,7 +105,7 @@ impl ContextProvider for ContextStore {
 /// A set of registered providers. Fans a query out to those whose capabilities
 /// match, then concatenates (deduping by frame id). Cross-provider reciprocal-
 /// rank fusion is the store's internal pipeline today; multi-provider fusion is
-/// the tracked follow-up once external OCP providers register here.
+/// the tracked follow-up once external CGP providers register here.
 #[derive(Default)]
 pub struct ProviderRegistry {
     providers: Vec<Arc<dyn ContextProvider>>,
@@ -193,7 +193,7 @@ mod tests {
     use super::*;
     use crate::store::{ContextStore, NodeInput};
     use crate::writeback::ContextDelta;
-    use ocp_types::{ContextFrame, FrameKind};
+    use contextgraph_types::{ContextFrame, FrameKind};
     use tempfile::TempDir;
 
     async fn seeded_store() -> (TempDir, Arc<ContextStore>) {
