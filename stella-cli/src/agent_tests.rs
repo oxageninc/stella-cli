@@ -441,9 +441,9 @@ fn non_tty_text_output_is_headless_without_losing_text_rendering() {
     let worker_model = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
     let non_tty = pipeline_config_for_approval_capability(
         &cfg,
-        &worker_model,
         PipelineApprovalCapability::Unavailable,
         None,
+        &worker_model,
     );
     assert!(
         non_tty.headless,
@@ -457,9 +457,9 @@ fn non_tty_text_output_is_headless_without_losing_text_rendering() {
 
     let interactive = pipeline_config_for_approval_capability(
         &cfg,
-        &worker_model,
         PipelineApprovalCapability::Stdio,
         None,
+        &worker_model,
     );
     assert!(
         !interactive.headless,

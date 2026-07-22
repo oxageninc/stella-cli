@@ -133,7 +133,7 @@ async fn different_roots_with_one_host_journal_submit_once() {
     let host_data = tempfile::tempdir().unwrap();
     let gate = Arc::new(CountingGate(AtomicUsize::new(0)));
     let provider = Arc::new(SlowImageProvider(AtomicUsize::new(0)));
-    let operation_journal = journal(&host_data.path().join("media-operations.db"));
+    let operation_journal = journal(&host_data.path().join("host-data/media-operations.db"));
     let options = RegistryOptions {
         media_requires_host_approval: true,
         media_spend_gate: Some(gate.clone()),
@@ -179,7 +179,7 @@ async fn different_roots_with_one_host_journal_submit_once() {
 async fn workspace_tools_cannot_modify_or_delete_host_journal() {
     let workspace = tempfile::tempdir().unwrap();
     let host_data = tempfile::tempdir().unwrap();
-    let journal_path = host_data.path().join("media-operations.db");
+    let journal_path = host_data.path().join("host-data/media-operations.db");
     let operation_journal = journal(&journal_path);
     let expires_at = unix_now() + 3600;
     assert_eq!(
@@ -232,7 +232,7 @@ async fn workspace_tools_cannot_modify_or_delete_host_journal() {
 async fn process_free_registry_cannot_spawn_a_journal_deletion() {
     let workspace = tempfile::tempdir().unwrap();
     let host_data = tempfile::tempdir().unwrap();
-    let journal_path = host_data.path().join("media-operations.db");
+    let journal_path = host_data.path().join("host-data/media-operations.db");
     let operation_journal = journal(&journal_path);
     let expires_at = unix_now() + 3600;
     assert_eq!(
