@@ -627,10 +627,13 @@ async fn untrusted_project_custom_tools_are_absent_from_the_runtime_surface() {
 fn non_tty_text_output_is_headless_without_losing_text_rendering() {
     let cfg = cfg_for("zai");
     let format = OutputFormat::Text;
+    let worker_model = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
     let non_tty = pipeline_config_for_approval_capability(
         &cfg,
         PipelineApprovalCapability::Unavailable,
+        &worker_model,
         None,
+        &model_ref,
     );
     assert!(
         non_tty.headless,
@@ -642,13 +645,113 @@ fn non_tty_text_output_is_headless_without_losing_text_rendering() {
     );
     assert_eq!(format, OutputFormat::Text, "rendering remains text");
 
-    let interactive =
-        pipeline_config_for_approval_capability(&cfg, PipelineApprovalCapability::Stdio, None);
+    let interactive = pipeline_config_for_approval_capability(
+        &cfg,
+        PipelineApprovalCapability::Stdio,
+        &worker_model,
+        None,
+    );
     assert!(
         !interactive.headless,
         "an explicit interactive approval host retains scope review"
     );
     assert!(!interactive.headless_bypass_scope_review);
+}
+
+/// Issue: a squash-merge (#284 x #297/#276) silently dropped
+/// `run_pipeline_one_shot`'s `approval_capability` computation, collapsing
+/// its production call site to a bare `is_text` check with no test to catch
+/// it — the helper above was already covered in isolation, but nothing
+/// exercised the actual condition the call site computes. These three tests
+/// pin `approval_capability_for` (the extracted, directly-testable seam)
+/// against every input combination that matters.
+#[test]
+fn approval_capability_for_requires_both_terminal_handles_not_just_text_format() {
+    // The exact regression: a redirected/piped text-format run (is_text,
+    // stdout still a TTY, but stdin is NOT) must stay Unavailable — a bare
+    // `is_text` check would wrongly select Stdio here and try to read an
+    // approval decision from a pipe no one is at the other end of.
+    assert_eq!(
+        approval_capability_for(true, false, true),
+        PipelineApprovalCapability::Unavailable,
+        "text format alone must not select Stdio when stdin isn't a real terminal"
+    );
+    assert_eq!(
+        approval_capability_for(true, true, false),
+        PipelineApprovalCapability::Unavailable,
+        "text format alone must not select Stdio when stdout isn't a real terminal"
+    );
+    assert_eq!(
+        approval_capability_for(true, false, false),
+        PipelineApprovalCapability::Unavailable
+    );
+}
+
+#[test]
+fn approval_capability_for_json_is_always_unavailable() {
+    // Output serialization must never grant execution authority, regardless
+    // of the terminal state — JSON output has nowhere to render a prompt.
+    assert_eq!(
+        approval_capability_for(false, true, true),
+        PipelineApprovalCapability::Unavailable
+    );
+    assert_eq!(
+        approval_capability_for(false, false, false),
+        PipelineApprovalCapability::Unavailable
+    );
+}
+
+#[test]
+fn approval_capability_for_full_tty_text_is_stdio() {
+    // Only the genuine interactive case — text format, real stdin, real
+    // stdout — selects Stdio.
+    assert_eq!(
+        approval_capability_for(true, true, true),
+        PipelineApprovalCapability::Stdio
+    );
+}
+
+/// The composition gap the incident actually exploited: `approval_capability_for`
+/// and `pipeline_config_for_approval_capability` were each covered above in
+/// isolation, but nothing pinned them wired together the way
+/// `run_pipeline_one_shot` actually wires them (agent.rs, around the
+/// `pipeline_config` construction) — feeding one straight into the other. A
+/// regression that breaks *that* composition (e.g. hardcoding
+/// `PipelineApprovalCapability::Stdio` at the call site instead of using the
+/// computed value) would pass every test above while still shipping the
+/// scope-review bypass this incident (#284 x #297, fixed in #305) shipped.
+#[test]
+fn non_tty_text_run_wiring_stays_headless_and_json_run_wiring_never_bypasses_scope_review() {
+    let cfg = cfg_for("zai");
+    let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
+
+    // A non-TTY text-format run (e.g. `stella run` piped in a script or CI)
+    // must not select the interactive stdio approval gate, and its wired
+    // config must stay headless.
+    let text_capability = approval_capability_for(true, false, false);
+    let text_config =
+        pipeline_config_for_approval_capability(&cfg, text_capability, None, &model_ref);
+    assert_ne!(
+        text_capability,
+        PipelineApprovalCapability::Stdio,
+        "a non-tty text run must not select the interactive stdio approval gate"
+    );
+    assert!(
+        text_config.headless,
+        "a non-tty text run's wired config must stay headless"
+    );
+
+    // A JSON-format one-shot run is headless by construction — and even with
+    // both terminal handles real, its wired config must never bypass scope
+    // review; JSON has nowhere to render a prompt regardless of TTY state.
+    let json_capability = approval_capability_for(false, true, true);
+    let json_config =
+        pipeline_config_for_approval_capability(&cfg, json_capability, None, &model_ref);
+    assert!(json_config.headless);
+    assert!(
+        !json_config.headless_bypass_scope_review,
+        "a JSON-format run's wired config must never bypass scope review"
+    );
 }
 
 #[tokio::test]

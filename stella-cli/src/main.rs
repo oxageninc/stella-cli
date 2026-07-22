@@ -21,6 +21,7 @@ mod agent;
 mod agents_installed;
 mod attachments;
 mod auth_cmd;
+mod cache_insight;
 mod candidate_ws;
 mod claims;
 mod command_deck;

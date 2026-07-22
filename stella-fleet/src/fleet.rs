@@ -39,6 +39,7 @@ use stella_core::{BudgetGuard, BudgetOutcome, Clock};
 use stella_store::Store;
 use tokio::sync::{oneshot, watch};
 
+use crate::cache_schedule::{RunnableSession, warmest_first};
 use crate::git::{GitCli, Worktree, WorktreeError, WorktreeManager};
 use crate::ledger::{
     AttemptFinish, AttemptId, AttemptStart, CommitRecord, Ledger, LedgerError, RunRecord,
@@ -240,7 +241,20 @@ pub struct Fleet<W: FleetWorker, G: GitCli, C: Clock> {
     /// `dispatch_claimed` for exactly the span its worker runs, so the
     /// control verbs address live workers only.
     controls: Mutex<HashMap<TaskId, TaskControlHandle>>,
+    /// Per-task prompt-cache warmth, for [`Fleet::with_cache_warmth`]
+    /// (issue #269) — `None` (the default) leaves every ready wave in its
+    /// existing order.
+    warmth: Option<CacheWarmthLookup>,
 }
+
+/// Seconds until a task's session prompt-cache prefix expires, `None` when
+/// there is no warm prefix to preserve — the caller-supplied signal
+/// [`Fleet::with_cache_warmth`] reorders ready waves against. Boxed so a
+/// caller can close over its own store/clock rather than the fleet owning
+/// one; `stella-fleet` stays free of `stella-model`/`stella-store`, matching
+/// [`crate::cache_schedule`]'s pure, no-I/O contract (this closure is the
+/// caller's I/O, called synchronously between waves).
+pub type CacheWarmthLookup = Box<dyn Fn(&TaskId) -> Option<u64> + Send + Sync>;
 
 impl<W, G, C> Fleet<W, G, C>
 where
@@ -273,6 +287,7 @@ where
             config,
             claims: None,
             controls: Mutex::new(HashMap::new()),
+            warmth: None,
         })
     }
 
@@ -283,6 +298,45 @@ where
     pub fn with_claim_store(mut self, store: Store) -> Self {
         self.claims = Some(store);
         self
+    }
+
+    /// Make each ready wave's dispatch order cache-TTL-aware (builder style,
+    /// issue #269): before every `run_wave`, `run_plan` sorts that wave
+    /// warmest-first (soonest-to-expire prefix first) using `lookup`,
+    /// falling back to `ready_tasks`' existing order for any task the lookup
+    /// reports no warmth for. This only changes anything when a wave has more
+    /// ready tasks than `max_concurrency` (`run_wave`'s `buffer_unordered`
+    /// fills its bounded concurrency window in the order it is handed), so a
+    /// session about to lose its cached prefix is resumed before a colder one
+    /// gets the slot instead. Without this call (the default) every wave
+    /// dispatches in `ready_tasks`' order, unchanged from before #269.
+    pub fn with_cache_warmth(mut self, lookup: CacheWarmthLookup) -> Self {
+        self.warmth = Some(lookup);
+        self
+    }
+
+    /// Reorder one ready wave warmest-first when a warmth lookup is
+    /// installed; a single priority class (fleet.rs has no priority concept
+    /// of its own — [`crate::cache_schedule::warmest_first`]'s priority
+    /// dimension goes unused here, `id` tie-breaking the rest) so this is
+    /// purely a warmth sort. Returns `ready` unchanged when no lookup was
+    /// installed, so every existing caller keeps today's order.
+    fn order_ready_by_warmth<'a>(&self, ready: Vec<&'a Task>) -> Vec<&'a Task> {
+        let Some(lookup) = &self.warmth else {
+            return ready;
+        };
+        let sessions: Vec<RunnableSession> = ready
+            .iter()
+            .map(|t| RunnableSession {
+                id: t.id.clone(),
+                priority: 0,
+                warmth_secs: lookup(&t.id),
+            })
+            .collect();
+        warmest_first(&sessions)
+            .into_iter()
+            .filter_map(|s| ready.iter().find(|t| t.id == s.id).copied())
+            .collect()
     }
 
     /// Recover the mutex guard even if a prior holder panicked — the fleet
@@ -542,6 +596,9 @@ where
             if ready.is_empty() {
                 break;
             }
+            // Cache-TTL-aware scheduling (#269): a no-op unless
+            // `with_cache_warmth` was installed.
+            let ready = self.order_ready_by_warmth(ready);
 
             // A dispatch error (worktree creation, ledger I/O) is recorded as
             // that task's failure — never an early return that would throw
@@ -1385,5 +1442,59 @@ mod tests {
         assert!(!f.pause_task(&id), "a settled task has no live pause line");
         assert!(!f.resume_task(&id));
         assert!(!f.stop_task(&id), "a settled task has no live stop line");
+    }
+
+    // ---- cache-TTL-aware scheduling (#269) -----------------------------
+
+    #[test]
+    fn ready_order_is_unchanged_without_a_warmth_lookup() {
+        let f = fleet(
+            FakeWorker::new(0.0),
+            OkGit::new(),
+            BudgetGuard::new(BudgetMode::Observed, None, None),
+            FleetConfig::new("run1", "HEAD"),
+        );
+        let (a, b) = (Task::new("a", "a", "p"), Task::new("b", "b", "p"));
+        let order = f.order_ready_by_warmth(vec![&a, &b]);
+        assert_eq!(
+            order.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    /// End-to-end proof `run_plan` actually consults the warmth order: three
+    /// independent (no `depends_on`) tasks land in one ready wave,
+    /// `max_concurrency: 1` makes `run_wave`'s `buffer_unordered` strictly
+    /// serial, so `FakeWorker`'s recorded dispatch order IS the warmth order
+    /// — fails on the pre-#269 `Fleet` (no `with_cache_warmth` to call).
+    #[tokio::test]
+    async fn run_plan_dispatches_a_serial_wave_warmest_first() {
+        let plan = Plan::new(vec![
+            Task::new("cold", "cold", "p"),
+            Task::new("hot", "hot", "p"),
+            Task::new("warm", "warm", "p"),
+        ]);
+        let worker = FakeWorker::new(0.0);
+        let seen = worker.seen_roots.clone();
+        let f = fleet(
+            worker,
+            OkGit::new(),
+            BudgetGuard::new(BudgetMode::Observed, None, None),
+            FleetConfig::new("run1", "HEAD").with_max_concurrency(1),
+        )
+        .with_cache_warmth(Box::new(|id: &TaskId| match id.as_str() {
+            "cold" => Some(280),
+            "hot" => Some(10),
+            "warm" => Some(90),
+            _ => None,
+        }));
+        f.run_plan(&plan).await.unwrap();
+        let dispatched: Vec<String> = seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(dispatched, vec!["hot", "warm", "cold"]);
     }
 }

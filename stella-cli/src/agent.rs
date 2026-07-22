@@ -49,6 +49,7 @@ use stella_context::EpisodeOutcome;
 
 mod engine;
 mod goal;
+mod graph;
 mod outcome;
 mod output;
 mod prompt;
@@ -57,6 +58,10 @@ mod tools;
 
 pub(crate) use engine::*;
 pub(crate) use goal::*;
+use graph::build_code_graph;
+pub(crate) use graph::spawn_session_graph;
+#[cfg(test)]
+use graph::{GraphSummary, format_graph_stats, index_workspace_graph_blocking};
 use outcome::{
     pipeline_episode_outcome, pipeline_failure_reason, pipeline_status_label,
     pipeline_status_result,
@@ -245,9 +250,15 @@ async fn run_pipeline_one_shot(
             } else {
                 PipelineApprovalCapability::Unavailable
             };
-        let mut pipeline_config =
-            pipeline_config_for_approval_capability(cfg, approval_capability, test_command);
-        pipeline_config.engine = pipeline_engine_config_for(cfg, &wiring.worker_model);
+        // `--test-command` arms the deterministic verify ladder: the
+        // fail→pass flip oracle and SubmitFast/Revise decisions all key off
+        // it. Left unset, every verification escalates to the model judge.
+        let mut pipeline_config = pipeline_config_for_approval_capability(
+            cfg,
+            approval_capability,
+            &wiring.worker_model,
+            test_command,
+        );
         pipeline_config.role_overrides = wiring.role_overrides.clone();
 
         let stdio_gate = StdioApprovalGate;
@@ -1052,6 +1063,33 @@ pub(crate) fn spawn_session_graph(
         }
     });
     (SessionGraph { graph: slot }, handle)
+}
+
+/// Surface a post-turn [`ReflectionReport`] for a headless / line-based
+/// format — the reflection outcome must never vanish (the silent-reflection
+/// blind spot this closes). `stream-json` gets one machine event line so a
+/// metering/CI consumer sees that reflection ran and whether it errored;
+/// `text` and `json` get a one-line stderr warning ONLY when the reflection
+/// model call actually failed — a clean empty reflection is the common,
+/// correct case and stays quiet. Never writes stdout in `json` mode, so that
+/// format's single-object contract is untouched. Best-effort: a `None` model
+/// error in `text`/`json` prints nothing.
+fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
+    if format == OutputFormat::StreamJson {
+        let line = serde_json::json!({
+            "type": "reflect",
+            "recorded": report.recorded,
+            "error": report.model_error,
+        });
+        println!("{line}");
+        return;
+    }
+    if let Some(err) = &report.model_error {
+        eprintln!(
+            "  {} post-turn reflection skipped — model call failed: {err}",
+            "!".yellow()
+        );
+    }
 }
 
 /// The shared init flow behind `stella init` and the `/init` chat command:
