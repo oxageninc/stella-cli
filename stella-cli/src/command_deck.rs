@@ -23,8 +23,7 @@
 //! (`Fleet::pause_task` / `resume_task` / `stop_task`, riding
 //! `stella_fleet::WorkerControls` through the `FleetWorker` port);
 //! surfacing `stella fleet` tasks as controllable deck lanes and
-//! fleet-worktree isolation for deck workers remain follow-ups on that seam
-//! (`COMMAND_DECK_DESIGN.md` → "Backend seams").
+//! fleet-worktree isolation for deck workers remain follow-ups on that seam.
 //!
 //! ## The three engine seams handled here
 //!

@@ -42,7 +42,6 @@ pub mod ui;
 // ── Command Deck: the multi-tab, multi-agent operations workspace ───────────
 // Extends the single-session REPL above into a tabbed deck (Session · Agents ·
 // Traces · Graph · Files) while preserving the pure-core / thin-shell design.
-// See `COMMAND_DECK_DESIGN.md`.
 pub mod cache_panel;
 pub mod deck;
 pub mod deck_render;
