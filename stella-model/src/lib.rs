@@ -6,6 +6,7 @@
 pub mod anthropic;
 pub(crate) mod attachment;
 pub mod bedrock;
+pub mod cache_economics;
 pub mod catalog;
 pub mod credential;
 pub mod gemini;
@@ -19,6 +20,10 @@ pub mod sse;
 pub mod vertex;
 pub mod zai;
 
-pub use catalog::{Catalog, CatalogEntry, ToolDialect};
+pub use cache_economics::{
+    CacheWarmth, cache_write_premium_multiplier, diagnose_cache, hit_rate as cache_hit_rate,
+    is_cache_expired_rewrite, provider_cache_ttl_secs,
+};
+pub use catalog::{Catalog, CatalogEntry, Pricing, ToolDialect};
 pub use credential::{ApiKey, CredentialError};
 pub use provider::Provider;

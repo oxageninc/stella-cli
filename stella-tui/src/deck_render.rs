@@ -15,6 +15,7 @@ use ratatui_comfy_tabs::{TabNav, TabNavState};
 
 use stella_protocol::{CiStatus, PrStatus};
 
+use crate::cache_panel;
 use crate::composer::{ComposerLayout, layout as composer_layout, split_row_at};
 use crate::deck::{DeckTab, PrInfo, WorkspaceModel};
 use crate::deck_ui::DeckUi;
@@ -62,6 +63,16 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
     let text_w = (area.width as usize).saturating_sub(PROMPT_PREFIX_W + COMPOSER_GUTTER_W);
     let c_layout = composer_layout(&ui.composer, text_w.max(1));
     let composer_h = c_layout.rows.len().clamp(1, DECK_COMPOSER_MAX_ROWS) as u16;
+    // The statline grows a third row only when the focused agent has earned a
+    // low-hit-rate diagnosis (#267) — the common case stays the compact
+    // label-over-value pair; a session that needs the warning gets it without
+    // permanently taxing every other session's content area.
+    let has_diagnosis = model
+        .agents
+        .get(ui.focused)
+        .and_then(|a| a.cache_diagnosis(cache_panel::LOW_HIT_RATE_THRESHOLD))
+        .is_some();
+    let statline_h = if has_diagnosis { 3 } else { 2 };
     let bands = Layout::vertical([
         Constraint::Length(3),          // tab bar
         Constraint::Min(1),             // active view
@@ -69,7 +80,7 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
         Constraint::Length(1),          // run progress bar
         Constraint::Length(composer_h), // composer
         Constraint::Length(1),          // composer footer (keys + line counter)
-        Constraint::Length(2),          // statline (label over value)
+        Constraint::Length(statline_h), // statline (label over value[, diagnosis])
     ])
     .split(area);
 
@@ -911,7 +922,13 @@ fn render_composer_footer(
 /// The statline: labeled cells (dim micro-label over bright value) separated by
 /// hairlines, with the brand pinned left and the ethos chip pinned right.
 /// Two rows tall; the context/token meter is kept prominent.
-fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut Buffer) {
+///
+/// `pub(crate)`: the cache-panel integration tests in
+/// [`crate::cache_panel`] render a full statline to assert on the CACHE /
+/// SAVED / WARMTH cells, so they need to call this from outside the file
+/// (kept out of `deck_render.rs`'s own test module to respect its size
+/// ratchet — see that module's doc comment).
+pub(crate) fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut Buffer) {
     if area.height == 0 {
         return;
     }
@@ -944,31 +961,17 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
         theme::AURORA_AZURE
     };
 
-    // CACHE: the session prompt-cache hit rate — cumulative cache-read (hit)
-    // tokens over cumulative input tokens (a subset of it by the
-    // `CompletionUsage` contract, so the ratio is always in `[0, 1]`; clamped
-    // regardless), with the raw counts in parens. `—` before any usage has
-    // been metered.
-    let cache_hit = model.cache_hit_tokens();
+    // Cache economics panel (#267/#269) — CACHE hit%/volumes, SAVED dollars,
+    // WARMTH countdown; the pricing/TTL math already happened in the producer.
     let cache_total = model.total_input_tokens();
-    let cache_spans: Vec<Span<'static>> = if cache_total == 0 {
-        vec![Span::styled("—", val)]
-    } else {
-        let pct = ((cache_hit as f64 / cache_total as f64) * 100.0)
-            .round()
-            .clamp(0.0, 100.0);
-        vec![
-            Span::styled(format!("{pct:.0}%"), val),
-            Span::styled(
-                format!(
-                    " ({}/{} tokens)",
-                    fmt_tokens(cache_hit),
-                    fmt_tokens(cache_total)
-                ),
-                dim,
-            ),
-        ]
-    };
+    let cache_spans = cache_panel::cache_cell(
+        model.cache_hit_tokens(),
+        model.total_cache_write_tokens(),
+        cache_total,
+    );
+    let saved_spans = cache_panel::saved_cell(model.total_cache_savings_usd(), cache_total > 0);
+    let warmth_spans =
+        cache_panel::warmth_cell(focused.and_then(|a| a.cache_warmth_secs(model.now_ms)));
 
     // PIPELINE: ON when the session drives the staged pipeline, OFF for the
     // raw engine loop (`model.pipeline`).
@@ -1040,6 +1043,8 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
             6,
         ),
         ("CACHE", cache_spans, 4),
+        ("SAVED", saved_spans, 3),
+        ("WARMTH", warmth_spans, 3),
         (
             "ENGINE",
             vec![Span::styled(
@@ -1185,6 +1190,27 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
             buf,
         );
     }
+
+    // Third row: the low-hit-rate diagnosis, full-sentence and byte-identical
+    // to `stella stats`'s wording — only present when `render_deck` reserved
+    // the extra row (`AgentEntry::cache_diagnosis` fired for the focused
+    // agent) AND the area actually has it (a caller that hands this function
+    // a bare 2-row area, as every pre-#267 snapshot fixture still does, gets
+    // no diagnosis row rather than a clipped one).
+    if area.height >= 3
+        && let Some(cause) =
+            focused.and_then(|a| a.cache_diagnosis(cache_panel::LOW_HIT_RATE_THRESHOLD))
+    {
+        Paragraph::new(Line::from(cache_panel::diagnosis_spans(cause))).render(
+            Rect {
+                x: area.x,
+                y: top_y + 2,
+                width: area.width,
+                height: 1,
+            },
+            buf,
+        );
+    }
 }
 
 /// A compact 6-cell utilization meter for a `[0, 1]` fraction.
@@ -1258,7 +1284,7 @@ fn fmt_k(n: u64) -> String {
 /// `105.3M`, `211.4K`, `950` — the CACHE-cell convention. `fmt_k` (the context
 /// meter) caps at `k`; cumulative cache counts reach the millions, so this
 /// carries an `M` tier, matching the requested `67% (105.3M/211.4M tokens)`.
-fn fmt_tokens(n: u64) -> String {
+pub(crate) fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
@@ -1476,9 +1502,10 @@ mod tests {
             ui.composer.insert_char(c);
         }
 
-        // 160 (was 120) so the now-wider statline (with the CACHE + PIPELINE
-        // cells) still has room for the ethos chip, which is dropped first.
-        for (w, h) in [(80u16, 24u16), (160, 40)] {
+        // 190 (was 160, before that 120) so the now-wider statline (CACHE +
+        // PIPELINE, then SAVED + WARMTH for #267/#269) still has room for the
+        // ethos chip, which is dropped first.
+        for (w, h) in [(80u16, 24u16), (190, 40)] {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|f| render_deck(&model, &mut ui, f)).unwrap();
             let text = buffer_text(term.backend().buffer());
@@ -1526,6 +1553,66 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn full_deck_frame_grows_a_third_statline_row_for_a_diagnosed_agent() {
+        // The acceptance case: an opt-in provider (anthropic), 4 calls (past
+        // MIN_TURNS=3), 0% hit rate, 0 cache writes — the marker never
+        // engaged. `render_deck` must reserve the statline's third row and
+        // `render_status_bar` must fill it with the full-sentence hint, not a
+        // clipped fragment.
+        let mut model = running_model_with_queue();
+        for step in 1..=4usize {
+            model.apply_inbound(&Inbound::Event {
+                agent: "lead".into(),
+                event: AgentEvent::StepUsage {
+                    step,
+                    model: "claude-fable-5".into(),
+                    input_tokens: 10_000,
+                    output_tokens: 500,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 0,
+                    estimated_input_tokens: 0,
+                    cost_usd: 0.05,
+                    duration_ms: 100,
+                    retries: 0,
+                    tool_calls: 0,
+                },
+            });
+        }
+        model.apply_inbound(&Inbound::CacheInsight {
+            agent: "lead".into(),
+            savings_usd_delta: 0.0,
+            ttl_secs: 300,
+            is_opt_in_provider: true,
+        });
+
+        let mut ui = DeckUi::default();
+        ui.splash.skip();
+        let mut term = Terminal::new(TestBackend::new(190, 40)).unwrap();
+        term.draw(|f| render_deck(&model, &mut ui, f)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(
+            text.contains("cache opt-in never engaged"),
+            "diagnosis row missing from the full frame:\n{text}"
+        );
+
+        // A healthy session (no StepUsage at all) never grows the row or
+        // shows the sentence — the common case stays the compact two rows.
+        let healthy = running_model_with_queue();
+        let mut healthy_ui = DeckUi::default();
+        healthy_ui.splash.skip();
+        let mut healthy_term = Terminal::new(TestBackend::new(190, 40)).unwrap();
+        healthy_term
+            .draw(|f| render_deck(&healthy, &mut healthy_ui, f))
+            .unwrap();
+        let healthy_text = buffer_text(healthy_term.backend().buffer());
+        assert!(
+            !healthy_text.contains("cache opt-in never engaged")
+                && !healthy_text.contains("prompt prefix is unstable"),
+            "a healthy session must not show a diagnosis:\n{healthy_text}"
+        );
     }
 
     #[test]

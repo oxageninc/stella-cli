@@ -164,6 +164,32 @@ pub enum Inbound {
     /// raw engine loop. Folded into [`crate::deck::WorkspaceModel::pipeline`]
     /// so the `PIPELINE` stat box flips live.
     Pipeline(bool),
+    /// Derived prompt-cache economics for one agent's latest model call —
+    /// dollars saved and the provider's cache TTL — computed by the
+    /// pricing-aware producer (the CLI has the model catalog; the deck does
+    /// not) and folded into the agent's [`crate::deck::AgentEntry`]. Paired
+    /// with the raw `StepUsage` the same call emits (which carries the token
+    /// counts the deck already folds): this adds only the two figures that
+    /// need list pricing / the TTL table, keeping the single savings formula
+    /// in `stella-model` and the deck free of a model-tier dependency.
+    ///
+    /// `savings_usd_delta` is this call's signed savings (negative when the
+    /// write premium outran the reads it bought — the low-hit incident), added
+    /// to the agent's running total. `ttl_secs` is the provider's prompt-cache
+    /// TTL in seconds (`0` = no prompt cache / no TTL to preserve); the deck
+    /// pairs it with the last provider-call time to render a live warmth
+    /// countdown. `is_opt_in_provider` is whether this provider only caches
+    /// behind an explicit marker (Anthropic/Bedrock/OpenRouter-Claude) —
+    /// resolved once here from `stella-model`'s cache-posture table so
+    /// [`crate::deck::AgentEntry::cache_diagnosis`] can name
+    /// `CacheCause::OptInNeverEngaged` without the deck itself needing to
+    /// know which providers require the marker.
+    CacheInsight {
+        agent: AgentId,
+        savings_usd_delta: f64,
+        ttl_secs: u64,
+        is_opt_in_provider: bool,
+    },
     /// The installed-agents list for the Agents tab's INSTALLED AGENTS pane.
     /// Out-of-band view state (applied straight to `DeckUi::installed` by
     /// [`crate::deck_ui::ingest_inbound`], ignored by the model fold). The

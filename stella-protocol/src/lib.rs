@@ -8,6 +8,7 @@
 //! `serde_json` byte-for-byte (see the `roundtrip` tests in each module).
 
 pub mod attachment;
+pub mod cache;
 pub mod completion;
 pub mod error;
 pub mod event;
@@ -19,6 +20,7 @@ pub use attachment::{
     Attachment, AttachmentKind, AttachmentSource, classify_media_type, human_bytes,
     media_type_for_path,
 };
+pub use cache::CacheCause;
 pub use completion::{
     CompletionMessage, CompletionRequest, CompletionResult, CompletionUsage, FinishReason,
     GenerationParams, MessageRole, ReasoningEffort, ServiceTier, Verbosity,

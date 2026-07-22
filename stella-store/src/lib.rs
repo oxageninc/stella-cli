@@ -84,13 +84,17 @@ use stella_protocol::{AgentEvent, TaskItem, TaskStatus, ToolOutput};
 
 // Module map — this file holds the row types, the `Store` handle and its
 // query surface, and the tests; everything else is split by concern:
-//   ddl        (crate-private) every table/index DDL at the CURRENT schema
-//   migrations (crate-private) versioned upgrades + the fresh-file bootstrap
-//   catalog    `catalog.db` — user-tier model catalog (slugs, pricing)
-//   journal    append-only per-session sidecar journal (crash-safe resume)
-//   notify     persist-until-read cross-session notifications
-//   sessions   cross-process session registry (one JSON file per session)
-//   usage      `usage.db` — user-tier cross-project telemetry aggregate
+//   ddl         (crate-private) every table/index DDL at the CURRENT schema
+//   migrations  (crate-private) versioned upgrades + the fresh-file bootstrap
+//   cache_gaps  per-call cache-gap facts behind the `cache_expired_rewrite`
+//               counter (split out to keep this file under its size ratchet)
+//   cache_trend per-session cache trend — telemetry already persists these
+//               facts; this groups them by session for `stella stats`
+//   catalog     `catalog.db` — user-tier model catalog (slugs, pricing)
+//   journal     append-only per-session sidecar journal (crash-safe resume)
+//   notify      persist-until-read cross-session notifications
+//   sessions    cross-process session registry (one JSON file per session)
+//   usage       `usage.db` — user-tier cross-project telemetry aggregate
 mod ddl;
 mod migrations;
 mod private;
@@ -104,6 +108,8 @@ mod tests;
 #[cfg(test)]
 mod usage_completeness_tests;
 
+pub mod cache_gaps;
+pub mod cache_trend;
 pub mod catalog;
 pub mod enterprise_telemetry;
 pub mod journal;
@@ -116,6 +122,7 @@ use migrations::{
     MIGRATIONS, SCHEMA_VERSION, any_store_table_exists, apply_migration, create_latest_schema,
 };
 
+pub use cache_gaps::CacheCallGap;
 pub use catalog::CatalogStore;
 // The sidecar journal's writer is deliberately NOT re-exported at the top
 // level: `SessionJournal` here names the DB read-model reassembled by
@@ -641,7 +648,10 @@ impl Store {
         Ok(())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+    /// `pub(crate)`: [`crate::cache_gaps`] is a separate module (split out to
+    /// keep this file under its size ratchet) whose `impl Store` block needs
+    /// the same connection access every query method here has.
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         // A poisoned mutex means a panic mid-write; the connection itself
         // is still usable and refusing all further persistence would turn
         // one bad write into total observability loss.

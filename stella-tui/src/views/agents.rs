@@ -20,15 +20,18 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Widget};
 
+use crate::cache_panel;
 use crate::deck::{ACTIVITY_WINDOW, AgentEntry, WorkspaceModel};
 use crate::deck_ui::{AgentsPane, DeckUi};
 use crate::theme;
 
 /// Column headers, in display order — matches the `widths` array in
-/// [`render`] index-for-index.
-const HEADERS: [&str; 11] = [
-    "Agent", "Goal", "Status", "Ctx%", "Cost", "$/hr", "Elapsed", "CPU%", "MEM", "In/Out",
-    "Activity",
+/// [`render`] index-for-index. `Cache`/`Warmth` (#267/#269) sit at the end,
+/// next to `Activity` — density signal like `$/hr`/`CPU%`/`MEM`, not row
+/// identity, so appending them keeps every earlier column's index stable.
+const HEADERS: [&str; 13] = [
+    "Agent", "Goal", "Status", "Ctx%", "Cost", "$/hr", "Elapsed", "CPU%", "MEM", "In/Out", "Cache",
+    "Warmth", "Activity",
 ];
 
 /// The goal/title column is pre-truncated to this many characters so a very
@@ -136,6 +139,8 @@ fn render_executions(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &
         Constraint::Length(6),                      // CPU%
         Constraint::Length(7),                      // MEM
         Constraint::Length(14),                     // In/Out
+        Constraint::Length(6),                      // Cache
+        Constraint::Length(7),                      // Warmth
         Constraint::Length(ACTIVITY_WINDOW as u16), // Activity
     ];
     let widths: Vec<Constraint> = full_widths
@@ -215,6 +220,28 @@ fn agent_row(entry: &AgentEntry, now_ms: u64, is_focused: bool, compact: bool) -
     ))
     .style(theme::muted());
 
+    // Per-agent cache economics (#267 breakdown, #269 warmth countdown) —
+    // the same formulas the deck's statline CACHE/WARMTH cells use
+    // (`cache_panel`), just scoped to this one agent instead of the session
+    // total. `—` before any input is metered / no warm prefix to preserve.
+    let cache_cell = Cell::from(
+        match cache_panel::hit_pct(entry.cache_read_tokens, entry.tokens_in) {
+            Some(pct) => format!("{pct}%"),
+            None => "—".to_string(),
+        },
+    )
+    .style(theme::muted());
+
+    let warmth_secs = entry.cache_warmth_secs(now_ms);
+    let warmth_color = match warmth_secs {
+        Some(0) => theme::DANGER_BRIGHT,
+        Some(s) if s < 60 => theme::WARNING_BRIGHT,
+        Some(_) => theme::SUCCESS_BRIGHT,
+        None => theme::TEXT_TERTIARY,
+    };
+    let warmth_cell =
+        Cell::from(cache_panel::fmt_warmth(warmth_secs)).style(Style::default().fg(warmth_color));
+
     let spark: String = entry
         .activity
         .padded()
@@ -234,6 +261,8 @@ fn agent_row(entry: &AgentEntry, now_ms: u64, is_focused: bool, compact: bool) -
         cpu_cell,
         mem_cell,
         io_cell,
+        cache_cell,
+        warmth_cell,
         activity_cell,
     ];
     let cells: Vec<Cell> = cells
@@ -408,6 +437,73 @@ mod tests {
         assert!(text.contains("62.0k"), "tokens-in humanized:\n{text}");
         assert!(text.contains("12.4k"), "tokens-out humanized:\n{text}");
         assert!(text.contains("$0.42"), "cost shown:\n{text}");
+    }
+
+    /// The per-agent cache breakdown (#267) and warmth countdown on the
+    /// agent row (#269): two agents with different cache histories must show
+    /// DIFFERENT Cache/Warmth cells, not a session-wide aggregate smeared
+    /// across every row.
+    #[test]
+    fn dashboard_shows_per_agent_cache_hit_rate_and_warmth_countdown() {
+        let mut model = WorkspaceModel::new();
+        model.now_ms = 0;
+        model.apply_inbound(&Inbound::Register(AgentMeta::new("lead", "warm agent", 0)));
+        model.apply_inbound(&Inbound::Register(AgentMeta::new("sub", "cold agent", 0)));
+
+        // "lead": 750/1000 input tokens served from cache (75% hit), then a
+        // CacheInsight pins a 5-minute provider TTL; 60s idle since leaves
+        // 4:00 of warmth remaining.
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::StepUsage {
+                step: 1,
+                model: "claude".into(),
+                input_tokens: 1_000,
+                output_tokens: 100,
+                cached_input_tokens: 750,
+                cache_write_tokens: 0,
+                estimated_input_tokens: 0,
+                cost_usd: 0.01,
+                duration_ms: 100,
+                retries: 0,
+                tool_calls: 0,
+            },
+        });
+        model.apply_inbound(&Inbound::CacheInsight {
+            agent: "lead".into(),
+            savings_usd_delta: 0.1,
+            ttl_secs: 300,
+            is_opt_in_provider: true,
+        });
+        model.now_ms += 60_000;
+        // "sub" never calls the model — no cache data, no warm prefix.
+
+        let mut ui = DeckUi::default();
+        let area = Rect::new(0, 0, 220, 6); // wide: Cache/Warmth are density signal, wide-only
+        let mut buf = Buffer::empty(area);
+        render(&model, &mut ui, area, &mut buf);
+        let text = buffer_text(&buf);
+
+        assert!(text.contains("Cache"), "cache header present:\n{text}");
+        assert!(text.contains("Warmth"), "warmth header present:\n{text}");
+        assert!(text.contains("75%"), "lead's hit rate shown:\n{text}");
+        assert!(
+            text.contains("4:00"),
+            "lead's warmth countdown shown:\n{text}"
+        );
+
+        let sub_line = text
+            .lines()
+            .find(|l| l.contains("sub"))
+            .unwrap_or_else(|| panic!("sub's row present:\n{text}"));
+        assert!(
+            !sub_line.contains("75%") && !sub_line.contains("4:00"),
+            "sub has its own (dash) cells, not lead's numbers: {sub_line:?}"
+        );
+        assert!(
+            sub_line.contains('—'),
+            "sub's untouched cache/warmth cells read as a dash: {sub_line:?}"
+        );
     }
 
     #[test]
