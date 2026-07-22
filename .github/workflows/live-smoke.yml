@@ -1,0 +1,134 @@
+# Opt-in LIVE provider smoke suite (issue #274) — one minimal REAL call per
+# adapter against the provider's own endpoint. See
+# `stella-model/tests/live_smoke.rs` for exactly what each test asserts (wire-
+# shape ACCEPTANCE — a 200 the adapter can parse back into a
+# `CompletionResult` — never model quality) and why it exists (the Anthropic
+# adapter shipped a legacy `thinking` shape for months with only wiremock
+# coverage before a live call ever surfaced its 400 — see #240).
+#
+# Deliberately NOT wired to `pull_request`/`push`: every armed provider
+# spends real money on every run, so this only fires on a manual trigger or
+# the weekly schedule below. `cargo test`'s own default run (CI's `ci.yml`,
+# any local `cargo test --workspace`) never touches this suite unless
+# `STELLA_LIVE_SMOKE=1` is set — see `live_smoke_enabled` in the test file.
+# A provider whose secret isn't configured here skips that one test cleanly
+# (see `armed_key`) rather than failing the job — so this workflow is safe to
+# run with any subset of the secrets below configured.
+#
+# A red run on a configured provider needs a human read of the failure, not
+# an assumption: this suite deliberately does NOT auto-classify a failure
+# into "wire-shape regression" vs. "account/auth/quota/billing problem" (a
+# 400 with billing language in the body is genuinely ambiguous with a 400
+# from a malformed request on at least Anthropic — see the 2026-07-21 run
+# noted on `anthropic_smoke`'s doc comment — and sniffing the body for
+# billing keywords to auto-skip would be fragile and could paper over a
+# real regression). Read the printed status/body in the job log before
+# re-triggering.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions ->
+# Repository secrets) — add only the ones for the providers you want this
+# job to actually exercise; every other provider's test just skips:
+#
+#   ANTHROPIC_API_KEY       - Anthropic Messages API (also settles the
+#                             top-level `cache_control` question — see the
+#                             doc comment on `anthropic_smoke`)
+#   OPENAI_API_KEY          - OpenAI Responses API
+#   GEMINI_API_KEY          - Gemini direct generateContent
+#   OPENROUTER_API_KEY      - OpenRouter (routed through `openrouter/auto`)
+#   ZAI_API_KEY             - Z.ai (GLM)
+#   DEEPSEEK_API_KEY        - DeepSeek
+#   XAI_API_KEY             - xAI (Grok)
+#   AWS_ACCESS_KEY_ID       - Bedrock Converse (an IAM user/role scoped to
+#                             just `bedrock:InvokeModel` is enough)
+#   AWS_SECRET_ACCESS_KEY   - paired with AWS_ACCESS_KEY_ID above
+#   AWS_REGION              - optional; the test defaults to us-east-1 if
+#                             this secret is absent/empty
+#   GCP_SERVICE_ACCOUNT_KEY - Vertex AI: a service-account JSON key with
+#                             `roles/aiplatform.user`. Vertex is the one
+#                             adapter that CANNOT take a static bearer
+#                             secret directly — `VERTEX_ACCESS_TOKEN` is an
+#                             OAuth2 token with a ~1h TTL, so a value saved
+#                             as a secret would already be expired by the
+#                             next scheduled run. This job mints a fresh
+#                             token from the service-account key at runtime
+#                             instead (the two `google-github-actions` steps
+#                             below) rather than pretending a stored token
+#                             would work.
+#   VERTEX_PROJECT_ID       - required alongside GCP_SERVICE_ACCOUNT_KEY
+#   VERTEX_LOCATION         - optional; the test defaults to "global" if
+#                             this secret is absent/empty
+#
+# None of these secrets are required for the workflow itself to run — with
+# zero configured, every live-* test skips and the job still goes green
+# (it's the same clean no-op the local default is).
+name: live-smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 1" # weekly, Monday 07:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  live-smoke:
+    name: live provider smoke (opt-in, spends real money)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Vertex only: exchange the long-lived service-account key for a
+      # short-lived bearer token, freshly minted this run. The `secrets`
+      # context can't be referenced directly in a step `if:` (GitHub Actions
+      # only exposes it to `env:`/`with:`/`run:` interpolation), so detect
+      # presence here into a step output first, then gate the next three
+      # steps on that — skips cleanly when GCP_SERVICE_ACCOUNT_KEY isn't
+      # configured, so this workflow works with zero, some, or all secrets.
+      - name: Detect Vertex credentials
+        id: vertex_creds
+        env:
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+        run: |
+          if [ -n "$GCP_SERVICE_ACCOUNT_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate to Google Cloud (Vertex)
+        if: steps.vertex_creds.outputs.present == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Set up gcloud (Vertex)
+        if: steps.vertex_creds.outputs.present == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Mint VERTEX_ACCESS_TOKEN
+        if: steps.vertex_creds.outputs.present == 'true'
+        run: echo "VERTEX_ACCESS_TOKEN=$(gcloud auth print-access-token)" >> "$GITHUB_ENV"
+
+      - name: cargo test -p stella-model --test live_smoke
+        env:
+          STELLA_LIVE_SMOKE: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          VERTEX_PROJECT_ID: ${{ secrets.VERTEX_PROJECT_ID }}
+          VERTEX_LOCATION: ${{ secrets.VERTEX_LOCATION }}
+        run: cargo test -p stella-model --test live_smoke -- --nocapture --test-threads=1

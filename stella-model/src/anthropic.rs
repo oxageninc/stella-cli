@@ -216,9 +216,16 @@ const EPHEMERAL_CACHE: AnthropicCacheControl = AnthropicCacheControl { kind: "ep
 /// LAST content block of the final message, so each agent-loop turn reads
 /// the prefix written by the previous turn instead of re-paying the whole
 /// replayed history at the full input rate. Pairs with the system-block
-/// marker (two of the four allowed breakpoints). Block-level is the only
-/// placement the Messages API accepts — a top-level `cache_control`
-/// request field is an unknown parameter the API rejects with a 400.
+/// marker (two of the four allowed breakpoints). Block-level is the
+/// placement this adapter sends (never a top-level `cache_control` request
+/// field, which Anthropic's documented behavior for unknown parameters
+/// says would 400) — see `stella-model/tests/live_smoke.rs`'s
+/// `anthropic_smoke` (#274) for the live-wire status of that claim: as of
+/// 2026-07-21 it's still unverified end-to-end (the one available
+/// credential hit an account-billing 400 before the request shape was ever
+/// evaluated), so treat "top-level would 400" as an inherited assumption
+/// from PR #221, not a confirmed fact, until that smoke test reports a
+/// clean pass.
 fn stamp_tail_cache_breakpoint(messages: &mut [AnthropicMessage]) {
     let Some(block) = messages.last_mut().and_then(|m| m.content.last_mut()) else {
         return;
