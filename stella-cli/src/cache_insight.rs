@@ -38,6 +38,7 @@ pub(crate) fn cache_insight_for(
         output_tokens,
         cached_input_tokens,
         cache_write_tokens,
+        complete,
         ..
     } = event
     else {
@@ -48,6 +49,7 @@ pub(crate) fn cache_insight_for(
         output_tokens: *output_tokens,
         cached_input_tokens: *cached_input_tokens,
         cache_write_tokens: *cache_write_tokens,
+        reported: *complete,
     };
     let savings_usd_delta = Catalog::current()
         .resolve_for(provider_id, model)
@@ -69,6 +71,8 @@ mod tests {
     fn step_usage(model: &str, input: u64, cached: u64, write: u64) -> AgentEvent {
         AgentEvent::StepUsage {
             step: 1,
+            role: stella_protocol::ModelCallRole::Worker,
+            provider: "anthropic".into(),
             model: model.to_string(),
             input_tokens: input,
             output_tokens: 0,
@@ -79,6 +83,7 @@ mod tests {
             duration_ms: 1,
             retries: 0,
             tool_calls: 0,
+            complete: true,
         }
     }
 

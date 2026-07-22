@@ -7,6 +7,7 @@ use stella_store::Store;
 use stella_tui::Inbound;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use super::cache_insight_for;
 use crate::agent;
 
 /// Persist each event and forward it to the deck. The returned bit is false
@@ -41,10 +42,15 @@ pub(crate) fn spawn_forwarder(
                 }
                 seq += 1;
             }
+            // Sent after StepUsage so the lane is already registered.
+            let cache_insight = cache_insight_for(&provider_id, &lane, &event);
             let _ = inbound.send(Inbound::Event {
                 agent: lane.clone(),
                 event,
             });
+            if let Some(insight) = cache_insight {
+                let _ = inbound.send(insight);
+            }
         }
         persistence_complete
     })
