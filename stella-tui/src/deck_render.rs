@@ -1719,6 +1719,8 @@ mod tests {
     fn step_usage(input: u64, cached: u64) -> AgentEvent {
         AgentEvent::StepUsage {
             step: 1,
+            role: stella_protocol::ModelCallRole::Worker,
+            provider: "test".into(),
             model: "glm".into(),
             input_tokens: input,
             output_tokens: 0,
@@ -1729,6 +1731,7 @@ mod tests {
             duration_ms: 1,
             retries: 0,
             tool_calls: 0,
+            complete: true,
         }
     }
 

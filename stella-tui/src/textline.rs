@@ -829,6 +829,8 @@ mod tests {
             },
             AgentEvent::StepUsage {
                 step: 0,
+                role: stella_protocol::ModelCallRole::Worker,
+                provider: "test".into(),
                 model: "m".into(),
                 input_tokens: 1,
                 output_tokens: 1,
@@ -839,6 +841,7 @@ mod tests {
                 duration_ms: 1,
                 retries: 0,
                 tool_calls: 0,
+                complete: true,
             },
             AgentEvent::GoalVerdict {
                 round: 1,

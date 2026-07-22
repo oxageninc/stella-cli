@@ -1280,6 +1280,8 @@ mod tests {
             "lead",
             AgentEvent::StepUsage {
                 step: 1,
+                role: stella_protocol::ModelCallRole::Worker,
+                provider: "zai".into(),
                 model: "glm-5.2".into(),
                 input_tokens: 1200,
                 output_tokens: 300,
@@ -1290,6 +1292,7 @@ mod tests {
                 duration_ms: 100,
                 retries: 0,
                 tool_calls: 1,
+                complete: true,
             },
         ));
         w.apply_inbound(&ev(
@@ -1360,6 +1363,8 @@ mod tests {
         w.apply_inbound(&reg("lead"));
         let step = |input: u64| AgentEvent::StepUsage {
             step: 1,
+            role: stella_protocol::ModelCallRole::Worker,
+            provider: "zai".into(),
             model: "glm-5.2".into(),
             input_tokens: input,
             output_tokens: 10,
@@ -1370,6 +1375,7 @@ mod tests {
             duration_ms: 1,
             retries: 0,
             tool_calls: 0,
+            complete: true,
         };
         // Three calls of 150k each: cumulative 450k dwarfs the 200k window, but
         // the window was only 150k full on the LAST call.
@@ -1388,6 +1394,8 @@ mod tests {
     fn budget_tick_sets_live_spend_without_double_counting_step_usage() {
         let step = |cost_usd: f64| AgentEvent::StepUsage {
             step: 1,
+            role: stella_protocol::ModelCallRole::Worker,
+            provider: "test".into(),
             model: "m".into(),
             input_tokens: 1,
             output_tokens: 1,
@@ -1398,6 +1406,7 @@ mod tests {
             duration_ms: 1,
             retries: 0,
             tool_calls: 0,
+            complete: true,
         };
         let mut w = WorkspaceModel::new();
         w.apply_inbound(&reg("lead"));
