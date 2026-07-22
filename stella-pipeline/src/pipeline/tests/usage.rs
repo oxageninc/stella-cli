@@ -126,7 +126,13 @@ async fn triage_success_emits_usage_before_budget_abort() {
     assert_eq!(serialized[usage]["role"], "triage");
     assert_eq!(serialized[usage]["provider"], "scripted");
     assert_eq!(serialized[usage]["model"], "scripted");
-    assert_eq!(serialized[usage]["complete"], false);
+    assert_eq!(serialized[usage]["complete"], true);
+    assert!(
+        serialized
+            .iter()
+            .all(|event| event["type"] != "usage_incomplete"),
+        "a later local budget abort must not invalidate settled provider usage"
+    );
 }
 
 #[tokio::test]
