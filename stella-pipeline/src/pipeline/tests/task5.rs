@@ -166,18 +166,28 @@ async fn witness_worker_and_revision_hooks_are_bound_to_the_candidate_root() {
     assert_eq!(std::fs::read_dir(session_root.path()).unwrap().count(), 0);
 }
 
+/// Pinning worker and judge to one model costs the run its authored witness,
+/// not the task: the pipeline warns once and proceeds down the unauthored
+/// verify ladder. (The profile-level single-model case is covered by
+/// `single_model_config_degrades_to_unauthored_witness_instead_of_aborting`;
+/// this pins the roles explicitly, which is a distinct resolution path.)
 #[tokio::test]
-async fn authored_witness_fails_closed_before_workspace_creation_when_judge_is_worker() {
-    let provider = ScriptedProvider::new(vec![text_result("single")]);
+async fn authored_witness_degrades_when_judge_is_worker() {
+    let provider = ScriptedProvider::new(vec![
+        text_result("single"),
+        text_result("done"),
+        text_result("PASS looks right"),
+    ]);
     let resolver = OneProvider(&provider);
-    let diagnostics = NeverRunner;
-    let repo_status = NeverRepoStatus;
+    // Session ports, not candidate ones: with no author to isolate from, the
+    // run stays in the working tree and engages no snapshot machinery.
+    let runner = ScriptedRunner::new(vec![], "@@ -1 +1 @@\n-a\n+b");
+    let repo_status = SeqRepoStatus::new(vec![vec![]]);
     let tools = EmptyTools;
     let recall = NoContextRecall;
     let repo = NoRepoStructure;
     let approvals = AutoApproveGate;
     let sleeper = NoopSleeper;
-    let port = FakeWorkspacePort::untouchable();
     let same = ModelRef::new("scripted", "same-model");
     let mut roles = RoleTable::new();
     roles.pin(Role::Worker, same.clone());
@@ -201,12 +211,12 @@ async fn authored_witness_fails_closed_before_workspace_creation_when_judge_is_w
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            diagnostics: &diagnostics,
-            tests: &diagnostics,
+            diagnostics: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
-            candidate_workspaces: Some(&port),
+            candidate_workspaces: None,
             mcp_prefetch: None,
             steering: None,
         },
@@ -219,13 +229,22 @@ async fn authored_witness_fails_closed_before_workspace_creation_when_judge_is_w
     let outcome = pipeline
         .run("Fix the failing test", &mut messages, &mut budget)
         .await
-        .expect("independence failure is a truthful candidate abort");
-    assert!(matches!(
+        .expect("independence failure is a degradation, not a failure");
+    assert_eq!(
         outcome.status,
-        PipelineStatus::Aborted { ref reason }
-            if reason.contains("independent witness author")
-    ));
-    assert!(!stages(&drain(&mut rx)).contains(&StageKind::Witness));
+        PipelineStatus::Completed,
+        "pinning judge to the worker must not abort the task: {outcome:?}"
+    );
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { message, retryable: true }
+                if message.contains("no witness author independent of the worker")
+        )),
+        "the degradation is announced once: {events:?}"
+    );
+    assert!(!stages(&events).contains(&StageKind::Witness));
 }
 
 #[tokio::test]

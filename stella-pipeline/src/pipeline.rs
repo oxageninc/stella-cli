@@ -515,9 +515,16 @@ impl<'a> Pipeline<'a> {
         // --- 5. Witness + execute + verify (single-shot or best-of-N). ------
         let n = self.config.candidate_count();
         let base_messages = messages.clone();
+        // Decided here, before the single-shot/best-of-N split, because an
+        // authored witness is the *only* reason a single candidate needs
+        // disposable isolation. Resolving independence later would commit the
+        // run to snapshot machinery it then discovers it cannot use — and
+        // candidate isolation requires a git working tree, so on a plain
+        // directory that is a hard failure rather than an unused cost.
         let authored_witness = self.config.test_command.is_none()
             && self.config.witness_writer
-            && task_class.verifies_unconditionally();
+            && task_class.verifies_unconditionally()
+            && self.can_author_independent_witness();
         // Single-shot (the default) runs directly over the session ports —
         // zero snapshot/adoption machinery only when the user supplied the
         // test invocation (or witness authoring is otherwise disabled).
@@ -950,34 +957,31 @@ impl<'a> Pipeline<'a> {
             self.emit_fallback(fallback);
         }
         let worker_label = worker.model_ref.to_string();
-        let witness_author = if author_witness {
-            let Ok(author) = self.resolve_provider(Role::Judge) else {
-                return Ok((
-                    CandidateResult::aborted(
-                        base_messages.to_vec(),
-                        "could not resolve an independent witness author".to_string(),
-                    ),
-                    Some(worker_label),
-                ));
-            };
-            if author.model_ref == worker.model_ref {
-                return Ok((
-                    CandidateResult::aborted(
-                        base_messages.to_vec(),
-                        format!(
-                            "could not resolve an independent witness author: judge and worker both resolved to `{}`",
-                            worker.model_ref
-                        ),
-                    ),
-                    Some(worker_label),
-                ));
+        // Losing the independent author costs the run its authored witness —
+        // it must never cost the run the whole task. A single-model
+        // configuration (every role pinned to one model, as benchmark and
+        // solo-provider setups do) previously aborted here after one model
+        // call, having done no work at all. Degrade to the unauthored verify
+        // ladder instead, and say so once.
+        // `can_author_independent_witness` already gated `author_witness` and
+        // announced any degradation, so this is the invariant guard for that
+        // decision — silent on purpose, never a second warning.
+        let mut author_witness = author_witness;
+        let witness_author = match author_witness
+            .then(|| self.resolve_provider(Role::Judge))
+            .and_then(Result::ok)
+            .filter(|author| author.model_ref != worker.model_ref)
+        {
+            Some(author) => {
+                if let Some(fallback) = &author.fallback {
+                    self.emit_fallback(fallback);
+                }
+                Some(author)
             }
-            if let Some(fallback) = &author.fallback {
-                self.emit_fallback(fallback);
+            None => {
+                author_witness = false;
+                None
             }
-            Some(author)
-        } else {
-            None
         };
 
         let mut candidates: Vec<CandidateResult> = Vec::with_capacity(n as usize);
@@ -1830,6 +1834,39 @@ impl<'a> Pipeline<'a> {
             provider_mix: mix,
             tokens,
         });
+    }
+
+    /// Whether a witness author independent of the worker can be resolved.
+    ///
+    /// Losing the author costs the run its authored witness, never the task:
+    /// a `false` here routes to the ordinary single-shot path and the
+    /// deterministic/judge verify ladder. Announced once, at the one point
+    /// that decides it, so the run never pays for isolation it cannot use.
+    fn can_author_independent_witness(&self) -> bool {
+        let Ok(worker) = self.resolve_provider(Role::Worker) else {
+            // A worker that won't resolve fails later, on its own terms —
+            // not here, disguised as a witness-independence verdict.
+            return false;
+        };
+        match self.resolve_provider(Role::Judge) {
+            Ok(judge) if judge.model_ref != worker.model_ref => true,
+            Ok(_) => {
+                self.warn(format!(
+                    "no witness author independent of the worker (judge and worker both \
+                     resolved to `{}`); continuing without an authored witness",
+                    worker.model_ref
+                ));
+                false
+            }
+            Err(_) => {
+                self.warn(
+                    "no witness author independent of the worker (the judge role is \
+                     unresolvable); continuing without an authored witness"
+                        .to_string(),
+                );
+                false
+            }
+        }
     }
 
     fn emit_fallback(&self, fb: &FallbackInfo) {

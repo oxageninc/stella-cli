@@ -1441,3 +1441,78 @@ async fn zai_identity_never_sends_reasoning_effort_even_when_pinned() {
 }
 
 mod error_classify_tests;
+
+#[test]
+fn rejects_disabled_reasoning_matches_the_upstream_wording_only() {
+    assert!(rejects_disabled_reasoning(
+        "OpenRouter rejected the request (HTTP 400): Reasoning is mandatory for this \
+         endpoint and cannot be disabled."
+    ));
+    // Any other 400 is a genuine malformed request — resending without the
+    // reasoning field would just burn a second paid call.
+    assert!(!rejects_disabled_reasoning(
+        "OpenRouter rejected the request (HTTP 400): not a valid model id"
+    ));
+    assert!(!rejects_disabled_reasoning(
+        "OpenRouter rejected the request (HTTP 400): temperature must be <= 2"
+    ));
+}
+
+/// An upstream that mandates reasoning answers `reasoning:{enabled:false}`
+/// with a hard 400. The caller's "off" is an economy preference, not a
+/// correctness requirement, so the adapter resends once without the field
+/// rather than failing the call. This is exactly what the pipeline's triage
+/// role hit on every single turn: `reasoning: off` → 400 → dead stage.
+#[tokio::test]
+async fn openrouter_resends_without_reasoning_when_the_endpoint_mandates_it() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    // First attempt carries `enabled:false` and is rejected — once.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("\"enabled\":false"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            "{\"error\":{\"message\":\"Reasoning is mandatory for this endpoint and \
+             cannot be disabled.\",\"code\":400}}",
+        ))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = ZaiProvider::new(ApiKey::new("sk-or-test"), "anthropic/claude-fable-5")
+        .with_base_url(server.uri())
+        .with_identity("openrouter", "OpenRouter");
+    let req = CompletionRequest {
+        messages: vec![CompletionMessage::user("classify this")],
+        max_output_tokens: None,
+        temperature: None,
+        effort: Some(stella_protocol::ReasoningEffort::Low),
+        tools: vec![],
+        reasoning: Some(false),
+        params: None,
+    };
+
+    let result = provider.complete(req).await.expect("the resend succeeds");
+    assert_eq!(result.text, "ok");
+
+    let sent = server.received_requests().await.expect("recorded requests");
+    assert_eq!(sent.len(), 2, "exactly one resend, never a retry storm");
+    let first = String::from_utf8_lossy(&sent[0].body);
+    let second = String::from_utf8_lossy(&sent[1].body);
+    assert!(
+        first.contains("\"enabled\":false"),
+        "the caller's explicit off is attempted first: {first}"
+    );
+    assert!(
+        !second.contains("\"reasoning\""),
+        "the resend drops the field so the endpoint applies its own default: {second}"
+    );
+}

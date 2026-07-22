@@ -303,6 +303,19 @@ fn map_openrouter_effort(effort: ReasoningEffort) -> &'static str {
 /// sends `{"enabled": true}` and lets the gateway pick the level; and
 /// neither set keeps the field off the wire entirely (provider default,
 /// byte-stable with the pre-field body).
+/// Whether a terminal provider error says reasoning cannot be turned off.
+/// Matched on the upstream's own wording rather than a status code: the same
+/// 400 covers every other malformed-request cause, and only this one is
+/// recoverable by resending without the field.
+fn rejects_disabled_reasoning(detail: &str) -> bool {
+    let detail = detail.to_lowercase();
+    detail.contains("reasoning")
+        && (detail.contains("cannot be disabled")
+            || detail.contains("can not be disabled")
+            || detail.contains("is mandatory")
+            || detail.contains("mandatory for this endpoint"))
+}
+
 fn openrouter_reasoning(
     reasoning: Option<bool>,
     effort: Option<ReasoningEffort>,
@@ -827,6 +840,32 @@ impl ZaiProvider {
         req: CompletionRequest,
         observer: Option<&dyn ToolCallObserver>,
     ) -> Result<CompletionResult, ProviderError> {
+        // Some upstreams OpenRouter fronts make reasoning mandatory and answer
+        // `reasoning:{enabled:false}` with a hard 400. The caller's "off" is an
+        // economy preference, never a correctness requirement — losing it must
+        // not lose the call. Resend once, letting the endpoint apply its own
+        // default. Same family of provider-quirk gate as the sampling-param and
+        // thinking-shape omissions in the sibling adapters.
+        let disables_reasoning = self.id == "openrouter" && req.reasoning == Some(false);
+        match self.complete_attempt(req.clone(), observer, false).await {
+            Err(ProviderError::Terminal(detail))
+                if disables_reasoning && rejects_disabled_reasoning(&detail) =>
+            {
+                self.complete_attempt(req, observer, true).await
+            }
+            other => other,
+        }
+    }
+
+    /// One request/stream/aggregate cycle. `force_default_reasoning` drops the
+    /// `reasoning` object from the body so an endpoint that mandates reasoning
+    /// applies its own default instead of rejecting the request.
+    async fn complete_attempt(
+        &self,
+        req: CompletionRequest,
+        observer: Option<&dyn ToolCallObserver>,
+        force_default_reasoning: bool,
+    ) -> Result<CompletionResult, ProviderError> {
         // "Include" semantics: every override is `None` unless the caller
         // set it, and `None` never reaches the wire — a request without
         // params serializes byte-identical to the pre-params body.
@@ -857,7 +896,7 @@ impl ZaiProvider {
                     })
                 })
                 .flatten(),
-            reasoning: (self.id == "openrouter")
+            reasoning: (self.id == "openrouter" && !force_default_reasoning)
                 .then(|| openrouter_reasoning(req.reasoning, req.effort))
                 .flatten(),
             // xAI's Grok reasoning models speak a top-level `reasoning_effort`

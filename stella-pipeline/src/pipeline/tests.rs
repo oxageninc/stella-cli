@@ -503,6 +503,22 @@ fn router() -> Router {
     )
 }
 
+/// Every role pinned to one model — what `--model` alone, a single-provider
+/// account, and the benchmark engine posture all produce.
+fn single_model_router() -> Router {
+    let only = ModelRef::new("scripted", "only");
+    Router::new(
+        RoleTable::new(),
+        vec![ProviderProfile::new(
+            "scripted",
+            only.clone(),
+            only.clone(),
+            only,
+        )],
+        CircuitBreaker::new(Box::new(ZeroClock)),
+    )
+}
+
 fn drain(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
     let mut out = Vec::new();
     while let Ok(e) = rx.try_recv() {
@@ -1069,6 +1085,48 @@ async fn witness_authored_command_arms_the_flip_oracle_and_submits_fast() {
     assert!(!s.contains(&StageKind::Judge), "judge skipped on the flip");
 }
 
+/// Losing the independent witness author must cost the run its authored
+/// witness, never the whole task. With every role pinned to one model the
+/// pipeline used to abort here after a single model call, having executed
+/// nothing — which is what a benchmark or solo-provider account always hits.
+/// It must instead warn once and fall through to the unauthored verify ladder.
+#[tokio::test]
+async fn single_model_config_degrades_to_unauthored_witness_instead_of_aborting() {
+    // triage → "single"; worker → done; judge → verdict. No witness-author
+    // turn is scripted because no independent author can be resolved.
+    let provider = ScriptedProvider::new(vec![
+        text_result("single"),
+        text_result("done"),
+        text_result("PASS looks right"),
+    ]);
+    let (outcome, events, _) = run_unisolated_with_router(
+        &provider,
+        PipelineConfig::default(),
+        "Fix the retry bug",
+        single_model_router(),
+    )
+    .await;
+    let outcome = outcome.expect("run succeeds");
+
+    assert_eq!(
+        outcome.status,
+        PipelineStatus::Completed,
+        "a single-model config must still complete the task"
+    );
+    assert!(
+        !stages(&events).contains(&StageKind::Witness),
+        "witness authoring is skipped, not attempted without an author"
+    );
+    let warned = events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::Error { message, retryable: true }
+                if message.contains("no witness author independent of the worker")
+        )
+    });
+    assert!(warned, "the degradation is announced once: {events:?}");
+}
+
 /// A witness whose test passes on the unmodified code proves nothing: one
 /// bounded repair retry, and if it still passes the contaminated candidate is
 /// discarded rather than letting author-written files reach adoption.
@@ -1246,6 +1304,73 @@ async fn run_isolated(
     Vec<AgentEvent>,
     Vec<CompletionMessage>,
 ) {
+    run_isolated_with_router(provider, port, config, goal, router()).await
+}
+
+/// Run over ordinary *session* ports with no candidate-workspace port, the
+/// path an unauthored run takes. Isolation exists to protect the session tree
+/// from a witness author; with no author there is nothing to protect it from,
+/// so no snapshot machinery is engaged — which is what lets Stella work in a
+/// plain directory that is not a git repository.
+async fn run_unisolated_with_router(
+    provider: &ScriptedProvider,
+    config: PipelineConfig,
+    goal: &str,
+    router: Router,
+) -> (
+    Result<PipelineOutcome, PipelineRunError>,
+    Vec<AgentEvent>,
+    Vec<CompletionMessage>,
+) {
+    let resolver = OneProvider(provider);
+    let runner = ScriptedRunner::new(vec![], "@@ -1 +1 @@\n-a\n+b");
+    let repo_status = SeqRepoStatus::new(vec![vec![]]);
+    let tools = EmptyTools;
+    let recall = NoContextRecall;
+    let repo = NoRepoStructure;
+    let approvals = AutoApproveGate;
+    let sleeper = NoopSleeper;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let pipeline = Pipeline::new(
+        PipelinePorts {
+            router: &router,
+            providers: &resolver,
+            tools: &tools,
+            recall: &recall,
+            repo: &repo,
+            repo_status: &repo_status,
+            diagnostics: &runner,
+            tests: &runner,
+            approvals: &approvals,
+            sleeper: &sleeper,
+            hooks: None,
+            candidate_workspaces: None,
+            mcp_prefetch: None,
+            steering: None,
+        },
+        tx,
+        config,
+    );
+    let mut messages = vec![CompletionMessage::system("sys")];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let outcome = pipeline.run(goal, &mut messages, &mut budget).await;
+    (outcome, drain(&mut rx), messages)
+}
+
+/// [`run_isolated`] over a caller-supplied router, so a test can pin the
+/// roles to one model (the single-model configuration every benchmark and
+/// solo-provider setup uses).
+async fn run_isolated_with_router(
+    provider: &ScriptedProvider,
+    port: &FakeWorkspacePort,
+    config: PipelineConfig,
+    goal: &str,
+    router: Router,
+) -> (
+    Result<PipelineOutcome, PipelineRunError>,
+    Vec<AgentEvent>,
+    Vec<CompletionMessage>,
+) {
     let resolver = OneProvider(provider);
     let diagnostics = NeverRunner;
     let repo_status = NeverRepoStatus;
@@ -1254,7 +1379,6 @@ async fn run_isolated(
     let repo = NoRepoStructure;
     let approvals = AutoApproveGate;
     let sleeper = NoopSleeper;
-    let router = router();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let pipeline = Pipeline::new(
         PipelinePorts {

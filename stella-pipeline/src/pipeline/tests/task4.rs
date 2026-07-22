@@ -1,14 +1,15 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-struct FirstTwoProviderLookups<'a> {
+/// Every role resolves except the judge — "no independent witness author is
+/// available", stated by identity rather than by call count so the fixture
+/// survives a change in the order roles are resolved.
+struct NoJudgeProvider<'a> {
     provider: &'a ScriptedProvider,
-    lookups: AtomicUsize,
 }
 
-impl ProviderResolver for FirstTwoProviderLookups<'_> {
-    fn provider_for(&self, _model: &ModelRef) -> Option<&dyn Provider> {
-        (self.lookups.fetch_add(1, Ordering::SeqCst) < 2).then_some(self.provider as &dyn Provider)
+impl ProviderResolver for NoJudgeProvider<'_> {
+    fn provider_for(&self, model: &ModelRef) -> Option<&dyn Provider> {
+        (model.model_id != "judge").then_some(self.provider as &dyn Provider)
     }
 }
 
@@ -155,15 +156,17 @@ async fn enforced_budget_breach_in_triage_stops_before_the_next_paid_stage() {
     );
 }
 
+/// An unresolvable judge costs the run its authored witness, not the task.
+/// The pipeline warns once and falls through to the unauthored verify ladder
+/// rather than aborting with no work done.
 #[tokio::test]
-async fn unavailable_independent_witness_fails_closed_before_authoring() {
+async fn unavailable_independent_witness_degrades_instead_of_aborting() {
     let provider = ScriptedProvider::new(vec![
         text_result("single"),
         text_result("TEST_COMMAND: cargo test --test witness witness -- --exact"),
     ]);
-    let resolver = FirstTwoProviderLookups {
+    let resolver = NoJudgeProvider {
         provider: &provider,
-        lookups: AtomicUsize::new(0),
     };
     let runner = ScriptedRunner::new(vec![false], "");
     let tools = EmptyTools;
@@ -174,11 +177,11 @@ async fn unavailable_independent_witness_fails_closed_before_authoring() {
     let workspace = FakeWorkspace::new(0, vec![false], Ok(vec![]), log.clone()).with_repo_status(
         SeqRepoStatus::new(vec![vec![], vec![("tests/witness.rs", "sha256:test")]]),
     );
-    let candidate_workspaces = FakeWorkspacePort::new(vec![Ok(workspace)], log);
+    let _candidate_workspaces = FakeWorkspacePort::new(vec![Ok(workspace)], log);
     let approvals = AutoApproveGate;
     let sleeper = NoopSleeper;
     let router = router();
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::unbounded_channel();
     let pipeline = Pipeline::new(
         PipelinePorts {
             router: &router,
@@ -192,7 +195,7 @@ async fn unavailable_independent_witness_fails_closed_before_authoring() {
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
-            candidate_workspaces: Some(&candidate_workspaces),
+            candidate_workspaces: None,
             mcp_prefetch: None,
             steering: None,
         },
@@ -205,15 +208,27 @@ async fn unavailable_independent_witness_fails_closed_before_authoring() {
     let outcome = pipeline
         .run("Fix the parser", &mut messages, &mut budget)
         .await
-        .expect("unavailable independent witness is a truthful abort");
+        .expect("an unresolvable witness author is a degradation, not a failure");
 
-    assert!(matches!(
-        outcome.status,
-        PipelineStatus::Aborted { ref reason }
-            if reason.contains("independent witness author")
-    ));
     assert!(
-        (outcome.total_cost_usd - 0.0001).abs() < 1e-9,
-        "only triage spend settles before role independence is checked: {outcome:?}"
+        !matches!(
+            outcome.status,
+            PipelineStatus::Aborted { ref reason }
+                if reason.contains("independent witness author")
+        ),
+        "losing the author must not abort the task: {outcome:?}"
+    );
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { message, retryable: true }
+                if message.contains("no witness author independent of the worker")
+        )),
+        "the degradation is announced once: {events:?}"
+    );
+    assert!(
+        !stages(&events).contains(&StageKind::Witness),
+        "witness authoring is skipped, never attempted without an author"
     );
 }
