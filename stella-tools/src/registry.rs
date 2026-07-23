@@ -1476,6 +1476,7 @@ mod tests {
             "send_stdin",
             "stop_process",
             "repo_status",
+            "repo_diff",
             "repo_commit",
             "repo_push",
             "repo_pull",
@@ -1504,7 +1505,7 @@ mod tests {
         }
         // `bash` is NOT in the default surface — it is the settings opt-in.
         assert!(!names.contains(&"bash".to_string()), "{names:?}");
-        assert_eq!(names.len(), 46, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 47, "unexpected tool count: {names:?}");
     }
 
     // bash opt-in (default OFF everywhere)
@@ -1629,7 +1630,7 @@ mod tests {
     fn issue_tools_absent_without_a_configured_backend() {
         let (_root, reg) = bare_registry(None);
         let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
-        assert_eq!(names.len(), 38, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 39, "unexpected tool count: {names:?}");
         for absent in [
             "create_issue",
             "update_issue",
@@ -1774,6 +1775,7 @@ mod tests {
                     | "list_labels"
                     | "list_members"
                     | "repo_status"
+                    | "repo_diff"
             );
             assert_eq!(
                 schema.read_only, expected,

@@ -81,6 +81,7 @@ These 38 tools register in every session — no configuration, no prerequisites.
 | Tool | Description | Access |
 | --- | --- | --- |
 | `repo_status` | Current branch, commits ahead/behind upstream, and the changed files as structured rows. | Read-only |
+| `repo_diff` | The pending changes as patch hunks plus a per-file +added/-removed summary — self-review before committing. Unstaged by default, `staged: true` for staged changes, optionally scoped to `paths`; the patch is capped with a loud elision marker. | Read-only |
 | `repo_commit` | Commit exactly the named paths — there is no stage-everything mode. | Mutating |
 | `repo_push` | Push the current (or named) branch; structurally refuses the default branch, and force-push does not exist here. | Mutating |
 | `repo_pull` | Update the current branch from upstream, fast-forward only — never merges or rewrites. | Mutating |
@@ -106,7 +107,7 @@ These 38 tools register in every session — no configuration, no prerequisites.
 | `task_assign` | Delegate a board task to a parallel sub-agent — the briefing is passed verbatim, so write it self-contained. | Mutating |
 
 <Callout type="info">
-`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `graph_query`, `project_overview`, `list_scripts`, `gather_context`, `explorations`, `ci_status`, `repo_status`, `task_list`, and (when present) `search_issues`, `get_issue`, `list_labels`, `list_members`, `web_search`, `web_fetch`, `web_extract_assets` — plus `search_skills`, `tool_search`, `skill_search`, and `mcp_search` at the session layer. (`web_download` writes a file, so it is mutating.)
+`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `graph_query`, `project_overview`, `list_scripts`, `gather_context`, `explorations`, `ci_status`, `repo_status`, `repo_diff`, `task_list`, and (when present) `search_issues`, `get_issue`, `list_labels`, `list_members`, `web_search`, `web_fetch`, `web_extract_assets` — plus `search_skills`, `tool_search`, `skill_search`, and `mcp_search` at the session layer. (`web_download` writes a file, so it is mutating.)
 </Callout>
 
 ### Conditionally registered
