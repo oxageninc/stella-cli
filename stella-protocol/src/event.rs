@@ -187,6 +187,20 @@ pub enum AgentEvent {
         #[serde(default)]
         speculated: bool,
     },
+    /// A speculatively-executed read-only call (`stella-core::speculation`)
+    /// whose result never reached the transcript: its stream attempt failed
+    /// and the pool was dropped, or the committed call diverged from what
+    /// was announced so the pooled result was rejected at harvest. The
+    /// tool's real I/O still ran — this is the event-log's record of that
+    /// work, so call counts reconcile with what actually executed rather
+    /// than silently diverging. `reason` is a short stable token
+    /// (`"attempt_failed"`, `"harvest_mismatch"`). Additive to the wire
+    /// contract: consumers recorded before speculation existed never see it.
+    SpeculationDiscarded {
+        call_id: String,
+        name: String,
+        reason: String,
+    },
     Retry {
         attempt: u32,
         reason: String,
@@ -769,6 +783,33 @@ mod tests {
                 assert!(!speculated, "missing field must default to false")
             }
             other => panic!("old stream must parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn speculation_discarded_roundtrips_and_names_the_reason() {
+        let event = AgentEvent::SpeculationDiscarded {
+            call_id: "c1".into(),
+            name: "read_file".into(),
+            reason: "attempt_failed".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"type\":\"speculation_discarded\""),
+            "{json}"
+        );
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentEvent::SpeculationDiscarded {
+                call_id,
+                name,
+                reason,
+            } => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(name, "read_file");
+                assert_eq!(reason, "attempt_failed");
+            }
+            other => panic!("unexpected variant: {other:?}"),
         }
     }
 
