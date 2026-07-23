@@ -127,8 +127,8 @@ pub fn demo_inbound(started_ms: u64, self_pid: u32) -> Vec<Inbound> {
         ev(lead, AgentEvent::Stage { name: StageKind::Triage }),
         ev(lead, AgentEvent::ContextRecall {
             frames: vec![
-                ContextFrameRef { id: None, citation_label: "engine step-driver (driver.rs)".into(), provider: "code-graph".into(), source: "code-graph".into(), kind: "symbol".into(), uri: None, method: None, token_cost: 120 },
-                ContextFrameRef { id: None, citation_label: "ADR-023 event-log REPL".into(), provider: "workspace-memory".into(), source: "stella-context".into(), kind: "memory".into(), uri: None, method: None, token_cost: 90 },
+                ContextFrameRef { id: None, citation_label: "engine step-driver (driver.rs)".into(), provider: "code-graph".into(), source: "code-graph".into(), kind: "symbol".into(), uri: None, method: None, token_cost: 120, block_id: None, content_digest: None },
+                ContextFrameRef { id: None, citation_label: "ADR-023 event-log REPL".into(), provider: "workspace-memory".into(), source: "stella-context".into(), kind: "memory".into(), uri: None, method: None, token_cost: 90, block_id: None, content_digest: None },
             ],
             provider_mix: vec![ProviderShare { provider: "code-graph".into(), frames: 1 }, ProviderShare { provider: "memory".into(), frames: 1 }],
             tokens: 210,

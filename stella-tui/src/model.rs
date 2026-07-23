@@ -1251,6 +1251,8 @@ mod tests {
                 uri: None,
                 method: None,
                 token_cost: 100,
+                block_id: None,
+                content_digest: None,
             }],
             provider_mix: vec![ProviderShare {
                 provider: "code-graph".into(),
