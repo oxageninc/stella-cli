@@ -460,4 +460,65 @@ mod stream_tests {
                     && (*cost_usd - 1.25).abs() < f64::EPSILON
         ));
     }
+
+    #[test]
+    fn receipt_events_persist_into_queryable_block_and_manifest_rows() {
+        // The increment-1 promise, end to end: a BlockRegistered + StepManifest
+        // pair flowing through persist_event lands as queryable receipt rows,
+        // and the manifest reconstructs the step's block order with token_cost
+        // joined back from the block registry.
+        use stella_protocol::{BlockKind, BlockOrigin, CacheZone, ManifestEntry, ModelCallRole};
+        let store = Store::in_memory().expect("store");
+        let id = store
+            .begin_execution("run", "p", "anthropic", "opus")
+            .expect("exec");
+
+        let registered = AgentEvent::BlockRegistered {
+            block_id: "blk_tool1".into(),
+            kind: BlockKind::ToolResult,
+            origin: BlockOrigin {
+                turn_instance: 0,
+                step: 0,
+                call_id: Some("c1".into()),
+                memory_id: None,
+            },
+            token_cost: 40,
+            content_digest: "sha256:abc".into(),
+            citation_label: None,
+        };
+        assert!(persist_event(&store, id, 0, &registered, "anthropic"));
+
+        let manifest = AgentEvent::StepManifest {
+            turn_instance: 0,
+            step: 0,
+            role: ModelCallRole::Worker,
+            provider: "anthropic".into(),
+            model: "opus".into(),
+            blocks: vec![ManifestEntry {
+                block_id: "blk_tool1".into(),
+                cache_zone: CacheZone::Volatile,
+                token_cost: 40,
+                resident_since_step: 0,
+            }],
+            effective_budget_tokens: 136_363,
+            calibration_factor: 1.1,
+            estimated_input_tokens: 40,
+        };
+        assert!(persist_event(&store, id, 1, &manifest, "anthropic"));
+
+        // The block registry row, with its call_id join key and snake_case kind.
+        let blocks = store.context_blocks(id).expect("blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_id, "blk_tool1");
+        assert_eq!(blocks[0].call_id.as_deref(), Some("c1"));
+        assert_eq!(blocks[0].kind, "tool_result");
+
+        // The manifest reconstructs the step's ordered blocks, token_cost joined
+        // back from context_blocks.
+        let entries = store.step_manifest(id, 0, 0).expect("manifest");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].block_id, "blk_tool1");
+        assert_eq!(entries[0].cache_zone, "volatile");
+        assert_eq!(entries[0].token_cost, 40);
+    }
 }
