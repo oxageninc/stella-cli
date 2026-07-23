@@ -194,6 +194,27 @@ fn concurrent_first_open_initializes_one_private_journal() {
 }
 
 #[test]
+fn concurrent_first_open_with_many_racers_all_succeed() {
+    const RACERS: usize = 8;
+    let dir = tempfile::tempdir().unwrap();
+    let path = Arc::new(dir.path().join("host").join("operations.db"));
+    let barrier = Arc::new(Barrier::new(RACERS + 1));
+    let mut workers = Vec::new();
+    for _ in 0..RACERS {
+        let path = path.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            SqliteMediaOperationJournal::open(path.as_path(), config(3600, 100))
+        }));
+    }
+    barrier.wait();
+    for worker in workers {
+        worker.join().unwrap().unwrap();
+    }
+}
+
+#[test]
 fn concurrent_claims_have_one_winner() {
     let dir = tempfile::tempdir().unwrap();
     let path = journal_path(&dir);

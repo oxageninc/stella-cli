@@ -117,12 +117,33 @@ impl SqliteMediaOperationJournal {
         Self::init(connection, retention)
     }
 
+    /// One secure open attempt, retried while a concurrent first-open is
+    /// initializing the same journal.
+    ///
+    /// The loser of that race can observe the winner's freshly created WAL
+    /// sidecars *between* its own secure preparation and validation — the
+    /// exact signature the sidecar-injection defense fails closed on.
+    /// Retrying from scratch resolves the ambiguity safely: the re-run
+    /// preparation now finds the sidecars up front and subjects them to the
+    /// same owner-only validation as any pre-existing pair, so a genuinely
+    /// untrusted injection still fails (`security_tests` pin that a single
+    /// attempt never tolerates an appearing sidecar).
     fn open_private(
         path: &Path,
         forbidden_root: Option<&Path>,
         retention: MediaOperationRetention,
     ) -> Result<Self, MediaError> {
-        Self::open_private_with_hook(path, forbidden_root, retention, |_| {})
+        let mut attempts = 0;
+        loop {
+            match Self::open_private_with_hook(path, forbidden_root, retention, |_| {}) {
+                Ok(journal) => return Ok(journal),
+                Err(error) if attempts < INIT_RETRY_ATTEMPTS && is_sidecar_race(&error) => {
+                    attempts += 1;
+                    std::thread::sleep(INIT_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn open_private_with_hook(
@@ -157,10 +178,7 @@ impl SqliteMediaOperationJournal {
         connection
             .busy_timeout(std::time::Duration::from_secs(2))
             .map_err(|error| journal_error(format!("cannot configure journal: {error}")))?;
-        connection
-            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-            .and_then(|_| connection.execute_batch(SCHEMA))
-            .map_err(|error| journal_error(format!("cannot initialize journal: {error}")))?;
+        initialize_journal_schema(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             retention,
@@ -357,6 +375,60 @@ impl MediaOperationJournal for SqliteMediaOperationJournal {
     }
 }
 
+/// How long a first-open initializer keeps yielding to a concurrent one
+/// before failing closed. The init work itself is milliseconds; the bound
+/// exists only so a genuinely wedged database still errors.
+const INIT_RETRY_ATTEMPTS: u32 = 40;
+const INIT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Marker shared between the sidecar-appearance rejection and the
+/// first-open retry that classifies it as a concurrent-initializer race.
+const SIDECAR_APPEARED: &str = "appeared after secure preparation";
+
+fn is_sidecar_race(error: &MediaError) -> bool {
+    matches!(error, MediaError::Artifact(message) if message.contains(SIDECAR_APPEARED))
+}
+
+/// Run the WAL/schema setup, serializing with concurrent first-opens.
+///
+/// The connection's busy timeout is *not* enough here: converting a fresh
+/// rollback-journal database to WAL needs an exclusive lock, and when two
+/// initializers race, each holds a shared lock the other must wait out —
+/// SQLite detects the would-be deadlock and returns `SQLITE_BUSY`
+/// immediately, without consulting the busy handler. The loser must give
+/// up its locks and retry the whole batch on a fresh attempt, where it
+/// finds the winner's completed conversion (every statement here is
+/// idempotent: the WAL switch is a no-op once converted and the schema is
+/// `IF NOT EXISTS`).
+fn initialize_journal_schema(connection: &Connection) -> Result<(), MediaError> {
+    let mut attempts = 0;
+    loop {
+        let result = connection
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .and_then(|_| connection.execute_batch(SCHEMA));
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if attempts < INIT_RETRY_ATTEMPTS && is_transient_lock_error(&error) => {
+                attempts += 1;
+                std::thread::sleep(INIT_RETRY_DELAY);
+            }
+            Err(error) => {
+                return Err(journal_error(format!("cannot initialize journal: {error}")));
+            }
+        }
+    }
+}
+
+/// `SQLITE_BUSY`/`SQLITE_LOCKED` are the only errors a competing
+/// well-formed initializer can inflict; anything else is a real defect
+/// and fails closed immediately.
+fn is_transient_lock_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
 fn expire(transaction: &rusqlite::Transaction<'_>, now: u64) -> Result<(), MediaError> {
     let now = sql_integer(now);
     transaction
@@ -529,7 +601,7 @@ impl PreparedSidecar {
             None => match std::fs::symlink_metadata(&self.path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Ok(_) => Err(journal_error(format!(
-                    "journal SQLite sidecar {} appeared after secure preparation; refusing initialization",
+                    "journal SQLite sidecar {} {SIDECAR_APPEARED}; refusing initialization",
                     self.path.display()
                 ))),
                 Err(error) => Err(journal_error(format!(
