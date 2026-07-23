@@ -1005,10 +1005,6 @@ fn trace_of(ev: &AgentEvent) -> (TraceKind, String) {
             TraceKind::Other,
             format!("steer: {}", text.chars().take(40).collect::<String>()),
         ),
-        AgentEvent::SpeculationDiscarded { name, reason, .. } => (
-            TraceKind::Other,
-            format!("speculation discarded: {name} ({reason})"),
-        ),
         AgentEvent::Compaction {
             before_tokens,
             after_tokens,

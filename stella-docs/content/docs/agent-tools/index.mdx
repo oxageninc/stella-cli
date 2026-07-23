@@ -25,7 +25,7 @@ Tool names are their exact identifiers — the agent dispatches by name, and the
 
 ### Always available
 
-These 41 tools register in every session — no configuration, no prerequisites. Grouped by what they touch:
+These 42 tools register in every session — no configuration, no prerequisites. Grouped by what they touch:
 
 #### Files
 
@@ -35,6 +35,7 @@ These 41 tools register in every session — no configuration, no prerequisites.
 | `read_symbol` | Read a named symbol's exact source span, resolved through the code graph — no line-offset guessing. Multiple definitions are listed (pick one with `path`), never silently chosen. | Read-only |
 | `write_file` | Create a file or overwrite an existing one — parent directories are created as needed. | Mutating |
 | `edit_file` | Replace an exact substring in a file — exactly-once by default, every occurrence with `replace_all`. | Mutating |
+| `apply_edits` | Apply a batch of exact-substring edits — across multiple files — in one transactional call: every edit validates first, and if any fails nothing is written. `dry_run` validates without writing. | Mutating |
 | `delete_file` | Delete a file — preferred over shelling out to `rm`, so the deletion lands in the file-touch audit log. | Mutating |
 
 #### Search
@@ -217,7 +218,7 @@ The other three session tools are read-only **discovery** tools layered over the
 
 Set `STELLA_LEAN_TOOLS=1` to advertise only a lean core toolset (file CRUD, search, build/test/verify, `ask_user`, and `bash` when the opt-in has enabled it) plus the discovery tools; everything else stays out of the prompt until a `tool_search` surfaces it. Matched tools are *activated* — advertised for the rest of the session. Set the variable to a comma-separated list of tool names to choose your own core. A hidden tool called by name still executes, so lean mode trims prompt weight without ever gating a capability.
 
-All told: 41 always-on tools, up to 57 native tools with the `bash` and `web` opt-ins, the code graph, media keys, a search key, and an issue backend, plus the six session tools — before any custom script tools or MCP servers merge in.
+All told: 42 always-on tools, up to 58 native tools with the `bash` and `web` opt-ins, the code graph, media keys, a search key, and an issue backend, plus the six session tools — before any custom script tools or MCP servers merge in.
 
 ## Where to go next
 
