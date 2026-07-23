@@ -205,6 +205,11 @@ pub fn event_signature(event: &AgentEvent) -> String {
         // exists only to keep this function total.
         AgentEvent::TextDelta { .. } => "text_delta".to_string(),
         AgentEvent::Reasoning { .. } => "reasoning".to_string(),
+        // A discarded speculation is timing-dependent — which stream attempt
+        // failed (and so which read-only pool is dropped) varies run to run —
+        // so, like `TextDelta`, [`structural_diff`] excludes it before
+        // comparing; the signature exists only to keep this function total.
+        AgentEvent::SpeculationDiscarded { .. } => "speculation_discarded".to_string(),
         AgentEvent::ToolStart { call } => format!("tool_start:{}", call.name),
         // A tool_result's structural identity is that it answered a call and
         // whether it errored — not its duration or output body.
@@ -307,6 +312,7 @@ pub fn structural_diff(left: &[AgentEvent], right: &[AgentEvent]) -> Vec<StreamD
             AgentEvent::TextDelta { .. }
                 | AgentEvent::BlockRegistered { .. }
                 | AgentEvent::StepManifest { .. }
+                | AgentEvent::SpeculationDiscarded { .. }
         )
     };
     let left: Vec<&AgentEvent> = left.iter().filter(keep).collect();
