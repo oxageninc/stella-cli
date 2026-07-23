@@ -86,6 +86,12 @@ pub enum ModelCallRole {
 pub enum UsageIncompleteReason {
     ProviderError,
     Timeout,
+    /// The caller dropped the turn (hard cancel) while a paid provider
+    /// attempt was still in flight — the call may have real server-side
+    /// cost whose usage is unknowable. Emitted by the engine's drop guard,
+    /// which is armed only for exactly that window (a call that settles
+    /// normally reports through its ordinary `StepUsage` envelope instead).
+    Cancelled,
 }
 
 /// One event in the turn's stream. Every stage boundary emits an event;

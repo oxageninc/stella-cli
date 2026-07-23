@@ -17,17 +17,24 @@
 //! history while synchronously exposing each failed provider attempt to the
 //! accounting path. Ordinary retry narration stays deferred until success;
 //! content-free `UsageIncomplete` envelopes are durable immediately because
-//! a later successful attempt cannot recover the failed call's usage.
+//! a later successful attempt cannot recover the failed call's usage. A
+//! caller-side hard cancel that drops the turn while an attempt is still in
+//! flight emits one `Cancelled` envelope from a drop guard
+//! ([`CancelUsageGuard`]) armed for exactly that window.
 //!
-//! # Retry never re-executes a tool call
+//! # Retry never re-executes a mutating tool call
 //!
-//! [`crate::retry::retry_with_backoff_observed`] wraps *only* the model call
-//! (`Provider::complete`). Tool execution happens exactly once, after a
-//! model call has already succeeded and returned tool calls to run — it is
-//! never inside the retried closure. A retried step therefore structurally
-//! cannot re-execute a non-idempotent tool call; see the property test
-//! `retry_never_re_executes_a_tool_call` below, which proves it by
-//! counting real executions against a flaky scripted provider.
+//! [`crate::retry::retry_with_backoff_observed`] wraps the model call
+//! (`Provider::complete_observed`) together with that attempt's speculation
+//! pump (`crate::speculation`): read-only calls announced by the stream may
+//! execute inside a failed attempt and execute again when the retry
+//! re-announces them — discarded work, safe precisely because they are
+//! read-only. MUTATING tool execution happens exactly once, after a model
+//! call has already succeeded and returned tool calls to run — it is never
+//! inside the retried closure. A retried step therefore structurally
+//! cannot re-execute a non-idempotent (mutating) tool call; see the
+//! property test `retry_never_re_executes_a_tool_call` below, which proves
+//! it by counting real executions against a flaky scripted provider.
 //!
 //! # Budget is checked between steps, never mid-tool
 //!
@@ -213,9 +220,11 @@ const MAX_CONCURRENT_TOOL_CALLS: usize = 8;
 
 /// One committed model call plus the step-scoped context the phases after
 /// it consume: the pre-call raw token estimate (drift feedback + telemetry
-/// — raw, never calibrated, see [`Engine::run_model_call`]), the read-only
-/// tool set for dispatch scheduling, and the retry/duration figures for
-/// the `StepUsage` metering record.
+/// — raw, never calibrated, see [`Engine::run_model_call`]) and the
+/// read-only tool set for dispatch scheduling. The step's `StepUsage`
+/// metering record (retry and duration figures included) was already
+/// emitted by [`Engine::run_model_call`] at the no-await settlement
+/// boundary — it is deliberately NOT carried here.
 struct CommittedStep {
     result: CompletionResultAlias,
     budget_outcome: BudgetOutcome,
@@ -530,7 +539,9 @@ impl<'a> Engine<'a> {
         let mut end = messages
             .len()
             .saturating_sub(self.config.summarize_keep_recent);
-        while end > start && messages[end].role == MessageRole::Tool {
+        // `end == messages.len()` (keep_recent 0) has no kept tail to walk
+        // off — indexing it would be out of bounds, not a Tool message.
+        while end > start && end < messages.len() && messages[end].role == MessageRole::Tool {
             end -= 1;
         }
         // A tiny span isn't worth a model call — and this guard is also the
@@ -580,7 +591,7 @@ impl<'a> Engine<'a> {
         }
         let replaced = end - start;
         let summary = CompletionMessage::user(format!(
-            "[earlier history summarized to fit context — full detail was compacted away; \
+            "{SUMMARY_MARKER_PREFIX} to fit context — full detail was compacted away; \
              re-read files or re-run tools for specifics]\n\n{}",
             result.text.trim()
         ));
@@ -696,6 +707,19 @@ impl<'a> Engine<'a> {
         });
 
         let call_started = std::time::Instant::now();
+        // Armed for exactly the interval where a paid attempt may be in
+        // flight: a caller-side hard cancel that drops this future mid-await
+        // still leaves one content-free `Cancelled` envelope behind.
+        // Disarmed on BOTH normal exits — a success reports through its
+        // `StepUsage`, and a terminal failure's attempts already reported
+        // through the per-attempt observer below.
+        let mut cancel_guard = CancelUsageGuard {
+            events: events.clone(),
+            role: self.call_role,
+            provider: self.provider.id().to_string(),
+            started: call_started,
+            armed: true,
+        };
         let incomplete_events = events.clone();
         let RetryOutcome {
             value: (result, speculation_future),
@@ -705,21 +729,28 @@ impl<'a> Engine<'a> {
             &self.config.retry_policy,
             self.sleeper,
             attempt,
-            |attempt, _error| {
+            // Per-attempt duration (retry.rs times each dispatch
+            // individually): the failed call's own latency, never
+            // cumulative across earlier attempts or backoff sleeps.
+            |attempt, _error, attempt_duration| {
                 let _ = incomplete_events.send(AgentEvent::UsageIncomplete {
                     role: self.call_role,
                     provider: self.provider.id().to_string(),
                     model: "unknown".into(),
                     reason: stella_protocol::UsageIncompleteReason::ProviderError,
-                    duration_ms: call_started.elapsed().as_millis() as u64,
+                    duration_ms: attempt_duration.as_millis() as u64,
                     retries: Some(attempt.saturating_sub(1)),
                 });
             },
         )
         .await
         {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                cancel_guard.disarm();
+                outcome
+            }
             Err(error) => {
+                cancel_guard.disarm();
                 let message = error.to_string();
                 let _ = events.send(AgentEvent::Error {
                     message: message.clone(),
@@ -808,12 +839,12 @@ impl<'a> Engine<'a> {
     }
 
     /// Bookkeeping for the call that just committed: drift feedback into
-    /// the attached calibration and exactly one `StepUsage` metering record
-    /// per landed step. Its cost was already settled synchronously at the
-    /// provider-success boundary, before this method can be reached; the
-    /// carried outcome decides whether `Some` is the turn's clean abort.
-    /// That abort is issued only after delivering what was already paid for
-    /// (see body), never as a mid-tool kill.
+    /// the attached calibration. Its cost was settled — and its single
+    /// `StepUsage` metering record emitted — synchronously at the
+    /// provider-success boundary in [`Engine::run_model_call`], before this
+    /// method can be reached; the carried outcome decides whether `Some` is
+    /// the turn's clean abort. That abort is issued only after delivering
+    /// what was already paid for (see body), never as a mid-tool kill.
     fn handle_committed_result(
         &self,
         _step: usize,
@@ -852,8 +883,9 @@ impl<'a> Engine<'a> {
         // and append it to history, THEN abort before dispatching
         // anything further (its tool calls, if any, never run — recorded
         // so the transcript shows what was cut). Still not a mid-tool
-        // kill.
-        if !result.text.is_empty() {
+        // kill. Trimmed guard: whitespace-only text is not a deliverable
+        // answer and must not stream a blank `Text` event.
+        if !result.text.trim().is_empty() {
             let _ = events.send(AgentEvent::Text {
                 delta: result.text.clone(),
             });
@@ -873,7 +905,7 @@ impl<'a> Engine<'a> {
         // tool_result"). Close the pairing with a synthetic error
         // result per un-run call so resumption stays valid.
         if !result.tool_calls.is_empty() {
-            let tool_results = result
+            let tool_results: Vec<ToolResult> = result
                 .tool_calls
                 .iter()
                 .map(|call| ToolResult {
@@ -883,6 +915,19 @@ impl<'a> Engine<'a> {
                     },
                 })
                 .collect();
+            // Mirror the synthetic results onto the event stream: this
+            // step's `StepUsage` already reported `tool_calls: N`, and a
+            // transcript reconstructed from events must resolve every
+            // announced call the same way `messages` does. No `ToolStart`
+            // — these calls never ran.
+            for tool_result in &tool_results {
+                let _ = events.send(AgentEvent::ToolResult {
+                    call_id: tool_result.call_id.clone(),
+                    output: tool_result.output.clone(),
+                    duration_ms: 0,
+                    speculated: false,
+                });
+            }
             messages.push(CompletionMessage {
                 role: MessageRole::Tool,
                 content: String::new(),
@@ -923,7 +968,10 @@ impl<'a> Engine<'a> {
             ..
         } = committed;
 
-        if !result.text.is_empty() {
+        // Trimmed guard, matching the empty-turn check below: a
+        // whitespace-only response must not stream a blank `Text` event and
+        // then abort as "no text" — events and history stay consistent.
+        if !result.text.trim().is_empty() {
             let _ = events.send(AgentEvent::Text {
                 delta: result.text.clone(),
             });
@@ -1213,17 +1261,64 @@ type RetryAttemptFn<'a> = Box<
 type CompletionResultAlias = stella_protocol::CompletionResult;
 type SpeculationFuture<'a> = Pin<Box<dyn Future<Output = SpeculationPool> + 'a>>;
 
+/// Drop guard for the paid-call window ([`Engine::run_model_call`]): armed
+/// before the retried provider dispatch, disarmed on both normal exits. It
+/// fires only when the turn future is dropped mid-await — the caller-side
+/// hard cancel — leaving one content-free `Cancelled` usage envelope so a
+/// possibly-billed in-flight call never vanishes from the accounting
+/// stream. Content-free by construction, same privacy rule as every other
+/// `UsageIncomplete` envelope: no request or response body is representable.
+struct CancelUsageGuard {
+    events: EventSender,
+    role: stella_protocol::ModelCallRole,
+    provider: String,
+    started: std::time::Instant,
+    armed: bool,
+}
+
+impl CancelUsageGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelUsageGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.events.send(AgentEvent::UsageIncomplete {
+            role: self.role,
+            provider: self.provider.clone(),
+            model: "unknown".into(),
+            reason: stella_protocol::UsageIncompleteReason::Cancelled,
+            duration_ms: self.started.elapsed().as_millis() as u64,
+            retries: None,
+        });
+    }
+}
+
+/// Prefix of the overflow summarizer's marker message
+/// ([`Engine::summarize_overflow_span`]). Shared with [`recent_tool_calls`]:
+/// the marker is User-role on the wire, but it is NOT a real user turn and
+/// must not act as a loop-detection window boundary.
+const SUMMARY_MARKER_PREFIX: &str = "[earlier history summarized";
+
 /// Flatten the tool calls of the CURRENT turn — assistant messages after
 /// the last user message — in chronological order, for
 /// `crate::loop_detect::detect_loop`. Windowing at the user boundary
 /// matters: identical calls across turns are the user re-asking a
 /// question, not a stuck loop (a REPL session asking the same thing three
 /// times would otherwise trip the exact-repeat detector), and it keeps
-/// this per-step scan O(turn) instead of O(entire history).
+/// this per-step scan O(turn) instead of O(entire history). The overflow
+/// summary is also User-role but is not a real user turn — treating it as
+/// a boundary would truncate the loop window on every summarization pass
+/// and let a stuck loop outrun detection, so it is skipped when locating
+/// the boundary.
 fn recent_tool_calls(messages: &[CompletionMessage]) -> Vec<ToolCall> {
     let turn_start = messages
         .iter()
-        .rposition(|m| m.role == MessageRole::User)
+        .rposition(|m| m.role == MessageRole::User && !m.content.starts_with(SUMMARY_MARKER_PREFIX))
         .map(|i| i + 1)
         .unwrap_or(0);
     messages[turn_start..]

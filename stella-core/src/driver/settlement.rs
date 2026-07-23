@@ -1,7 +1,7 @@
 use stella_protocol::AgentEvent;
 
 use super::TurnOutcome;
-use crate::budget::{BudgetGuard, BudgetOutcome};
+use crate::budget::{BudgetAxis, BudgetGuard, BudgetOutcome};
 use crate::event_sender::EventSender;
 
 pub(super) fn record_settled_cost(
@@ -15,6 +15,30 @@ pub(super) fn record_settled_cost(
         limit_usd: budget.turn_limit_usd(),
         mode: budget.mode(),
     });
+    // Observed-mode breaches surface here, once per settled call — NOT in
+    // `check_budget`, which runs twice per step and would spam the same
+    // warning at every boundary. `BudgetTick` alone cannot carry this: it
+    // reports only turn-scoped numbers, so a session-axis breach would
+    // otherwise be invisible to every event-stream consumer
+    // (`BudgetOutcome::Warn`'s contract is that the driver surfaces it).
+    if let BudgetOutcome::Warn {
+        axis,
+        spent_usd,
+        limit_usd,
+    } = outcome
+    {
+        let axis = match axis {
+            BudgetAxis::Turn => "turn",
+            BudgetAxis::Session => "session",
+        };
+        let _ = events.send(AgentEvent::Error {
+            message: format!(
+                "budget warning: spent ${spent_usd:.4} against a ${limit_usd:.2} observed {axis} \
+                 limit; continuing"
+            ),
+            retryable: true,
+        });
+    }
     outcome
 }
 

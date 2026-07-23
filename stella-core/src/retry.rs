@@ -184,7 +184,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, ProviderError>>,
 {
-    retry_with_backoff_observed(policy, sleeper, attempt_fn, |_, _| {}).await
+    retry_with_backoff_observed(policy, sleeper, attempt_fn, |_, _, _| {}).await
 }
 
 /// Retry while synchronously observing every failed dispatched attempt.
@@ -193,6 +193,11 @@ where
 /// incompleteness envelope before any later attempt can succeed. A successful
 /// retry can report its own usage, but can never make an earlier provider
 /// attempt's unknown usage knowable after the fact.
+///
+/// The observer receives the 1-indexed attempt number, the error, and THAT
+/// attempt's own elapsed duration — never a cumulative figure across earlier
+/// attempts or the backoff sleeps between them, so a consumer characterizing
+/// provider failure latency from the durable envelopes sees per-call truth.
 pub(crate) async fn retry_with_backoff_observed<F, Fut, T, O>(
     policy: &RetryPolicy,
     sleeper: &dyn Sleeper,
@@ -202,11 +207,12 @@ pub(crate) async fn retry_with_backoff_observed<F, Fut, T, O>(
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, ProviderError>>,
-    O: FnMut(u32, &ProviderError),
+    O: FnMut(u32, &ProviderError, std::time::Duration),
 {
     let mut retries = Vec::new();
     let mut attempt: u32 = 0;
     loop {
+        let attempt_started = std::time::Instant::now();
         match attempt_fn().await {
             Ok(value) => {
                 return Ok(RetryOutcome {
@@ -216,7 +222,7 @@ where
                 });
             }
             Err(error) => {
-                observe_failure(attempt + 1, &error);
+                observe_failure(attempt + 1, &error, attempt_started.elapsed());
                 if !error.is_retryable() || attempt >= policy.max_retries {
                     return Err(error);
                 }

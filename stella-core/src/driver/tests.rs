@@ -1965,5 +1965,6 @@ async fn session_start_hooks_run_via_the_helper_not_per_turn() {
     assert!(payloads[0].contains("\"event\":\"SessionStart\""));
 }
 
+mod audit_fixes;
 mod task4;
 mod usage_completeness;

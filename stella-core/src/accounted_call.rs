@@ -42,11 +42,13 @@ pub async fn run_accounted_call(
         &call.retry_policy,
         sleeper,
         || call.provider.complete(call.request.clone()),
-        |attempt, _error| {
+        // Per-attempt duration (retry.rs times each dispatch individually):
+        // the failed call's own latency, never cumulative across attempts.
+        |attempt, _error, attempt_duration| {
             emit_incomplete(
                 &call,
                 events,
-                started.elapsed(),
+                attempt_duration,
                 Some(attempt.saturating_sub(1)),
             );
         },
