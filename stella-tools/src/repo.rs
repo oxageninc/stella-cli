@@ -1,5 +1,5 @@
-//! Vendor-neutral repository tools: `repo_status`, `repo_commit`,
-//! `repo_push`, `repo_pull`, `repo_rollback`.
+//! Vendor-neutral repository tools: `repo_status`, `repo_diff`,
+//! `repo_commit`, `repo_push`, `repo_pull`, `repo_rollback`.
 //!
 //! Nothing here says "git" — not the tool names, not the argument names.
 //! The tools speak in repository concepts (branch, paths, message) through
@@ -21,6 +21,9 @@
 //! - History rewriting (`reset --hard`, rebase, amend) is deliberately
 //!   absent: `repo_rollback` restores named paths to the last committed
 //!   state and that is the only "undo" this surface offers.
+//! - `repo_diff` caps its patch payload at [`MAX_PATCH_BYTES`] with a
+//!   **loud elision marker**, so a capped review can never be mistaken
+//!   for a complete one.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -35,8 +38,13 @@ use crate::registry::Tool;
 
 /// Timeout for backend commands (push/pull are network-bound).
 const REPO_TIMEOUT_SECS: u64 = 300;
-/// Cap on `repo_status` changed-file rows.
+/// Cap on `repo_status` changed-file rows (and `repo_diff` summary rows).
 const MAX_CHANGED_ROWS: usize = 200;
+/// Cap on `repo_diff` patch bytes; beyond it the patch is cut at a line
+/// boundary and the elision is loud (see the module doc). Sits below the
+/// shared runner's 30k output cap so this cut, not the runner's middle-out
+/// truncation, is the one the agent normally sees.
+const MAX_PATCH_BYTES: usize = 24_000;
 
 /// Typed, named failures crossing the [`RepoBackend`] port.
 #[derive(Debug)]
@@ -92,12 +100,41 @@ pub struct RepoStatus {
     pub truncated: bool,
 }
 
+/// One changed file in a [`RepoDiff`] summary; line counts are `None` for
+/// a binary change.
+#[derive(Debug, Clone)]
+pub struct DiffFileStat {
+    pub path: String,
+    /// Lines added, `None` for a binary change.
+    pub added: Option<u64>,
+    /// Lines removed, `None` for a binary change.
+    pub removed: Option<u64>,
+}
+
+/// The `repo_diff` payload: per-file line stats plus the raw patch hunks.
+/// The size caps live in the TOOL layer (see the module doc), so the port
+/// carries the backend's full answer.
+#[derive(Debug, Clone)]
+pub struct RepoDiff {
+    pub files: Vec<DiffFileStat>,
+    pub patch: String,
+}
+
 /// Vendor-neutral repository port. Adapters translate these operations to
 /// their VCS; the structural refusals (default-branch push, empty path
 /// lists) live in the tools, not here — see the module doc.
 #[async_trait]
 pub trait RepoBackend: Send + Sync {
     async fn status(&self, root: &Path) -> Result<RepoStatus, RepoError>;
+    /// Pending changes as patch hunks plus per-file line stats. `staged`
+    /// selects changes already staged for commit instead of unstaged ones;
+    /// a non-empty `paths` scopes the diff to those paths.
+    async fn diff(
+        &self,
+        root: &Path,
+        staged: bool,
+        paths: &[String],
+    ) -> Result<RepoDiff, RepoError>;
     /// Current branch, `None` when detached.
     async fn current_branch(&self, root: &Path) -> Result<Option<String>, RepoError>;
     /// The repository's default branch per the remote HEAD, `None` when it
@@ -204,6 +241,52 @@ impl RepoBackend for GitCli {
             changed,
             truncated,
         })
+    }
+
+    async fn diff(
+        &self,
+        root: &Path,
+        staged: bool,
+        paths: &[String],
+    ) -> Result<RepoDiff, RepoError> {
+        // `--no-ext-diff --no-textconv`: repository config can bind diff
+        // drivers to arbitrary commands, and a read-only "show me the
+        // hunks" must never execute repository-controlled code.
+        let mut base = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv"];
+        if staged {
+            base.push("--staged");
+        }
+        let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let mut stat_args = base.clone();
+        stat_args.push("--numstat");
+        if !path_refs.is_empty() {
+            stat_args.push("--");
+            stat_args.extend(&path_refs);
+        }
+        let numstat = Self::git_ok(root, "repo_diff", &stat_args).await?;
+        // `added\tremoved\tpath` per line; binary changes report `-` in the
+        // count columns, which parses to `None`.
+        let files = numstat
+            .lines()
+            .filter_map(|line| {
+                let mut cols = line.splitn(3, '\t');
+                let added = cols.next()?;
+                let removed = cols.next()?;
+                let path = cols.next()?;
+                Some(DiffFileStat {
+                    path: path.to_string(),
+                    added: added.parse().ok(),
+                    removed: removed.parse().ok(),
+                })
+            })
+            .collect();
+        let mut patch_args = base;
+        if !path_refs.is_empty() {
+            patch_args.push("--");
+            patch_args.extend(&path_refs);
+        }
+        let patch = Self::git_ok(root, "repo_diff", &patch_args).await?;
+        Ok(RepoDiff { files, patch })
     }
 
     async fn current_branch(&self, root: &Path) -> Result<Option<String>, RepoError> {
@@ -326,7 +409,8 @@ fn valid_branch_name(branch: &str) -> bool {
         && !branch.contains(|c: char| c.is_whitespace() || c.is_control())
 }
 
-/// `repo_status` — the one read-only repository tool.
+/// `repo_status` — read-only: names and states, never content (that is
+/// `repo_diff`).
 pub struct RepoStatusTool(pub Arc<dyn RepoBackend>);
 
 #[async_trait]
@@ -349,6 +433,114 @@ impl Tool for RepoStatusTool {
                 Err(e) => ToolOutput::Error {
                     message: format!("cannot render repository status: {e}"),
                 },
+            },
+            Err(e) => ToolOutput::Error {
+                message: e.to_string(),
+            },
+        }
+    }
+}
+
+/// Render a [`RepoDiff`] as a compact per-file summary followed by the raw
+/// patch hunks, capping the summary rows at [`MAX_CHANGED_ROWS`] and the
+/// patch at [`MAX_PATCH_BYTES`] — always with loud elision (module doc).
+fn render_diff(diff: &RepoDiff, staged: bool) -> String {
+    let scope = if staged { "staged" } else { "unstaged" };
+    let patch = diff.patch.trim_end();
+    if diff.files.is_empty() && patch.is_empty() {
+        return format!(
+            "no {scope} changes (files never staged or committed have no diff — \
+             repo_status lists those)"
+        );
+    }
+    let (added, removed) = diff.files.iter().fold((0u64, 0u64), |(a, r), f| {
+        (a + f.added.unwrap_or(0), r + f.removed.unwrap_or(0))
+    });
+    let mut out = format!(
+        "{} {scope} file(s) changed: +{added} -{removed}\n",
+        diff.files.len()
+    );
+    for f in diff.files.iter().take(MAX_CHANGED_ROWS) {
+        match (f.added, f.removed) {
+            (Some(a), Some(r)) => out.push_str(&format!("  {} +{a} -{r}\n", f.path)),
+            _ => out.push_str(&format!("  {} (binary)\n", f.path)),
+        }
+    }
+    if diff.files.len() > MAX_CHANGED_ROWS {
+        out.push_str(&format!(
+            "  [… {} more file(s) not listed …]\n",
+            diff.files.len() - MAX_CHANGED_ROWS
+        ));
+    }
+    out.push('\n');
+    if patch.len() > MAX_PATCH_BYTES {
+        // Snap to a char boundary, then back to a whole line: a half-shown
+        // hunk line would read as a content change that isn't there.
+        let mut cap = MAX_PATCH_BYTES;
+        while !patch.is_char_boundary(cap) {
+            cap -= 1;
+        }
+        let cut = patch[..cap].rfind('\n').map_or(cap, |i| i + 1);
+        out.push_str(&patch[..cut]);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "[… diff truncated: {cut} of {} bytes shown — re-run with `paths` scoped \
+             to specific files for their full hunks …]",
+            patch.len()
+        ));
+    } else {
+        out.push_str(patch);
+    }
+    out
+}
+
+/// `repo_diff` — the other read-only repository tool: the actual pending
+/// hunks, so a pre-commit self-review is grounded in the real patch rather
+/// than the agent's narration of it.
+pub struct RepoDiffTool(pub Arc<dyn RepoBackend>);
+
+#[async_trait]
+impl Tool for RepoDiffTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "repo_diff".into(),
+            description: "The pending changes as patch hunks (with file/line context) plus a \
+                          per-file +added/-removed summary — review what you ACTUALLY changed \
+                          before repo_commit or verify_done. Unstaged changes by default; \
+                          `staged: true` shows changes already staged for commit instead. \
+                          Files never staged or committed have no diff — repo_status lists \
+                          those."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "staged": { "type": "boolean", "description": "Show changes already staged for commit instead of unstaged ones (default false)" },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional workspace-relative paths to scope the diff to" }
+                }
+            }),
+            read_only: true,
+        }
+    }
+
+    async fn execute(&self, input: &Value, root: &Path) -> ToolOutput {
+        let staged = input
+            .get("staged")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let paths: Vec<String> = input
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        match self.0.diff(root, staged, &paths).await {
+            Ok(diff) => ToolOutput::Ok {
+                content: render_diff(&diff, staged),
             },
             Err(e) => ToolOutput::Error {
                 message: e.to_string(),
@@ -674,6 +866,121 @@ mod tests {
         assert!(changed.contains(&"README.md".to_string()), "{content}");
         assert!(changed.contains(&"new.txt".to_string()), "{content}");
         assert_eq!(status["truncated"], false);
+    }
+
+    /// The issue-#332 witness: after modifying a file, `repo_diff` returns
+    /// a hunk containing the changed line — not just names and states.
+    #[tokio::test]
+    async fn repo_diff_returns_hunks_containing_the_changed_line() {
+        if !git_available().await {
+            eprintln!("skipping repo_diff test: `git` not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = fixture(dir.path()).await;
+        std::fs::write(ws.join("README.md"), "reviewed line\n").unwrap();
+
+        let out = RepoDiffTool(backend()).execute(&Value::Null, &ws).await;
+        let ToolOutput::Ok { content } = out else {
+            panic!("repo_diff must succeed: {out:?}");
+        };
+        // The actual hunk — old line out, new line in — not a narration.
+        assert!(content.contains("+reviewed line"), "{content}");
+        assert!(content.contains("-seed"), "{content}");
+        // And the compact per-file line summary.
+        assert!(content.contains("README.md +1 -1"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn repo_diff_separates_staged_changes_and_scopes_to_paths() {
+        if !git_available().await {
+            eprintln!("skipping repo_diff test: `git` not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = fixture(dir.path()).await;
+
+        // A clean tree diffs to nothing, loudly named.
+        let clean = RepoDiffTool(backend()).execute(&Value::Null, &ws).await;
+        let ToolOutput::Ok { content } = clean else {
+            panic!("clean diff must succeed: {clean:?}");
+        };
+        assert!(content.contains("no unstaged changes"), "{content}");
+
+        // A second tracked file, so path scoping has two candidates.
+        std::fs::write(ws.join("b.txt"), "b\n").unwrap();
+        sh_git(&ws, &["add", "b.txt"]).await;
+        sh_git(&ws, &["commit", "-q", "-m", "add b"]).await;
+        std::fs::write(ws.join("README.md"), "readme edit\n").unwrap();
+        std::fs::write(ws.join("b.txt"), "b edit\n").unwrap();
+
+        // Unscoped: both files' hunks.
+        let both = RepoDiffTool(backend()).execute(&Value::Null, &ws).await;
+        let ToolOutput::Ok { content } = both else {
+            panic!("unscoped diff must succeed: {both:?}");
+        };
+        assert!(content.contains("+readme edit"), "{content}");
+        assert!(content.contains("+b edit"), "{content}");
+
+        // Scoped to b.txt: README's hunk is gone.
+        let scoped = RepoDiffTool(backend())
+            .execute(&serde_json::json!({"paths": ["b.txt"]}), &ws)
+            .await;
+        let ToolOutput::Ok { content } = scoped else {
+            panic!("scoped diff must succeed: {scoped:?}");
+        };
+        assert!(content.contains("+b edit"), "{content}");
+        assert!(!content.contains("readme edit"), "{content}");
+
+        // Stage README: it moves from the unstaged view to the staged one.
+        sh_git(&ws, &["add", "README.md"]).await;
+        let unstaged = RepoDiffTool(backend()).execute(&Value::Null, &ws).await;
+        let ToolOutput::Ok { content } = unstaged else {
+            panic!("unstaged diff must succeed: {unstaged:?}");
+        };
+        assert!(content.contains("+b edit"), "{content}");
+        assert!(!content.contains("readme edit"), "{content}");
+        let staged = RepoDiffTool(backend())
+            .execute(&serde_json::json!({"staged": true}), &ws)
+            .await;
+        let ToolOutput::Ok { content } = staged else {
+            panic!("staged diff must succeed: {staged:?}");
+        };
+        assert!(content.contains("+readme edit"), "{content}");
+        assert!(!content.contains("b edit"), "{content}");
+    }
+
+    #[test]
+    fn repo_diff_render_caps_the_patch_with_loud_elision() {
+        let patch = "+padding line\n".repeat(3_000);
+        let total = patch.trim_end().len();
+        let diff = RepoDiff {
+            files: vec![
+                DiffFileStat {
+                    path: "big.txt".into(),
+                    added: Some(3_000),
+                    removed: Some(0),
+                },
+                DiffFileStat {
+                    path: "logo.png".into(),
+                    added: None,
+                    removed: None,
+                },
+            ],
+            patch,
+        };
+        let rendered = render_diff(&diff, false);
+        assert!(rendered.len() < total, "the cap must actually cut");
+        assert!(rendered.contains("diff truncated"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("of {total} bytes shown")),
+            "{rendered}"
+        );
+        // The cut lands on a whole line — no half-shown hunk line.
+        let marker = rendered.find("[… diff truncated").unwrap();
+        assert_eq!(&rendered[marker - 1..marker], "\n");
+        // Binary files render as such, never as +0 -0.
+        assert!(rendered.contains("logo.png (binary)"), "{rendered}");
     }
 
     #[tokio::test]
