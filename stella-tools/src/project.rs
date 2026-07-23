@@ -80,13 +80,25 @@ impl Tool for RunTests {
         ToolSchema {
             name: "run_tests".into(),
             description: "Run tests with the workspace's own runner. kind: unit|e2e|all. \
-                          filter: module, package, file, or test name (runner-native)."
+                          filter: module, package, file, or test name (runner-native). \
+                          scope \"impacted\": run only the tests reaching the working-tree \
+                          change through the code graph's importer edges."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "kind": { "type": "string", "enum": ["unit", "e2e", "all"] },
                     "filter": { "type": "string", "description": "Narrow to a module/file/test" },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["impacted"],
+                        "description": "impacted: diff the working tree and run only the test \
+                                        files that transitively import a changed file \
+                                        (graph-driven; TS/JS/Python today). Falls back LOUDLY \
+                                        to the full suite when selection is unavailable (e.g. \
+                                        Rust until #335) — never silently under-tests. Not \
+                                        combinable with filter."
+                    },
                     "command": { "type": "string", "description": "Override the detected test command" },
                     "timeout_secs": { "type": "integer" }
                 }
@@ -102,96 +114,190 @@ impl Tool for RunTests {
         }
         let kind = input.get("kind").and_then(|v| v.as_str()).unwrap_or("all");
         let filter = input.get("filter").and_then(|v| v.as_str()).unwrap_or("");
+        let scope = input.get("scope").and_then(|v| v.as_str());
+        match scope {
+            None | Some("impacted") => {}
+            Some(other) => {
+                return ToolOutput::Error {
+                    message: format!(
+                        "unknown scope `{other}` — the only scope is \"impacted\" (omit \
+                         `scope` for the full suite)"
+                    ),
+                };
+            }
+        }
+        if scope.is_some() && !filter.is_empty() {
+            return ToolOutput::Error {
+                message: "`scope: \"impacted\"` computes its own selection — it cannot be \
+                          combined with `filter`; drop one of them"
+                    .into(),
+            };
+        }
 
         let index = ScriptIndex::detect(root).await;
         let Some(primary) = index.primary_runner() else {
             return no_toolchain_error();
         };
-        let command = match primary {
-            "cargo" => match kind {
-                // Unit tests live beside the code; e2e = the integration
-                // test targets under tests/.
-                "unit" => format!("cargo test --workspace --lib --bins {filter}"),
-                "e2e" => {
-                    if filter.is_empty() {
-                        "cargo test --workspace --test '*'".to_string()
+
+        // scope:"impacted" replaces the manual filter with the graph-driven
+        // selection, or stands down to the full suite with a one-line note —
+        // the note rides the report either way, so a widened run is never
+        // mistaken for a narrowed one.
+        let mut filter = filter.to_string();
+        let mut note = String::new();
+        if scope.is_some() {
+            use crate::impact::ImpactSelection;
+            match crate::impact::select_impacted(root).await {
+                ImpactSelection::NothingImpacted { changed: 0 } => {
+                    return ToolOutput::Ok {
+                        content: "scope:\"impacted\": the working tree is clean — no change, \
+                                  no impacted tests (omit `scope` to run the full suite)"
+                            .into(),
+                    };
+                }
+                ImpactSelection::NothingImpacted { changed } => {
+                    return ToolOutput::Ok {
+                        content: format!(
+                            "scope:\"impacted\": no test files transitively import the \
+                             {changed} changed file(s) — nothing to run (omit `scope` to \
+                             run the full suite)"
+                        ),
+                    };
+                }
+                ImpactSelection::FullSuite { note: n } => note = n,
+                ImpactSelection::Selected { tests, changed } => {
+                    if matches!(primary, "npm" | "pnpm" | "yarn" | "bun" | "uv" | "poetry") {
+                        note = format!(
+                            "scope:\"impacted\": selected {} test file(s) for {} changed \
+                             file(s)",
+                            tests.len(),
+                            changed
+                        );
+                        filter = tests.join(" ");
                     } else {
-                        format!("cargo test --workspace --test '*' {filter}")
-                    }
-                }
-                _ => format!("cargo test --workspace {filter}"),
-            },
-            pm @ ("npm" | "pnpm" | "yarn" | "bun") => {
-                let scripts = index.root_script_names(pm);
-                let script = match kind {
-                    "unit" if scripts.contains("test:unit") => "test:unit",
-                    "e2e" if scripts.contains("test:e2e") => "test:e2e",
-                    "e2e" if scripts.contains("e2e") => "e2e",
-                    // NO generic-`test` fallback for e2e: running unit tests
-                    // while reporting "e2e passed" is a lie.
-                    "unit" | "all" if scripts.contains("test") => "test",
-                    _ => {
-                        return ToolOutput::Error {
-                            message: format!(
-                                "package.json has no matching test script for kind `{kind}` — \
-                                 pass `command`"
-                            ),
-                        };
-                    }
-                };
-                if filter.is_empty() {
-                    format!("{pm} run {script}")
-                } else {
-                    format!("{pm} run {script} -- {filter}")
-                }
-            }
-            "go" => {
-                if filter.is_empty() {
-                    "go test ./...".to_string()
-                } else {
-                    format!("go test ./... -run {filter}")
-                }
-            }
-            runner => {
-                // uv/poetry/make/just/task/composer/deno: the project's own
-                // e2e script or nothing (same no-lying rule as above); unit
-                // and all ride the index's `test` verb binding. pytest takes
-                // the filter as a positional; the task runners have no
-                // native filter flag, so a filter there is ignored.
-                let scripts = index.root_script_names(runner);
-                if kind == "e2e" {
-                    let script = ["test:e2e", "e2e"]
-                        .into_iter()
-                        .find(|s| scripts.contains(s));
-                    match script.and_then(|s| index.resolve(s, Some(".")).ok()) {
-                        Some(entry) => entry.command.clone(),
-                        None => {
-                            return ToolOutput::Error {
-                                message: "no e2e test script detected for kind `e2e` — pass \
-                                          `command`"
-                                    .into(),
-                            };
-                        }
-                    }
-                } else {
-                    match index.verb_entry("test") {
-                        Some(entry) if matches!(runner, "uv" | "poetry") && !filter.is_empty() => {
-                            format!("{} {filter}", entry.command)
-                        }
-                        Some(entry) => entry.command.clone(),
-                        None => {
-                            return ToolOutput::Error {
-                                message: "no test script detected in this workspace (see \
-                                          list_scripts) — pass `command`"
-                                    .into(),
-                            };
-                        }
+                        // Composing a per-file filter for this runner is not
+                        // confidently possible — widen loudly, never guess.
+                        note = format!(
+                            "impact selection found {} impacted test file(s), but \
+                             `{primary}` has no per-file filter mapping here — ran the \
+                             full suite",
+                            tests.len()
+                        );
                     }
                 }
             }
-        };
-        run_and_report(&command, root, timeout_secs).await
+        }
+
+        match test_command(&index, primary, kind, &filter) {
+            Ok(command) => with_note(&note, run_and_report(&command, root, timeout_secs).await),
+            Err(message) => with_note(&note, ToolOutput::Error { message }),
+        }
     }
+}
+
+/// Prefix an impact-selection note onto a run's report, on whichever side
+/// it landed — the note must survive both PASSED and FAILED.
+fn with_note(note: &str, out: ToolOutput) -> ToolOutput {
+    if note.is_empty() {
+        return out;
+    }
+    match out {
+        ToolOutput::Ok { content } => ToolOutput::Ok {
+            content: format!("{note}\n{content}"),
+        },
+        ToolOutput::Error { message } => ToolOutput::Error {
+            message: format!("{note}\n{message}"),
+        },
+    }
+}
+
+/// The runner-native test command for `kind` + `filter`, or a named error.
+/// Pure over the detected index — separable from process spawning (the same
+/// discipline as [`lint_argv`]), which is what lets `scope:"impacted"`
+/// substitute its computed file list for the manual filter upstream.
+fn test_command(
+    index: &ScriptIndex,
+    primary: &str,
+    kind: &str,
+    filter: &str,
+) -> Result<String, String> {
+    Ok(match primary {
+        "cargo" => match kind {
+            // Unit tests live beside the code; e2e = the integration
+            // test targets under tests/.
+            "unit" => format!("cargo test --workspace --lib --bins {filter}"),
+            "e2e" => {
+                if filter.is_empty() {
+                    "cargo test --workspace --test '*'".to_string()
+                } else {
+                    format!("cargo test --workspace --test '*' {filter}")
+                }
+            }
+            _ => format!("cargo test --workspace {filter}"),
+        },
+        pm @ ("npm" | "pnpm" | "yarn" | "bun") => {
+            let scripts = index.root_script_names(pm);
+            let script = match kind {
+                "unit" if scripts.contains("test:unit") => "test:unit",
+                "e2e" if scripts.contains("test:e2e") => "test:e2e",
+                "e2e" if scripts.contains("e2e") => "e2e",
+                // NO generic-`test` fallback for e2e: running unit tests
+                // while reporting "e2e passed" is a lie.
+                "unit" | "all" if scripts.contains("test") => "test",
+                _ => {
+                    return Err(format!(
+                        "package.json has no matching test script for kind `{kind}` — \
+                             pass `command`"
+                    ));
+                }
+            };
+            if filter.is_empty() {
+                format!("{pm} run {script}")
+            } else {
+                format!("{pm} run {script} -- {filter}")
+            }
+        }
+        "go" => {
+            if filter.is_empty() {
+                "go test ./...".to_string()
+            } else {
+                format!("go test ./... -run {filter}")
+            }
+        }
+        runner => {
+            // uv/poetry/make/just/task/composer/deno: the project's own
+            // e2e script or nothing (same no-lying rule as above); unit
+            // and all ride the index's `test` verb binding. pytest takes
+            // the filter as a positional; the task runners have no
+            // native filter flag, so a filter there is ignored.
+            let scripts = index.root_script_names(runner);
+            if kind == "e2e" {
+                let script = ["test:e2e", "e2e"]
+                    .into_iter()
+                    .find(|s| scripts.contains(s));
+                match script.and_then(|s| index.resolve(s, Some(".")).ok()) {
+                    Some(entry) => entry.command.clone(),
+                    None => {
+                        return Err("no e2e test script detected for kind `e2e` — pass \
+                                        `command`"
+                            .into());
+                    }
+                }
+            } else {
+                match index.verb_entry("test") {
+                    Some(entry) if matches!(runner, "uv" | "poetry") && !filter.is_empty() => {
+                        format!("{} {filter}", entry.command)
+                    }
+                    Some(entry) => entry.command.clone(),
+                    None => {
+                        return Err("no test script detected in this workspace (see \
+                                        list_scripts) — pass `command`"
+                            .into());
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Named "nothing configured" error for `run_lint` / `format_code`: says
@@ -516,6 +622,170 @@ mod tests {
         let err = format_argv(&bare, false).unwrap_err();
         assert!(err.contains("no formatter configured"), "{err}");
         assert!(err.contains("package.json `format` script"), "{err}");
+    }
+
+    /// Whether a real `git` is on PATH; the impacted-scope tests skip
+    /// cleanly (with a printed note) when it isn't — mirroring repo.rs.
+    async fn git_available() -> bool {
+        tokio::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Fixture plumbing: run git expecting success (unwrap is fine in tests).
+    async fn sh_git(dir: &std::path::Path, args: &[&str]) {
+        let out = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A committed git fixture with deterministic identity and no signing.
+    async fn git_fixture(dir: &std::path::Path) {
+        sh_git(dir, &["init", "--quiet"]).await;
+        for (k, v) in [
+            ("user.email", "test@stella.local"),
+            ("user.name", "Stella Test"),
+            ("commit.gpgsign", "false"),
+        ] {
+            sh_git(dir, &["config", k, v]).await;
+        }
+        sh_git(dir, &["add", "-A"]).await;
+        sh_git(dir, &["commit", "-q", "-m", "seed"]).await;
+    }
+
+    /// The issue-#334 witness: test A imports changed module X, test B
+    /// imports unrelated Y — `scope:"impacted"` selects A and not B (and a
+    /// clean tree is a named no-op). Fails before the mode exists, when
+    /// `scope` is ignored and the plain full-suite command runs.
+    #[tokio::test]
+    async fn impacted_scope_selects_only_tests_reaching_the_change() {
+        if !git_available().await {
+            eprintln!("skipping impacted-scope test: `git` not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("package.json"),
+            r#"{"scripts": {"test": "echo tests-ran"}}"#,
+        )
+        .unwrap();
+        std::fs::write(ws.join("package-lock.json"), "{}").unwrap();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/x.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(ws.join("src/y.ts"), "export const y = 1;\n").unwrap();
+        std::fs::write(ws.join("a.test.ts"), "import { x } from './src/x';\n").unwrap();
+        std::fs::write(ws.join("b.test.ts"), "import { y } from './src/y';\n").unwrap();
+        git_fixture(ws).await;
+
+        // A clean tree is a named no-op — no runner is ever spawned.
+        let clean = RunTests
+            .execute(&serde_json::json!({"scope": "impacted"}), ws)
+            .await;
+        match &clean {
+            ToolOutput::Ok { content } => assert!(content.contains("clean"), "{content}"),
+            other => panic!("clean tree must be a named Ok: {other:?}"),
+        }
+
+        // Change X: only the test importing it is selected and passed to
+        // the runner; the unrelated test is not.
+        std::fs::write(ws.join("src/x.ts"), "export const x = 2;\n").unwrap();
+        let out = RunTests
+            .execute(&serde_json::json!({"scope": "impacted"}), ws)
+            .await;
+        let text = match &out {
+            ToolOutput::Ok { content } => content.clone(),
+            ToolOutput::Error { message } => message.clone(),
+        };
+        assert!(
+            text.contains("a.test.ts"),
+            "selects the test importing the change: {text}"
+        );
+        assert!(
+            !text.contains("b.test.ts"),
+            "must NOT select the unrelated test: {text}"
+        );
+        assert!(
+            text.contains("scope:\"impacted\""),
+            "the selection provenance note rides the report: {text}"
+        );
+    }
+
+    /// Rust has no resolved import edges yet (#335): a changed `.rs` file
+    /// stands selection down to the WHOLE suite with a one-line note —
+    /// loudly over-testing, never silently under-testing.
+    #[tokio::test]
+    async fn impacted_scope_falls_back_loudly_to_the_full_suite_for_rust() {
+        if !git_available().await {
+            eprintln!("skipping impacted-scope fallback test: `git` not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[package]\nname = \"impactfix\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/lib.rs"), "pub fn one() -> u32 { 1 }\n").unwrap();
+        git_fixture(ws).await;
+        std::fs::write(ws.join("src/lib.rs"), "pub fn one() -> u32 { 2 }\n").unwrap();
+
+        let out = RunTests
+            .execute(&serde_json::json!({"scope": "impacted"}), ws)
+            .await;
+        let text = match &out {
+            ToolOutput::Ok { content } => content.clone(),
+            ToolOutput::Error { message } => message.clone(),
+        };
+        assert!(
+            text.contains("impact selection unavailable for Rust"),
+            "{text}"
+        );
+        assert!(text.contains("#335"), "{text}");
+        assert!(
+            text.contains("cargo test --workspace"),
+            "the full suite actually ran: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn impacted_scope_refuses_a_manual_filter_and_unknown_scopes() {
+        let root = tempfile::tempdir().unwrap();
+        let out = RunTests
+            .execute(
+                &serde_json::json!({"scope": "impacted", "filter": "foo"}),
+                root.path(),
+            )
+            .await;
+        match &out {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("cannot be combined"), "{message}")
+            }
+            other => panic!("scope+filter must be refused: {other:?}"),
+        }
+        let out = RunTests
+            .execute(&serde_json::json!({"scope": "blast"}), root.path())
+            .await;
+        match &out {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("unknown scope"), "{message}")
+            }
+            other => panic!("unknown scope must be a named error: {other:?}"),
+        }
     }
 
     #[test]

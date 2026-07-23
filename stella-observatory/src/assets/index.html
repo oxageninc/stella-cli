@@ -187,6 +187,13 @@ pre.cfg{font:11px var(--mono);color:var(--text-2);background:rgba(0,0,0,.28);
 .tokbar{display:flex;height:12px;border-radius:0 3px 3px 0;overflow:hidden;gap:2px}
 .tokbar i{display:block;height:100%}
 .empty{padding:34px 10px;text-align:center;color:var(--text-3);font:13px var(--mono)}
+.crumbs{display:flex;flex-wrap:wrap;align-items:center;gap:2px;margin-top:8px}
+.crumbs .crumb{background:var(--raised);border:1px solid var(--hairline);color:var(--text-2);
+  border-radius:7px;padding:3px 10px;cursor:pointer;font:12px var(--mono)}
+.crumbs .crumb:hover{color:var(--text);border-color:var(--accent)}
+.crumbs .sep{color:var(--text-3);margin:0 3px}
+tr.drill{cursor:pointer}
+tr.drill:hover td{background:var(--raised)}
 .empty code{color:var(--accent);background:rgba(63,224,255,.08);padding:2px 8px;border-radius:6px}
 .section-gap{margin-bottom:14px}
 .loop-strip{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
@@ -220,6 +227,7 @@ footer b{color:var(--text-2)}
     <button class="tab" data-tab="mcp">mcp</button>
     <button class="tab" data-tab="memory">memory &amp; rules</button>
     <button class="tab" data-tab="improve">self-improve</button>
+    <button class="tab" data-tab="hub">org / hub</button>
     <button class="tab" data-tab="config">config</button>
     <div class="tf" id="tf">
       <span>window</span>
@@ -229,6 +237,40 @@ footer b{color:var(--text-2)}
       <button data-tf="all" class="on">all</button>
     </div>
   </nav>
+
+  <!-- ══ ORG / HUB ═════════════════════════════════════════════════════ -->
+  <section data-tab="hub">
+    <div class="card" style="margin-bottom:14px">
+      <div class="kick">Cross-project telemetry · from the hub (~/.stella/usage.db)</div>
+      <h2>Org &amp; project spend</h2>
+      <div id="hubScope" class="crumbs"></div>
+    </div>
+    <div class="grid kpis" id="hubKpis"></div>
+    <div class="grid cols-2">
+      <div class="card">
+        <div class="kick" id="hubDrillKick">Breakdown</div>
+        <h2 id="hubDrillTitle">By org</h2>
+        <div class="scroll-x" id="hubDrill"></div>
+      </div>
+      <div class="card">
+        <div class="kick">$ · all providers · scoped</div>
+        <h2>Models</h2>
+        <div class="scroll-x" id="hubModels"></div>
+      </div>
+    </div>
+    <div class="grid cols-2">
+      <div class="card">
+        <div class="kick">Daily activity · scoped</div>
+        <h2>Spend per day</h2>
+        <div id="hubDays"></div>
+      </div>
+      <div class="card">
+        <div class="kick">Repositories · scoped</div>
+        <h2>By repo</h2>
+        <div class="scroll-x" id="hubRepos"></div>
+      </div>
+    </div>
+  </section>
 
   <!-- ══ OVERVIEW ══════════════════════════════════════════════════════ -->
   <section data-tab="overview" class="on">
@@ -476,6 +518,9 @@ function hideTip() { tip.style.display = "none"; }
 
 /* ── state ───────────────────────────────────────────────────────────── */
 const state = { project: "", tf: "all", tab: "overview" };
+// Hub drill scope: null = not selected. `(local)` selects the NULL/unregistered
+// bucket the backend understands. Deepest set field picks the drill level.
+const hub = { org: null, workspace: null, repo: null };
 const TF_MS = { "24h": 864e5, "7d": 7 * 864e5, "30d": 30 * 864e5 };
 const D = {};            // core payloads, refreshed every 5s
 const lazyCache = {};    // per-tab payloads keyed `${tab}:${project}`
@@ -1415,6 +1460,106 @@ function bindGraphEvents() {
   new ResizeObserver(() => { if (graph.ready) drawGraph(); }).observe(c);
 }
 
+/* ── org / hub telemetry ─────────────────────────────────────────────── */
+function hubQuery() {
+  const p = [];
+  if (hub.org != null) p.push("org=" + encodeURIComponent(hub.org));
+  if (hub.workspace != null) p.push("workspace=" + encodeURIComponent(hub.workspace));
+  if (hub.repo != null) p.push("repo=" + encodeURIComponent(hub.repo));
+  return p.length ? "?" + p.join("&") : "";
+}
+const hubReload = () => loadTab("hub", true);
+// The NULL org/workspace and '' repo buckets render as `(local)`.
+const scopeLabel = (v) => (v == null || v === "" ? "(local)" : v);
+
+function renderHub(d) {
+  const totals = d.totals ?? {};
+  const scoped = hub.org != null || hub.workspace != null || hub.repo != null;
+
+  // Breadcrumb: all › org › workspace › repo, each popping to its own level.
+  const crumbs = [`<button class="crumb" data-pop="all">all orgs</button>`];
+  if (hub.org != null) crumbs.push(`<button class="crumb" data-pop="org">${esc(scopeLabel(hub.org))}</button>`);
+  if (hub.workspace != null) crumbs.push(`<button class="crumb" data-pop="workspace">ws ${esc(scopeLabel(hub.workspace))}</button>`);
+  if (hub.repo != null) crumbs.push(`<button class="crumb" data-pop="repo">repo ${esc(scopeLabel(hub.repo))}</button>`);
+  $("hubScope").innerHTML = crumbs.join(`<span class="sep">›</span>`);
+  $("hubScope").querySelectorAll(".crumb").forEach(b => b.addEventListener("click", () => {
+    const to = b.dataset.pop;
+    if (to === "all") hub.org = hub.workspace = hub.repo = null;
+    else if (to === "org") hub.workspace = hub.repo = null;
+    else if (to === "workspace") hub.repo = null;
+    hubReload();
+  }));
+
+  if (!d.available && (totals.calls ?? 0) === 0 && !scoped) {
+    $("hubKpis").innerHTML = `<div class="card"><div class="empty">no hub telemetry yet — finished turns replicate into ~/.stella/usage.db (or run <code>stella usage sync --all</code>)</div></div>`;
+  } else {
+    $("hubKpis").innerHTML =
+      tile("calls", (totals.calls ?? 0).toLocaleString()) +
+      tile("cost", fmtUsd(totals.cost_usd ?? 0), null, true) +
+      tile("input", fmtTok(totals.input_tokens ?? 0)) +
+      tile("output", fmtTok(totals.output_tokens ?? 0)) +
+      tile("cache read", pct(totals.cache_read_rate ?? 0)) +
+      tile("projects", totals.projects ?? 0) +
+      tile("orgs", totals.orgs ?? 0);
+  }
+
+  // Drill table — one level in from the current scope.
+  const level = d.drill?.level ?? "org";
+  const titles = { org: "By org", workspace: "By workspace", repo: "By repo", project: "By project" };
+  $("hubDrillTitle").textContent = titles[level] ?? "Breakdown";
+  $("hubDrillKick").textContent = level === "project" ? "click a project to open its dashboard" : "click a row to drill in";
+  const rows = d.drill?.rows ?? [];
+  if (!rows.length) {
+    $("hubDrill").innerHTML = `<div class="empty">nothing in scope</div>`;
+  } else {
+    $("hubDrill").innerHTML = `<table><thead><tr><th>${level}</th><th class="num">calls</th>
+      <th class="num">cost</th><th class="num">cache</th><th class="num">in</th>
+      <th class="num">out</th><th class="num">${level === "project" ? "ws" : "proj"}</th></tr></thead><tbody>` +
+      rows.map((r, i) => {
+        const label = level === "project" ? (r.name || r.key) : scopeLabel(r.key);
+        const tail = level === "project" ? (r.workspaces ?? 0) : (r.projects ?? 0);
+        return `<tr class="drill" data-i="${i}"><td class="main">${esc(String(label))}</td>
+          <td class="num">${r.calls}</td><td class="num">${fmtUsd(r.cost_usd)}</td>
+          <td class="num">${pct(r.cache_read_rate ?? 0)}</td>
+          <td class="num">${fmtTok(r.input_tokens)}</td><td class="num">${fmtTok(r.output_tokens)}</td>
+          <td class="num">${tail}</td></tr>`;
+      }).join("") + `</tbody></table>`;
+    $("hubDrill").querySelectorAll("tr.drill").forEach(el => el.addEventListener("click", () => {
+      const r = rows[+el.dataset.i];
+      if (level === "org") { hub.org = r.key == null ? "(local)" : r.key; hubReload(); }
+      else if (level === "workspace") { hub.workspace = r.key == null ? "(local)" : r.key; hubReload(); }
+      else if (level === "repo") { hub.repo = r.key === "" ? "(local)" : r.key; hubReload(); }
+      else if (level === "project") { state.project = r.key; renderProjects(D.projects); switchTab("overview"); }
+    }));
+  }
+
+  // Provider / model — mirrors `stella usage report`, plus a cache-read rate.
+  const pm = d.by_provider_model ?? [];
+  $("hubModels").innerHTML = !pm.length ? `<div class="empty">no model traffic in scope</div>`
+    : `<table><thead><tr><th>model</th><th class="num">calls</th><th class="num">cost</th>
+        <th class="num">cache</th><th class="num">in</th><th class="num">out</th></tr></thead><tbody>` +
+      pm.map(r => `<tr><td class="main" title="${esc(r.provider)}/${esc(r.model)}">${esc(r.provider)}/${esc(r.model)}</td>
+        <td class="num">${r.calls}</td><td class="num">${fmtUsd(r.cost_usd)}</td>
+        <td class="num">${pct(r.cache_read_rate ?? 0)}</td>
+        <td class="num">${fmtTok(r.input_tokens)}</td><td class="num">${fmtTok(r.output_tokens)}</td></tr>`).join("") +
+      `</tbody></table>`;
+
+  // Daily spend.
+  const days = d.by_day ?? [];
+  $("hubDays").innerHTML = !days.length ? `<div class="empty">no dated activity in scope</div>`
+    : hbars(days, r => r.day, r => r.cost_usd, r => `${fmtUsd(r.cost_usd)} · ${r.calls}×`);
+
+  // Repos.
+  const repos = d.by_repo ?? [];
+  $("hubRepos").innerHTML = !repos.length ? `<div class="empty">no repo activity in scope</div>`
+    : `<table><thead><tr><th>repo</th><th class="num">calls</th><th class="num">cost</th>
+        <th class="num">in</th><th class="num">out</th><th class="num">proj</th></tr></thead><tbody>` +
+      repos.map(r => `<tr><td class="main">${esc(r.repo_id || "(none)")}</td>
+        <td class="num">${r.calls}</td><td class="num">${fmtUsd(r.cost_usd)}</td>
+        <td class="num">${fmtTok(r.input_tokens)}</td><td class="num">${fmtTok(r.output_tokens)}</td>
+        <td class="num">${r.projects}</td></tr>`).join("") + `</tbody></table>`;
+}
+
 /* ── tabs, lazy loads, refresh loop ──────────────────────────────────── */
 async function loadTab(tab, force) {
   const key = `${tab}:${state.project}`;
@@ -1446,6 +1591,10 @@ async function loadTab(tab, force) {
       const data = cached ?? await api("/api/config");
       lazyCache[key] = data;
       renderConfig(data);
+    } else if (tab === "hub") {
+      // Never cached: the payload depends on the live drill scope, not just
+      // the project. Cheap hub-only query, so re-fetch each entry/drill.
+      renderHub(await api("/api/hub-telemetry" + hubQuery()) ?? {});
     }
   } catch { /* section keeps its previous contents; the LIVE dot reports */ }
 }

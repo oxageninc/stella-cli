@@ -290,6 +290,16 @@ impl CodeGraph {
         frames::importers_of(&self.inner.read_guard(), &self.inner.root, &rel)
     }
 
+    /// The files whose imports resolve to `file` — raw root-relative
+    /// forward-slash paths, not rendered frames. The reverse-dependency
+    /// lookup behind `run_tests`' `scope:"impacted"` selection
+    /// (stella-tools), which walks this relation transitively and needs the
+    /// plain path list per hop rather than a prose frame.
+    pub fn importer_paths(&self, file: &Path) -> Result<Vec<String>, GraphError> {
+        let rel = self.resolve_rel(file);
+        store::importers_of(&self.inner.read_guard(), &rel)
+    }
+
     /// The immediate graph neighborhood of `file` (its symbols + edges).
     pub fn neighbors(&self, file: &Path) -> Result<Vec<ContextFrame>, GraphError> {
         let rel = self.resolve_rel(file);
@@ -529,6 +539,38 @@ mod tests {
     fn all_files_is_empty_on_an_empty_index() {
         let (graph, _ws, _dbdir) = open_graph();
         assert!(graph.all_files().unwrap().is_empty());
+    }
+
+    /// `importer_paths` answers the raw reverse-dependency question — which
+    /// files' imports resolve to this one — as plain root-relative paths,
+    /// the relation `run_tests` `scope:"impacted"` walks transitively.
+    #[test]
+    fn importer_paths_lists_files_whose_imports_resolve_here() {
+        let ws = TempDir::new().unwrap();
+        let dbdir = TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("src")).unwrap();
+        std::fs::write(ws.path().join("src/x.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(
+            ws.path().join("a.test.ts"),
+            "import { x } from './src/x';\n",
+        )
+        .unwrap();
+        std::fs::write(ws.path().join("b.test.ts"), "export const b = 2;\n").unwrap();
+        let graph = CodeGraph::open(ws.path(), &dbdir.path().join("context.db")).unwrap();
+        graph.index_all().unwrap();
+
+        assert_eq!(
+            graph.importer_paths(Path::new("src/x.ts")).unwrap(),
+            vec!["a.test.ts".to_string()],
+            "only the file whose import resolves to src/x.ts"
+        );
+        assert!(
+            graph
+                .importer_paths(Path::new("b.test.ts"))
+                .unwrap()
+                .is_empty(),
+            "nothing imports b.test.ts"
+        );
     }
 
     /// `definition_spans` reports each site's exact 1-based inclusive range —

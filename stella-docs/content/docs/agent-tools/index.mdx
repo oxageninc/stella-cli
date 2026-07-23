@@ -25,7 +25,7 @@ Tool names are their exact identifiers — the agent dispatches by name, and the
 
 ### Always available
 
-These 41 tools register in every session — no configuration, no prerequisites. Grouped by what they touch:
+These 42 tools register in every session — no configuration, no prerequisites. Grouped by what they touch:
 
 #### Files
 
@@ -35,6 +35,7 @@ These 41 tools register in every session — no configuration, no prerequisites.
 | `read_symbol` | Read a named symbol's exact source span, resolved through the code graph — no line-offset guessing. Multiple definitions are listed (pick one with `path`), never silently chosen. | Read-only |
 | `write_file` | Create a file or overwrite an existing one — parent directories are created as needed. | Mutating |
 | `edit_file` | Replace an exact substring in a file — exactly-once by default, every occurrence with `replace_all`. | Mutating |
+| `apply_edits` | Apply a batch of exact-substring edits — across multiple files — in one transactional call: every edit validates first, and if any fails nothing is written. `dry_run` validates without writing. | Mutating |
 | `delete_file` | Delete a file — preferred over shelling out to `rm`, so the deletion lands in the file-touch audit log. | Mutating |
 
 #### Search
@@ -62,7 +63,7 @@ These 41 tools register in every session — no configuration, no prerequisites.
 | --- | --- | --- |
 | `verify_done` | Prove a change is done: the test command must pass on the new code and fail on `git HEAD`. Runs in a shadow worktree and never edits your working tree. | Mutating |
 | `build_project` | Build the workspace with its own toolchain (cargo/npm/go/make), or a custom command. | Mutating |
-| `run_tests` | Run the project's tests with its own runner — `kind` picks unit/e2e/all, `filter` is runner-native. | Mutating |
+| `run_tests` | Run the project's tests with its own runner — `kind` picks unit/e2e/all, `filter` is runner-native, and `scope: "impacted"` runs only the tests reaching the working-tree change through the code graph's importer edges (TS/JS/Python today; falls back loudly to the full suite when selection is unavailable). | Mutating |
 | `diagnostics` | Fast typecheck: run the toolchain's native machine-readable check (`cargo check` / `tsc` / `eslint` / `ruff`) and return structured file:line:col diagnostics with severity and rule code, grouped by file. | Read-only |
 | `run_lint` | Run the project's own linter (cargo clippy, or the `lint` script); `fix` applies automatic fixes. | Mutating |
 | `format_code` | Run the project's own formatter (cargo fmt, or the `format` script); `check` verifies without rewriting. | Mutating |
@@ -217,7 +218,7 @@ The other three session tools are read-only **discovery** tools layered over the
 
 Set `STELLA_LEAN_TOOLS=1` to advertise only a lean core toolset (file CRUD, search, build/test/verify, `ask_user`, and `bash` when the opt-in has enabled it) plus the discovery tools; everything else stays out of the prompt until a `tool_search` surfaces it. Matched tools are *activated* — advertised for the rest of the session. Set the variable to a comma-separated list of tool names to choose your own core. A hidden tool called by name still executes, so lean mode trims prompt weight without ever gating a capability.
 
-All told: 41 always-on tools, up to 57 native tools with the `bash` and `web` opt-ins, the code graph, media keys, a search key, and an issue backend, plus the six session tools — before any custom script tools or MCP servers merge in.
+All told: 42 always-on tools, up to 58 native tools with the `bash` and `web` opt-ins, the code graph, media keys, a search key, and an issue backend, plus the six session tools — before any custom script tools or MCP servers merge in.
 
 ## Where to go next
 

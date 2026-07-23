@@ -586,15 +586,6 @@ impl SessionModel {
             | AgentEvent::BlockRegistered { .. }
             | AgentEvent::StepManifest { .. }
             | AgentEvent::GoalVerdict { .. } => {}
-            // A discarded speculation pool (#415) is store/telemetry
-            // bookkeeping; no user-visible panel state depends on it.
-            AgentEvent::SpeculationDiscarded { .. } => {}
-            // Typed decision events (receipts spec §6.3/§6.4): parseable
-            // twins of prose already folded above — no extra panel state.
-            AgentEvent::LoopDetected { .. }
-            | AgentEvent::BudgetDenied { .. }
-            | AgentEvent::RetriesExhausted { .. }
-            | AgentEvent::PolicyDecision { .. } => {}
             AgentEvent::Error { message, retryable } => {
                 self.pending_scope_review = None;
                 self.pending_ask_user = None;

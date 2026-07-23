@@ -7,6 +7,7 @@
 //! for subsequent file operations (L-S2).
 
 pub mod agent_use;
+pub mod apply_edits;
 pub mod bash;
 pub mod ci;
 pub mod code_map;
@@ -23,6 +24,7 @@ pub mod glob;
 pub mod graph;
 pub mod grep;
 pub mod hook_runner;
+pub(crate) mod impact;
 pub mod issue_ops;
 pub mod issues;
 pub mod media;
