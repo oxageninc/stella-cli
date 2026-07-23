@@ -1015,9 +1015,10 @@ async fn malformed_tool_call_input_is_repaired_not_executed_blindly() {
 
 #[tokio::test]
 async fn stuck_loop_aborts_the_turn_cleanly_before_the_step_cap() {
-    // Every call returns the identical tool call — well past the
-    // default exact-repeat threshold (3) — so loop detection must
-    // abort long before EngineConfig::default()'s 200-step cap.
+    // Every call returns the identical tool call and the tool answers with
+    // identical output — well past the default exact-repeat threshold (3)
+    // — so loop detection must end the turn long before
+    // EngineConfig::default()'s 200-step cap.
     let repeated = tool_call_result("call_1", "bash");
     let provider = ScriptedProvider {
         id: "scripted".into(),
@@ -1047,6 +1048,214 @@ async fn stuck_loop_aborts_the_turn_cleanly_before_the_step_cap() {
 
     let events = drain_events(&mut rx);
     assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+}
+
+#[tokio::test]
+async fn stuck_loop_steers_once_then_aborts_on_re_detection() {
+    // The exact steer-then-abort sequencing: three identical no-progress
+    // calls earn a steering warning, the model ignores it with a fourth
+    // identical call, and only THAT detection aborts. The count also
+    // proves the injected warning (a User-role message) did not reset the
+    // detection window — a reset would demand three more calls, not one.
+    let repeated = tool_call_result("call_1", "bash");
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(vec![Ok(repeated)]),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tool_calls = Arc::new(AtomicU32::new(0));
+    let tools = CountingTools {
+        calls: tool_calls.clone(),
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("hi"),
+    ];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+    assert!(matches!(outcome, TurnOutcome::Aborted { .. }));
+    assert_eq!(
+        tool_calls.load(Ordering::SeqCst),
+        4,
+        "three calls to detect and steer, ONE more no-progress call to abort"
+    );
+
+    let events = drain_events(&mut rx);
+    let steers: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Steered { .. }))
+        .collect();
+    assert_eq!(steers.len(), 1, "exactly one steering warning per turn");
+    assert!(matches!(
+        steers[0],
+        AgentEvent::Steered { text } if text.contains("looping")
+    ));
+    // The warning precedes the abort's Error event — steer first, abort
+    // second.
+    let steer_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }));
+    let error_pos = events.iter().position(|e| {
+        matches!(
+            e,
+            AgentEvent::Error {
+                retryable: false,
+                ..
+            }
+        )
+    });
+    assert!(
+        steer_pos < error_pos,
+        "steer at {steer_pos:?}, abort at {error_pos:?}"
+    );
+    // The warning is in history for the model (and the next turn) to see.
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content.starts_with(LOOP_STEER_PREFIX)),
+        "the steering warning must ride the conversation itself"
+    );
+}
+
+/// A tool whose output changes every invocation — a `read_output`-style
+/// poll of a still-running process.
+struct PollingTools {
+    calls: Arc<AtomicU32>,
+}
+#[async_trait]
+impl ToolExecutor for PollingTools {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        vec![ToolSchema {
+            name: "bash".into(),
+            description: "run a command".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only: false,
+        }]
+    }
+    async fn execute(&self, _name: &str, _input: &Value) -> ToolOutput {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        ToolOutput::Ok {
+            content: format!("[{n}s] still running..."),
+        }
+    }
+}
+
+#[tokio::test]
+async fn identical_polls_with_changing_output_complete_without_abort() {
+    // Six byte-identical calls (same name, same input, no cursor field) —
+    // but every poll returns new output. That is visible progress, not a
+    // loop: the turn must run to completion with no steering and no abort.
+    let mut script: Vec<Result<CompletionResultAlias, ProviderError>> = (0..6)
+        .map(|_| Ok(tool_call_result("call_1", "bash")))
+        .collect();
+    script.push(Ok(text_result("build finished")));
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(script),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tool_calls = Arc::new(AtomicU32::new(0));
+    let tools = PollingTools {
+        calls: tool_calls.clone(),
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("run the build and wait for it"),
+    ];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+    match outcome {
+        TurnOutcome::Completed { text, .. } => assert_eq!(text, "build finished"),
+        other => panic!("polling with changing output must complete, got {other:?}"),
+    }
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 6, "every poll ran");
+    let events = drain_events(&mut rx);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { .. })),
+        "progress must not even draw a steering warning"
+    );
+}
+
+#[tokio::test]
+async fn period_three_cycle_with_no_progress_steers_then_aborts() {
+    // The common real stuck signature: read → failing edit → failing test,
+    // with byte-identical outputs every cycle — invisible to exact-repeat
+    // (no consecutive repeat) and to a two-call-only cycle detector.
+    let cycle_call = |i: usize| {
+        let (name, input) = match i % 3 {
+            0 => ("read_file", serde_json::json!({"path": "a.rs"})),
+            1 => (
+                "edit_file",
+                serde_json::json!({"path": "a.rs", "old": "x", "new": "y"}),
+            ),
+            _ => ("bash", serde_json::json!({"cmd": "cargo test"})),
+        };
+        Ok(CompletionResultAlias {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                call_id: format!("call_{i}"),
+                name: name.into(),
+                input,
+            }],
+            usage: CompletionUsage::reported_zero(),
+            model: "scripted".into(),
+            cost_usd: 0.0001,
+            finish_reason: None,
+        })
+    };
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new((0..12).map(cycle_call).collect()),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tool_calls = Arc::new(AtomicU32::new(0));
+    let tools = CountingTools {
+        calls: tool_calls.clone(),
+    };
+    let sleeper = NoopSleeper;
+    let config = EngineConfig {
+        loop_detection: LoopDetectionConfig {
+            exact_repeat_threshold: 3,
+            short_cycle_repeats: 2,
+        },
+        ..EngineConfig::default()
+    };
+    let engine = Engine::with_sleeper(&provider, &tools, config, &sleeper);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("fix the test"),
+    ];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+    match outcome {
+        TurnOutcome::Aborted { reason, .. } => {
+            assert!(reason.contains("stuck-loop"), "unexpected reason: {reason}")
+        }
+        other => panic!("expected a stuck-loop abort, got {other:?}"),
+    }
+    // Two full cycles (6 calls) to detect and steer, one more no-progress
+    // call to abort — never the 12-entry script (let alone the step cap).
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 7);
+    let events = drain_events(&mut rx);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Steered { .. }))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

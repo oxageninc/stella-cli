@@ -72,7 +72,7 @@ use crate::compaction::compact;
 use crate::estimator::{CalibrationMap, estimate_conversation_tokens};
 use crate::event_sender::EventSender;
 use crate::hooks::{HookPayload, HookRunner, Hooks, run_hooks};
-use crate::loop_detect::{LoopDetectionConfig, detect_loop};
+use crate::loop_detect::{CallRecord, LoopDetectionConfig, detect_loop};
 use crate::ports::ToolExecutor;
 use crate::receipts::ReceiptLedger;
 use crate::retry::{RetryOutcome, RetryPolicy, Sleeper, retry_with_backoff_observed};
@@ -385,6 +385,10 @@ impl<'a> Engine<'a> {
         // `CalibrationMap::factor` then falls back to the session's single
         // seeded entry.
         let mut calibration_model: Option<String> = None;
+        // Whether this turn already spent its one stuck-loop steering
+        // warning ([`Engine::check_loop_detection`]) — the next detection
+        // aborts instead of warning again.
+        let mut loop_steered = false;
         // Per-turn context-receipt state: block registry + residency, carried
         // by reference into each model call. Stack-local — the engine holds no
         // receipt state of its own.
@@ -429,7 +433,9 @@ impl<'a> Engine<'a> {
                 self.effective_compaction_budget(calibration_model.as_deref());
             receipts.set_effective_budget(effective_budget, calibration_factor);
 
-            if let Some(aborted) = self.check_loop_detection(messages, total_cost_usd, events) {
+            if let Some(aborted) =
+                self.check_loop_detection(messages, &mut loop_steered, total_cost_usd, events)
+            {
                 return aborted;
             }
             if let Some(aborted) = check_budget(budget, total_cost_usd, events) {
@@ -642,27 +648,51 @@ impl<'a> Engine<'a> {
     }
 
     /// Loop detection, before spending a model call on a step that's
-    /// already stuck. `Some` is the turn's clean abort.
+    /// already stuck. Progress-aware: each call is paired with the output
+    /// it produced ([`recent_call_records`]), so only repeats and cycles
+    /// with byte-identical outputs count — legitimate polling (identical
+    /// input, changing output) never trips it (`crate::loop_detect`).
+    ///
+    /// Steer first, abort second: the FIRST detection of a turn injects a
+    /// warning through the same seam as user steering — a user-role
+    /// message the model answers this very step, plus its `Steered`
+    /// transcript event — and lets the turn continue. Only a detection
+    /// after that warning is the turn's clean abort (`Some`): the model
+    /// was told, kept looping anyway, and more steps would be pure waste.
     fn check_loop_detection(
         &self,
-        messages: &[CompletionMessage],
+        messages: &mut Vec<CompletionMessage>,
+        loop_steered: &mut bool,
         total_cost_usd: f64,
         events: &EventSender,
     ) -> Option<TurnOutcome> {
-        let recent_calls = recent_tool_calls(messages);
-        let verdict = detect_loop(&recent_calls, self.config.loop_detection);
+        let records = recent_call_records(messages);
+        let verdict = detect_loop(&records, self.config.loop_detection);
         if !verdict.is_loop() {
             return None;
         }
         let reason = verdict
             .evidence()
             .unwrap_or_else(|| "loop detected".to_string());
+        if !*loop_steered {
+            *loop_steered = true;
+            let text = format!(
+                "{LOOP_STEER_PREFIX}] you appear to be looping: {reason}. Repeating the \
+                 same call cannot produce new information — change strategy: vary the \
+                 arguments, try a different tool, or report what is blocking you. If you \
+                 keep looping, the turn will be aborted."
+            );
+            let _ = events.send(AgentEvent::Steered { text: text.clone() });
+            messages.push(CompletionMessage::user(text));
+            return None;
+        }
+        let reason = format!("stuck-loop detected (persisted after a steering warning): {reason}");
         let _ = events.send(AgentEvent::Error {
             message: reason.clone(),
             retryable: false,
         });
         Some(TurnOutcome::Aborted {
-            reason: format!("stuck-loop detected: {reason}"),
+            reason,
             cost_usd: total_cost_usd,
         })
     }
@@ -1380,33 +1410,71 @@ impl Drop for CancelUsageGuard {
 }
 
 /// Prefix of the overflow summarizer's marker message
-/// ([`Engine::summarize_overflow_span`]). Shared with [`recent_tool_calls`]:
-/// the marker is User-role on the wire, but it is NOT a real user turn and
-/// must not act as a loop-detection window boundary.
+/// ([`Engine::summarize_overflow_span`]). Shared with
+/// [`recent_call_records`]: the marker is User-role on the wire, but it is
+/// NOT a real user turn and must not act as a loop-detection window
+/// boundary.
 const SUMMARY_MARKER_PREFIX: &str = "[earlier history summarized";
 
-/// Flatten the tool calls of the CURRENT turn — assistant messages after
-/// the last user message — in chronological order, for
-/// `crate::loop_detect::detect_loop`. Windowing at the user boundary
-/// matters: identical calls across turns are the user re-asking a
+/// Prefix of the engine-injected stuck-loop steering message
+/// ([`Engine::check_loop_detection`]). User-role on the wire like every
+/// steer, but engine-generated, not a real user turn — treating it as a
+/// window boundary would erase the very evidence that triggered it, and
+/// the abort-on-re-detection would need a whole fresh threshold's worth of
+/// looping instead of one more no-progress call.
+const LOOP_STEER_PREFIX: &str = "[stuck-loop warning";
+
+/// Pair the tool calls of the CURRENT turn — assistant messages after the
+/// last user message — with the outputs they produced, in chronological
+/// order, for `crate::loop_detect::detect_loop`. Windowing at the user
+/// boundary matters: identical calls across turns are the user re-asking a
 /// question, not a stuck loop (a REPL session asking the same thing three
 /// times would otherwise trip the exact-repeat detector), and it keeps
 /// this per-step scan O(turn) instead of O(entire history). The overflow
-/// summary is also User-role but is not a real user turn — treating it as
-/// a boundary would truncate the loop window on every summarization pass
-/// and let a stuck loop outrun detection, so it is skipped when locating
-/// the boundary.
-fn recent_tool_calls(messages: &[CompletionMessage]) -> Vec<ToolCall> {
+/// summary and the stuck-loop warning are also User-role but are not real
+/// user turns — treating either as a boundary would truncate the loop
+/// window (on every summarization pass, or right when re-detection needs
+/// the evidence), so both are skipped when locating the boundary.
+///
+/// Results attach to the most recent still-unresolved call with a matching
+/// `call_id` — providers only guarantee ids unique within one step, and a
+/// scripted or misbehaving backend may reuse them across steps. A call
+/// whose result is missing keeps `output: None`, which the detector treats
+/// as unprovable progress, never loop evidence.
+fn recent_call_records(messages: &[CompletionMessage]) -> Vec<CallRecord> {
     let turn_start = messages
         .iter()
-        .rposition(|m| m.role == MessageRole::User && !m.content.starts_with(SUMMARY_MARKER_PREFIX))
+        .rposition(|m| {
+            m.role == MessageRole::User
+                && !m.content.starts_with(SUMMARY_MARKER_PREFIX)
+                && !m.content.starts_with(LOOP_STEER_PREFIX)
+        })
         .map(|i| i + 1)
         .unwrap_or(0);
-    messages[turn_start..]
-        .iter()
-        .filter(|m| m.role == MessageRole::Assistant)
-        .flat_map(|m| m.tool_calls.iter().cloned())
-        .collect()
+    let mut records: Vec<CallRecord> = Vec::new();
+    for message in &messages[turn_start..] {
+        match message.role {
+            MessageRole::Assistant => {
+                records.extend(message.tool_calls.iter().map(|call| CallRecord {
+                    call: call.clone(),
+                    output: None,
+                }));
+            }
+            MessageRole::Tool => {
+                for result in &message.tool_results {
+                    if let Some(record) = records
+                        .iter_mut()
+                        .rev()
+                        .find(|r| r.output.is_none() && r.call.call_id == result.call_id)
+                    {
+                        record.output = Some(result.output.clone());
+                    }
+                }
+            }
+            MessageRole::System | MessageRole::User => {}
+        }
+    }
+    records
 }
 
 /// The [`TurnOutcome::Aborted`] reason of a user-requested soft stop —

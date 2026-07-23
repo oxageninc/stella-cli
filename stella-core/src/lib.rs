@@ -52,7 +52,7 @@ pub use extensions::{
 };
 pub use goal::{GoalConfig, GoalJudgeVerdict, GoalOutcome};
 pub use hooks::{HookEvent, HookPayload, HookRunOutcome, HookRunner, Hooks, run_hooks};
-pub use loop_detect::{LoopDetectionConfig, LoopVerdict, detect_loop};
+pub use loop_detect::{CallRecord, LoopDetectionConfig, LoopVerdict, detect_loop};
 pub use mcp_usage::{McpUsageLedger, McpUsageRecord, drain_usage, push_usage};
 pub use ports::{Clock, ToolExecutor};
 pub use retry::{RetryOutcome, RetryPolicy, retry_with_backoff};

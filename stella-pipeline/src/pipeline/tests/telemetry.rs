@@ -42,9 +42,12 @@ fn repeated_tool_result(input_tokens: u64, output_tokens: u64) -> CompletionResu
 /// every landed call to the final authoritative cost.
 #[tokio::test]
 async fn aborted_pipeline_totals_match_every_management_and_execute_usage_record() {
+    // Three identical no-progress calls draw the engine's stuck-loop
+    // steering warning; the fourth (still identical) is what aborts.
     let provider = ScriptedProvider::new(vec![
         metered_result(text_result("multi"), 11, 1),
         metered_result(text_result(r#"["refactor the parser"]"#), 22, 2),
+        repeated_tool_result(33, 3),
         repeated_tool_result(33, 3),
         repeated_tool_result(33, 3),
         repeated_tool_result(33, 3),
@@ -105,8 +108,8 @@ async fn aborted_pipeline_totals_match_every_management_and_execute_usage_record
         .collect();
     assert_eq!(
         usages.len(),
-        5,
-        "triage + plan + three execute calls must all be machine-readable"
+        6,
+        "triage + plan + four execute calls must all be machine-readable"
     );
     let roles: Vec<ModelCallRole> = usages
         .iter()
@@ -120,6 +123,7 @@ async fn aborted_pipeline_totals_match_every_management_and_execute_usage_record
         [
             ModelCallRole::Triage,
             ModelCallRole::Plan,
+            ModelCallRole::Worker,
             ModelCallRole::Worker,
             ModelCallRole::Worker,
             ModelCallRole::Worker,
@@ -157,8 +161,8 @@ async fn aborted_pipeline_totals_match_every_management_and_execute_usage_record
             _ => unreachable!("filtered to StepUsage"),
         },
     );
-    assert_eq!((input_tokens, output_tokens), (132, 12));
-    assert!((usage_cost - 0.0005).abs() < 1e-12);
+    assert_eq!((input_tokens, output_tokens), (165, 15));
+    assert!((usage_cost - 0.0006).abs() < 1e-12);
     assert!((outcome.total_cost_usd - usage_cost).abs() < 1e-12);
     assert!((budget.spent_usd() - usage_cost).abs() < 1e-12);
 }

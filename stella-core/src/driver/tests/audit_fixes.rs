@@ -178,10 +178,12 @@ async fn whitespace_only_completion_aborts_without_a_text_event() {
     );
 }
 
-/// F7: the overflow summary rides a User-role message, but it is not a real
-/// user turn — the loop-detection window must see straight through it.
+/// F7: the overflow summary and the stuck-loop warning both ride User-role
+/// messages, but neither is a real user turn — the loop-detection window
+/// must see straight through them, and every surviving call must arrive
+/// paired with the output it produced.
 #[test]
-fn summary_marker_is_not_a_loop_window_boundary() {
+fn engine_injected_user_messages_are_not_loop_window_boundaries() {
     let assistant_with_call = |call_id: &str| CompletionMessage {
         role: MessageRole::Assistant,
         content: String::new(),
@@ -205,32 +207,57 @@ fn summary_marker_is_not_a_loop_window_boundary() {
         }],
         attachments: Vec::new(),
     };
+    let history = |middle: CompletionMessage| {
+        vec![
+            CompletionMessage::user("task"),
+            assistant_with_call("c1"),
+            tool_result_msg("c1"),
+            middle,
+            assistant_with_call("c2"),
+            tool_result_msg("c2"),
+        ]
+    };
+
     let summary = CompletionMessage::user(format!(
         "{SUMMARY_MARKER_PREFIX} to fit context — full detail was compacted away; \
          re-read files or re-run tools for specifics]\n\nSUMMARY"
     ));
-
-    let with_summary = vec![
-        CompletionMessage::user("task"),
-        assistant_with_call("c1"),
-        tool_result_msg("c1"),
-        summary,
-        assistant_with_call("c2"),
-        tool_result_msg("c2"),
-    ];
-    let calls = recent_tool_calls(&with_summary);
+    let records = recent_call_records(&history(summary));
     assert_eq!(
-        calls.iter().map(|c| c.call_id.as_str()).collect::<Vec<_>>(),
+        records
+            .iter()
+            .map(|r| r.call.call_id.as_str())
+            .collect::<Vec<_>>(),
         vec!["c1", "c2"],
         "a summarization pass must not truncate the loop window"
     );
+    // The detector can only prove no-progress from outputs, so the window
+    // must carry each call's result, not bare calls.
+    assert!(
+        records.iter().all(|r| r.output
+            == Some(ToolOutput::Ok {
+                content: "ok".into()
+            })),
+        "records must pair each call with its result: {records:?}"
+    );
+
+    let steer = CompletionMessage::user(format!(
+        "{LOOP_STEER_PREFIX}] you appear to be looping: change strategy."
+    ));
+    let records = recent_call_records(&history(steer));
+    assert_eq!(
+        records.len(),
+        2,
+        "the stuck-loop warning must not truncate the loop window"
+    );
 
     // A REAL user message (a steer, a REPL turn) still resets the window.
-    let mut with_real_user = with_summary;
-    with_real_user[3] = CompletionMessage::user("also check the tests");
-    let calls = recent_tool_calls(&with_real_user);
+    let records = recent_call_records(&history(CompletionMessage::user("also check the tests")));
     assert_eq!(
-        calls.iter().map(|c| c.call_id.as_str()).collect::<Vec<_>>(),
+        records
+            .iter()
+            .map(|r| r.call.call_id.as_str())
+            .collect::<Vec<_>>(),
         vec!["c2"],
         "a genuine user turn is still a window boundary"
     );
