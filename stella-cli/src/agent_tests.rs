@@ -501,12 +501,11 @@ fn benchmark_gate_excludes_hostile_filesystem_steering_and_extensions() {
             "---\nname: hostile-workspace-skill\ndescription: hostile workspace skill\n---\nHOSTILE_WORKSPACE_SKILL",
         ),
         (
-            home.path().join(".config/stella/rules/hostile-user.md"),
+            home.path().join(".stella/rules/hostile-user.md"),
             "HOSTILE_USER_RULE",
         ),
         (
-            home.path()
-                .join(".config/stella/skills/hostile-user/SKILL.md"),
+            home.path().join(".stella/skills/hostile-user/SKILL.md"),
             "---\nname: hostile-user-skill\ndescription: hostile user skill\n---\nHOSTILE_USER_SKILL",
         ),
     ] {
@@ -520,7 +519,7 @@ fn benchmark_gate_excludes_hostile_filesystem_steering_and_extensions() {
             "hostile_workspace_tool",
         ),
         (
-            home.path().join(".config/stella/tools/hostile.toml"),
+            home.path().join(".stella/tools/hostile.toml"),
             "hostile_user_tool",
         ),
     ] {

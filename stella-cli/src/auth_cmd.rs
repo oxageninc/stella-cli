@@ -1,5 +1,5 @@
 //! `stella auth` — manage BYOK provider keys stored in
-//! `~/.config/stella/credentials.toml`. A small, flat store for a handful of
+//! `~/.stella/credentials.toml`. A small, flat store for a handful of
 //! keys, not a config language (`CredentialsFile`'s own doc intent) —
 //! `set`/`remove`/`list` is the whole surface. Every command here masks the
 //! secret value in its own output; the only place a plaintext key is ever
@@ -8,7 +8,7 @@
 //! Every subcommand splits into a pure core (operates on an already-loaded
 //! `&mut CredentialsFile`, returns the lines to print — never touches the
 //! real filesystem) and a thin `run_*` wrapper that loads/saves the real
-//! `~/.config/stella/credentials.toml`. This is what lets the core be unit
+//! `~/.stella/credentials.toml`. This is what lets the core be unit
 //! tested against a temp-path `CredentialsFile` instead of ever touching a
 //! developer's actual credentials file.
 
@@ -34,7 +34,7 @@ pub fn run(cmd: &crate::AuthCmd) -> Result<(), String> {
 fn credentials_path_display() -> String {
     CredentialsFile::default_path()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "~/.config/stella/credentials.toml".to_string())
+        .unwrap_or_else(|| "~/.stella/credentials.toml".to_string())
 }
 
 fn load_file() -> Result<CredentialsFile, String> {

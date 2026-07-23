@@ -15,7 +15,7 @@
 //! Directory conventions mirror the skills engine:
 //! `<workspace>/.stella/commands/` and `<workspace>/.stella/agents/`
 //! (workspace scope, wins on name collisions) and the user-global
-//! `~/.config/stella/{commands,agents}/`. Files are flat `<slug>.md`; the
+//! `~/.stella/{commands,agents}/`. Files are flat `<slug>.md`; the
 //! frontmatter `name:` overrides the filename stem.
 //!
 //! # Adoption from other agents' directories (the sync plan)

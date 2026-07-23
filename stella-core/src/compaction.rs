@@ -176,9 +176,10 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
                 let Some(key) = invocation.get(result.call_id.as_str()) else {
                     continue;
                 };
-                // Errors stay: a superseding success makes the old error
-                // history, but errors are small + diagnostic (same posture
-                // as eviction below).
+                // Supersession only restubs Ok results. A superseded error is
+                // left to aging/eviction below, which reclaim it by size
+                // rather than by staleness — a still-small diagnostic survives
+                // whole, only a large one is truncated head+tail.
                 let ToolOutput::Ok { content } = &result.output else {
                     continue;
                 };
@@ -211,11 +212,20 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
             }
             let before = estimate_message_tokens(message);
             for result in &mut message.tool_results {
-                if let ToolOutput::Ok { content } = &result.output
-                    && content.len() > AGE_THRESHOLD_CHARS
-                {
-                    result.output = ToolOutput::Ok {
-                        content: age_content(content),
+                let (payload, is_error) = match &result.output {
+                    ToolOutput::Ok { content } => (content, false),
+                    ToolOutput::Error { message } => (message, true),
+                };
+                if payload.len() > AGE_THRESHOLD_CHARS {
+                    let aged_payload = age_content(payload);
+                    result.output = if is_error {
+                        ToolOutput::Error {
+                            message: aged_payload,
+                        }
+                    } else {
+                        ToolOutput::Ok {
+                            content: aged_payload,
+                        }
                     };
                     aged += 1;
                 }
@@ -243,13 +253,19 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
             }
             let before = estimate_message_tokens(message);
             for result in &mut message.tool_results {
-                let is_large = match &result.output {
-                    ToolOutput::Ok { content } => content.len() > 400,
-                    ToolOutput::Error { .. } => false, // errors are small + diagnostic
+                let (payload_len, is_error) = match &result.output {
+                    ToolOutput::Ok { content } => (content.len(), false),
+                    ToolOutput::Error { message } => (message.len(), true),
                 };
-                if is_large {
-                    result.output = ToolOutput::Ok {
-                        content: EVICTION_STUB.to_string(),
+                if payload_len > 400 {
+                    result.output = if is_error {
+                        ToolOutput::Error {
+                            message: EVICTION_STUB.to_string(),
+                        }
+                    } else {
+                        ToolOutput::Ok {
+                            content: EVICTION_STUB.to_string(),
+                        }
                     };
                     evicted += 1;
                 }
@@ -290,6 +306,19 @@ mod tests {
             tool_results: vec![ToolResult {
                 call_id: call_id.into(),
                 output: ToolOutput::Ok { content },
+            }],
+            attachments: Vec::new(),
+        }
+    }
+
+    fn tool_error_msg(call_id: &str, message: String) -> CompletionMessage {
+        CompletionMessage {
+            role: MessageRole::Tool,
+            content: String::new(),
+            tool_calls: vec![],
+            tool_results: vec![ToolResult {
+                call_id: call_id.into(),
+                output: ToolOutput::Error { message },
             }],
             attachments: Vec::new(),
         }
@@ -502,31 +531,116 @@ mod tests {
     }
 
     #[test]
-    fn error_outputs_are_never_evicted() {
+    fn small_error_output_is_left_intact() {
+        // A small error is pure diagnostic and below every size floor: it
+        // must survive compaction whole even as large neighbors are reclaimed.
         let mut messages = vec![
             CompletionMessage::system("sys"),
             assistant_with_call("c1"),
-            CompletionMessage {
-                role: MessageRole::Tool,
-                content: String::new(),
-                tool_calls: vec![],
-                tool_results: vec![ToolResult {
-                    call_id: "c1".into(),
-                    output: ToolOutput::Error {
-                        message: "diagnostic that matters".into(),
-                    },
-                }],
-                attachments: Vec::new(),
-            },
+            tool_error_msg("c1", "diagnostic that matters".into()),
             assistant_with_call("c2"),
             tool_msg("c2", "filler ".repeat(2000)),
+            assistant_with_call("c3"),
+            tool_msg("c3", "recent ".repeat(10)),
         ];
-        compact(&mut messages, 100);
+        compact(&mut messages, 200);
         match &messages[2].tool_results[0].output {
             ToolOutput::Error { message } => {
                 assert_eq!(message, "diagnostic that matters")
             }
-            _ => panic!("error diagnostics must survive compaction"),
+            _ => panic!("small error diagnostics must survive compaction"),
+        }
+    }
+
+    #[test]
+    fn aging_shrinks_old_error_outputs_keeping_head_and_tail_before_eviction() {
+        // A large error is truncated middle-out like a large Ok output: the
+        // head (framing) and tail (the failure lines) survive where whole
+        // eviction would lose them.
+        let body = format!("HEADLINE\n{}\nTAILLINE", "filler ".repeat(6000));
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            assistant_with_call("c1"),
+            tool_error_msg("c1", body),
+            assistant_with_call("c2"),
+            tool_msg("c2", "recent ".repeat(50)),
+        ];
+        let report = compact(&mut messages, 2_000).expect("should compact");
+        assert!(report.aged >= 1, "{report:?}");
+        assert_eq!(report.evicted, 0, "aging must run before eviction");
+        match &messages[2].tool_results[0].output {
+            ToolOutput::Error { message } => {
+                assert!(message.starts_with("HEADLINE"), "head lost: {message:.40}");
+                assert!(message.ends_with("TAILLINE"), "tail lost");
+                assert!(message.contains("middle elided"));
+                assert!(message.len() < 2_000, "aged error still huge");
+            }
+            _ => panic!("expected aged error content"),
+        }
+    }
+
+    #[test]
+    fn large_error_output_is_evicted_like_large_ok() {
+        // Between the aging threshold and the eviction size floor, so aging
+        // can't touch it and eviction is what reclaims it — mirroring Ok.
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            assistant_with_call("c1"),
+            tool_error_msg("c1", "boom ".repeat(300)),
+            assistant_with_call("c2"),
+            tool_msg("c2", "recent ".repeat(50)),
+        ];
+        let report = compact(&mut messages, 200).expect("should compact");
+        assert!(report.evicted >= 1, "{report:?}");
+        match &messages[2].tool_results[0].output {
+            ToolOutput::Error { message } => assert!(message.contains("evicted")),
+            _ => panic!("expected an eviction stub that keeps the error variant"),
+        }
+    }
+
+    #[test]
+    fn red_loop_of_large_errors_is_reclaimable() {
+        // The bug: a red loop of repeated ~100 KB failures accumulated context
+        // no pure compaction pass could reclaim. Now every large error but the
+        // most recent is reclaimable, so the conversation fits budget again.
+        let big_err = |n: usize| format!("failure {n}\n{}", "E".repeat(100_000));
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            assistant_with_call("c1"),
+            tool_error_msg("c1", big_err(1)),
+            assistant_with_call("c2"),
+            tool_error_msg("c2", big_err(2)),
+            assistant_with_call("c3"),
+            tool_error_msg("c3", big_err(3)),
+            assistant_with_call("c4"),
+            tool_error_msg("c4", big_err(4)),
+        ];
+        let before = estimate_conversation_tokens(&messages);
+        let budget = 35_000;
+        let report = compact(&mut messages, budget).expect("should compact");
+        assert!(
+            report.aged >= 3,
+            "older failures must be reclaimed: {report:?}"
+        );
+        let after = estimate_conversation_tokens(&messages);
+        assert!(after < before, "compaction must reclaim tokens");
+        assert!(
+            after <= budget,
+            "still over budget after compaction: {after}"
+        );
+        // The most recent failure — the one the agent is acting on — survives.
+        match &messages[8].tool_results[0].output {
+            ToolOutput::Error { message } => {
+                assert!(
+                    message.starts_with("failure 4"),
+                    "latest error must survive whole"
+                );
+                assert!(
+                    message.len() > 100_000,
+                    "latest error must not be truncated"
+                );
+            }
+            _ => panic!("most recent error must survive intact"),
         }
     }
 }

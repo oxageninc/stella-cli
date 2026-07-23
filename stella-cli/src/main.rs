@@ -56,6 +56,7 @@ mod skill_manager;
 mod stats;
 mod subsession;
 mod tui;
+mod usage_cmd;
 
 /// Serializes tests that mutate process environment variables. `setenv` /
 /// `getenv` from concurrent threads is documented UB on POSIX, and the test
@@ -134,7 +135,7 @@ struct GlobalArgs {
     /// API key for the selected provider, highest-precedence step of the
     /// credential chain (CLI flag -> env var -> credentials file ->
     /// interactive prompt). Prefer an env var or
-    /// ~/.config/stella/credentials.toml for anything long-lived — a flag
+    /// ~/.stella/credentials.toml for anything long-lived — a flag
     /// value is visible in shell history and `ps`.
     #[arg(long, global = true)]
     api_key: Option<String>,
@@ -249,7 +250,7 @@ enum Command {
         /// collisions with built-ins and other manifests, then exit
         /// non-zero if any manifest has errors. Pass a directory to check
         /// (defaults to the dirs discovery scans: .stella/tools/ and
-        /// ~/.config/stella/tools/).
+        /// ~/.stella/tools/).
         #[arg(long, value_name = "DIR")]
         validate: Option<Option<std::path::PathBuf>>,
     },
@@ -345,6 +346,20 @@ enum Command {
         provider: Option<String>,
     },
 
+    /// Cross-project telemetry hub (~/.stella/usage.db): global report,
+    /// cursor-based sync, backfill across every known project
+    Usage {
+        #[command(subcommand)]
+        cmd: Option<usage_cmd::UsageCmd>,
+    },
+
+    /// Cloud account registration (stub): org / workspace identity that
+    /// scopes replicated telemetry; OAuth login attaches here later
+    Cloud {
+        #[command(subcommand)]
+        cmd: usage_cmd::CloudCmd,
+    },
+
     /// Inspect or explicitly flush the managed enterprise operational spool.
     /// Disabled by default; requires a signed org-managed enrollment.
     Telemetry {
@@ -388,7 +403,7 @@ enum Command {
     /// Connect an issue tracker (GitHub/Linear) via OAuth or a pasted key —
     /// enables the issue tools (search_issues, create_issue, list_labels, …)
     /// and the deck's Issues tab. Credentials land owner-only in
-    /// ~/.config/stella/integrations.json; needs no model API key.
+    /// ~/.stella/integrations.json; needs no model API key.
     Connect {
         #[command(subcommand)]
         cmd: ConnectCmd,
@@ -398,7 +413,7 @@ enum Command {
     Config,
 
     /// Manage BYOK provider keys stored in
-    /// ~/.config/stella/credentials.toml (set/remove/list) — keys resolved
+    /// ~/.stella/credentials.toml (set/remove/list) — keys resolved
     /// via an env var or settings.json still take precedence per the normal
     /// chain; `stella models`/`stella config` show which source actually
     /// wins. Never prints a secret value; needs no model API key itself.
@@ -421,7 +436,7 @@ enum TelemetryCmd {
     RolloverDiscard,
 }
 
-/// `stella auth` subcommands — the whole `~/.config/stella/credentials.toml`
+/// `stella auth` subcommands — the whole `~/.stella/credentials.toml`
 /// management surface. Deliberately small: a handful of BYOK keys, not a
 /// config language (mirrors `CredentialsFile`'s own doc intent).
 #[derive(Subcommand)]
@@ -1058,6 +1073,11 @@ fn main() -> ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
+    // Everything user-global lives at ~/.stella; move data from the legacy
+    // split layout (platform data dir + ~/.config/stella) before any store,
+    // settings, or extension loader resolves a path.
+    stella_store::home::migrate_legacy_global_dirs();
+
     // A trusted benchmark launcher may provide the selected provider key on
     // an inherited anonymous FD. Consume and close it before project env-file
     // loading, clap, a runtime, or any model/repository-controlled process.
@@ -1154,6 +1174,13 @@ fn run(cli: Cli, loaded_env: &env_files::Loaded) -> Result<(), String> {
             // it is `Copy`, so deref rather than move.
             return stats::run_stats(*format, provider.as_deref());
         }
+        Some(Command::Usage { cmd }) => {
+            // Hub-only reads/writes — no provider, no API keys.
+            return usage_cmd::run_usage(cmd.clone());
+        }
+        Some(Command::Cloud { cmd }) => {
+            return usage_cmd::run_cloud(cmd.clone());
+        }
         Some(Command::Telemetry { cmd }) => {
             // Managed operational export is independent of model/provider
             // configuration. Community/default status constructs no client.
@@ -1189,7 +1216,7 @@ fn run(cli: Cli, loaded_env: &env_files::Loaded) -> Result<(), String> {
             return connect_cmd::run(cmd);
         }
         Some(Command::Auth { cmd }) => {
-            // Reads/writes ~/.config/stella/credentials.toml directly — no
+            // Reads/writes ~/.stella/credentials.toml directly — no
             // provider needs to already resolve (this is often how the
             // FIRST key gets configured), so this short-circuits before
             // `Config::load` like `Connect`/`Mcp` do.
@@ -1354,6 +1381,8 @@ fn run(cli: Cli, loaded_env: &env_files::Loaded) -> Result<(), String> {
         | Command::Scripts { .. }
         | Command::Storage { .. }
         | Command::Stats { .. }
+        | Command::Usage { .. }
+        | Command::Cloud { .. }
         | Command::Telemetry { .. }
         | Command::Memory { .. }
         | Command::Mcp { .. }

@@ -3,7 +3,7 @@
 //!
 //!
 //! Resolution order: CLI flag -> env var ->
-//! provider-native config (`~/.config/stella/credentials.toml` here; the AWS
+//! provider-native config (`~/.stella/credentials.toml` here; the AWS
 //! profile file and Google ADC file remain deferred — the Bedrock/Vertex
 //! adapters take ready credentials from env vars for now, see their module
 //! docs) -> interactive prompt on first use, which never silently fails
@@ -20,7 +20,7 @@ use thiserror::Error;
 pub enum CredentialError {
     #[error(
         "no credential found for `{env_var}` — set the environment variable, add it to \
-         ~/.config/stella/credentials.toml, or run interactively to be prompted"
+         ~/.stella/credentials.toml, or run interactively to be prompted"
     )]
     NotFound { env_var: String },
     #[error("credential for `{env_var}` is empty")]
@@ -179,7 +179,7 @@ impl fmt::Debug for ApiKey {
 fn prompt_for_key(provider_id: &str, env_var: &str) -> Result<String, CredentialError> {
     let value = rpassword::prompt_password(format!(
         "No {env_var} found for `{provider_id}`. Enter it now (saved to \
-         ~/.config/stella/credentials.toml for next time; input hidden): "
+         ~/.stella/credentials.toml for next time; input hidden): "
     ))
     .map_err(|e| CredentialError::PromptFailed(e.to_string()))?;
     let trimmed = value.trim();
@@ -191,7 +191,7 @@ fn prompt_for_key(provider_id: &str, env_var: &str) -> Result<String, Credential
     Ok(trimmed.to_string())
 }
 
-/// `~/.config/stella/credentials.toml` — optional provider keys for users
+/// `~/.stella/credentials.toml` — optional provider keys for users
 /// who prefer file storage over env vars. Written
 /// with `0600` permissions on Unix (owner read/write only) since it holds
 /// secrets in plaintext, same threat model as `~/.ssh/config`.
@@ -211,13 +211,13 @@ pub struct CredentialsFile {
 }
 
 impl CredentialsFile {
-    /// The default path: `~/.config/stella/credentials.toml`. Returns `None`
+    /// The default path: `~/.stella/credentials.toml`. Returns `None`
     /// if the platform has no resolvable home directory (never panics —
     /// callers treat "no credentials file available" as just another
     /// resolution step that falls through).
     pub fn default_path() -> Option<PathBuf> {
         let home = std::env::var_os("HOME").map(PathBuf::from)?;
-        Some(home.join(".config").join("stella").join("credentials.toml"))
+        Some(home.join(".stella").join("credentials.toml"))
     }
 
     /// Load from `path`. A missing file is not an error — it's the common

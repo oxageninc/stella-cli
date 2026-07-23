@@ -30,7 +30,7 @@
 //!
 //! Any `guard-*` key makes the rule Tier 2 (hard-enforced); none keeps it
 //! Tier 1 (prompt-only). Rule files live in `.stella/rules/*.md` (also
-//! `.claude/rules/` and `~/.config/stella/rules/`) — the format promoted
+//! `.claude/rules/` and `~/.stella/rules/`) — the format promoted
 //! rules are written in. The SAME markdown, as one string, is what
 //! extension providers publish through `stella_store::Store::upsert_rule`.
 
@@ -161,8 +161,8 @@ pub(crate) fn load_workspace_rules(
     if crate::settings::filesystem_settings_disabled() {
         return ResolvedRules::default();
     }
-    let user_rules_dir = crate::settings::user_home_dir()
-        .map(|home| home.join(".config").join("stella").join("rules"));
+    let user_rules_dir =
+        crate::settings::user_home_dir().map(|home| home.join(".stella").join("rules"));
     ResolvedRules(
         load_rules_from_with_authority(
             workspace_root,

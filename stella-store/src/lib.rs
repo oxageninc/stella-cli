@@ -114,6 +114,8 @@ pub mod cache_gaps;
 pub mod cache_trend;
 pub mod catalog;
 pub mod enterprise_telemetry;
+pub mod home;
+pub mod identity;
 pub mod journal;
 pub mod notify;
 pub mod sessions;
@@ -146,7 +148,7 @@ pub(crate) use private::{
 pub use receipts::{ContextBlockRow, ManifestBlockRow, StepManifestRow};
 pub use reconstruct::Reconstruction;
 pub use sessions::{SessionRecord, SessionRegistry, SessionStatus};
-pub use telemetry::TelemetryRow;
+pub use telemetry::{SourceTelemetryRow, TelemetryRow};
 
 /// FNV-1a/64 hex — a stable, dependency-free digest for prompt hashes and
 /// tool-arg fingerprints (loop detection, not security). Also the
@@ -1251,6 +1253,10 @@ impl Store {
         workspace_root: &Path,
         usage: &usage::UsageStore,
     ) -> Result<bool> {
+        // Full-fidelity telemetry replication first, independent of the
+        // rollup: cursor-based, so rows a failed earlier sync stranded are
+        // healed by this turn. Best-effort — the rollup below still runs.
+        let _ = self.replicate_telemetry_to_usage(usage, workspace_root);
         match self.execution_rollup(execution_id, workspace_root)? {
             Some(rollup) if rollup.usage_complete => {
                 usage.sync_execution(&rollup)?;
@@ -1258,6 +1264,35 @@ impl Store {
             }
             Some(_) | None => Ok(false),
         }
+    }
+
+    /// Replicate every telemetry row above the hub's cursor for this
+    /// workspace into `usage`, in batches, advancing the cursor per batch.
+    /// Returns the number of rows shipped. Identity scoping (`org_id`,
+    /// `workspace_id`, `repo_id`) is resolved here — `None` org/workspace
+    /// until this installation/workspace is registered to a cloud account.
+    pub fn replicate_telemetry_to_usage(
+        &self,
+        usage: &usage::UsageStore,
+        workspace_root: &Path,
+    ) -> Result<u64> {
+        const BATCH: usize = 500;
+        let scope = identity::TelemetryScope::resolve(workspace_root);
+        let mut total: u64 = 0;
+        loop {
+            let cursor = usage.telemetry_cursor(&scope.project_id)?;
+            let rows = self.telemetry_rows_after(cursor, BATCH)?;
+            if rows.is_empty() {
+                break;
+            }
+            let shipped = rows.len();
+            usage.replicate_telemetry(&scope, &rows)?;
+            total += shipped as u64;
+            if shipped < BATCH {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     /// Mirror one task-board snapshot into `tasks`: every item is upserted

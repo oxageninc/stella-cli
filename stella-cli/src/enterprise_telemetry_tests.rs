@@ -1230,6 +1230,7 @@ fn finalization_stays_successful_when_telemetry_host_state_is_rejected() {
         &store,
         id,
         &registry,
+        0,
         "completed",
         0.01,
         true,

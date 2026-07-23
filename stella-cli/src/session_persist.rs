@@ -222,6 +222,45 @@ impl SessionSink {
     }
 }
 
+/// The boxed panic-hook type `std::panic::take_hook` hands back.
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+/// Installs a layered panic hook that flushes the session journal before an
+/// abort-build panic kills the process, and puts the previous hook back on
+/// drop — the journal's only flush point on that path, since under
+/// `[profile.release] panic = "abort"` neither `catch_unwind` nor any `Drop`
+/// runs (stella-tui's own hook restores the terminal the same way). In
+/// unwind builds the sync is skipped: panics there are either caught (panel
+/// draws, worker bodies) or unwind into the orderly teardown that already
+/// syncs. Best-effort by the store's contract — `try_lock`, because the
+/// panicking process must never deadlock on a sink another thread holds.
+pub struct JournalPanicGuard {
+    prev: Arc<PanicHook>,
+}
+
+impl JournalPanicGuard {
+    pub fn install(sink: SharedSink) -> Self {
+        let prev: Arc<PanicHook> = Arc::new(std::panic::take_hook());
+        let delegate = Arc::clone(&prev);
+        std::panic::set_hook(Box::new(move |info| {
+            if cfg!(panic = "abort")
+                && let Ok(mut sink) = sink.try_lock()
+            {
+                sink.sync();
+            }
+            (*delegate)(info);
+        }));
+        Self { prev }
+    }
+}
+
+impl Drop for JournalPanicGuard {
+    fn drop(&mut self) {
+        let prev = Arc::clone(&self.prev);
+        std::panic::set_hook(Box::new(move |info| (*prev)(info)));
+    }
+}
+
 /// Sit between the driver's send side and the deck's receive side: mirror
 /// every fold-relevant envelope into the session journal, then forward it
 /// untouched. One interception point — every producer (the driver loop, the

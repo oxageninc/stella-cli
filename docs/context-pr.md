@@ -73,7 +73,7 @@ shipped today and is the surface a Context PR changes:
   `key: value` frontmatter between `---` fences, then the rule statement as
   the body. Parsed by `stella_core::rules::rule_from_file`.
 - **Locations and precedence.** `.stella/rules/*.md` (repository), plus
-  `.claude/rules/` (compatibility) and `~/.config/stella/rules/` (personal).
+  `.claude/rules/` (compatibility) and `~/.stella/rules/` (personal).
   Directory walking and store reads live in `stella-cli/src/rules.rs`; all
   rule semantics — frontmatter parsing, precedence merging, rendering,
   guard evaluation — live in `stella-core::rules` (pure, no I/O).

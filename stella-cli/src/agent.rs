@@ -174,6 +174,7 @@ async fn run_pipeline_one_shot(
     // and can replay its journal after it ends.
     let mut presence = SessionPresence::announce(cfg, prompt);
     let execution = begin_execution(&store, "pipeline", prompt, cfg, Some(presence.id()));
+    let files_before = registry.files_touched().len();
 
     let (raw_tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (tx, durable_pre_persisted) = event_sender_for_run(raw_tx, format);
@@ -410,6 +411,7 @@ async fn run_pipeline_one_shot(
             store,
             *id,
             &registry,
+            files_before,
             outcome_label,
             cost + reflection_report.cost_usd,
             persistence_complete,
@@ -1516,7 +1518,7 @@ pub fn run_tools_listing() -> Result<(), String> {
     );
     println!(
         "\n  {}",
-        "custom (.stella/tools/, ~/.config/stella/tools/):".dimmed()
+        "custom (.stella/tools/, ~/.stella/tools/):".dimmed()
     );
     if report.tools.is_empty() {
         println!(
@@ -1567,7 +1569,7 @@ pub fn run_tools_validation(dir: Option<&std::path::Path>) -> Result<(), String>
             if !dir.is_dir() {
                 return Err(format!(
                     "`{}` is not a directory — pass a directory of *.toml manifests, or omit \
-                     the value to check .stella/tools/ and ~/.config/stella/tools/",
+                     the value to check .stella/tools/ and ~/.stella/tools/",
                     dir.display()
                 ));
             }
@@ -1578,7 +1580,7 @@ pub fn run_tools_validation(dir: Option<&std::path::Path>) -> Result<(), String>
             println!(
                 "  {} {}",
                 "checking:".dimmed(),
-                ".stella/tools/, ~/.config/stella/tools/".dimmed()
+                ".stella/tools/, ~/.stella/tools/".dimmed()
             );
             validate::validate_default(&workspace_root)
         }
@@ -1865,6 +1867,7 @@ async fn run_turn(
     budget.begin_turn();
     let turn_start = Instant::now();
     let execution = begin_execution(store, kind, prompt, cfg, session);
+    let files_before = registry.files_touched().len();
 
     let (raw_tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (tx, durable_pre_persisted) = event_sender_for_run(raw_tx, format);
@@ -1935,6 +1938,7 @@ async fn run_turn(
             store,
             *id,
             registry,
+            files_before,
             outcome_label,
             cost,
             persistence_complete,
@@ -2017,7 +2021,7 @@ fn print_help() {
         "/files".bright_magenta()
     );
     println!(
-        "  {}      List custom agents (⚡ from .stella/agents or ~/.config/stella/agents)",
+        "  {}      List custom agents (⚡ from .stella/agents or ~/.stella/agents)",
         "/agents".bright_magenta()
     );
     println!(

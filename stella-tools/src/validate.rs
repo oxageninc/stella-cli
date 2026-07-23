@@ -109,7 +109,7 @@ impl ValidationReport {
 }
 
 /// Validate the default discovery locations for `workspace_root`: the
-/// workspace `.stella/tools/` then the user-global `~/.config/stella/tools/`
+/// workspace `.stella/tools/` then the user-global `~/.stella/tools/`
 /// (read from `$HOME`), exactly the directories and order
 /// [`crate::custom::discover`] scans — so duplicate-name findings mirror the
 /// real workspace-wins shadowing. Thin env-reading wrapper over
@@ -125,7 +125,7 @@ pub fn validate_default(workspace_root: &Path) -> ValidationReport {
 pub fn validate_default_in(workspace_root: &Path, home: Option<&Path>) -> ValidationReport {
     let mut dirs: Vec<PathBuf> = vec![workspace_root.join(".stella").join("tools")];
     if let Some(home) = home {
-        dirs.push(home.join(".config").join("stella").join("tools"));
+        dirs.push(home.join(".stella").join("tools"));
     }
     validate_dirs(&dirs, workspace_root)
 }
@@ -357,7 +357,7 @@ mod tests {
     }
 
     fn global_tools(home: &Path) -> PathBuf {
-        home.join(".config").join("stella").join("tools")
+        home.join(".stella").join("tools")
     }
 
     /// Drop an executable script at `root/name` so command[0] checks pass.

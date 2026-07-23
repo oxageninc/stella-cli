@@ -698,10 +698,13 @@ fn finalize_fleet_execution(
     let Some((store, execution_id)) = execution else {
         return false;
     };
+    // A fleet worker owns a fresh registry and runs exactly one execution in
+    // it, so every touched path belongs to this execution: the watermark is 0.
     agent::record_execution_end(
         store,
         *execution_id,
         registry,
+        0,
         outcome_label,
         cost_usd,
         persistence_complete && !force_incomplete,

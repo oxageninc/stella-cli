@@ -4,7 +4,7 @@
 //! access token with `--token`); `connect linear` runs browser OAuth when a
 //! Linear app is configured (`STELLA_LINEAR_CLIENT_ID`/`_SECRET`), else
 //! stores a personal API key. Credentials land owner-only in
-//! `~/.config/stella/integrations.json` and are consumed by the issue tools
+//! `~/.stella/integrations.json` and are consumed by the issue tools
 //! (`search_issues`, `create_issue`, …), which register automatically in the
 //! next session once a connection exists.
 

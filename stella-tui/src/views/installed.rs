@@ -1,5 +1,5 @@
 //! The AGENTS tab's INSTALLED AGENTS pane: the agents configured on disk at
-//! the user (`~/.config/stella/agents`) and project (`.stella/agents`)
+//! the user (`~/.stella/agents`) and project (`.stella/agents`)
 //! levels — name, description, and toolbelt per row — plus the pane's modal
 //! sub-views (the definition editor, the create-from-prompt flow, and the
 //! version picker).
@@ -210,7 +210,7 @@ fn render_create_scope(panel: &InstalledPanel, area: Rect, buf: &mut Buffer) {
     }
     let options = [
         "project — .stella/agents (this workspace)",
-        "user — ~/.config/stella/agents (all projects)",
+        "user — ~/.stella/agents (all projects)",
     ];
     for (i, option) in options.iter().enumerate() {
         if (i as u16) >= inner.height {
@@ -421,6 +421,6 @@ mod tests {
         render(&mut ui, area, &mut buf);
         let text = buffer_text(&buf);
         assert!(text.contains(".stella/agents"), "{text}");
-        assert!(text.contains("~/.config/stella/agents"), "{text}");
+        assert!(text.contains("~/.stella/agents"), "{text}");
     }
 }

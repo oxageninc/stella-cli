@@ -10,7 +10,7 @@ fn user_settings_are_private_but_project_settings_modes_are_untouched() {
     let _env = crate::test_env::lock();
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    let user_dir = home.join(".config/stella");
+    let user_dir = home.join(".stella");
     std::fs::create_dir_all(&user_dir).unwrap();
     std::fs::set_permissions(&user_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
     let previous_home = std::env::var_os("HOME");
@@ -55,7 +55,7 @@ fn user_settings_save_rejects_a_symlink_without_touching_target() {
     let _env = crate::test_env::lock();
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    let user_dir = home.join(".config/stella");
+    let user_dir = home.join(".stella");
     std::fs::create_dir_all(&user_dir).unwrap();
     let previous_home = std::env::var_os("HOME");
     // SAFETY: serialized behind the binary-wide environment lock.

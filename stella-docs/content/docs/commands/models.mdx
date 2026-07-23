@@ -17,7 +17,7 @@ stella models list [--provider <id>] [--all]
 
 `stella models` enumerates the built-in providers and reports, for each one, its display name, key status, default model, and base URL, followed by a status line for the local model catalog. Any custom providers you define in `settings.json` are listed too, under a separate **Config-defined providers** heading with their wire dialect. It is the quickest way to confirm which providers are ready to use before you pin one with `--model`.
 
-The **key status** reflects only whether the provider's environment variable (primary or an alias) is set, or a non-empty `api_key` is present in `settings.json`. A key stored only in `~/.config/stella/credentials.toml` (or supplied at the interactive prompt) resolves fine at run time but does not light up this column.
+The **key status** reflects only whether the provider's environment variable (primary or an alias) is set, or a non-empty `api_key` is present in `settings.json`. A key stored only in `~/.stella/credentials.toml` (or supplied at the interactive prompt) resolves fine at run time but does not light up this column.
 
 The same listing is available from inside an interactive session via the [`/models`](/docs/commands/chat) slash command.
 
@@ -50,7 +50,7 @@ stella models list --all
 | `--all` | Include providers with no configured credential (the listing is otherwise scoped to providers whose credential resolves). |
 
 <Callout type="info">
-Provider credentials are resolved through the credential chain: `--api-key` flag, then the provider env var (and aliases), then `settings.json`, then `~/.config/stella/credentials.toml`, and finally an interactive prompt on a TTY.
+Provider credentials are resolved through the credential chain: `--api-key` flag, then the provider env var (and aliases), then `settings.json`, then `~/.stella/credentials.toml`, and finally an interactive prompt on a TTY.
 </Callout>
 
 ## Flags

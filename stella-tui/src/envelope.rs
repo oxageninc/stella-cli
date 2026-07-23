@@ -470,7 +470,7 @@ pub enum SplashCue {
 pub enum AgentScope {
     /// The workspace's `.stella/agents/` directory.
     Project,
-    /// The user's `~/.config/stella/agents/` directory.
+    /// The user's `~/.stella/agents/` directory.
     User,
 }
 
@@ -656,7 +656,7 @@ pub enum WorkspaceInput {
     NotificationsReadAll,
     /// ENGINE overlay: persist the edited agent-engine configuration into
     /// `settings.json` at `scope` (project `.stella/settings.json` or the
-    /// user's `~/.config/stella/settings.json`). The driver writes the
+    /// user's `~/.stella/settings.json`). The driver writes the
     /// `agent_engine_config` object — preserving every other key in the
     /// file — and answers with a fresh [`Inbound::EngineConfig`] carrying
     /// the save outcome in `status`. Saved config applies to runs started
@@ -816,13 +816,13 @@ impl EngineConfigState {
 }
 
 /// Which scope a skill lives in / is installed to. The loader reads both
-/// (`<workspace>/.stella/skills` and `~/.config/stella/skills`); the SKILLS
+/// (`<workspace>/.stella/skills` and `~/.stella/skills`); the SKILLS
 /// tab asks this on install/create.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillScope {
     /// `<workspace>/.stella/skills` — travels with the repo.
     Project,
-    /// `~/.config/stella/skills` — the user-global directory.
+    /// `~/.stella/skills` — the user-global directory.
     User,
 }
 

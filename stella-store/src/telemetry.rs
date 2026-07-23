@@ -27,6 +27,18 @@ pub struct TelemetryRow {
     pub usage_complete: bool,
 }
 
+/// One source-store telemetry row addressed for hub replication: its stable
+/// `rowid` (the replication cursor), owning execution, and the execution's
+/// start time (the hub's day-bucketing timestamp — per-call telemetry rows
+/// carry no clock of their own).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceTelemetryRow {
+    pub source_rowid: i64,
+    pub execution_id: i64,
+    pub recorded_at: String,
+    pub telemetry: TelemetryRow,
+}
+
 impl Store {
     /// Record one uniquely identified model call's telemetry.
     pub fn record_telemetry(&self, execution_id: i64, row: &TelemetryRow) -> Result<()> {
@@ -68,6 +80,55 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Every telemetry row above the replication cursor, oldest first,
+    /// capped at `limit` — the batch feed for
+    /// [`Store::replicate_telemetry_to_usage`].
+    pub fn telemetry_rows_after(
+        &self,
+        after_rowid: i64,
+        limit: usize,
+    ) -> Result<Vec<SourceTelemetryRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT t.rowid, t.execution_id, COALESCE(e.started_at, ''), t.step, t.provider, \
+                    t.call_role, t.model, t.input_tokens, t.estimated_input_tokens, \
+                    t.output_tokens, t.cache_read_tokens, t.cache_miss_tokens, \
+                    t.cache_write_tokens, t.cost_usd, t.duration_ms, t.retries, t.tool_calls, \
+                    t.usage_complete \
+             FROM telemetry t LEFT JOIN executions e ON e.id = t.execution_id \
+             WHERE t.rowid > ?1 ORDER BY t.rowid ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after_rowid, limit as i64], |r| {
+            Ok(SourceTelemetryRow {
+                source_rowid: r.get(0)?,
+                execution_id: r.get(1)?,
+                recorded_at: r.get(2)?,
+                telemetry: TelemetryRow {
+                    step: r.get::<_, i64>(3)? as u64,
+                    provider: r.get(4)?,
+                    call_role: r.get(5)?,
+                    model: r.get(6)?,
+                    input_tokens: r.get::<_, i64>(7)? as u64,
+                    estimated_input_tokens: r.get::<_, i64>(8)? as u64,
+                    output_tokens: r.get::<_, i64>(9)? as u64,
+                    cache_read_tokens: r.get::<_, i64>(10)? as u64,
+                    cache_miss_tokens: r.get::<_, i64>(11)? as u64,
+                    cache_write_tokens: r.get::<_, i64>(12)? as u64,
+                    cost_usd: r.get(13)?,
+                    duration_ms: r.get::<_, i64>(14)? as u64,
+                    retries: r.get(15)?,
+                    tool_calls: r.get::<_, i64>(16)? as u64,
+                    usage_complete: r.get(17)?,
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Recent complete (estimated, actual) input-token pairs, oldest first.

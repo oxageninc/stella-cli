@@ -116,7 +116,7 @@ exit 0
 Blocking is **fail-closed** on `PreToolUse`: a hook that times out or fails to start at all also blocks the tool, with the failure message as the reason — a missing or broken guard script never silently waves a call through. (`PostToolUse` and `SessionStart` never block on either failure mode.)
 
 <Callout type="warn">
-**Project-scope hooks are a trust boundary.** Hooks declared in a repository's project-scope file (`<workspace>/.stella/settings.json`) do **not** load unless you set `STELLA_PROJECT_HOOKS=1` — otherwise the merged hook set is rebuilt from the user and org-managed scopes alone, and a stderr notice names what was skipped. This stops a cloned repo from running arbitrary commands on your machine. Hooks in the user scope (`~/.config/stella/settings.json`) always load.
+**Project-scope hooks are a trust boundary.** Hooks declared in a repository's project-scope file (`<workspace>/.stella/settings.json`) do **not** load unless you set `STELLA_PROJECT_HOOKS=1` — otherwise the merged hook set is rebuilt from the user and org-managed scopes alone, and a stderr notice names what was skipped. This stops a cloned repo from running arbitrary commands on your machine. Hooks in the user scope (`~/.stella/settings.json`) always load.
 </Callout>
 
 <Callout type="info">

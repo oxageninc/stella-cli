@@ -376,6 +376,24 @@ impl MediaOperationJournal for SqliteMediaOperationJournal {
     }
 }
 
+/// Attempts a losing first-open racer retries before giving up, and the
+/// pause between them. A concurrent first-open can momentarily expose the
+/// winner's freshly created WAL sidecars to the loser's security validation;
+/// retrying from scratch lets the loser re-run its preparation against the
+/// now-settled sidecars instead of failing closed on the transient overlap.
+const INIT_RETRY_ATTEMPTS: u32 = 40;
+const INIT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Marker embedded in the sidecar-injection defense's error message so a
+/// first-open race can be told apart from a genuine untrusted injection.
+const SIDECAR_APPEARED: &str = "appeared after secure preparation";
+
+/// Whether `error` is the benign first-open sidecar race (a concurrent
+/// initializer's WAL files appearing mid-preparation), not a real injection.
+fn is_sidecar_race(error: &MediaError) -> bool {
+    matches!(error, MediaError::Artifact(message) if message.contains(SIDECAR_APPEARED))
+}
+
 /// Runs the idempotent first-open statements, absorbing `SQLITE_BUSY`.
 ///
 /// Converting a fresh rollback-journal database into WAL needs an exclusive

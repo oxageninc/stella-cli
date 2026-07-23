@@ -330,7 +330,7 @@ pub fn rule_from_file(path: &str, raw: &str) -> Option<Rule> {
 pub struct LoadRulesOptions {
     /// Project root.
     pub cwd: String,
-    /// The user rules directory (normally `~/.config/stella/rules`).
+    /// The user rules directory (normally `~/.stella/rules`).
     pub user_rules_dir: String,
 }
 
@@ -995,7 +995,7 @@ mod tests {
     fn opts() -> LoadRulesOptions {
         LoadRulesOptions {
             cwd: "/proj".to_string(),
-            user_rules_dir: "/home/u/.config/stella/rules".to_string(),
+            user_rules_dir: "/home/u/.stella/rules".to_string(),
         }
     }
 

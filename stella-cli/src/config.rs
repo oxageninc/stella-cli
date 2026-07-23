@@ -1,7 +1,7 @@
 //! Configuration: provider/model resolution, BYOK credential lookup.
 //!
 //! Resolution order: CLI flag -> env var ->
-//! `~/.config/stella/credentials.toml` -> interactive prompt on first use.
+//! `~/.stella/credentials.toml` -> interactive prompt on first use.
 //! The full chain lives in `stella_model::credential::ApiKey::resolve`; this
 //! module's job is picking WHICH provider (from `--model`, or the first one
 //! with a resolvable credential) and then running that chain for it.
@@ -658,7 +658,7 @@ impl Config {
             CredentialsFile::empty()
         } else {
             CredentialsFile::load_default().map_err(|e| {
-                format!("~/.config/stella/credentials.toml exists but could not be read: {e}")
+                format!("~/.stella/credentials.toml exists but could not be read: {e}")
             })?
         };
 
@@ -882,7 +882,7 @@ impl Config {
         Err(format!(
             "no API key found. Set one of: {}\n\nExample: export ZAI_API_KEY=your_key_here\n\
              (or put it in a project .env / .env.local, add it to \
-             ~/.config/stella/credentials.toml, or pass --model provider/model to be prompted \
+             ~/.stella/credentials.toml, or pass --model provider/model to be prompted \
              interactively)",
             PROVIDERS
                 .iter()
@@ -928,7 +928,7 @@ impl Config {
             credentials_file.set(provider.id, key.reveal());
             if let Err(e) = credentials_file.save() {
                 eprintln!(
-                    "  {} could not save the credential to ~/.config/stella/credentials.toml \
+                    "  {} could not save the credential to ~/.stella/credentials.toml \
                      ({e}) — you'll be prompted again next time",
                     "warning:".yellow()
                 );
@@ -1007,16 +1007,14 @@ impl Config {
     /// The credentials file to check provider status against, degrading to
     /// an empty in-memory one (rather than aborting the whole listing) on a
     /// read/parse failure — the listing commands must still show the
-    /// built-ins even when `~/.config/stella/credentials.toml` is malformed.
+    /// built-ins even when `~/.stella/credentials.toml` is malformed.
     /// Returns the degradation warning line, if any, alongside the file.
     fn credentials_file_for_listing() -> (CredentialsFile, Option<String>) {
         match CredentialsFile::load_default() {
             Ok(f) => (f, None),
             Err(e) => (
                 CredentialsFile::empty(),
-                Some(format!(
-                    "~/.config/stella/credentials.toml could not be read: {e}"
-                )),
+                Some(format!("~/.stella/credentials.toml could not be read: {e}")),
             ),
         }
     }

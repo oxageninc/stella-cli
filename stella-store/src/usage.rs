@@ -1,6 +1,6 @@
-//! `usage.db` — the **user-tier** telemetry aggregate, one database per
-//! developer (not per project), living under the OS data dir (e.g.
-//! `~/.local/share/stella/usage.db`). It is a *derived* store: every project's
+//! `usage.db` — the **user-tier** telemetry hub, one database per
+//! developer (not per project), living at `~/.stella/usage.db`. It is a
+//! *derived* store: every project's
 //! `.stella/private/store.db` is the source of truth, and each finished turn is rolled
 //! up here so a future cross-project dashboard can answer "how do I actually
 //! use Stella, across all my repos?" without opening every project database.
@@ -20,27 +20,14 @@ use rusqlite::{Connection, params};
 use crate::Result;
 
 /// The user-tier stella data dir (usage rollup, session registry,
-/// notifications). `STELLA_DATA_DIR` overrides; otherwise the platform data
-/// dir (NOT the config dir — this is data, not config).
+/// notifications, enterprise spool). `STELLA_DATA_DIR` overrides; otherwise
+/// `~/.stella` on every platform (see [`crate::home::stella_home`]) — no
+/// platform-specific guessing.
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("STELLA_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join("Library/Application Support/stella");
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        return PathBuf::from(appdata).join("stella");
-    }
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(xdg).join("stella");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/share/stella");
-    }
-    PathBuf::from(".")
+    crate::home::stella_home().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Where the user-tier aggregate lives: `data_dir()/usage.db`.
@@ -146,6 +133,43 @@ CREATE TABLE IF NOT EXISTS tool_usage_rollup (
     errors     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, tool, surface, day)
 );
+CREATE TABLE IF NOT EXISTS telemetry (
+    project_id     TEXT NOT NULL,
+    source_rowid   INTEGER NOT NULL,
+    org_id         TEXT,
+    workspace_id   TEXT,
+    repo_id        TEXT NOT NULL DEFAULT '',
+    execution_id   INTEGER NOT NULL,
+    step           INTEGER NOT NULL,
+    recorded_at    TEXT NOT NULL DEFAULT '',
+    provider       TEXT NOT NULL,
+    call_role      TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    input_tokens   INTEGER NOT NULL,
+    estimated_input_tokens INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    cache_read_tokens  INTEGER NOT NULL,
+    cache_miss_tokens  INTEGER NOT NULL,
+    cache_write_tokens INTEGER NOT NULL,
+    cost_usd       REAL NOT NULL,
+    duration_ms    INTEGER NOT NULL,
+    retries        INTEGER NOT NULL,
+    tool_calls     INTEGER NOT NULL,
+    usage_complete INTEGER NOT NULL,
+    PRIMARY KEY (project_id, source_rowid)
+);
+CREATE INDEX IF NOT EXISTS telemetry_by_org
+    ON telemetry(org_id, recorded_at);
+CREATE INDEX IF NOT EXISTS telemetry_by_model
+    ON telemetry(provider, model);
+CREATE TABLE IF NOT EXISTS telemetry_sync_cursors (
+    project_id        TEXT PRIMARY KEY,
+    last_source_rowid INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS cloud_sync_cursors (
+    org_id         TEXT PRIMARY KEY,
+    last_hub_rowid INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 /// The user-tier aggregate store. Read/write, loopback-local, no server.
@@ -155,9 +179,11 @@ pub struct UsageStore {
 
 impl UsageStore {
     /// Open (creating dirs + schema) the per-user `usage.db` at the default
-    /// location. Best-effort callers treat an `Err` as "no cross-project
-    /// aggregation this run".
+    /// location, migrating the legacy split layout into `~/.stella` first.
+    /// Best-effort callers treat an `Err` as "no cross-project aggregation
+    /// this run".
     pub fn open_default() -> Result<Self> {
+        crate::home::migrate_legacy_global_dirs();
         Self::open_at(&usage_db_path())
     }
 
@@ -291,6 +317,223 @@ impl UsageStore {
             |r| r.get(0),
         )?)
     }
+
+    /// The replication watermark for one project: the highest source-store
+    /// `telemetry.rowid` already in the hub. 0 for a never-synced project.
+    pub fn telemetry_cursor(&self, project_id: &str) -> Result<i64> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT last_source_rowid FROM telemetry_sync_cursors WHERE project_id = ?1",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0))
+    }
+
+    /// Replicate a batch of source telemetry rows into the hub and advance
+    /// the project's cursor, in one transaction. Idempotent on
+    /// (project_id, source_rowid): a re-replicated row overwrites itself, so
+    /// a crash between commit and the caller observing it never double-counts.
+    pub fn replicate_telemetry(
+        &self,
+        scope: &crate::identity::TelemetryScope,
+        rows: &[crate::SourceTelemetryRow],
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let mut max_rowid: i64 = 0;
+        for row in rows {
+            let t = &row.telemetry;
+            tx.execute(
+                "INSERT OR REPLACE INTO telemetry \
+                 (project_id, source_rowid, org_id, workspace_id, repo_id, execution_id, step, \
+                  recorded_at, provider, call_role, model, input_tokens, estimated_input_tokens, \
+                  output_tokens, cache_read_tokens, cache_miss_tokens, cache_write_tokens, \
+                  cost_usd, duration_ms, retries, tool_calls, usage_complete) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    scope.project_id,
+                    row.source_rowid,
+                    scope.org_id,
+                    scope.workspace_id,
+                    scope.repo_id,
+                    row.execution_id,
+                    t.step as i64,
+                    row.recorded_at,
+                    t.provider,
+                    t.call_role,
+                    t.model,
+                    t.input_tokens as i64,
+                    t.estimated_input_tokens as i64,
+                    t.output_tokens as i64,
+                    t.cache_read_tokens as i64,
+                    t.cache_miss_tokens as i64,
+                    t.cache_write_tokens as i64,
+                    t.cost_usd,
+                    t.duration_ms as i64,
+                    t.retries,
+                    t.tool_calls as i64,
+                    t.usage_complete,
+                ],
+            )?;
+            max_rowid = max_rowid.max(row.source_rowid);
+        }
+        tx.execute(
+            "INSERT INTO telemetry_sync_cursors (project_id, last_source_rowid) \
+             VALUES (?1, ?2) \
+             ON CONFLICT(project_id) DO UPDATE SET \
+               last_source_rowid = MAX(last_source_rowid, excluded.last_source_rowid)",
+            params![scope.project_id, max_rowid],
+        )?;
+        tx.commit()?;
+        Ok(rows.len() as u64)
+    }
+
+    /// The global report: per (org, provider, model) call counts, token and
+    /// cache totals, cost, and how many projects contributed — the query a
+    /// cross-project dashboard or `stella usage` renders. `org` filters to
+    /// one org id; `None` reports everything (NULL-org rows group as
+    /// unregistered/local).
+    pub fn global_telemetry_totals(&self, org: Option<&str>) -> Result<Vec<GlobalTelemetryRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT org_id, provider, model, COUNT(*), SUM(input_tokens), SUM(output_tokens), \
+                    SUM(cache_read_tokens), SUM(cost_usd), COUNT(DISTINCT project_id) \
+             FROM telemetry \
+             WHERE (?1 IS NULL OR org_id = ?1) \
+             GROUP BY org_id, provider, model \
+             ORDER BY SUM(cost_usd) DESC, provider, model",
+        )?;
+        let rows = stmt.query_map(params![org], |r| {
+            Ok(GlobalTelemetryRow {
+                org_id: r.get(0)?,
+                provider: r.get(1)?,
+                model: r.get(2)?,
+                calls: r.get(3)?,
+                input_tokens: r.get(4)?,
+                output_tokens: r.get(5)?,
+                cache_read_tokens: r.get(6)?,
+                cost_usd: r.get(7)?,
+                projects: r.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Hub rows for one org not yet acknowledged by the cloud, oldest first
+    /// — the drain a cloud syncer walks before [`Self::ack_cloud_synced`].
+    pub fn cloud_pending(&self, org_id: &str, limit: usize) -> Result<Vec<CloudTelemetryEvent>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT t.rowid, t.org_id, t.workspace_id, t.repo_id, t.project_id, t.execution_id, \
+                    t.step, t.recorded_at, t.provider, t.call_role, t.model, t.input_tokens, \
+                    t.estimated_input_tokens, t.output_tokens, t.cache_read_tokens, \
+                    t.cache_miss_tokens, t.cache_write_tokens, t.cost_usd, t.duration_ms, \
+                    t.retries, t.tool_calls, t.usage_complete \
+             FROM telemetry t \
+             WHERE t.org_id = ?1 \
+               AND t.rowid > COALESCE((SELECT last_hub_rowid FROM cloud_sync_cursors \
+                                       WHERE org_id = ?1), 0) \
+             ORDER BY t.rowid ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![org_id, limit as i64], |r| {
+            Ok(CloudTelemetryEvent {
+                hub_rowid: r.get(0)?,
+                org_id: r.get(1)?,
+                workspace_id: r.get(2)?,
+                repo_id: r.get(3)?,
+                project_id: r.get(4)?,
+                execution_id: r.get(5)?,
+                recorded_at: r.get(7)?,
+                telemetry: crate::TelemetryRow {
+                    step: r.get::<_, i64>(6)? as u64,
+                    provider: r.get(8)?,
+                    call_role: r.get(9)?,
+                    model: r.get(10)?,
+                    input_tokens: r.get::<_, i64>(11)? as u64,
+                    estimated_input_tokens: r.get::<_, i64>(12)? as u64,
+                    output_tokens: r.get::<_, i64>(13)? as u64,
+                    cache_read_tokens: r.get::<_, i64>(14)? as u64,
+                    cache_miss_tokens: r.get::<_, i64>(15)? as u64,
+                    cache_write_tokens: r.get::<_, i64>(16)? as u64,
+                    cost_usd: r.get(17)?,
+                    duration_ms: r.get::<_, i64>(18)? as u64,
+                    retries: r.get(19)?,
+                    tool_calls: r.get::<_, i64>(20)? as u64,
+                    usage_complete: r.get(21)?,
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Acknowledge cloud receipt of every hub row up to `up_to_hub_rowid`
+    /// for one org. Monotonic — an out-of-order ack never rewinds.
+    pub fn ack_cloud_synced(&self, org_id: &str, up_to_hub_rowid: i64) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO cloud_sync_cursors (org_id, last_hub_rowid) VALUES (?1, ?2) \
+             ON CONFLICT(org_id) DO UPDATE SET \
+               last_hub_rowid = MAX(last_hub_rowid, excluded.last_hub_rowid)",
+            params![org_id, up_to_hub_rowid],
+        )?;
+        Ok(())
+    }
+
+    /// Every project the hub knows: (project_id, name, root_path) — the
+    /// registry `stella usage sync --all` walks for backfill.
+    pub fn registered_projects(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT project_id, name, root_path FROM projects ORDER BY last_seen_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+}
+
+/// One line of the global telemetry report: per (org, provider, model)
+/// totals across every replicated project. A `None` org is
+/// unregistered/local usage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalTelemetryRow {
+    pub org_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cost_usd: f64,
+    pub projects: i64,
+}
+
+/// One org-scoped hub row awaiting cloud acknowledgement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloudTelemetryEvent {
+    pub hub_rowid: i64,
+    pub org_id: String,
+    pub workspace_id: Option<String>,
+    pub repo_id: String,
+    pub project_id: String,
+    pub execution_id: i64,
+    pub recorded_at: String,
+    pub telemetry: crate::TelemetryRow,
 }
 
 #[cfg(test)]
@@ -389,6 +632,94 @@ mod tests {
         usage.sync_execution(&a).unwrap();
         assert_eq!(usage.project_count().unwrap(), 2);
         assert_eq!(usage.tool_totals().unwrap(), vec![("grep".to_string(), 6)]);
+    }
+
+    fn scope(org: Option<&str>, workspace: Option<&str>) -> crate::identity::TelemetryScope {
+        crate::identity::TelemetryScope {
+            org_id: org.map(String::from),
+            workspace_id: workspace.map(String::from),
+            repo_id: "repo01".into(),
+            project_id: "proj_a".into(),
+        }
+    }
+
+    fn source_row(source_rowid: i64, cost: f64) -> crate::SourceTelemetryRow {
+        crate::SourceTelemetryRow {
+            source_rowid,
+            execution_id: 1,
+            recorded_at: "2026-07-23T10:00:00Z".into(),
+            telemetry: crate::TelemetryRow {
+                step: source_rowid as u64,
+                provider: "zai".into(),
+                call_role: "engine".into(),
+                model: "glm-5.2".into(),
+                input_tokens: 1000,
+                estimated_input_tokens: 900,
+                output_tokens: 100,
+                cache_read_tokens: 500,
+                cache_miss_tokens: 500,
+                cache_write_tokens: 0,
+                cost_usd: cost,
+                duration_ms: 1200,
+                retries: 0,
+                tool_calls: 2,
+                usage_complete: true,
+            },
+        }
+    }
+
+    #[test]
+    fn replication_advances_the_cursor_and_is_idempotent() {
+        let hub = UsageStore::in_memory().unwrap();
+        let s = scope(None, None);
+        assert_eq!(hub.telemetry_cursor("proj_a").unwrap(), 0);
+        hub.replicate_telemetry(&s, &[source_row(1, 0.01), source_row(2, 0.02)])
+            .unwrap();
+        assert_eq!(hub.telemetry_cursor("proj_a").unwrap(), 2);
+        // Re-replicating the same rows overwrites, never duplicates.
+        hub.replicate_telemetry(&s, &[source_row(1, 0.01), source_row(2, 0.02)])
+            .unwrap();
+        let totals = hub.global_telemetry_totals(None).unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].calls, 2);
+        assert_eq!(totals[0].org_id, None, "unregistered rows carry NULL org");
+        assert!((totals[0].cost_usd - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn org_scoping_filters_the_report_and_the_cloud_drain() {
+        let hub = UsageStore::in_memory().unwrap();
+        hub.replicate_telemetry(&scope(None, None), &[source_row(1, 0.01)])
+            .unwrap();
+        let acme = scope(Some("acme"), Some("ws-1"));
+        let mut acme_scope = acme.clone();
+        acme_scope.project_id = "proj_b".into();
+        hub.replicate_telemetry(&acme_scope, &[source_row(1, 0.05), source_row(2, 0.05)])
+            .unwrap();
+
+        // The org filter sees only acme's rows; None sees both groups.
+        assert_eq!(
+            hub.global_telemetry_totals(Some("acme")).unwrap()[0].calls,
+            2
+        );
+        assert_eq!(hub.global_telemetry_totals(None).unwrap().len(), 2);
+
+        // The cloud drain is org-scoped: NULL-org (unregistered) rows are
+        // never shipped.
+        let pending = hub.cloud_pending("acme", 10).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].workspace_id.as_deref(), Some("ws-1"));
+        assert_eq!(pending[0].repo_id, "repo01");
+
+        // Ack advances monotonically and drains the backlog.
+        let last = pending.last().unwrap().hub_rowid;
+        hub.ack_cloud_synced("acme", last).unwrap();
+        assert!(hub.cloud_pending("acme", 10).unwrap().is_empty());
+        hub.ack_cloud_synced("acme", last - 1).unwrap(); // out-of-order ack
+        assert!(
+            hub.cloud_pending("acme", 10).unwrap().is_empty(),
+            "an out-of-order ack never rewinds the cursor"
+        );
     }
 
     #[test]

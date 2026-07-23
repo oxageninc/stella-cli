@@ -1,5 +1,6 @@
 //! I/O-free one-shot provider accounting shared by non-engine callers.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use stella_protocol::{
@@ -38,10 +39,25 @@ pub async fn run_accounted_call(
     sleeper: &dyn Sleeper,
 ) -> Result<CompletionResult, AccountedCallError> {
     let started = Instant::now();
+    // True only while a provider dispatch is actually being polled — cleared
+    // for the backoff sleeps between attempts. A per-call timeout wraps the
+    // whole retry future (sleeps included), so its expiry must not attribute a
+    // Timeout envelope to a moment when nothing was in flight: the attempt that
+    // preceded a sleep already reported its own per-attempt envelope.
+    let attempt_in_flight = AtomicBool::new(false);
     let future = retry_with_backoff_observed(
         &call.retry_policy,
         sleeper,
-        || call.provider.complete(call.request.clone()),
+        || {
+            let call_fut = call.provider.complete(call.request.clone());
+            let in_flight = &attempt_in_flight;
+            async move {
+                in_flight.store(true, Ordering::SeqCst);
+                let result = call_fut.await;
+                in_flight.store(false, Ordering::SeqCst);
+                result
+            }
+        },
         // Per-attempt duration (retry.rs times each dispatch individually):
         // the failed call's own latency, never cumulative across attempts.
         |attempt, _error, attempt_duration| {
@@ -60,7 +76,13 @@ pub async fn run_accounted_call(
                 return Err(AccountedCallError::Provider(error));
             }
             Err(_) => {
-                emit_incomplete(&call, events, started.elapsed(), None);
+                // The per-call deadline fired. Attribute a Timeout envelope only
+                // if a paid attempt was genuinely in flight — an expiry during a
+                // backoff sleep would double-report a failure the per-attempt
+                // observer already accounted for.
+                if attempt_in_flight.load(Ordering::SeqCst) {
+                    emit_incomplete(&call, events, started.elapsed(), None);
+                }
                 return Err(AccountedCallError::Timeout);
             }
         },
@@ -259,6 +281,92 @@ mod tests {
             !serde_json::to_string(&incomplete)
                 .expect("wire")
                 .contains("private failed body")
+        );
+    }
+
+    /// A [`Sleeper`] backed by real (here, paused-virtual) tokio time so a
+    /// caller-supplied per-call timeout can expire *during* a backoff sleep.
+    struct TokioSleeper;
+
+    #[async_trait]
+    impl Sleeper for TokioSleeper {
+        async fn sleep(&self, duration_ms: u64) {
+            tokio::time::sleep(Duration::from_millis(duration_ms)).await;
+        }
+    }
+
+    struct AlwaysRetryable;
+
+    #[async_trait]
+    impl Provider for AlwaysRetryable {
+        fn id(&self) -> &str {
+            "scripted"
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResult, ProviderError> {
+            Err(ProviderError::Transport("private failed body".into()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_during_backoff_does_not_emit_a_spurious_timeout_envelope() {
+        // Deadline (100ms) shorter than the first backoff floor (250ms): the
+        // per-call timeout expires while the retry loop is sleeping between
+        // attempts, not while a paid dispatch is in flight.
+        let provider = AlwaysRetryable;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+        let result = run_accounted_call(
+            AccountedCall {
+                provider: &provider,
+                role: ModelCallRole::SkillAuthor,
+                model_hint: "configured-model".into(),
+                request: CompletionRequest {
+                    messages: vec![CompletionMessage::user("work")],
+                    max_output_tokens: None,
+                    temperature: None,
+                    effort: None,
+                    tools: Vec::new(),
+                    reasoning: None,
+                    params: None,
+                },
+                retry_policy: RetryPolicy::new(3, 250, 250),
+                timeout: Some(Duration::from_millis(100)),
+                estimated_input_tokens: 1,
+            },
+            &mut budget,
+            &EventSender::new(tx),
+            &TokioSleeper,
+        )
+        .await;
+
+        assert!(matches!(result, Err(AccountedCallError::Timeout)));
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let incomplete: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::UsageIncomplete { .. }))
+            .collect();
+        // The one failed attempt reported its own per-attempt `ProviderError`
+        // envelope; no `Timeout` envelope may follow, because the deadline fired
+        // mid-backoff with nothing in flight (that would double-report the
+        // already-accounted failure).
+        assert_eq!(
+            incomplete.len(),
+            1,
+            "exactly the single failed attempt's envelope, no spurious timeout: {incomplete:?}"
+        );
+        assert!(
+            incomplete.iter().all(|event| matches!(
+                event,
+                AgentEvent::UsageIncomplete {
+                    reason: UsageIncompleteReason::ProviderError,
+                    ..
+                }
+            )),
+            "the deadline fired during a backoff sleep, so no Timeout envelope is owed: {incomplete:?}"
         );
     }
 }

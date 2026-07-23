@@ -167,7 +167,7 @@ pub struct LoadedSkills {
 pub struct LoadSkillsOptions {
     /// `<workspace>/.stella/skills` — highest precedence.
     pub workspace_skills_dir: String,
-    /// The user-global skills directory (e.g. `~/.config/stella/skills`).
+    /// The user-global skills directory (e.g. `~/.stella/skills`).
     pub user_skills_dir: String,
 }
 
@@ -959,7 +959,7 @@ mod tests {
     fn opts() -> LoadSkillsOptions {
         LoadSkillsOptions {
             workspace_skills_dir: "/ws/.stella/skills".to_string(),
-            user_skills_dir: "/home/u/.config/stella/skills".to_string(),
+            user_skills_dir: "/home/u/.stella/skills".to_string(),
         }
     }
 

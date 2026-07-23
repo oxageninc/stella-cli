@@ -18,7 +18,7 @@ stella tools [--validate [DIR]] [global flags]
 - **Built-in tools** — the always-available and conditionally-registered tools. See the full [Built-in Tools](/docs/agent-tools) catalog for names and read-only/mutating flags.
 - **Developer custom tools** — loaded from `<name>.toml` manifests.
 
-Custom tools come from a `<name>.toml` manifest dropped in `<workspace>/.stella/tools/` (workspace-scoped) or `~/.config/stella/tools/` (user-global). On a name collision, the workspace copy wins.
+Custom tools come from a `<name>.toml` manifest dropped in `<workspace>/.stella/tools/` (workspace-scoped) or `~/.stella/tools/` (user-global). On a name collision, the workspace copy wins.
 
 <Callout type="info">
 `stella tools` does **not** enumerate MCP tools — it prints a note that servers configured in `.stella/mcp.toml` merge more tools at session start. Use [`stella mcp list`](/docs/commands/mcp) to see configured MCP servers.
@@ -28,7 +28,7 @@ Custom tools come from a `<name>.toml` manifest dropped in `<workspace>/.stella/
 
 | Flag | Meaning |
 | --- | --- |
-| `--validate [DIR]` | Strict pre-flight check of custom-tool manifests instead of listing. Parses every `<name>.toml` in `.stella/tools/` and `~/.config/stella/tools/` (or the given `DIR`), reports errors, warnings, and info per manifest, and exits non-zero if any manifest has errors. |
+| `--validate [DIR]` | Strict pre-flight check of custom-tool manifests instead of listing. Parses every `<name>.toml` in `.stella/tools/` and `~/.stella/tools/` (or the given `DIR`), reports errors, warnings, and info per manifest, and exits non-zero if any manifest has errors. |
 
 `stella tools` otherwise takes the [global flags](/docs/commands); model selection rarely matters for this diagnostic command.
 

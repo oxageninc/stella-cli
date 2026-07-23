@@ -46,7 +46,7 @@ duplicates collapsed. An empty list or the explicit wildcard forms (`*`,
 | Scope | Path | Travels with |
 | --- | --- | --- |
 | Project | `<workspace>/.stella/agents/` | The repo — commit it, the team shares it |
-| User | `~/.config/stella/agents/` | You, across every workspace |
+| User | `~/.stella/agents/` | You, across every workspace |
 
 Definitions load user-global first, then workspace — **workspace wins** on
 a name collision.
@@ -87,7 +87,7 @@ existing setup carries over instead of being rewritten:
 | Source | Destination |
 | --- | --- |
 | `<workspace>/.claude/agents/` · `<workspace>/.agents/agents/` | `<workspace>/.stella/agents/` |
-| `~/.claude/agents/` · `~/.agents/agents/` | `~/.config/stella/agents/` |
+| `~/.claude/agents/` · `~/.agents/agents/` | `~/.stella/agents/` |
 
 (The same sync adopts `commands/` and `skills/` into their matching
 directories.) Three rules keep the adoption sane:

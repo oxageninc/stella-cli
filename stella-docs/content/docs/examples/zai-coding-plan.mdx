@@ -24,7 +24,7 @@ export ZAI_GLM_CODING_PLAN=1
 **The settings route** (durable, provider-agnostic mechanism). A subscription is
 personal, so this belongs in **user scope**:
 
-```json title="~/.config/stella/settings.json"
+```json title="~/.stella/settings.json"
 {
   "providers": {
     "zai": {
@@ -62,7 +62,7 @@ worker's marginal cost near zero. The judge stays cross-family on a metered key 
 barely touch (a verdict is a few cents, and `--test-command` runs often skip it
 entirely):
 
-```json title="~/.config/stella/settings.json"
+```json title="~/.stella/settings.json"
 {
   "providers": {
     "zai": { "base_url": "https://api.z.ai/api/coding/paas/v4" }
@@ -82,7 +82,7 @@ with the worker, so give it a strict prompt and prefer arming
 [`--test-command`](/docs/inference-pipeline) so verification is deterministic rather
 than a same-family opinion:
 
-```json title="~/.config/stella/settings.json"
+```json title="~/.stella/settings.json"
 {
   "providers": {
     "zai": { "base_url": "https://api.z.ai/api/coding/paas/v4" }

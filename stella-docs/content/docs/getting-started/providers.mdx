@@ -60,7 +60,7 @@ For the selected provider, Stella resolves the API key in this order — **first
 1. `--api-key` flag (needs an explicit `--model provider/...`)
 2. The provider's env var (and aliases, e.g. `GOOGLE_API_KEY` for Gemini)
 3. [`settings.json`](/docs/configuration/settings) `providers.<id>.api_key`
-4. `~/.config/stella/credentials.toml`
+4. `~/.stella/credentials.toml`
 5. Interactive prompt (on a TTY) — the entered key is saved to `credentials.toml`, so you
    are only prompted once
 
@@ -113,7 +113,7 @@ Any built-in provider's base URL, key, display name, or default model can be ove
 [`settings.json`](/docs/configuration/settings) — the recommended way to, for example,
 route Z.ai through its coding-plan endpoint without a provider-specific environment
 variable. For personal routing like a subscription endpoint, put the override in **user
-scope** (`~/.config/stella/settings.json`): project-scope `base_url`/`api_key` overrides
+scope** (`~/.stella/settings.json`): project-scope `base_url`/`api_key` overrides
 are held back by the
 [trust boundary](/docs/configuration/settings#the-project-trust-boundary) until you set
 `STELLA_TRUST_PROJECT=1`. Ready-to-paste setups, organized by use case, live in
