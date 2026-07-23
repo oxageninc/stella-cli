@@ -305,6 +305,8 @@ async fn mini_run(tx: &mpsc::UnboundedSender<Inbound>, id: &str) {
             spent_usd: 0.008,
             limit_usd: Some(1.0),
             mode: stella_protocol::BudgetMode::Observed,
+            session_spent_usd: None,
+            session_limit_usd: None,
         }),
         ev(AgentEvent::Complete {
             model: "glm-5.2".into(),

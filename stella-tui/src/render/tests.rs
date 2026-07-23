@@ -713,6 +713,8 @@ fn streaming_preview_renders_live_and_the_authoritative_text_leaves_no_duplicate
         spent_usd: 0.01,
         limit_usd: None,
         mode: BudgetMode::Observed,
+        session_spent_usd: None,
+        session_limit_usd: None,
     });
     model.apply(&AgentEvent::Text {
         delta: "streamed tokens arriving token by token".into(),
@@ -1134,6 +1136,8 @@ fn any_event() -> impl Strategy<Value = AgentEvent> {
             spent_usd: a.abs() % 10.0,
             limit_usd: Some(b.abs() % 10.0),
             mode: BudgetMode::Observed,
+            session_spent_usd: None,
+            session_limit_usd: None,
         }),
         Just(AgentEvent::Complete {
             model: "glm".into(),

@@ -136,7 +136,7 @@ pub fn demo_inbound(started_ms: u64, self_pid: u32) -> Vec<Inbound> {
         ev(lead, AgentEvent::Stage { name: StageKind::Plan }),
         ev(lead, AgentEvent::Text { delta: "Planning the automations cluster: list, editor, triggers, workflows.".into() }),
         ev(lead, AgentEvent::StepUsage { output_text: None, step: 1, role: ModelCallRole::Worker, provider: "zai".into(), model: "glm-5.2".into(), input_tokens: 12_400, output_tokens: 640, cached_input_tokens: 9_000, cache_write_tokens: 0, estimated_input_tokens: 12_000, cost_usd: 0.021, duration_ms: 1830, retries: 0, tool_calls: 0, complete: true }),
-        ev(lead, AgentEvent::BudgetTick { spent_usd: 0.021, limit_usd: Some(2.5), mode: stella_protocol::BudgetMode::Observed }),
+        ev(lead, AgentEvent::BudgetTick { spent_usd: 0.021, limit_usd: Some(2.5), mode: stella_protocol::BudgetMode::Observed, session_spent_usd: None, session_limit_usd: None }),
 
         // ── two subagents are dispatched ────────────────────────────────
         reg(auth, "wire automations triggers API", "subagent"),
@@ -150,14 +150,14 @@ pub fn demo_inbound(started_ms: u64, self_pid: u32) -> Vec<Inbound> {
         ev(lead, AgentEvent::ToolResult { call_id: "c1".into(), output: ToolOutput::Ok { content: "312 lines".into() }, duration_ms: 42, speculated: false }),
         ev(lead, AgentEvent::FileChange { path: "apps/app/automations/page.tsx".into(), kind: FileChangeKind::Modified, diff: Some("@@ -10,3 +10,7 @@\n-  const items = []\n+  const items = useAutomations()\n+  const [q, setQ] = useState(\"\")\n+  const filtered = filter(items, q)\n+  const onNew = () => open()\n".into()) }),
         ev(lead, AgentEvent::StepUsage { output_text: None, step: 2, role: ModelCallRole::Worker, provider: "zai".into(), model: "glm-5.2".into(), input_tokens: 8_200, output_tokens: 900, cached_input_tokens: 6_000, cache_write_tokens: 0, estimated_input_tokens: 8_000, cost_usd: 0.018, duration_ms: 2100, retries: 0, tool_calls: 1, complete: true }),
-        ev(lead, AgentEvent::BudgetTick { spent_usd: 0.039, limit_usd: Some(2.5), mode: stella_protocol::BudgetMode::Observed }),
+        ev(lead, AgentEvent::BudgetTick { spent_usd: 0.039, limit_usd: Some(2.5), mode: stella_protocol::BudgetMode::Observed, session_spent_usd: None, session_limit_usd: None }),
 
         // ── auth subagent creates a file, then asks a question ──────────
         ev(auth, AgentEvent::Stage { name: StageKind::Execute }),
         ev(auth, tool_start("c2", "grep", json!({ "pattern": "trigger" }))),
         ev(auth, AgentEvent::FileChange { path: "apps/api/routes/v1/automations.ts".into(), kind: FileChangeKind::Created, diff: Some("+export const triggers = router()\n+  .post(\"/\", create)\n+  .get(\"/\", list)\n".into()) }),
         ev(auth, AgentEvent::StepUsage { output_text: None, step: 1, role: ModelCallRole::Worker, provider: "zai".into(), model: "glm-5.2".into(), input_tokens: 5_100, output_tokens: 420, cached_input_tokens: 3_000, cache_write_tokens: 0, estimated_input_tokens: 5_000, cost_usd: 0.011, duration_ms: 1400, retries: 0, tool_calls: 1, complete: true }),
-        ev(auth, AgentEvent::BudgetTick { spent_usd: 0.011, limit_usd: Some(1.0), mode: stella_protocol::BudgetMode::Observed }),
+        ev(auth, AgentEvent::BudgetTick { spent_usd: 0.011, limit_usd: Some(1.0), mode: stella_protocol::BudgetMode::Observed, session_spent_usd: None, session_limit_usd: None }),
         ev(auth, AgentEvent::AskUser { id: "q1".into(), question: "Which auth guard should the triggers route use?".into(), options: vec!["assertOrgMember".into(), "assertBillingManager".into()] }),
 
         // ── ci subagent verifies + opens a PR ───────────────────────────

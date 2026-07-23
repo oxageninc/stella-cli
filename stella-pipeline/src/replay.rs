@@ -432,6 +432,8 @@ mod tests {
             spent_usd: spent,
             limit_usd: None,
             mode: BudgetMode::Observed,
+            session_spent_usd: None,
+            session_limit_usd: None,
         }
     }
     fn complete() -> AgentEvent {

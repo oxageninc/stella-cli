@@ -79,6 +79,8 @@ pub(super) fn record_settled_cost(
         spent_usd: budget.spent_usd(),
         limit_usd: budget.turn_limit_usd(),
         mode: budget.mode(),
+        session_spent_usd: Some(budget.session_spent_usd()),
+        session_limit_usd: budget.session_limit_usd(),
     });
     emit_budget_warning(outcome, warnings, events);
     outcome

@@ -226,6 +226,18 @@ pub enum AgentEvent {
         spent_usd: f64,
         limit_usd: Option<f64>,
         mode: BudgetMode,
+        /// Session-scoped spend at this tick — `spent_usd`/`limit_usd` are
+        /// turn-scoped, so a HUD cannot otherwise reconstruct session state
+        /// (or see a session-axis breach) from this stream. `None` when the
+        /// emitter does not track a session axis, and on events serialized
+        /// before these fields existed (hence `serde(default)`, so older
+        /// streams still parse).
+        #[serde(default)]
+        session_spent_usd: Option<f64>,
+        /// The configured per-session limit, when one is set. `None` mirrors
+        /// `session_spent_usd`.
+        #[serde(default)]
+        session_limit_usd: Option<f64>,
     },
     /// One committed model call — the metering record. Emitted exactly once
     /// per step that lands, carrying the normalized usage envelope plus
@@ -773,11 +785,13 @@ mod tests {
     }
 
     #[test]
-    fn budget_tick_roundtrips_with_optional_limit() {
+    fn budget_tick_roundtrips_with_session_axis() {
         let event = AgentEvent::BudgetTick {
             spent_usd: 0.42,
             limit_usd: Some(2.5),
             mode: BudgetMode::Enforced,
+            session_spent_usd: Some(1.75),
+            session_limit_usd: Some(10.0),
         };
         let json = serde_json::to_string(&event).unwrap();
         let back: AgentEvent = serde_json::from_str(&json).unwrap();
@@ -786,12 +800,35 @@ mod tests {
                 spent_usd,
                 limit_usd,
                 mode,
+                session_spent_usd,
+                session_limit_usd,
             } => {
                 assert_eq!(spent_usd, 0.42);
                 assert_eq!(limit_usd, Some(2.5));
                 assert_eq!(mode, BudgetMode::Enforced);
+                assert_eq!(session_spent_usd, Some(1.75));
+                assert_eq!(session_limit_usd, Some(10.0));
             }
             other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budget_tick_without_session_fields_parses_with_none() {
+        // A stream recorded BEFORE the session axis existed must still parse,
+        // with both new fields defaulting to `None` (not `0.0`, which would
+        // read as a real "spent nothing").
+        let old = r#"{"type":"budget_tick","spent_usd":0.42,"limit_usd":2.5,"mode":"enforced"}"#;
+        match serde_json::from_str::<AgentEvent>(old) {
+            Ok(AgentEvent::BudgetTick {
+                session_spent_usd,
+                session_limit_usd,
+                ..
+            }) => {
+                assert_eq!(session_spent_usd, None);
+                assert_eq!(session_limit_usd, None);
+            }
+            other => panic!("old stream must parse: {other:?}"),
         }
     }
 
