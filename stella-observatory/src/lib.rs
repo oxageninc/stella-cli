@@ -131,6 +131,20 @@ pub fn respond(workspace_root: &Path, path: &str) -> Response {
         "/api/fleet" => obs.fleet(),
         "/api/activity" => obs.activity(),
         "/api/projects" => Ok(global::projects(workspace_root)),
+        // Hub telemetry is inherently cross-project: like `/api/projects` it
+        // runs against the original `workspace_root`, ignoring `?project=`.
+        // `?org=/workspace=/repo=` narrow the scope and step the drill in.
+        "/api/hub-telemetry" => {
+            let org = query_param(query, "org");
+            let workspace = query_param(query, "workspace");
+            let repo = query_param(query, "repo");
+            Ok(global::hub_telemetry(
+                workspace_root,
+                org.as_deref(),
+                workspace.as_deref(),
+                repo.as_deref(),
+            ))
+        }
         "/api/codegraph" => Ok(codegraph::snapshot(root)),
         "/api/skills" => Ok(fsview::skills(root)),
         "/api/mcp-servers" => Ok(fsview::mcp_servers(root)),
@@ -527,6 +541,7 @@ mod tests {
             "/api/fleet",
             "/api/activity",
             "/api/projects",
+            "/api/hub-telemetry",
             "/api/codegraph",
             "/api/skills",
             "/api/mcp-servers",
@@ -711,8 +726,15 @@ mod tests {
         assert_eq!(ratings[0]["what_to_improve"], "read the failing test first");
     }
 
+    /// Serializes the tests that mutate `STELLA_DATA_DIR` — it is process-wide,
+    /// so one test's `set_var` racing another's `respond` (which reads it via
+    /// `usage_db_path`) would flake. Poison-tolerant: a panicking holder must
+    /// not cascade into unrelated failures.
+    static DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn project_param_drills_into_another_registered_workspace() {
+        let _env = DATA_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Two workspaces: `home` is empty, `other` is seeded. A usage.db in a
         // private STELLA_DATA_DIR registers `other`; ?project= must re-point
         // the request at it, and unknown ids must fall back to `home`.
@@ -757,6 +779,139 @@ mod tests {
         assert_eq!(v["available"], true);
         assert_eq!(v["projects"][0]["name"], "other");
         assert_eq!(v["projects"][0]["has_store"], true);
+    }
+
+    #[test]
+    fn hub_telemetry_aggregates_scope_and_drills_to_project() {
+        let _env = DATA_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDir::new().unwrap();
+
+        // A hub dir with no usage.db is an empty state, never an error.
+        let empty = TempDir::new().unwrap();
+        unsafe { std::env::set_var("STELLA_DATA_DIR", empty.path()) };
+        let none = respond(home.path(), "/api/hub-telemetry");
+
+        // A populated hub spanning an org AND the common never-cloud-registered
+        // case (NULL org/workspace, '' repo), plus a row with no recorded_at.
+        let data = TempDir::new().unwrap();
+        let usage = Connection::open(data.path().join("usage.db")).unwrap();
+        usage
+            .execute_batch(
+                "CREATE TABLE projects (
+                   project_id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                   root_path TEXT NOT NULL, first_seen_at TEXT NOT NULL,
+                   last_seen_at TEXT NOT NULL);
+                 CREATE TABLE telemetry (
+                   project_id TEXT NOT NULL, source_rowid INTEGER NOT NULL,
+                   org_id TEXT, workspace_id TEXT, repo_id TEXT NOT NULL DEFAULT '',
+                   execution_id INTEGER NOT NULL, step INTEGER NOT NULL,
+                   recorded_at TEXT NOT NULL DEFAULT '',
+                   provider TEXT NOT NULL, call_role TEXT NOT NULL, model TEXT NOT NULL,
+                   input_tokens INTEGER NOT NULL, estimated_input_tokens INTEGER NOT NULL,
+                   output_tokens INTEGER NOT NULL, cache_read_tokens INTEGER NOT NULL,
+                   cache_miss_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+                   cost_usd REAL NOT NULL, duration_ms INTEGER NOT NULL,
+                   retries INTEGER NOT NULL, tool_calls INTEGER NOT NULL,
+                   usage_complete INTEGER NOT NULL,
+                   PRIMARY KEY (project_id, source_rowid));
+                 INSERT INTO projects VALUES
+                   ('p1','proj-one','/tmp/p1','2026-07-20','2026-07-21'),
+                   ('p2','proj-two','/tmp/p2','2026-07-20','2026-07-20'),
+                   ('p3','proj-three','/tmp/p3','2026-07-22','2026-07-22');
+                 INSERT INTO telemetry
+                   (project_id,source_rowid,org_id,workspace_id,repo_id,execution_id,step,
+                    recorded_at,provider,call_role,model,input_tokens,estimated_input_tokens,
+                    output_tokens,cache_read_tokens,cache_miss_tokens,cache_write_tokens,
+                    cost_usd,duration_ms,retries,tool_calls,usage_complete)
+                 VALUES
+                   ('p1',1,'acme','ws1','r1',100,0,'2026-07-20 10:00:00','anthropic','worker','claude-x',1000,1000,200,800,200,0,0.50,1200,0,3,1),
+                   ('p1',2,'acme','ws1','r1',101,0,'2026-07-21 10:00:00','anthropic','worker','claude-x',500,500,100,400,100,0,0.25,900,0,1,1),
+                   ('p2',1,'acme','ws1','r2',200,0,'2026-07-20 12:00:00','openai','worker','gpt-y',800,800,300,0,800,0,0.40,1500,0,2,1),
+                   ('p3',1,NULL,NULL,'',300,0,'2026-07-22 09:00:00','anthropic','worker','claude-x',300,300,50,100,200,0,0.10,600,0,0,1),
+                   ('p3',2,NULL,NULL,'',301,0,'','anthropic','worker','claude-x',100,100,20,0,100,0,0.05,400,0,0,1);",
+            )
+            .unwrap();
+        drop(usage);
+        unsafe { std::env::set_var("STELLA_DATA_DIR", data.path()) };
+
+        let all = respond(home.path(), "/api/hub-telemetry");
+        let acme = respond(home.path(), "/api/hub-telemetry?org=acme");
+        let local = respond(home.path(), "/api/hub-telemetry?org=(local)");
+        let repos = respond(home.path(), "/api/hub-telemetry?org=acme&workspace=ws1");
+        let proj = respond(
+            home.path(),
+            "/api/hub-telemetry?org=acme&workspace=ws1&repo=r1",
+        );
+        unsafe { std::env::remove_var("STELLA_DATA_DIR") };
+
+        // Empty hub: available:false, zeroed, 200 OK.
+        assert_eq!(none.status, "200 OK");
+        let v: serde_json::Value = serde_json::from_slice(&none.body).unwrap();
+        assert_eq!(v["available"], false);
+        assert_eq!(v["totals"]["calls"], 0);
+        assert!(v["drill"]["rows"].as_array().unwrap().is_empty());
+
+        // Unscoped totals + org drill.
+        let v: serde_json::Value = serde_json::from_slice(&all.body).unwrap();
+        assert_eq!(v["available"], true);
+        assert_eq!(v["totals"]["calls"], 5);
+        assert_eq!(v["totals"]["projects"], 3);
+        assert_eq!(v["totals"]["orgs"], 1, "NULL org is not a distinct org");
+        assert!((v["totals"]["cost_usd"].as_f64().unwrap() - 1.30).abs() < 1e-9);
+        assert_eq!(v["drill"]["level"], "org");
+        let orgs = v["drill"]["rows"].as_array().unwrap();
+        let acme_row = orgs.iter().find(|r| r["key"] == "acme").unwrap();
+        assert!((acme_row["cost_usd"].as_f64().unwrap() - 1.15).abs() < 1e-9);
+        assert_eq!(acme_row["projects"], 2);
+        let local_row = orgs.iter().find(|r| r["key"].is_null()).unwrap();
+        assert!((local_row["cost_usd"].as_f64().unwrap() - 0.15).abs() < 1e-9);
+        // provider/model mirrors `usage report`, ordered by cost, with a rate.
+        let pm = v["by_provider_model"].as_array().unwrap();
+        assert_eq!(pm[0]["provider"], "anthropic");
+        assert_eq!(pm[0]["model"], "claude-x");
+        assert_eq!(pm[0]["calls"], 4);
+        assert!((pm[0]["cache_read_rate"].as_f64().unwrap() - 1300.0 / 1900.0).abs() < 1e-6);
+        // Daily series excludes the row with no recorded_at.
+        let days: Vec<&str> = v["by_day"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["day"].as_str().unwrap())
+            .collect();
+        assert_eq!(days, ["2026-07-20", "2026-07-21", "2026-07-22"]);
+
+        // Org filter narrows totals and steps the drill to workspace.
+        let v: serde_json::Value = serde_json::from_slice(&acme.body).unwrap();
+        assert_eq!(v["totals"]["calls"], 3);
+        assert_eq!(v["drill"]["level"], "workspace");
+        assert_eq!(v["drill"]["rows"][0]["key"], "ws1");
+
+        // The `(local)` sentinel selects the NULL-org bucket.
+        let v: serde_json::Value = serde_json::from_slice(&local.body).unwrap();
+        assert_eq!(v["totals"]["calls"], 2);
+        assert!((v["totals"]["cost_usd"].as_f64().unwrap() - 0.15).abs() < 1e-9);
+        assert_eq!(v["drill"]["level"], "workspace");
+        assert!(v["drill"]["rows"][0]["key"].is_null());
+
+        // workspace set → drill by repo.
+        let v: serde_json::Value = serde_json::from_slice(&repos.body).unwrap();
+        assert_eq!(v["drill"]["level"], "repo");
+        let repo_keys: Vec<&str> = v["drill"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["key"].as_str().unwrap())
+            .collect();
+        assert!(repo_keys.contains(&"r1") && repo_keys.contains(&"r2"));
+
+        // repo set → drill to the project leaf, carrying its name.
+        let v: serde_json::Value = serde_json::from_slice(&proj.body).unwrap();
+        assert_eq!(v["drill"]["level"], "project");
+        let leaf = &v["drill"]["rows"][0];
+        assert_eq!(leaf["key"], "p1");
+        assert_eq!(leaf["name"], "proj-one");
+        assert_eq!(leaf["calls"], 2);
+        assert!((leaf["cost_usd"].as_f64().unwrap() - 0.75).abs() < 1e-9);
     }
 
     #[test]
