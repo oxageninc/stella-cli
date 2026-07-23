@@ -336,12 +336,19 @@ pub enum AgentEvent {
         superseded: u32,
     },
     /// A context block first became eligible to enter the prompt (spec §4).
-    /// Content-free on the wire: carries a digest + provenance, never the
-    /// payload bytes — the bytes already live in the originating event
-    /// (`ToolResult`, `Text`, …) or, for recalled frames, the local block
-    /// registry. This is the birth record that makes the per-step manifest an
-    /// index over the fold rather than a parallel content store. Additive:
-    /// consumers recorded before receipts existed simply never see it.
+    /// The birth record that makes the per-step manifest an index over the fold.
+    ///
+    /// Digest, not bytes, for the kinds the journal already carries whole
+    /// (`ToolResult`, `ToolCall`/`ToolStart`, assistant `Text`): those preimages
+    /// are resolved from the originating event at reconstruction time, never
+    /// re-stored. For the two kinds the fold does NOT carry — the system prefix
+    /// and the assembled user/recall message — `content` carries the bytes so
+    /// the step is reconstructable (spec §5.3). That content is **local-only**:
+    /// it is stripped by the content-free enterprise export projection and never
+    /// leaves the local journal. So "content-free" means content-free *on
+    /// export*, and content-free *on the wire for journal-resolvable kinds* —
+    /// gap-kind blocks deliberately carry their bytes locally. Additive:
+    /// consumers recorded before receipts existed simply never see this event.
     BlockRegistered {
         /// `blk_<24 hex of sha256(kind \0 content)>`. Byte-identical blocks
         /// share an id, so dedup/supersession become identities not counts.
@@ -355,6 +362,12 @@ pub enum AgentEvent {
         /// Human label for recall frames / memory nodes, when the block has one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         citation_label: Option<String>,
+        /// Local-only preimage for gap kinds the journal cannot resolve (the
+        /// system prefix, the assembled user/recall message). `None` for
+        /// journal-resolvable kinds (tool I/O, assistant text) — those never
+        /// carry bytes here. Redacted by the content-free export projection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
     },
     /// The ordered receipt of exactly what the model saw on one step (spec §5):
     /// the block sequence sent, in wire order, plus the budget the compaction
@@ -551,6 +564,14 @@ pub struct ManifestEntry {
     pub token_cost: u32,
     /// The step this block first entered a manifest — drives cost-of-carry.
     pub resident_since_step: usize,
+    /// Which `CompletionMessage` this block belonged to, by position in the
+    /// sent sequence. Event-granular blocks (a tool message's several results,
+    /// an assistant message's text + calls) share one `message_index`, so
+    /// reconstruction regroups them back into the exact message boundaries
+    /// rather than inferring them from kinds (spec §5.1). `0` on manifests
+    /// recorded before reconstruction existed.
+    #[serde(default)]
+    pub message_index: usize,
 }
 
 /// One provider's share of a recall's frame mix.
@@ -1219,8 +1240,10 @@ mod tests {
     }
 
     #[test]
-    fn block_registered_roundtrips_and_is_content_free() {
-        let event = AgentEvent::BlockRegistered {
+    fn block_registered_carries_bytes_only_for_gap_kinds() {
+        // Journal-resolvable kinds (tool I/O, assistant text) carry NO content —
+        // their preimage is resolved from the originating event, never re-stored.
+        let tool = AgentEvent::BlockRegistered {
             block_id: "blk_0123456789abcdef01234567".into(),
             kind: BlockKind::ToolResult,
             origin: BlockOrigin {
@@ -1232,21 +1255,42 @@ mod tests {
             token_cost: 480,
             content_digest: "sha256:deadbeef".into(),
             citation_label: None,
+            content: None,
         };
-        let value = serde_json::to_value(&event).unwrap();
+        let value = serde_json::to_value(&tool).unwrap();
         assert_eq!(value["type"], "block_registered");
         assert_eq!(value["kind"], "tool_result");
         assert_eq!(value["origin"]["call_id"], "call_9");
-        // Content-free: the payload bytes never appear, only a digest.
         assert!(
             value.get("content").is_none() && value.get("output").is_none(),
-            "block_registered must not carry payload bytes: {value}"
+            "a journal-resolvable block must not carry payload bytes: {value}"
         );
+
+        // Gap kinds the journal cannot resolve (the system prefix, the assembled
+        // user message) DO carry their bytes — local-only, stripped on export —
+        // so the step stays reconstructable (spec §5.3).
+        let system = AgentEvent::BlockRegistered {
+            block_id: "blk_sys0000000000000000000".into(),
+            kind: BlockKind::SystemPrefix,
+            origin: BlockOrigin {
+                turn_instance: 0,
+                step: 0,
+                call_id: None,
+                memory_id: None,
+            },
+            token_cost: 300,
+            content_digest: "sha256:beef".into(),
+            citation_label: None,
+            content: Some("you are a careful engineer".into()),
+        };
+        let value = serde_json::to_value(&system).unwrap();
+        assert_eq!(value["content"], "you are a careful engineer");
+
         let back: AgentEvent = serde_json::from_str(&value.to_string()).unwrap();
         match back {
-            AgentEvent::BlockRegistered { block_id, kind, .. } => {
-                assert_eq!(block_id, "blk_0123456789abcdef01234567");
-                assert_eq!(kind, BlockKind::ToolResult);
+            AgentEvent::BlockRegistered { kind, content, .. } => {
+                assert_eq!(kind, BlockKind::SystemPrefix);
+                assert_eq!(content.as_deref(), Some("you are a careful engineer"));
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -1266,12 +1310,14 @@ mod tests {
                     cache_zone: CacheZone::StablePrefix,
                     token_cost: 1200,
                     resident_since_step: 0,
+                    message_index: 0,
                 },
                 ManifestEntry {
                     block_id: "blk_tail".into(),
                     cache_zone: CacheZone::Volatile,
                     token_cost: 90,
                     resident_since_step: 3,
+                    message_index: 3,
                 },
             ],
             effective_budget_tokens: 136_363,

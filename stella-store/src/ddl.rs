@@ -382,6 +382,7 @@ pub(crate) const CONTEXT_BLOCKS_DDL: &str = "CREATE TABLE IF NOT EXISTS context_
        token_cost INTEGER NOT NULL,
        content_digest TEXT NOT NULL,
        citation_label TEXT,
+       content TEXT,
        first_seen_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
        PRIMARY KEY (execution_id, block_id)
      );
@@ -403,6 +404,7 @@ pub(crate) const STEP_MANIFEST_DDL: &str = "CREATE TABLE IF NOT EXISTS step_mani
        block_id TEXT NOT NULL,
        cache_zone TEXT NOT NULL,
        resident_since_step INTEGER NOT NULL,
+       message_index INTEGER NOT NULL DEFAULT 0,
        PRIMARY KEY (execution_id, turn_instance, step, ordinal)
      );
      CREATE INDEX IF NOT EXISTS step_manifest_by_block

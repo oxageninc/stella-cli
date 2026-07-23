@@ -23,6 +23,10 @@ pub struct ContextBlockRow {
     pub token_cost: u32,
     pub content_digest: String,
     pub citation_label: Option<String>,
+    /// Local-only preimage for gap kinds the journal cannot resolve (system
+    /// prefix, assembled user/recall message); `None` for journal-resolvable
+    /// kinds (spec §5.3). Never leaves the local store.
+    pub content: Option<String>,
 }
 
 /// One block's membership in a step's manifest (`step_manifest`, spec §5),
@@ -33,6 +37,9 @@ pub struct ManifestBlockRow {
     pub cache_zone: String,
     pub token_cost: u32,
     pub resident_since_step: u64,
+    /// The sent-message this block belonged to; reconstruction regroups blocks
+    /// sharing a `message_index` back into one `CompletionMessage` (spec §5.1).
+    pub message_index: u64,
 }
 
 /// A full per-step manifest: the header (`step_receipt`) plus its ordered
@@ -62,8 +69,8 @@ impl Store {
         self.lock().execute(
             "INSERT OR IGNORE INTO context_blocks
                (execution_id, block_id, kind, origin_turn, origin_step, call_id, memory_id,
-                token_cost, content_digest, citation_label)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                token_cost, content_digest, citation_label, content)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 execution_id,
                 row.block_id,
@@ -75,6 +82,7 @@ impl Store {
                 token_cost,
                 row.content_digest,
                 row.citation_label,
+                row.content,
             ],
         )?;
         Ok(())
@@ -122,11 +130,12 @@ impl Store {
         for (ordinal, block) in row.blocks.iter().enumerate() {
             let ordinal = sqlite_i64("manifest ordinal", ordinal as u64)?;
             let resident = sqlite_i64("manifest residency", block.resident_since_step)?;
+            let message_index = sqlite_i64("manifest message index", block.message_index)?;
             tx.execute(
                 "INSERT INTO step_manifest
                    (execution_id, turn_instance, step, ordinal, block_id, cache_zone,
-                    resident_since_step)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    resident_since_step, message_index)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     execution_id,
                     turn,
@@ -135,6 +144,7 @@ impl Store {
                     block.block_id,
                     block.cache_zone,
                     resident,
+                    message_index,
                 ],
             )?;
         }
@@ -147,7 +157,7 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT block_id, kind, origin_turn, origin_step, call_id, memory_id,
-                    token_cost, content_digest, citation_label
+                    token_cost, content_digest, citation_label, content
              FROM context_blocks WHERE execution_id = ? ORDER BY rowid",
         )?;
         let rows = stmt
@@ -162,6 +172,7 @@ impl Store {
                     token_cost: r.get::<_, i64>(6)? as u32,
                     content_digest: r.get(7)?,
                     citation_label: r.get(8)?,
+                    content: r.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -179,7 +190,8 @@ impl Store {
         let step = sqlite_i64("manifest step", step)?;
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT sm.block_id, sm.cache_zone, cb.token_cost, sm.resident_since_step
+            "SELECT sm.block_id, sm.cache_zone, cb.token_cost, sm.resident_since_step,
+                    sm.message_index
              FROM step_manifest sm
              LEFT JOIN context_blocks cb
                ON cb.execution_id = sm.execution_id AND cb.block_id = sm.block_id
@@ -196,6 +208,7 @@ impl Store {
                     // surfacing, not crashing on); default 0.
                     token_cost: r.get::<_, Option<i64>>(2)?.unwrap_or(0) as u32,
                     resident_since_step: r.get::<_, i64>(3)? as u64,
+                    message_index: r.get::<_, i64>(4)? as u64,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -218,6 +231,7 @@ mod tests {
             token_cost: 100 + step as u32,
             content_digest: format!("sha256:{id}"),
             citation_label: None,
+            content: None,
         }
     }
 
@@ -265,12 +279,14 @@ mod tests {
                     cache_zone: "stable_prefix".into(),
                     token_cost: 100,
                     resident_since_step: 0,
+                    message_index: 0,
                 },
                 ManifestBlockRow {
                     block_id: "blk_tail".into(),
                     cache_zone: "volatile".into(),
                     token_cost: 103,
                     resident_since_step: 3,
+                    message_index: 1,
                 },
             ],
         };
@@ -308,6 +324,7 @@ mod tests {
                     cache_zone: "cacheable".into(),
                     token_cost: 1,
                     resident_since_step: 0,
+                    message_index: 0,
                 })
                 .collect(),
         };
