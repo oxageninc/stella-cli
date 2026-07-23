@@ -10,6 +10,7 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::syntax;
 use crate::theme;
 
 /// Render a markdown string into styled lines.
@@ -19,17 +20,24 @@ use crate::theme;
 /// in a distinct style.
 pub fn render(text: &str) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    let mut in_code_block = false;
+    // `Some(lang)` while inside a fenced block: the opening fence's info
+    // string (```rust, ```toml, …) picks the language its lines highlight in.
+    let mut code_block: Option<Option<syntax::Lang>> = None;
 
     for raw in text.lines() {
         // ── Fenced code block toggle ────────────────────────────────────────
         if raw.trim_start().starts_with("```") {
-            in_code_block = !in_code_block;
+            code_block = match code_block {
+                Some(_) => None,
+                None => Some(syntax::lang_from_fence(
+                    raw.trim_start().trim_start_matches('`'),
+                )),
+            };
             continue;
         }
 
-        if in_code_block {
-            out.push(Line::from(Span::styled(format!("  {raw}"), code_style())));
+        if let Some(lang) = code_block {
+            out.push(code_block_line(raw, lang));
             continue;
         }
 
@@ -297,6 +305,26 @@ fn code_style() -> Style {
     Style::new().fg(theme::WARN)
 }
 
+/// One line inside a fenced code block: indented two spaces, tokenized in the
+/// fence's language when it named one we highlight (keywords/strings/numbers/
+/// comments take their syntax colors; plain runs keep the code amber), or
+/// rendered verbatim in the code style otherwise.
+fn code_block_line(raw: &str, lang: Option<syntax::Lang>) -> Line<'static> {
+    let mut spans = vec![Span::styled("  ", code_style())];
+    match lang {
+        Some(lang) => {
+            for (text, tok) in syntax::tokenize(raw, lang) {
+                spans.push(match tok {
+                    Some(t) => Span::styled(text, syntax::tok_style(t)),
+                    None => Span::styled(text, code_style()),
+                });
+            }
+        }
+        None => spans.push(Span::styled(raw.to_string(), code_style())),
+    }
+    Line::from(spans)
+}
+
 // ── Search helpers ─────────────────────────────────────────────────────────
 
 /// Find the index of `needle` in `chars[start..]`, or `None`.
@@ -534,5 +562,57 @@ mod tests {
                 .contains(Modifier::BOLD | Modifier::ITALIC),
             "nested formatting: bold inside italic has both modifiers"
         );
+    }
+
+    #[test]
+    fn tagged_fences_highlight_their_language() {
+        let lines = render("```rust\nfn main() {}\n```");
+        assert_eq!(lines.len(), 1);
+        let kw = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content == "fn")
+            .expect("keyword is its own span");
+        assert_eq!(kw.style.fg, Some(theme::SYNTAX_KEYWORD), "keyword colored");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(theme::WARN)),
+            "plain runs keep the amber code style: {:?}",
+            lines[0].spans
+        );
+    }
+
+    #[test]
+    fn untagged_fences_keep_the_uniform_code_style() {
+        let lines = render("```\nfn main() {}\n```");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|s| s.style.fg == Some(theme::WARN)),
+            "no tag, no tokenizing: {:?}",
+            lines[0].spans
+        );
+    }
+
+    #[test]
+    fn toml_fences_highlight_keys_and_values() {
+        let lines = render("```toml\n[server]\nport = 8080\n```");
+        assert_eq!(lines.len(), 2);
+        let header = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content == "[server]")
+            .expect("table header is its own span");
+        assert_eq!(header.style.fg, Some(theme::SYNTAX_KEYWORD));
+        let num = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content == "8080")
+            .expect("value is its own span");
+        assert_eq!(num.style.fg, Some(theme::SYNTAX_NUMBER));
     }
 }

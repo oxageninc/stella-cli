@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 
 use crate::deck::WorkspaceModel;
 use crate::deck_ui::{DeckUi, SkillPrompt, SkillsFocus};
+use crate::syntax;
 use crate::theme;
 
 pub fn render(_model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
@@ -377,20 +378,25 @@ fn render_edit_overlay(name: &str, buffer: &str, area: Rect, buf: &mut Buffer) {
         return;
     }
     // Body lines with a block caret appended, tail-scrolled to the last rows.
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    // The buffer is SKILL.md source, so it highlights as markdown — the
+    // frontmatter keys, headings, and fenced examples that make the file
+    // navigable while it's edited. Every line feeds the highlighter (fence /
+    // frontmatter state spans the whole buffer); only the tail renders.
     let text_lines: Vec<&str> = buffer.split('\n').collect();
+    let mut hl = syntax::Highlighter::new(Some(syntax::Lang::Markdown));
+    let styled: Vec<Vec<Span<'static>>> = text_lines
+        .iter()
+        .map(|l| hl.spans(l, theme::body()))
+        .collect();
     let visible = inner.height as usize;
-    let start = text_lines.len().saturating_sub(visible);
-    for (i, l) in text_lines.iter().enumerate().skip(start) {
-        let is_last = i == text_lines.len() - 1;
-        if is_last {
-            lines.push(Line::from(vec![
-                Span::styled((*l).to_string(), theme::body()),
-                Span::styled("▌", Style::default().fg(theme::ACCENT)),
-            ]));
-        } else {
-            lines.push(Line::from(Span::styled((*l).to_string(), theme::body())));
+    let start = styled.len().saturating_sub(visible);
+    let last = styled.len() - 1;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, mut spans) in styled.into_iter().enumerate().skip(start) {
+        if i == last {
+            spans.push(Span::styled("▌", Style::default().fg(theme::ACCENT)));
         }
+        lines.push(Line::from(spans));
     }
     Paragraph::new(lines).render(inner, buf);
 }
@@ -549,6 +555,23 @@ mod tests {
             .join("\n")
     }
 
+    /// The style of the first cell of the first occurrence of `needle`.
+    fn style_at(buf: &Buffer, needle: &str) -> Style {
+        let area = *buf.area();
+        let want: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        for y in 0..area.height {
+            'col: for x in 0..area.width {
+                for (k, w) in want.iter().enumerate() {
+                    if buf.cell((x + k as u16, y)).map(|c| c.symbol()) != Some(w.as_str()) {
+                        continue 'col;
+                    }
+                }
+                return buf.cell((x, y)).expect("cell in area").style();
+            }
+        }
+        panic!("{needle:?} not on screen");
+    }
+
     fn row(name: &str, scope: SkillScope, enabled: bool, version: u32, latest: u32) -> SkillRow {
         SkillRow {
             scope,
@@ -666,6 +689,39 @@ mod tests {
         // The whole point: no raw ANSI / SGR codes leak into the rendered list.
         assert!(!text.contains("[38;5"), "no raw ANSI escapes:\n{text}");
         assert!(!text.contains("[0m"), "no raw reset codes:\n{text}");
+    }
+
+    #[test]
+    fn edit_overlay_highlights_markdown_source() {
+        let mut ui = DeckUi {
+            tab: crate::deck::DeckTab::Skills,
+            ..Default::default()
+        };
+        ui.skills.prompt = Some(SkillPrompt::Edit {
+            scope: SkillScope::Project,
+            name: "writer".into(),
+            buffer: "---\nname: writer\n---\n# Usage\nplain prose".into(),
+        });
+        let area = Rect::new(0, 0, 90, 16);
+        let mut buf = Buffer::empty(area);
+        render(&WorkspaceModel::new(), &mut ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("# Usage"), "content on screen:\n{text}");
+        assert_eq!(
+            style_at(&buf, "# Usage").fg,
+            Some(theme::SYNTAX_KEYWORD),
+            "headings light up in the edit overlay"
+        );
+        assert_eq!(
+            style_at(&buf, "name:").fg,
+            Some(theme::SYNTAX_KEYWORD),
+            "frontmatter keys light up"
+        );
+        assert_eq!(
+            style_at(&buf, "plain prose").fg,
+            theme::body().fg,
+            "prose keeps the body style"
+        );
     }
 
     #[test]

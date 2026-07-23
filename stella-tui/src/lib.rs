@@ -57,6 +57,7 @@ pub mod progress;
 pub mod resource;
 pub mod scenario;
 pub mod splash;
+pub mod syntax;
 pub mod theme;
 pub mod views;
 
