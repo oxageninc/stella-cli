@@ -322,3 +322,198 @@ async fn hard_cancel_mid_stream_emits_a_cancelled_usage_envelope() {
         "the envelope must stay content-free: {wire}"
     );
 }
+
+/// A conversation whose oldest span (after the task statement, before the
+/// kept tail) is a summarizable ≥4-message run — the input every direct
+/// `summarize_overflow_span` witness below needs.
+fn overflow_messages() -> Vec<CompletionMessage> {
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("the task"),
+    ];
+    for i in 0..8 {
+        messages.push(big_assistant_text(&format!("t{i}")));
+    }
+    messages
+}
+
+fn summary_markers(messages: &[CompletionMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|m| m.content.starts_with(SUMMARY_MARKER_PREFIX))
+        .count()
+}
+
+/// #368.2: the summarizer is the last line of defense before a terminal
+/// context overflow, so a transient blip must be retried (standard policy),
+/// not fast-failed (deterministic policy, which discarded the recovery).
+#[tokio::test]
+async fn overflow_summarizer_retries_a_transient_error() {
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(vec![
+            Err(ProviderError::Transport("429 blip".into())),
+            Ok(text_result("SUMMARY")),
+        ]),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let calls = provider.calls.clone();
+    let tools = CountingTools {
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, overflow_config(), &sleeper);
+    let mut messages = overflow_messages();
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let mut health = SummarizerHealth::default();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let events = EventSender::new(tx);
+
+    let cost = engine
+        .summarize_overflow_span(&mut messages, &mut budget, &mut health, &events)
+        .await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the transient error must be retried, not fast-failed"
+    );
+    assert!(cost > 0.0, "the successful retry is paid for: {cost}");
+    assert_eq!(
+        summary_markers(&messages),
+        1,
+        "the summary lands after the retry"
+    );
+    assert_eq!(health.consecutive_failures, 0, "a success clears the latch");
+    let events = drain_events(&mut rx);
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "a recovered blip surfaces no failure: {events:?}"
+    );
+}
+
+/// #368.3: a summary generated and paid for right as the budget trips must
+/// still be spliced in — applying it only shrinks the context the resumed
+/// session reloads. Discarding it lost paid work for no benefit.
+#[tokio::test]
+async fn budget_aborted_summary_is_applied_not_discarded() {
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(vec![Ok(text_result("SUMMARY"))]),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tools = CountingTools {
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, overflow_config(), &sleeper);
+    let mut messages = overflow_messages();
+    let before_len = messages.len();
+    // The single summarizer call overruns the enforced limit → budget abort
+    // with the paid result in hand.
+    let mut budget = BudgetGuard::new(BudgetMode::Enforced, Some(0.00005), None);
+    let mut health = SummarizerHealth::default();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let events = EventSender::new(tx);
+
+    let cost = engine
+        .summarize_overflow_span(&mut messages, &mut budget, &mut health, &events)
+        .await;
+
+    assert!(
+        (cost - 0.0001).abs() < f64::EPSILON,
+        "the paid cost is still returned: {cost}"
+    );
+    assert_eq!(
+        summary_markers(&messages),
+        1,
+        "the paid summary must be spliced in, not dropped"
+    );
+    assert!(
+        messages.len() < before_len,
+        "the span shrank: {} !< {before_len}",
+        messages.len()
+    );
+    let events = drain_events(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Compaction { summarized, .. } if *summarized > 0
+        )),
+        "the applied summary is announced: {events:?}"
+    );
+}
+
+/// #368.4: a summarizer that keeps failing must surface each failure and,
+/// after enough consecutive misses, latch — a persistently-timing-out cheap
+/// summarizer can't be allowed to re-fire (and re-pay) every remaining step.
+#[tokio::test]
+async fn repeated_summarizer_failures_emit_events_and_latch() {
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(vec![Err(ProviderError::Transport("down".into()))]),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let calls = provider.calls.clone();
+    let tools = CountingTools {
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, overflow_config(), &sleeper);
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let mut health = SummarizerHealth::default();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let events = EventSender::new(tx);
+
+    // Every over-budget step this turn hits the same dead summarizer.
+    for _ in 0..SUMMARIZER_FAILURE_LATCH {
+        let mut messages = overflow_messages();
+        let cost = engine
+            .summarize_overflow_span(&mut messages, &mut budget, &mut health, &events)
+            .await;
+        assert_eq!(cost, 0.0, "a failed summarizer is free and changes nothing");
+        assert_eq!(summary_markers(&messages), 0, "nothing spliced on failure");
+    }
+    assert!(
+        health.is_latched(),
+        "consecutive failures must latch the summarizer"
+    );
+    let calls_while_unlatched = calls.load(Ordering::SeqCst);
+    assert!(
+        calls_while_unlatched > 0,
+        "the summarizer actually ran before latching"
+    );
+    let failures = drain_events(&mut rx)
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::Error {
+                    retryable: true,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        failures, SUMMARIZER_FAILURE_LATCH as usize,
+        "each failure surfaces exactly one retryable error"
+    );
+
+    // Latched: a further over-budget step must NOT re-fire (or re-pay for)
+    // the summarizer.
+    let mut messages = overflow_messages();
+    let cost = engine
+        .summarize_overflow_span(&mut messages, &mut budget, &mut health, &events)
+        .await;
+    assert_eq!(cost, 0.0, "the latched pass spends nothing");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        calls_while_unlatched,
+        "latched: the provider is not called again"
+    );
+    assert!(
+        drain_events(&mut rx).is_empty(),
+        "latched: no further events are emitted"
+    );
+}

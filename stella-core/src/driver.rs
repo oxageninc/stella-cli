@@ -389,6 +389,9 @@ impl<'a> Engine<'a> {
         // by reference into each model call. Stack-local — the engine holds no
         // receipt state of its own.
         let mut receipts = ReceiptLedger::new(self.config.turn_instance);
+        // Per-turn overflow-summarizer latch: stops a persistently failing
+        // cheap summarizer re-firing every step for the rest of the turn.
+        let mut summarizer_health = SummarizerHealth::default();
 
         for step in 0..self.config.max_steps {
             // Pause parks HERE — after the previous step fully settled and
@@ -422,7 +425,13 @@ impl<'a> Engine<'a> {
                 return aborted;
             }
             total_cost_usd += self
-                .run_compaction_pass(messages, calibration_model.as_deref(), budget, events)
+                .run_compaction_pass(
+                    messages,
+                    calibration_model.as_deref(),
+                    budget,
+                    &mut summarizer_health,
+                    events,
+                )
                 .await;
             // The manifest reports the budget compaction just compared against.
             let (effective_budget, calibration_factor) =
@@ -520,6 +529,7 @@ impl<'a> Engine<'a> {
         messages: &mut Vec<CompletionMessage>,
         calibration_model: Option<&str>,
         budget: &mut BudgetGuard,
+        health: &mut SummarizerHealth,
         events: &EventSender,
     ) -> f64 {
         let (compaction_budget, _factor) = self.effective_compaction_budget(calibration_model);
@@ -541,7 +551,9 @@ impl<'a> Engine<'a> {
         if self.config.summarize_overflow
             && crate::estimator::estimate_conversation_tokens(messages) > compaction_budget
         {
-            return self.summarize_overflow_span(messages, budget, events).await;
+            return self
+                .summarize_overflow_span(messages, budget, health, events)
+                .await;
         }
         0.0
     }
@@ -552,6 +564,7 @@ impl<'a> Engine<'a> {
         &self,
         messages: &mut Vec<CompletionMessage>,
         budget: &mut BudgetGuard,
+        health: &mut SummarizerHealth,
         events: &EventSender,
     ) -> f64 {
         let before_tokens = crate::estimator::estimate_conversation_tokens(messages);
@@ -584,6 +597,13 @@ impl<'a> Engine<'a> {
         if end <= start || end - start < 4 {
             return 0.0;
         }
+        // Give-up latch: once the summarizer has failed this many steps in a
+        // row this turn, stop re-firing it — each attempt is a completion and
+        // its latency. The next model call overflows and surfaces one clear
+        // failure instead of one per remaining step.
+        if health.is_latched() {
+            return 0.0;
+        }
         let rendered = crate::summarize::render_span_for_summary(&messages[start..end]);
         let request = CompletionRequest {
             messages: vec![
@@ -604,7 +624,10 @@ impl<'a> Engine<'a> {
                 role: stella_protocol::ModelCallRole::Summarization,
                 model_hint: "unknown".into(),
                 request,
-                retry_policy: RetryPolicy::deterministic(),
+                // The last line of defense before a terminal context
+                // overflow — a transient blip here must be retried, not
+                // fast-failed into an oversized, doomed next call.
+                retry_policy: RetryPolicy::standard(),
                 timeout: None,
                 estimated_input_tokens,
             },
@@ -615,18 +638,73 @@ impl<'a> Engine<'a> {
         .await
         {
             Ok(result) => result,
-            Err(AccountedCallError::Budget { result, .. }) => return result.cost_usd,
-            Err(AccountedCallError::Provider(_) | AccountedCallError::Timeout) => return 0.0,
+            // The summary was generated and paid for before the budget
+            // tripped. Splicing it in only shrinks the context the resumed
+            // session reloads, so apply it rather than discard the spend.
+            Err(AccountedCallError::Budget { result, .. }) => {
+                let text = result.text.trim();
+                if !text.is_empty() {
+                    self.apply_overflow_summary(messages, start, end, before_tokens, text, events);
+                }
+                return result.cost_usd;
+            }
+            // A silent 0.0 hid a failing summarizer that re-fired every step
+            // until the provider hard-failed. Surface it and count it toward
+            // the give-up latch.
+            Err(AccountedCallError::Provider(e)) => {
+                health.record_failure();
+                let _ = events.send(AgentEvent::Error {
+                    message: format!("overflow summarizer failed ({e}); context left intact"),
+                    retryable: true,
+                });
+                return 0.0;
+            }
+            Err(AccountedCallError::Timeout) => {
+                health.record_failure();
+                let _ = events.send(AgentEvent::Error {
+                    message: "overflow summarizer timed out; context left intact".to_string(),
+                    retryable: true,
+                });
+                return 0.0;
+            }
         };
         let cost_usd = result.cost_usd;
-        if result.text.trim().is_empty() {
+        let text = result.text.trim();
+        if text.is_empty() {
+            // An empty summary shrinks nothing, so the next step re-fires on
+            // the same span — the same non-progress the error paths latch
+            // against, and just as invisible if left unannounced.
+            health.record_failure();
+            let _ = events.send(AgentEvent::Error {
+                message: "overflow summarizer returned an empty summary; context left intact"
+                    .to_string(),
+                retryable: true,
+            });
             return cost_usd;
         }
+        health.reset();
+        self.apply_overflow_summary(messages, start, end, before_tokens, text, events);
+        cost_usd
+    }
+
+    /// Splice `text` (trimmed, non-empty) over `messages[start..end]` as the
+    /// overflow summary and announce the resulting shrink. Shared by the
+    /// normal path and the budget-abort path: a paid summary is applied even
+    /// when the turn is about to abort, since it only shrinks the context the
+    /// resumed session reloads.
+    fn apply_overflow_summary(
+        &self,
+        messages: &mut Vec<CompletionMessage>,
+        start: usize,
+        end: usize,
+        before_tokens: u64,
+        text: &str,
+        events: &EventSender,
+    ) {
         let replaced = end - start;
         let summary = CompletionMessage::user(format!(
             "{SUMMARY_MARKER_PREFIX} to fit context — full detail was compacted away; \
-             re-read files or re-run tools for specifics]\n\n{}",
-            result.text.trim()
+             re-read files or re-run tools for specifics]\n\n{text}"
         ));
         messages.splice(start..end, std::iter::once(summary));
         let _ = events.send(AgentEvent::Compaction {
@@ -638,7 +716,6 @@ impl<'a> Engine<'a> {
             aged: 0,
             summarized: replaced,
         });
-        cost_usd
     }
 
     /// Loop detection, before spending a model call on a step that's
@@ -1384,6 +1461,37 @@ impl Drop for CancelUsageGuard {
 /// the marker is User-role on the wire, but it is NOT a real user turn and
 /// must not act as a loop-detection window boundary.
 const SUMMARY_MARKER_PREFIX: &str = "[earlier history summarized";
+
+/// Consecutive overflow-summarizer failures this turn that trip the give-up
+/// latch ([`SummarizerHealth`]). Each failed attempt is a wasted completion
+/// and its latency; past this many in a row the pass stops re-firing and
+/// lets the next model call surface one clear overflow instead of N.
+const SUMMARIZER_FAILURE_LATCH: u32 = 2;
+
+/// Per-turn health of the overflow summarizer. A cheap summarizer model that
+/// keeps erroring, timing out, or returning nothing must not re-fire every
+/// remaining step of the turn: this latches after
+/// [`SUMMARIZER_FAILURE_LATCH`] consecutive non-progress results, and a
+/// successful splice clears it. Stack-local to [`Engine::run_turn`] — the
+/// engine holds no summarizer state of its own, so the latch is per-turn.
+#[derive(Default)]
+struct SummarizerHealth {
+    consecutive_failures: u32,
+}
+
+impl SummarizerHealth {
+    fn record_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    fn is_latched(&self) -> bool {
+        self.consecutive_failures >= SUMMARIZER_FAILURE_LATCH
+    }
+}
 
 /// Flatten the tool calls of the CURRENT turn — assistant messages after
 /// the last user message — in chronological order, for
