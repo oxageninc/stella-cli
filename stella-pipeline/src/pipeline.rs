@@ -980,6 +980,7 @@ impl<'a> Pipeline<'a> {
         .pop()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_shared_candidates(
         &self,
         goal: &str,

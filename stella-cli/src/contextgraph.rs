@@ -27,7 +27,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use contextgraph_host::{ContextProvider, Host, HostError, ProviderResult};
-use contextgraph_types::Representation;
 use contextgraph_types::{
     Capabilities, ContextFrame, ContextQuery, ContextQueryResult, DataFlow, ProviderInfo,
 };
@@ -305,7 +304,7 @@ mod tests {
             score,
             token_cost,
             content_digest: None,
-            representation: Representation::Full,
+            representation: contextgraph_types::Representation::Full,
             content_fidelity: None,
             canonical_content_hash: None,
             content_ref: None,
