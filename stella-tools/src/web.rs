@@ -289,9 +289,7 @@ fn require_str<'a>(input: &'a Value, field: &str) -> Result<&'a str, ToolOutput>
         })
 }
 
-// ---------------------------------------------------------------------------
 // web_search
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchProvider {
@@ -521,9 +519,7 @@ async fn tavily_search(
         .collect())
 }
 
-// ---------------------------------------------------------------------------
 // web_fetch
-// ---------------------------------------------------------------------------
 
 pub struct WebFetch(pub Arc<WebAuthState>);
 
@@ -650,9 +646,7 @@ impl Tool for WebFetch {
     }
 }
 
-// ---------------------------------------------------------------------------
 // web_extract_assets
-// ---------------------------------------------------------------------------
 
 pub struct WebExtractAssets(pub Arc<WebAuthState>);
 
@@ -838,9 +832,7 @@ fn push_list(out: &mut String, heading: &str, items: &[String], cap: usize) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // web_download
-// ---------------------------------------------------------------------------
 
 pub struct WebDownload(pub Arc<WebAuthState>);
 

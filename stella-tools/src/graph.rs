@@ -101,11 +101,9 @@ impl Tool for CodeGraphQuery {
 /// index exists yet.
 ///
 /// The index is a session-start background build (`spawn_session_graph`), so
-/// a query on turn 1 can race ahead of it — and the tool used to be gated on
-/// the db already existing, so it wasn't even advertised until that build
-/// finished. Bootstrapping here removes both: the graph tools are always
-/// advertised, and the first query that needs an index builds one instead of
-/// erroring. `index_all` is the same pass `stella init` runs — a full build
+/// a query on turn 1 can race ahead of it. Bootstrapping here means the graph
+/// tools are always advertised, and the first query that needs an index builds
+/// one instead of erroring. `index_all` is the same pass `stella init` runs — a full build
 /// on a fresh db, a hash-diff catch-up on an existing one — so it doubles as
 /// the freshness pass that lets the graph see files the agent just wrote.
 ///

@@ -667,7 +667,7 @@ mod tests {
 
     use super::*;
 
-    // ---- manifest parsing -------------------------------------------------
+    // manifest parsing
 
     const HAPPY: &str = r#"
 name = "lint_fix"
@@ -821,7 +821,7 @@ command = []"#;
         assert_eq!(tool.input_schema["type"], "object");
     }
 
-    // ---- discovery --------------------------------------------------------
+    // discovery
 
     fn write_manifest(dir: &Path, file: &str, body: &str) {
         std::fs::create_dir_all(dir).unwrap();
@@ -946,7 +946,7 @@ command = []"#;
         assert!(report.diagnostics[0].path.starts_with(home.path()));
     }
 
-    // ---- execution --------------------------------------------------------
+    // execution
 
     /// Write an executable `#!/bin/sh` script into `root` and return a
     /// [`CustomTool`] whose relative `command[0]` resolves against `root`.
@@ -1176,7 +1176,7 @@ command = []"#;
         }
     }
 
-    // ---- CustomToolSet composition ---------------------------------------
+    // CustomToolSet composition
 
     struct FakeInner;
     #[async_trait]

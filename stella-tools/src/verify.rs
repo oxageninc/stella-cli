@@ -211,7 +211,7 @@ impl Tool for VerifyDone {
             }
         };
 
-        // ---- Half 1: the new code must pass.
+        // Half 1: the new code must pass.
         let (new_exit, new_output) = match run(test_cmd, root, timeout_secs).await {
             Ok(pair) => pair,
             Err(e) => return ToolOutput::Error { message: e },
@@ -226,7 +226,7 @@ impl Tool for VerifyDone {
             };
         }
 
-        // ---- Half 2: the previous code (HEAD + your new tests) must fail.
+        // Half 2: the previous code (HEAD + your new tests) must fail.
         // Shadow names carry pid + a process-wide counter: two concurrent
         // verify_done calls (parallel tools, parallel tests) must never
         // collide on the same worktree path — a timestamp alone can.

@@ -229,7 +229,7 @@ pub fn check(request: &GateRequest<'_>) -> Result<GatePass, String> {
 
     let mut blocks: Vec<String> = Vec::new();
 
-    // ---- Ring 1: deterministic conflicts ---------------------------------
+    // Ring 1: deterministic conflicts
     // Kinds that hold data. A table, a collection, and a view holding the
     // same concept conflict with each other; an enum sharing a table's name
     // is a type definition, not a second home for the data.
@@ -360,7 +360,7 @@ pub fn check(request: &GateRequest<'_>) -> Result<GatePass, String> {
         }
     }
 
-    // ---- Ring 2: boundary redirects --------------------------------------
+    // Ring 2: boundary redirects
     let proposed_names = fresh_relations
         .iter()
         .map(|(r, layer)| {
@@ -419,7 +419,7 @@ pub fn check(request: &GateRequest<'_>) -> Result<GatePass, String> {
         return Err(message);
     }
 
-    // ---- Ring 3: similarity challenge ------------------------------------
+    // Ring 3: similarity challenge
     if request.storage_intent.is_none() {
         let mut challenges: Vec<String> = Vec::new();
         for (rel, layer) in &fresh_relations {
@@ -488,7 +488,7 @@ pub fn check(request: &GateRequest<'_>) -> Result<GatePass, String> {
         }
     }
 
-    // ---- Pass: report what this write creates ----------------------------
+    // Pass: report what this write creates
     let mut created: Vec<RelationEntry> = Vec::new();
     let mut intent_addresses: Vec<String> = Vec::new();
     for (rel, layer) in &fresh_relations {
@@ -839,7 +839,7 @@ mod tests {
         assert_eq!(token_jaccard("invoice_line", "line_item"), 1.0 / 3.0);
     }
 
-    // ---- Cross-adapter behavior ------------------------------------------
+    // Cross-adapter behavior
 
     const PAYMENTS_PRISMA: &str =
         "model Payment {\n  id Int @id\n  amount Decimal\n  @@map(\"payments\")\n}\n";

@@ -146,7 +146,7 @@ pub fn detect_issue_backend() -> Option<IssueBackend> {
     None
 }
 
-// ---- shared helpers --------------------------------------------------------
+// shared helpers
 
 fn issue_ref_description(backend: &IssueBackend) -> &'static str {
     match backend {
@@ -207,7 +207,7 @@ fn format_summary(issue: &ops::IssueSummary) -> String {
     line
 }
 
-// ---- the eight tools -------------------------------------------------------
+// the eight tools
 
 pub struct CreateIssue(pub Arc<IssueBackend>);
 #[async_trait]

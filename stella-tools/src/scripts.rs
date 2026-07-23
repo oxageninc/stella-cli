@@ -442,9 +442,7 @@ fn string_args(input: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-// ---------------------------------------------------------------------------
 // Detection
-// ---------------------------------------------------------------------------
 
 /// Run every ecosystem detector over one package dir. Cargo synthesizes at
 /// the workspace root only — per-crate cargo entries would be noise (the
@@ -1022,9 +1020,7 @@ fn strip_jsonc_comments(src: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Workspace members
-// ---------------------------------------------------------------------------
 
 /// Member dirs declared by the root manifests: `package.json` `workspaces`,
 /// `pnpm-workspace.yaml` `packages`, `[workspace] members` in `Cargo.toml`.
@@ -1124,9 +1120,7 @@ fn expand_member_pattern(root: &Path, pattern: &str, dirs: &mut BTreeSet<String>
     }
 }
 
-// ---------------------------------------------------------------------------
 // Verb resolution
-// ---------------------------------------------------------------------------
 
 /// Bind the six canonical verbs over the sorted entries (root package only):
 /// (1) an explicit script in the first-ranked ecosystem, (2) that
@@ -1179,9 +1173,7 @@ fn find_synthesized(entries: &[ScriptEntry], rank: u8, verb: &str) -> Option<usi
     })
 }
 
-// ---------------------------------------------------------------------------
 // Tools
-// ---------------------------------------------------------------------------
 
 pub struct ListScripts;
 

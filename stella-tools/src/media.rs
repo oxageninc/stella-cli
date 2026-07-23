@@ -988,7 +988,7 @@ mod tests {
         assert!(matches!(no_prompt, ToolOutput::Error { .. }));
     }
 
-    // ---- video --------------------------------------------------------
+    // video
 
     /// A deterministic video provider: fixed job handle, scripted poll
     /// state, no network — proves the tool pair drives the gate, the job
@@ -1408,7 +1408,7 @@ mod tests {
         assert!(matches!(no_id, ToolOutput::Error { .. }));
     }
 
-    // ---- svg ----------------------------------------------------------
+    // svg
 
     #[tokio::test]
     async fn svg_is_sanitized_and_persisted() {

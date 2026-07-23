@@ -1507,7 +1507,7 @@ mod tests {
         assert_eq!(names.len(), 46, "unexpected tool count: {names:?}");
     }
 
-    // ---- bash opt-in (default OFF everywhere) -------------------------
+    // bash opt-in (default OFF everywhere)
 
     /// Witness: the default registry has NO `bash` — not in the schemas
     /// the model sees, and executing it anyway is the standard
@@ -1566,7 +1566,7 @@ mod tests {
         }
     }
 
-    // ---- web opt-in (default OFF everywhere) --------------------------
+    // web opt-in (default OFF everywhere)
 
     /// Witness: the web family is settings opt-in exactly like bash —
     /// absent by default, registered (fetch/extract/download, all
@@ -1715,7 +1715,7 @@ mod tests {
 
     #[tokio::test]
     async fn graph_query_is_advertised_without_an_index_and_builds_one_on_first_use() {
-        // The gate is gone: `graph_query` is advertised from the start, even
+        // `graph_query` is advertised from the start, even
         // in a workspace with no `.stella/private/codegraph.db`. Hiding it
         // until an index existed hid the very tool that builds one, so the
         // agent grepped instead. The first call builds the index it needs.
@@ -2055,7 +2055,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- file-touch telemetry ----------------------------------------
+    // file-touch telemetry
 
     /// Fresh registry over a fresh tempdir, no optional backends.
     fn telemetry_fixture() -> (tempfile::TempDir, ToolRegistry) {
@@ -2382,7 +2382,7 @@ mod tests {
         );
     }
 
-    // ---- extension hook bus integration -------------------------------
+    // extension hook bus integration
 
     use std::sync::Arc as StdArc;
     use std::sync::Mutex as StdMutex;

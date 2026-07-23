@@ -379,7 +379,7 @@ mod tests {
             .collect()
     }
 
-    // ---- witness: clean pass ----------------------------------------------
+    // witness: clean pass
 
     #[test]
     fn valid_manifest_passes_clean() {
@@ -402,7 +402,7 @@ mod tests {
         assert_eq!(report.warning_count(), 0);
     }
 
-    // ---- witness: malformed TOML -------------------------------------------
+    // witness: malformed TOML
 
     #[test]
     fn malformed_toml_is_an_error_with_a_precise_message() {
@@ -441,7 +441,7 @@ mod tests {
         );
     }
 
-    // ---- witness: reserved name ---------------------------------------------
+    // witness: reserved name
 
     #[test]
     fn reserved_name_is_an_error() {
@@ -462,7 +462,7 @@ mod tests {
         );
     }
 
-    // ---- witness: duplicate names -------------------------------------------
+    // witness: duplicate names
 
     #[test]
     fn same_dir_duplicate_is_a_warning_on_the_losing_manifest() {
@@ -522,7 +522,7 @@ mod tests {
         assert!(warnings[0].contains("shadows"), "{}", warnings[0]);
     }
 
-    // ---- witness: timeout normalization ---------------------------------------
+    // witness: timeout normalization
 
     #[test]
     fn over_cap_timeout_warns_about_clamping() {
@@ -570,7 +570,7 @@ mod tests {
         }
     }
 
-    // ---- witness: command[0] checks --------------------------------------------
+    // witness: command[0] checks
 
     #[test]
     fn missing_relative_command_is_a_warning_naming_the_resolved_path() {
@@ -650,7 +650,7 @@ mod tests {
         assert!(issues_with(by_name("onpath_tool"), Severity::Warning).is_empty());
     }
 
-    // ---- shape of the report ----------------------------------------------------
+    // shape of the report
 
     #[test]
     fn absent_directories_yield_an_empty_report() {
