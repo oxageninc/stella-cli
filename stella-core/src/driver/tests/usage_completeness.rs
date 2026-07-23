@@ -102,7 +102,10 @@ async fn exhausted_retries_emit_typed_reasons_before_the_error() {
     let error_pos = events
         .iter()
         .position(|e| matches!(e, AgentEvent::Error { .. }));
-    assert!(exhausted_pos < error_pos, "{exhausted_pos:?} vs {error_pos:?}");
+    assert!(
+        exhausted_pos < error_pos,
+        "{exhausted_pos:?} vs {error_pos:?}"
+    );
 }
 
 #[tokio::test]

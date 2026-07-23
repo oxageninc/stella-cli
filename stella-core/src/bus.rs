@@ -831,7 +831,10 @@ pub fn bridge_policy_plane(
         };
         let (subject, outcome) = if kind == PolicyKind::SecretDetected {
             (
-                event.payload["path"].as_str().unwrap_or_default().to_string(),
+                event.payload["path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
                 event.payload["kinds"].to_string(),
             )
         } else {

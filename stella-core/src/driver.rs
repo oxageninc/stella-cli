@@ -1048,9 +1048,8 @@ impl<'a> Engine<'a> {
             }
             Err(error) => {
                 cancel_guard.disarm();
-                let reasons = std::mem::take(
-                    &mut *attempt_reasons.lock().unwrap_or_else(|p| p.into_inner()),
-                );
+                let reasons =
+                    std::mem::take(&mut *attempt_reasons.lock().unwrap_or_else(|p| p.into_inner()));
                 let _ = events.send(AgentEvent::RetriesExhausted {
                     turn_instance: self.config.turn_instance,
                     attempts: reasons.len() as u32,
