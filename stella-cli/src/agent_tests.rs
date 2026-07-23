@@ -1129,6 +1129,73 @@ fn reflection_budget_tick_is_rebased_to_the_caller_session() {
     assert_eq!(ticks[0].1, Some(1.0));
 }
 
+#[test]
+fn budget_flag_configures_the_session_axis_not_the_turn_axis() {
+    // `--budget` must cap the whole run, so its limit lives on the session
+    // axis (which `begin_turn` never resets) and the turn axis stays unset.
+    let guard = build_budget_guard(Some(5.0));
+    assert_eq!(guard.mode(), BudgetMode::Enforced);
+    assert_eq!(guard.session_limit_usd(), Some(5.0));
+    assert_eq!(
+        guard.turn_limit_usd(),
+        None,
+        "the CLI limit must not land on the per-turn axis"
+    );
+
+    // No flag still meters (observed) but never gates.
+    let unbounded = build_budget_guard(None);
+    assert_eq!(unbounded.mode(), BudgetMode::Observed);
+    assert_eq!(unbounded.session_limit_usd(), None);
+    assert_eq!(unbounded.turn_limit_usd(), None);
+}
+
+#[test]
+fn budget_cap_holds_across_turns_rather_than_resetting_each_one() {
+    use stella_core::BudgetOutcome;
+    use stella_core::budget::BudgetAxis;
+
+    // A multi-turn session (REPL, deck, or goal round) calls `begin_turn` at
+    // the top of every turn. Each turn here is individually under the $1.00
+    // limit, but their sum is not — the session axis must trip on the second
+    // turn instead of the per-turn reset handing back the full limit again.
+    let mut budget = build_budget_guard(Some(1.0));
+
+    budget.begin_turn();
+    assert_eq!(budget.record_spend(0.6), BudgetOutcome::Continue);
+
+    budget.begin_turn();
+    match budget.record_spend(0.6) {
+        BudgetOutcome::AbortTurn {
+            axis: BudgetAxis::Session,
+            spent_usd,
+            limit_usd,
+        } => {
+            assert!((spent_usd - 1.2).abs() < 1e-9);
+            assert_eq!(limit_usd, 1.0);
+        }
+        other => panic!("expected a session-axis abort across turns, got {other:?}"),
+    }
+}
+
+#[test]
+fn remaining_budget_tracks_session_headroom() {
+    let mut guard = build_budget_guard(Some(2.0));
+    assert_eq!(remaining_budget(&guard), Some(2.0));
+
+    guard.begin_turn();
+    guard.record_spend(0.5);
+    assert!((remaining_budget(&guard).unwrap() - 1.5).abs() < 1e-9);
+
+    // Headroom survives a turn reset — it is session-scoped, not turn-scoped.
+    guard.begin_turn();
+    assert!((remaining_budget(&guard).unwrap() - 1.5).abs() < 1e-9);
+    guard.record_spend(3.0);
+    assert_eq!(remaining_budget(&guard), Some(0.0));
+
+    // No configured limit means no headroom to report.
+    assert_eq!(remaining_budget(&build_budget_guard(None)), None);
+}
+
 #[path = "agent_tests/usage_completeness.rs"]
 mod usage_completeness;
 

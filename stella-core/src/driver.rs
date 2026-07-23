@@ -22,19 +22,29 @@
 //! flight emits one `Cancelled` envelope from a drop guard
 //! ([`CancelUsageGuard`]) armed for exactly that window.
 //!
-//! # Retry never re-executes a mutating tool call
+//! # Retry re-executes only read-only tool calls, never a mutating one
 //!
 //! [`crate::retry::retry_with_backoff_observed`] wraps the model call
 //! (`Provider::complete_observed`) together with that attempt's speculation
-//! pump (`crate::speculation`): read-only calls announced by the stream may
-//! execute inside a failed attempt and execute again when the retry
-//! re-announces them — discarded work, safe precisely because they are
-//! read-only. MUTATING tool execution happens exactly once, after a model
-//! call has already succeeded and returned tool calls to run — it is never
-//! inside the retried closure. A retried step therefore structurally
-//! cannot re-execute a non-idempotent (mutating) tool call; see the
-//! property test `retry_never_re_executes_a_tool_call` below, which proves
-//! it by counting real executions against a flaky scripted provider.
+//! pump (`crate::speculation`). The exactly-once guarantee is scoped to
+//! MUTATING tools: a mutating call runs once, after a model call has
+//! already succeeded and returned tool calls to run — never inside the
+//! retried closure — so a retried step structurally cannot re-execute a
+//! non-idempotent tool. See the property test
+//! `retry_never_re_executes_a_tool_call` below, which proves it by counting
+//! real executions against a flaky scripted provider.
+//!
+//! READ-ONLY tools carry no such guarantee: a read-only call announced by
+//! the stream DOES execute inside the retried attempt closure and can run
+//! more than once per step (a failed attempt runs it, the retry re-announces
+//! and runs it again). That is safe for the *workspace* — read-only calls
+//! mutate nothing — but a maintainer must not assume a read-only tool with
+//! an observable side channel (a network read, a rate-limited API, a write
+//! to internal state like `codegraph.db`) runs at most once. See
+//! `crate::speculation` for the read-only overlap semantics: user hooks are
+//! excluded from that overlap so they still fire exactly once per committed
+//! call, and every speculative execution that never commits is reported as a
+//! `SpeculationDiscarded` event so the I/O it ran stays accountable (#370).
 //!
 //! # Budget is checked between steps, never mid-tool
 //!
@@ -67,11 +77,11 @@ use stella_protocol::{
     ProviderError, ReasoningEffort, StageKind, ToolCall, ToolOutput, ToolResult,
 };
 
-use crate::budget::{BudgetGuard, BudgetOutcome};
+use crate::budget::{BudgetAxis, BudgetGuard, BudgetOutcome};
 use crate::compaction::compact;
 use crate::estimator::{CalibrationMap, estimate_conversation_tokens};
 use crate::event_sender::EventSender;
-use crate::hooks::{HookPayload, HookRunner, Hooks, run_hooks};
+use crate::hooks::{HookEvent, HookPayload, HookRunner, Hooks, run_hooks, select_matchers};
 use crate::loop_detect::{CallRecord, LoopDetectionConfig, detect_loop};
 use crate::ports::ToolExecutor;
 use crate::receipts::ReceiptLedger;
@@ -226,6 +236,15 @@ pub struct Engine<'a> {
 /// are I/O-bound (process spawns, file reads), so this caps descriptor and
 /// process pressure, not CPU.
 const MAX_CONCURRENT_TOOL_CALLS: usize = 8;
+
+/// `SpeculationDiscarded.reason` — a speculative pool was dropped because
+/// its stream attempt failed (or the turn was cancelled) before its
+/// read-only work could be harvested.
+const SPECULATION_DISCARD_ATTEMPT_FAILED: &str = "attempt_failed";
+/// `SpeculationDiscarded.reason` — a speculative pool entry was rejected at
+/// dispatch because the committed call diverged from what was announced, or
+/// no committed call ever claimed it.
+const SPECULATION_DISCARD_HARVEST_MISMATCH: &str = "harvest_mismatch";
 
 /// One committed model call plus the step-scoped context the phases after
 /// it consume: the pre-call raw token estimate (drift feedback + telemetry
@@ -820,6 +839,25 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Whether any configured `PreToolUse`/`PostToolUse` hook matches
+    /// `name`. Such a tool is never speculated: its hooks must fire exactly
+    /// once, on the committed dispatch path (`PreToolUse` gates *before*
+    /// execution) — a speculative attempt that later fails would otherwise
+    /// fire phantom hook side effects for a call that never reached the
+    /// transcript (#370). Matching is the same `select_matchers` glob the
+    /// hook runner itself uses, so the two can never disagree. `false`
+    /// whenever hooks are off, keeping hook-free turns byte-identical.
+    fn tool_has_matching_hook(&self, name: &str) -> bool {
+        let Some(handle) = self.hooks else {
+            return false;
+        };
+        [HookEvent::PreToolUse, HookEvent::PostToolUse]
+            .into_iter()
+            .any(|event| {
+                !select_matchers(event, handle.hooks.matchers_for(event), Some(name)).is_empty()
+            })
+    }
+
     /// One model call with retry+backoff (`crate::retry`). On commit,
     /// flushes the step's deferred `Retry` events (module docs, L-E10) and
     /// returns the result bundled with the request-time snapshots the
@@ -846,23 +884,39 @@ impl<'a> Engine<'a> {
             .filter(|s| s.read_only)
             .map(|s| s.name.clone())
             .collect();
+        // Read-only tools a configured hook matches are excluded from
+        // speculation (they run only on the committed dispatch path so their
+        // hooks fire exactly once — #370). The gate still needs the full
+        // read-only set for its mutation fence, so `hook_gated` is carried
+        // alongside it, not subtracted from it. Empty whenever hooks are off.
+        let hook_gated: HashSet<String> = read_only_tools
+            .iter()
+            .filter(|name| self.tool_has_matching_hook(name))
+            .cloned()
+            .collect();
         let estimated_input_tokens = estimate_conversation_tokens(messages);
         let messages_snapshot = messages.to_vec();
         let req_config = &self.config;
         let speculation_read_only = read_only_tools.clone();
+        let speculation_hook_gated = hook_gated;
         // The gate forwards answer fragments as `TextDelta` previews. Deliberately NOT rolled back
         // on a failed attempt: a retry's deltas re-stream from the start
         // with no reset marker — the eventual `Text` event is authoritative
         // and consumers replace the preview with it (protocol docs).
         let delta_events = events.clone();
+        // The pump reports its discarded read-only work (a failed attempt's
+        // pool, or a hard cancel mid-drain) as `SpeculationDiscarded` events
+        // so I/O that actually ran is never silently lost (#370).
+        let pump_events = events.clone();
         // Each attempt runs the provider call and the speculation pump
         // concurrently: the pump executes read-only calls the moment the
         // adapter announces them (`crate::speculation`), so their wall-clock
         // overlaps the stream instead of following it. The gate (and with
         // it the channel's send half) drops when the provider call resolves,
         // which is what lets the pump finish draining. A failed attempt
-        // drops its pool with the attempt — read-only work is safe to
-        // waste — and the retry builds a fresh channel and pool.
+        // drops its pool with the attempt — safe to waste for the workspace,
+        // but each completed entry emits a `SpeculationDiscarded` event on
+        // the way out (#370) — and the retry builds a fresh channel and pool.
         let attempt: RetryAttemptFn = Box::new(move || {
             let req = CompletionRequest {
                 messages: messages_snapshot.clone(),
@@ -874,12 +928,14 @@ impl<'a> Engine<'a> {
                 tools: tools_schema.clone(),
             };
             let read_only = speculation_read_only.clone();
+            let gated = speculation_hook_gated.clone();
             let delta_tx = delta_events.clone();
+            let pump_tx = pump_events.clone();
             Box::pin(async move {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                let mut pump: SpeculationFuture<'_> = Box::pin(self.pump_speculations(rx));
+                let mut pump: SpeculationFuture<'_> = Box::pin(self.pump_speculations(rx, pump_tx));
                 let mut complete = Box::pin(async move {
-                    let gate = SpeculationGate::new(read_only, tx, delta_tx);
+                    let gate = SpeculationGate::new(read_only, gated, tx, delta_tx);
                     self.provider.complete_observed(req, &gate).await
                     // `gate` (and its sender) drop here → the pump's
                     // stream ends once in-flight executions drain.
@@ -1011,9 +1067,17 @@ impl<'a> Engine<'a> {
     /// the gate drops the send half AND every in-flight execution finishes —
     /// speculated calls are exactly the calls dispatch would run first, so
     /// draining them is never wasted time on the committed path.
+    ///
+    /// Completed executions accumulate inside a [`SpeculationDropGuard`]: on
+    /// the committed path the pump runs to completion and hands the pool to
+    /// dispatch (disarming the guard), but if this future is dropped first —
+    /// its stream attempt failed, or the turn was hard-cancelled mid-drain —
+    /// the guard emits one `SpeculationDiscarded` per already-completed entry
+    /// so the read-only I/O that ran is never lost from the event log (#370).
     async fn pump_speculations(
         &self,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<ToolCall>,
+        events: EventSender,
     ) -> SpeculationPool {
         let announced = futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx));
         let mut in_flight = announced
@@ -1024,9 +1088,13 @@ impl<'a> Engine<'a> {
             })
             .buffer_unordered(MAX_CONCURRENT_TOOL_CALLS);
 
-        let mut pool = SpeculationPool::new();
+        let mut guard = SpeculationDropGuard {
+            events,
+            pool: SpeculationPool::new(),
+            armed: true,
+        };
         while let Some((call, output, duration_ms)) = in_flight.next().await {
-            pool.insert(
+            guard.pool.insert(
                 call.call_id.clone(),
                 SpeculativeResult {
                     name: call.name,
@@ -1036,7 +1104,20 @@ impl<'a> Engine<'a> {
                 },
             );
         }
-        pool
+        guard.harvest()
+    }
+
+    /// Emit `SpeculationDiscarded` for every entry a committed step's pool
+    /// left un-harvested — read-only calls that ran real I/O off a divergent
+    /// stream but never appeared in the committed transcript (#370).
+    fn discard_speculation_pool(&self, pool: SpeculationPool, events: &EventSender) {
+        for (call_id, result) in pool {
+            let _ = events.send(AgentEvent::SpeculationDiscarded {
+                call_id,
+                name: result.name,
+                reason: SPECULATION_DISCARD_HARVEST_MISMATCH.to_string(),
+            });
+        }
     }
 
     /// Bookkeeping for the call that just committed: drift feedback into
@@ -1070,9 +1151,9 @@ impl<'a> Engine<'a> {
         }
 
         let BudgetOutcome::AbortTurn {
+            axis,
             spent_usd,
             limit_usd,
-            ..
         } = committed.budget_outcome
         else {
             return None;
@@ -1137,8 +1218,13 @@ impl<'a> Engine<'a> {
                 attachments: Vec::new(),
             });
         }
+        let axis = match axis {
+            BudgetAxis::Turn => "turn",
+            BudgetAxis::Session => "session",
+        };
         let reason = format!(
-            "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} limit"
+            "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} \
+             {axis} limit"
         );
         let _ = events.send(AgentEvent::Error {
             message: reason.clone(),
@@ -1179,6 +1265,11 @@ impl<'a> Engine<'a> {
         }
 
         if result.tool_calls.is_empty() {
+            // A committed step that runs no tools can still have speculated
+            // read-only calls off a divergent stream (announced, then dropped
+            // from the commit): none are harvested here, so account for the
+            // discarded I/O rather than dropping the pool silently (#370).
+            self.discard_speculation_pool(speculation, events);
             // A turn that produced neither a tool call NOR any visible text is
             // never a real completion: the model was cut off at its output
             // limit (usually mid-reasoning) or returned nothing at all.
@@ -1319,9 +1410,22 @@ impl<'a> Engine<'a> {
                     .map(|(offset, call)| {
                         let _ = events.send(AgentEvent::ToolStart { call: call.clone() });
                         let index = group_start + offset;
-                        let harvested = speculation
-                            .remove(&call.call_id)
-                            .filter(|s| s.name == call.name && s.input == call.input);
+                        let harvested = match speculation.remove(&call.call_id) {
+                            Some(s) if s.name == call.name && s.input == call.input => Some(s),
+                            Some(stale) => {
+                                // The committed call diverged from what was
+                                // announced: reject the pooled result and
+                                // re-execute below. The speculative execution
+                                // still ran real I/O — record it (#370).
+                                let _ = events.send(AgentEvent::SpeculationDiscarded {
+                                    call_id: call.call_id.clone(),
+                                    name: stale.name,
+                                    reason: SPECULATION_DISCARD_HARVEST_MISMATCH.to_string(),
+                                });
+                                None
+                            }
+                            None => None,
+                        };
                         async move {
                             match harvested {
                                 Some(s) => (index, call, s.output, s.duration_ms, true),
@@ -1356,6 +1460,9 @@ impl<'a> Engine<'a> {
 
             i = group_end;
         }
+        // Any pool entry no committed call ever claimed ran real I/O that
+        // never reached the transcript — account for it, don't drop it (#370).
+        self.discard_speculation_pool(speculation, events);
         indexed.sort_by_key(|(index, _)| *index);
         indexed.into_iter().map(|(_, result)| result).collect()
     }
@@ -1529,6 +1636,43 @@ impl Drop for CancelUsageGuard {
             duration_ms: self.started.elapsed().as_millis() as u64,
             retries: None,
         });
+    }
+}
+
+/// Accumulates one attempt's completed speculative executions
+/// (`crate::speculation`) and, if the pump future is dropped before its pool
+/// is harvested, emits one `SpeculationDiscarded` per entry. The drop path
+/// is a failed stream attempt (the retry builds a fresh pool) or a hard
+/// cancel mid-drain: read-only work that already ran real I/O but whose
+/// result never reaches the transcript. The committed path calls
+/// [`Self::harvest`] to disarm the guard and hand the pool to dispatch,
+/// where each entry is instead harvested or discarded per call (#370).
+struct SpeculationDropGuard {
+    events: EventSender,
+    pool: SpeculationPool,
+    armed: bool,
+}
+
+impl SpeculationDropGuard {
+    /// Disarm and hand the accumulated pool to the committed dispatch path.
+    fn harvest(&mut self) -> SpeculationPool {
+        self.armed = false;
+        std::mem::take(&mut self.pool)
+    }
+}
+
+impl Drop for SpeculationDropGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for (call_id, result) in self.pool.drain() {
+            let _ = self.events.send(AgentEvent::SpeculationDiscarded {
+                call_id,
+                name: result.name,
+                reason: SPECULATION_DISCARD_ATTEMPT_FAILED.to_string(),
+            });
+        }
     }
 }
 

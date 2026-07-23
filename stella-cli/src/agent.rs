@@ -1642,20 +1642,39 @@ pub fn run_tools_validation(dir: Option<&std::path::Path>) -> Result<(), String>
     }
 }
 
-/// Construct the turn/session budget guard from `--budget`. No limit at
-/// all still meters spend (`BudgetMode::Observed`) so the cost summary and
+/// Construct the budget guard from `--budget`. The limit lands on the
+/// session axis, so it caps cumulative spend across every turn and goal
+/// round of the run — `begin_turn` (called at the top of each turn/round)
+/// resets only the turn-scoped counter while the session accumulator
+/// survives it. The turn axis is left unset on purpose: turn spend can
+/// never exceed session spend (it is a reset-to-zero subset of it), so a
+/// turn limit equal to the session limit could never trip first and would
+/// only mislabel a session breach as a turn one. No limit at all still
+/// meters spend (`BudgetMode::Observed`) so the cost summary and
 /// `BudgetTick` events stay meaningful even when nothing is enforced.
 pub(crate) fn build_budget_guard(budget_limit: Option<f64>) -> BudgetGuard {
     match budget_limit {
-        Some(limit) => BudgetGuard::new(BudgetMode::Enforced, Some(limit), None),
+        Some(limit) => BudgetGuard::new(BudgetMode::Enforced, None, Some(limit)),
         None => BudgetGuard::new(BudgetMode::Observed, None, None),
     }
 }
 
+/// Headroom before the next configured cap trips, in USD — the smaller of
+/// the turn- and session-axis remainders when both are set, so the reported
+/// value is always the binding constraint. `None` when neither axis has a
+/// limit.
 pub(crate) fn remaining_budget(guard: &BudgetGuard) -> Option<f64> {
-    guard
+    let turn = guard
         .turn_limit_usd()
-        .map(|limit| (limit - guard.spent_usd()).max(0.0))
+        .map(|limit| (limit - guard.spent_usd()).max(0.0));
+    let session = guard
+        .session_limit_usd()
+        .map(|limit| (limit - guard.session_spent_usd()).max(0.0));
+    match (turn, session) {
+        (Some(turn), Some(session)) => Some(turn.min(session)),
+        (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
+        (None, None) => None,
+    }
 }
 
 pub(crate) fn settle_reflection_budget(report: &mut ReflectionReport, guard: &mut BudgetGuard) {
