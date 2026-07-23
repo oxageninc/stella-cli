@@ -77,7 +77,7 @@ use stella_protocol::{
     ProviderError, ReasoningEffort, StageKind, ToolCall, ToolOutput, ToolResult,
 };
 
-use crate::budget::{BudgetGuard, BudgetOutcome};
+use crate::budget::{BudgetAxis, BudgetGuard, BudgetOutcome};
 use crate::compaction::compact;
 use crate::estimator::{CalibrationMap, estimate_conversation_tokens};
 use crate::event_sender::EventSender;
@@ -1105,9 +1105,9 @@ impl<'a> Engine<'a> {
         }
 
         let BudgetOutcome::AbortTurn {
+            axis,
             spent_usd,
             limit_usd,
-            ..
         } = committed.budget_outcome
         else {
             return None;
@@ -1172,8 +1172,13 @@ impl<'a> Engine<'a> {
                 attachments: Vec::new(),
             });
         }
+        let axis = match axis {
+            BudgetAxis::Turn => "turn",
+            BudgetAxis::Session => "session",
+        };
         let reason = format!(
-            "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} limit"
+            "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} \
+             {axis} limit"
         );
         let _ = events.send(AgentEvent::Error {
             message: reason.clone(),

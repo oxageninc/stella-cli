@@ -158,10 +158,11 @@ struct GlobalArgs {
     )]
     output_format: OutputFormat,
 
-    /// Hard USD spend limit for the whole run/session — enforced mode
-    /// : work aborts cleanly (never mid-tool) once
-    /// total spend exceeds this. Omit to meter spend for the cost summary
-    /// without ever blocking (observed mode).
+    /// Hard USD spend limit for the whole run — a session-scoped cap:
+    /// enforced mode aborts cleanly (never mid-tool) once cumulative spend
+    /// across every turn and goal round exceeds this, not each turn on its
+    /// own. Omit to meter spend for the cost summary without ever blocking
+    /// (observed mode).
     #[arg(long, global = true, env = "STELLA_BUDGET", value_parser = parse_budget)]
     budget: Option<f64>,
 
