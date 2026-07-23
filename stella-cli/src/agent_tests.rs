@@ -153,6 +153,28 @@ fn assemble_system_prompt_bakes_a_byte_stable_orientation_map() {
     assert!(first.contains("Entry points:"), "{first}");
 }
 
+/// The #336 wave-1 steering-parity witness: `read_symbol` (#383) must be
+/// advertised in BOTH static base personas the way its siblings `repo_diff`
+/// (#381) and `diagnostics` (#384) are — a tool the prompt never mentions
+/// loses to guessed read_file offsets no matter how good it is.
+#[test]
+fn both_static_prompts_carry_a_read_symbol_steering_line() {
+    for (name, prompt) in [
+        ("SYSTEM_PROMPT", SYSTEM_PROMPT),
+        ("PIPELINE_SYSTEM_PROMPT", PIPELINE_SYSTEM_PROMPT),
+    ] {
+        assert!(
+            prompt.contains("- read_symbol: "),
+            "{name} must carry a read_symbol steering line"
+        );
+        assert!(
+            prompt.contains("guessing read_file offsets after a graph_query"),
+            "{name}'s read_symbol line must steer AWAY from offset-guessing — \
+             that round-trip is the tool's reason to exist (issue #330)"
+        );
+    }
+}
+
 /// Build a real code-graph index in a tempdir: `hub.rs` (three symbols) is
 /// busiest, `leaf.rs` (one) is not. Returns the workspace root tempdir.
 fn graph_fixture() -> tempfile::TempDir {

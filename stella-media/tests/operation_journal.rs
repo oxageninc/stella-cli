@@ -162,9 +162,9 @@ fn open_refuses_unsafe_wal_and_shm_sidecars_without_mutating_them() {
 fn concurrent_first_open_initializes_one_private_journal() {
     let dir = tempfile::tempdir().unwrap();
     let path = Arc::new(dir.path().join("host").join("operations.db"));
-    let barrier = Arc::new(Barrier::new(3));
+    let barrier = Arc::new(Barrier::new(5));
     let mut workers = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..4 {
         let path = path.clone();
         let barrier = barrier.clone();
         workers.push(std::thread::spawn(move || {
@@ -185,12 +185,35 @@ fn concurrent_first_open_initializes_one_private_journal() {
             .unwrap(),
         MediaOperationClaim::New
     );
-    assert_eq!(
-        journals[1]
-            .claim("mop_concurrent_init", MediaKind::Image, "fake", expires_at)
-            .unwrap(),
-        MediaOperationClaim::Existing(MediaOperationState::Pending)
-    );
+    for journal in &journals[1..] {
+        assert_eq!(
+            journal
+                .claim("mop_concurrent_init", MediaKind::Image, "fake", expires_at)
+                .unwrap(),
+            MediaOperationClaim::Existing(MediaOperationState::Pending)
+        );
+    }
+}
+
+#[test]
+fn concurrent_first_open_with_many_racers_all_succeed() {
+    const RACERS: usize = 8;
+    let dir = tempfile::tempdir().unwrap();
+    let path = Arc::new(dir.path().join("host").join("operations.db"));
+    let barrier = Arc::new(Barrier::new(RACERS + 1));
+    let mut workers = Vec::new();
+    for _ in 0..RACERS {
+        let path = path.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            SqliteMediaOperationJournal::open(path.as_path(), config(3600, 100))
+        }));
+    }
+    barrier.wait();
+    for worker in workers {
+        worker.join().unwrap().unwrap();
+    }
 }
 
 #[test]

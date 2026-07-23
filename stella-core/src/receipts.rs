@@ -74,6 +74,22 @@ fn estimate_tokens(content: &str) -> u32 {
     (content.chars().count() as f64 / CHARS_PER_TOKEN).ceil() as u32
 }
 
+/// Whether a block kind's preimage lives in the event journal (resolved at
+/// reconstruction time) or must be captured locally at emission. Tool I/O and
+/// assistant text ride the journal (`ToolStart`/`ToolResult`/`Text`); the
+/// system prefix and the assembled user/recall/steer/summary messages do not,
+/// so their bytes are carried as local-only block content (spec §5.3).
+fn is_gap_kind(kind: BlockKind) -> bool {
+    matches!(
+        kind,
+        BlockKind::SystemPrefix
+            | BlockKind::UserGoal
+            | BlockKind::RecalledFrame
+            | BlockKind::Steered
+            | BlockKind::Summary
+    )
+}
+
 /// One decomposed context block, before it becomes a manifest entry.
 struct BlockDraft {
     block_id: String,
@@ -82,10 +98,15 @@ struct BlockDraft {
     token_cost: u32,
     call_id: Option<String>,
     cache_zone: CacheZone,
+    /// Which sent `CompletionMessage` this block belonged to — its position in
+    /// the message vector — so reconstruction regroups exactly (spec §5.1).
+    message_index: usize,
+    /// Local-only preimage for gap kinds; `None` for journal-resolvable kinds.
+    content: Option<String>,
 }
 
 impl BlockDraft {
-    fn new(kind: BlockKind, content: &str, call_id: Option<String>) -> Self {
+    fn new(kind: BlockKind, content: &str, call_id: Option<String>, message_index: usize) -> Self {
         BlockDraft {
             block_id: block_id(kind, content),
             kind,
@@ -93,30 +114,39 @@ impl BlockDraft {
             token_cost: estimate_tokens(content),
             call_id,
             cache_zone: CacheZone::Cacheable,
+            message_index,
+            content: is_gap_kind(kind).then(|| content.to_string()),
         }
     }
 }
 
 /// Decompose the live message vector into event-granular blocks, in wire order,
-/// and stamp each a structural cache zone. The zone is a hint at emission — the
-/// system prefix is the stable-cached head (L-E8) and the final message is the
-/// live tail that is recomputed each step; cache attribution (spec §7, A3)
-/// refines these against reported usage.
+/// tagging each with its source message index (for reconstruction regrouping)
+/// and a structural cache zone. The zone is a hint at emission — the system
+/// prefix is the stable-cached head (L-E8) and the final message is the live
+/// tail that is recomputed each step; cache attribution (spec §7, A3) refines
+/// these against reported usage.
 fn decompose(messages: &[CompletionMessage]) -> Vec<BlockDraft> {
     let mut drafts = Vec::new();
-    for message in messages {
+    for (message_index, message) in messages.iter().enumerate() {
         match message.role {
             MessageRole::System => {
                 drafts.push(BlockDraft::new(
                     BlockKind::SystemPrefix,
                     &message.content,
                     None,
+                    message_index,
                 ));
             }
             MessageRole::User => {
                 // The recalled frames live inside this message; splitting them
                 // into per-frame blocks is the memory-join increment (§9).
-                drafts.push(BlockDraft::new(BlockKind::UserGoal, &message.content, None));
+                drafts.push(BlockDraft::new(
+                    BlockKind::UserGoal,
+                    &message.content,
+                    None,
+                    message_index,
+                ));
             }
             MessageRole::Assistant => {
                 if !message.content.is_empty() {
@@ -124,6 +154,7 @@ fn decompose(messages: &[CompletionMessage]) -> Vec<BlockDraft> {
                         BlockKind::AssistantText,
                         &message.content,
                         None,
+                        message_index,
                     ));
                 }
                 for call in &message.tool_calls {
@@ -132,6 +163,7 @@ fn decompose(messages: &[CompletionMessage]) -> Vec<BlockDraft> {
                         BlockKind::ToolCall,
                         &content,
                         Some(call.call_id.clone()),
+                        message_index,
                     ));
                 }
             }
@@ -142,6 +174,7 @@ fn decompose(messages: &[CompletionMessage]) -> Vec<BlockDraft> {
                         BlockKind::ToolResult,
                         &content,
                         Some(result.call_id.clone()),
+                        message_index,
                     ));
                 }
             }
@@ -165,7 +198,10 @@ fn decompose(messages: &[CompletionMessage]) -> Vec<BlockDraft> {
 /// budget the driver computed for the step about to run. Lives on the stack in
 /// `run_turn`, threaded into the model call by reference — the engine holds no
 /// receipt state of its own.
-pub(crate) struct ReceiptLedger {
+///
+/// Public so reconstruction tests and inspect tooling can drive receipt
+/// emission directly against a message vector without standing up a full turn.
+pub struct ReceiptLedger {
     turn_instance: u32,
     first_seen_step: HashMap<String, usize>,
     effective_budget_tokens: u64,
@@ -173,7 +209,7 @@ pub(crate) struct ReceiptLedger {
 }
 
 impl ReceiptLedger {
-    pub(crate) fn new(turn_instance: u32) -> Self {
+    pub fn new(turn_instance: u32) -> Self {
         ReceiptLedger {
             turn_instance,
             first_seen_step: HashMap::new(),
@@ -186,7 +222,7 @@ impl ReceiptLedger {
     /// driver computed for the next step — the values the compaction pass
     /// actually compared against, carried onto the manifest so the receipt's
     /// numbers line up with the decision that was made (#364 item 1).
-    pub(crate) fn set_effective_budget(&mut self, budget_tokens: u64, factor: f64) {
+    pub fn set_effective_budget(&mut self, budget_tokens: u64, factor: f64) {
         self.effective_budget_tokens = budget_tokens;
         self.calibration_factor = factor;
     }
@@ -194,7 +230,7 @@ impl ReceiptLedger {
     /// Emit the receipt for one committed step: a `BlockRegistered` for every
     /// block first seen this step, then the ordered `StepManifest`. Called at
     /// the settled boundary where the served model/provider are known.
-    pub(crate) fn emit_step_receipt(
+    pub fn emit_step_receipt(
         &mut self,
         messages: &[CompletionMessage],
         step: usize,
@@ -215,7 +251,8 @@ impl ReceiptLedger {
                 None => {
                     self.first_seen_step.insert(draft.block_id.clone(), step);
                     // Durable-before-visible: register the block before the
-                    // manifest cites it.
+                    // manifest cites it. Gap kinds carry their local-only bytes
+                    // (spec §5.3); journal-resolvable kinds carry only a digest.
                     let _ = events.send(AgentEvent::BlockRegistered {
                         block_id: draft.block_id.clone(),
                         kind: draft.kind,
@@ -228,6 +265,7 @@ impl ReceiptLedger {
                         token_cost: draft.token_cost,
                         content_digest: draft.content_digest.clone(),
                         citation_label: None,
+                        content: draft.content.clone(),
                     });
                     step
                 }
@@ -237,6 +275,7 @@ impl ReceiptLedger {
                 cache_zone: draft.cache_zone,
                 token_cost: draft.token_cost,
                 resident_since_step,
+                message_index: draft.message_index,
             });
         }
         let _ = events.send(AgentEvent::StepManifest {

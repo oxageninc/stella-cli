@@ -28,7 +28,7 @@ pub(crate) type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// a file at `user_version` i to i + 1. Fresh files never run these — they
 /// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
 /// directly.
-pub(crate) const MIGRATIONS: [Migration; 11] = [
+pub(crate) const MIGRATIONS: [Migration; 12] = [
     // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
     // their write paths have always assumed.
     migrate_v0_to_v1,
@@ -62,6 +62,11 @@ pub(crate) const MIGRATIONS: [Migration; 11] = [
     // (the manifest header). All purely additive; no existing table changes
     // shape.
     migrate_v10_to_v11,
+    // v11 → v12: reconstruction support — `context_blocks` grows the local-only
+    // `content` column (gap-kind preimages the journal cannot resolve), and
+    // `step_manifest` grows `message_index` (regroups event-granular blocks into
+    // exact messages). Both additive ADD COLUMNs, column-guarded.
+    migrate_v11_to_v12,
 ];
 
 /// The schema version this build writes — the `PRAGMA user_version` of
@@ -413,6 +418,26 @@ fn migrate_v10_to_v11(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// v11 → v12: reconstruction support (spec §5, increment 2). `context_blocks`
+/// grows a nullable local-only `content` column — the preimage of gap kinds the
+/// journal cannot resolve (system prefix, assembled user/recall message);
+/// `step_manifest` grows `message_index` so event-granular blocks regroup into
+/// the exact `CompletionMessage`s that were sent. Both are plain additive
+/// ADD COLUMNs; column-guarded so this is a no-op on a store whose v11 tables
+/// were already created at the v12 shape (fresh files, or a v10→v11 upgrade run
+/// by this build's [`CONTEXT_BLOCKS_DDL`]/[`STEP_MANIFEST_DDL`]).
+fn migrate_v11_to_v12(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    if !column_exists(tx, "context_blocks", "content")? {
+        tx.execute_batch("ALTER TABLE context_blocks ADD COLUMN content TEXT;")?;
+    }
+    if !column_exists(tx, "step_manifest", "message_index")? {
+        tx.execute_batch(
+            "ALTER TABLE step_manifest ADD COLUMN message_index INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
 /// Run one migration in its own transaction, stamping `user_version` before
 /// commit so version and shape can never disagree on disk. The caller has
 /// already suspended foreign-key enforcement (a no-op inside a
@@ -559,5 +584,35 @@ mod tests {
         conn.execute_batch(CONTEXT_BLOCKS_DDL).expect("pre-grown");
         apply_migration(&mut conn, migrate_v10_to_v11, 11).expect("migrate is idempotent");
         assert!(table_exists(&conn, "step_manifest").unwrap());
+    }
+
+    #[test]
+    fn v12_migration_adds_reconstruction_columns_and_is_idempotent() {
+        // Build v11-shaped receipts tables WITHOUT the v12 columns (the shape a
+        // store created on the increment-1 branch has), then upgrade.
+        let mut conn = Connection::open_in_memory().expect("db");
+        conn.execute_batch(
+            "CREATE TABLE context_blocks (
+               execution_id INTEGER NOT NULL, block_id TEXT NOT NULL, kind TEXT NOT NULL,
+               origin_turn INTEGER NOT NULL, origin_step INTEGER NOT NULL, call_id TEXT,
+               memory_id TEXT, token_cost INTEGER NOT NULL, content_digest TEXT NOT NULL,
+               citation_label TEXT, first_seen_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               PRIMARY KEY (execution_id, block_id));
+             CREATE TABLE step_manifest (
+               execution_id INTEGER NOT NULL, turn_instance INTEGER NOT NULL, step INTEGER NOT NULL,
+               ordinal INTEGER NOT NULL, block_id TEXT NOT NULL, cache_zone TEXT NOT NULL,
+               resident_since_step INTEGER NOT NULL,
+               PRIMARY KEY (execution_id, turn_instance, step, ordinal));",
+        )
+        .expect("v11 receipts shape");
+        assert!(!column_exists(&conn, "context_blocks", "content").unwrap());
+
+        apply_migration(&mut conn, migrate_v11_to_v12, 12).expect("migrate");
+        assert!(column_exists(&conn, "context_blocks", "content").unwrap());
+        assert!(column_exists(&conn, "step_manifest", "message_index").unwrap());
+
+        // Idempotent on tables already at the v12 shape (fresh files, or a
+        // v10→v11 upgrade run by this build's DDL).
+        apply_migration(&mut conn, migrate_v11_to_v12, 12).expect("idempotent");
     }
 }

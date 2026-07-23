@@ -270,6 +270,19 @@ pub(crate) fn truncated_tool_input_error(
     ))
 }
 
+/// Build the retryable error for a stream that reached EOF without its
+/// protocol's terminal event (`terminal_event` names it: `message_stop`,
+/// `response.completed`, `[DONE]`). A clean EOF is how close-delimited
+/// HTTP/1.1 proxies, local gateways, and idle-reaping load balancers surface
+/// a dropped connection — whatever accumulated is a half-answer, so it must
+/// never be committed as a successful completion. Shared by every streaming
+/// adapter so the disconnect classifies as retryable `Transport` uniformly.
+pub(crate) fn stream_ended_before_terminal(provider: &str, terminal_event: &str) -> ProviderError {
+    ProviderError::Transport(format!(
+        "{provider} stream ended before {terminal_event} — connection closed mid-response"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

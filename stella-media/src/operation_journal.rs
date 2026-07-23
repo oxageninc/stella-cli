@@ -117,12 +117,33 @@ impl SqliteMediaOperationJournal {
         Self::init(connection, retention)
     }
 
+    /// One secure open attempt, retried while a concurrent first-open is
+    /// initializing the same journal.
+    ///
+    /// The loser of that race can observe the winner's freshly created WAL
+    /// sidecars *between* its own secure preparation and validation — the
+    /// exact signature the sidecar-injection defense fails closed on.
+    /// Retrying from scratch resolves the ambiguity safely: the re-run
+    /// preparation now finds the sidecars up front and subjects them to the
+    /// same owner-only validation as any pre-existing pair, so a genuinely
+    /// untrusted injection still fails (`security_tests` pin that a single
+    /// attempt never tolerates an appearing sidecar).
     fn open_private(
         path: &Path,
         forbidden_root: Option<&Path>,
         retention: MediaOperationRetention,
     ) -> Result<Self, MediaError> {
-        Self::open_private_with_hook(path, forbidden_root, retention, |_| {})
+        let mut attempts = 0;
+        loop {
+            match Self::open_private_with_hook(path, forbidden_root, retention, |_| {}) {
+                Ok(journal) => return Ok(journal),
+                Err(error) if attempts < INIT_RETRY_ATTEMPTS && is_sidecar_race(&error) => {
+                    attempts += 1;
+                    std::thread::sleep(INIT_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn open_private_with_hook(
@@ -157,9 +178,7 @@ impl SqliteMediaOperationJournal {
         connection
             .busy_timeout(std::time::Duration::from_secs(2))
             .map_err(|error| journal_error(format!("cannot configure journal: {error}")))?;
-        connection
-            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-            .and_then(|_| connection.execute_batch(SCHEMA))
+        initialize_journal_database(&connection)
             .map_err(|error| journal_error(format!("cannot initialize journal: {error}")))?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -357,6 +376,53 @@ impl MediaOperationJournal for SqliteMediaOperationJournal {
     }
 }
 
+/// Attempts a losing first-open racer retries before giving up, and the
+/// pause between them. A concurrent first-open can momentarily expose the
+/// winner's freshly created WAL sidecars to the loser's security validation;
+/// retrying from scratch lets the loser re-run its preparation against the
+/// now-settled sidecars instead of failing closed on the transient overlap.
+const INIT_RETRY_ATTEMPTS: u32 = 40;
+const INIT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Marker embedded in the sidecar-injection defense's error message so a
+/// first-open race can be told apart from a genuine untrusted injection.
+const SIDECAR_APPEARED: &str = "appeared after secure preparation";
+
+/// Whether `error` is the benign first-open sidecar race (a concurrent
+/// initializer's WAL files appearing mid-preparation), not a real injection.
+fn is_sidecar_race(error: &MediaError) -> bool {
+    matches!(error, MediaError::Artifact(message) if message.contains(SIDECAR_APPEARED))
+}
+
+/// Runs the idempotent first-open statements, absorbing `SQLITE_BUSY`.
+///
+/// Converting a fresh rollback-journal database into WAL needs an exclusive
+/// lock, and SQLite skips the busy handler on that upgrade to avoid deadlock,
+/// so a concurrent first-open gets an immediate `SQLITE_BUSY` that
+/// `busy_timeout` never absorbs. Back off until the winner finishes; the
+/// loser then observes WAL mode and the existing schema.
+fn initialize_journal_database(connection: &Connection) -> Result<(), rusqlite::Error> {
+    const BUSY_ATTEMPTS: u32 = 40;
+    const BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let mut attempts = 0;
+    loop {
+        let result = connection
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .and_then(|_| connection.execute_batch(SCHEMA));
+        match result {
+            Err(error)
+                if attempts < BUSY_ATTEMPTS
+                    && error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) =>
+            {
+                attempts += 1;
+                std::thread::sleep(BUSY_BACKOFF);
+            }
+            result => return result,
+        }
+    }
+}
+
 fn expire(transaction: &rusqlite::Transaction<'_>, now: u64) -> Result<(), MediaError> {
     let now = sql_integer(now);
     transaction
@@ -529,7 +595,7 @@ impl PreparedSidecar {
             None => match std::fs::symlink_metadata(&self.path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Ok(_) => Err(journal_error(format!(
-                    "journal SQLite sidecar {} appeared after secure preparation; refusing initialization",
+                    "journal SQLite sidecar {} {SIDECAR_APPEARED}; refusing initialization",
                     self.path.display()
                 ))),
                 Err(error) => Err(journal_error(format!(

@@ -1146,7 +1146,16 @@ async fn aggregate_zai_stream(
         }
     }
 
-    usage.reported = usage_seen && terminal_seen;
+    // EOF without the `[DONE]` sentinel is a disconnect, not a completion —
+    // whatever accumulated is a half-answer, and even a `finish_reason` seen
+    // earlier can't prove the stream wasn't cut after it. Retryable
+    // Transport, upholding the same "never a truncated Ok" promise as the
+    // mid-stream error-frame path above.
+    if !terminal_seen {
+        return Err(http::stream_ended_before_terminal(label, "[DONE]"));
+    }
+
+    usage.reported = usage_seen;
 
     // OpenAI-style tool calls stream sequentially by index, so when the
     // stream reports `finish_reason: "length"` only the highest-index call

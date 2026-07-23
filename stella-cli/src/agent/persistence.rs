@@ -305,12 +305,14 @@ pub(crate) fn persist_event(
         token_cost,
         content_digest,
         citation_label,
+        content,
     } = event
     {
         // Context receipts (spec §4). Best-effort — a receipt write failure
         // never fails the paid-call accounting boundary (these rows are
         // observability, not billing), and the block also survives verbatim in
-        // the generic `events` table via record_event above.
+        // the generic `events` table via record_event above. `content` is the
+        // local-only gap preimage (spec §5.3), present only for gap kinds.
         let _ = store.record_context_block(
             execution_id,
             &ContextBlockRow {
@@ -323,6 +325,7 @@ pub(crate) fn persist_event(
                 token_cost: *token_cost,
                 content_digest: content_digest.clone(),
                 citation_label: citation_label.clone(),
+                content: content.clone(),
             },
         );
     } else if let AgentEvent::StepManifest {
@@ -355,6 +358,7 @@ pub(crate) fn persist_event(
                         cache_zone: enum_tag(&b.cache_zone),
                         token_cost: b.token_cost,
                         resident_since_step: b.resident_since_step as u64,
+                        message_index: b.message_index as u64,
                     })
                     .collect(),
             },
@@ -485,6 +489,7 @@ mod stream_tests {
             token_cost: 40,
             content_digest: "sha256:abc".into(),
             citation_label: None,
+            content: None,
         };
         assert!(persist_event(&store, id, 0, &registered, "anthropic"));
 
@@ -499,6 +504,7 @@ mod stream_tests {
                 cache_zone: CacheZone::Volatile,
                 token_cost: 40,
                 resident_since_step: 0,
+                message_index: 0,
             }],
             effective_budget_tokens: 136_363,
             calibration_factor: 1.1,
@@ -520,5 +526,93 @@ mod stream_tests {
         assert_eq!(entries[0].block_id, "blk_tool1");
         assert_eq!(entries[0].cache_zone, "volatile");
         assert_eq!(entries[0].token_cost, 40);
+    }
+
+    #[test]
+    fn end_to_end_receipt_reconstructs_the_step_byte_exact_from_the_persisted_store() {
+        // The increment-2 gate: the REAL emitter produces a receipt that, once
+        // persisted, reconstructs byte-exact what the model saw — resolved from
+        // the fold (tool I/O, assistant text) + local gaps (system/user), never
+        // from the emitter's in-memory state. Exercises a full tool round-trip.
+        use stella_core::event_sender::EventSender;
+        use stella_core::receipts::ReceiptLedger;
+        use stella_protocol::{CompletionMessage, MessageRole, ToolCall, ToolOutput, ToolResult};
+
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({ "path": "a.rs" }),
+        };
+        let output = ToolOutput::Ok {
+            content: "fn a() {}".into(),
+        };
+        // The step-1 input: system, user, assistant (text + tool call), result.
+        let original = vec![
+            CompletionMessage::system("you are a careful engineer"),
+            CompletionMessage::user("fix the failing test"),
+            CompletionMessage {
+                role: MessageRole::Assistant,
+                content: "let me read the file".into(),
+                tool_calls: vec![call.clone()],
+                tool_results: vec![],
+                attachments: vec![],
+            },
+            CompletionMessage {
+                role: MessageRole::Tool,
+                content: String::new(),
+                tool_calls: vec![],
+                tool_results: vec![ToolResult {
+                    call_id: "c1".into(),
+                    output: output.clone(),
+                }],
+                attachments: vec![],
+            },
+        ];
+
+        // Drive the REAL emitter + the journal events the driver would emit.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let events = EventSender::new(tx);
+        let _ = events.send(AgentEvent::Text {
+            delta: "let me read the file".into(),
+        });
+        let _ = events.send(AgentEvent::ToolStart { call: call.clone() });
+        let _ = events.send(AgentEvent::ToolResult {
+            call_id: "c1".into(),
+            output: output.clone(),
+            duration_ms: 5,
+            speculated: false,
+        });
+        let mut ledger = ReceiptLedger::new(0);
+        ledger.set_effective_budget(136_363, 1.1);
+        ledger.emit_step_receipt(
+            &original,
+            1,
+            stella_protocol::ModelCallRole::Worker,
+            "anthropic",
+            "opus",
+            &events,
+        );
+        drop(events);
+
+        // Persist the whole stream exactly as the renderer would.
+        let store = Store::in_memory().expect("store");
+        let id = store
+            .begin_execution("run", "fix the failing test", "anthropic", "opus")
+            .expect("exec");
+        let mut seq = 0u64;
+        while let Ok(event) = rx.try_recv() {
+            persist_event(&store, id, seq, &event, "anthropic");
+            seq += 1;
+        }
+
+        // Reconstruct purely from the persisted store, and prove it byte-exact.
+        let recon = store.reconstruct_step(id, 0, 1).expect("reconstruct");
+        assert!(
+            recon.is_verified(),
+            "unresolved={:?} mismatches={:?}",
+            recon.unresolved,
+            recon.digest_mismatches
+        );
+        assert_eq!(recon.messages, original);
     }
 }

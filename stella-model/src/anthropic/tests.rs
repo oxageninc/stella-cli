@@ -117,7 +117,9 @@ async fn complete_reassembles_a_large_multi_fragment_tool_call() {
     }
     body.push_str(
             "event: message_delta\n\
-             data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":0,\"output_tokens\":15}}\n\n",
+             data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":0,\"output_tokens\":15}}\n\n\
+             event: message_stop\n\
+             data: {\"type\":\"message_stop\"}\n\n",
         );
 
     Mock::given(method("POST"))
@@ -169,6 +171,8 @@ async fn complete_surfaces_a_truncated_tool_call_instead_of_silent_null() {
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"# Title\\\\nlots of\"}}\n\n",
         "event: message_delta\n",
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":8192}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -222,6 +226,8 @@ async fn malformed_but_complete_tool_json_falls_back_to_the_null_repair_sentinel
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": not json,}\"}}\n\n",
         "event: message_delta\n",
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":40}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -259,6 +265,8 @@ async fn a_tool_call_with_no_arguments_cut_at_max_tokens_is_terminal() {
         "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"write_file\"}}\n\n",
         "event: message_delta\n",
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":8192}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -307,6 +315,8 @@ async fn truncation_is_blamed_on_the_call_that_was_cut_not_an_earlier_broken_one
         "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README\"}}\n\n",
         "event: message_delta\n",
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":8192}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -552,6 +562,8 @@ async fn fable5_sends_adaptive_shape_and_drops_budget_tokens_and_sampling() {
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
         "event: message_delta\n",
         "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -607,6 +619,8 @@ async fn legacy_model_still_sends_budget_tokens_and_no_output_config() {
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
         "event: message_delta\n",
         "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -656,6 +670,8 @@ async fn complete_streams_and_aggregates_text_deltas_from_a_mock_server() {
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"lo!\"}}\n\n",
         "event: message_delta\n",
         "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":2}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
 
     Mock::given(method("POST"))
@@ -708,6 +724,8 @@ async fn complete_reports_cache_write_tokens_from_the_usage_envelope() {
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
         "event: message_delta\n",
         "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -752,6 +770,8 @@ async fn complete_reassembles_a_streamed_tool_use_block() {
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"src/lib.rs\\\"}\"}}\n\n",
         "event: message_delta\n",
         "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":0,\"output_tokens\":15}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
 
     Mock::given(method("POST"))
@@ -826,6 +846,8 @@ async fn complete_observed_streams_answer_deltas_in_order_never_thinking() {
         "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n",
         "event: content_block_delta\n",
         "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo!\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -880,6 +902,8 @@ async fn complete_observed_announces_a_tool_call_at_its_block_stop() {
         "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\"}}\n\n",
         "event: content_block_delta\n",
         "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"reading it now\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -931,6 +955,8 @@ async fn complete_observed_never_announces_a_block_whose_json_is_broken() {
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": not json,}\"}}\n\n",
         "event: content_block_stop\n",
         "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -1132,6 +1158,8 @@ async fn complete_computes_nonzero_cost_from_catalog_pricing() {
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
         "event: message_delta\n",
         "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":0,\"output_tokens\":500}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -1173,6 +1201,8 @@ async fn complete_forwards_temperature_to_the_request_body() {
     let sse_body = concat!(
         "event: content_block_delta\n",
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     // Legacy models accept sampling params; the mock only matches if the
     // serialized body carries the temperature — proving it isn't dropped on
@@ -1263,6 +1293,51 @@ async fn complete_returns_err_on_mid_stream_error_event_not_truncated_ok() {
     assert!(err.is_retryable());
 }
 
+/// The clean-EOF twin of the test above: a well-formed stream that simply
+/// ENDS without `message_stop` (close-delimited HTTP/1.1 proxies, local
+/// gateways, and LB idle-reaps surface a dropped connection as clean EOF,
+/// not a reqwest error) must fail as a retryable Transport disconnect —
+/// never commit the partial "Hel" as a successful completion.
+#[tokio::test]
+async fn complete_returns_transport_err_on_clean_eof_without_message_stop() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":2}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(ApiKey::new("sk-test"), "claude-fable-5")
+        .with_base_url(server.uri());
+    let req = CompletionRequest {
+        messages: vec![CompletionMessage::user("hi")],
+        max_output_tokens: None,
+        temperature: None,
+        effort: None,
+        tools: vec![],
+        reasoning: None,
+        params: None,
+    };
+
+    let err = provider.complete(req).await.unwrap_err();
+    assert!(
+        matches!(err, ProviderError::Transport(_)),
+        "expected Transport, got {err:?}"
+    );
+    assert!(err.is_retryable(), "a disconnect must be retryable");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("message_stop"),
+        "names the missing terminal event: {msg}"
+    );
+}
+
 #[test]
 fn thinking_budgets_map_effort_tiers_and_default_to_medium() {
     use stella_protocol::ReasoningEffort::*;
@@ -1278,6 +1353,8 @@ fn thinking_budgets_map_effort_tiers_and_default_to_medium() {
 const OK_SSE: &str = concat!(
     "event: content_block_delta\n",
     "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
 );
 
 async fn mock_ok(server: &MockServer) {

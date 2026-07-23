@@ -840,6 +840,50 @@ async fn complete_returns_err_on_mid_stream_error_frame_not_truncated_ok() {
     assert!(err.is_retryable());
 }
 
+/// The clean-EOF twin of the test above: a well-formed stream that simply
+/// ENDS without the `[DONE]` sentinel (close-delimited HTTP/1.1 proxies,
+/// LM-Studio-style local gateways, and LB idle-reaps surface a dropped
+/// connection as clean EOF, not a reqwest error) must fail as a retryable
+/// Transport disconnect — never commit the partial "Hel" as a successful
+/// completion, even when a usage frame already arrived.
+#[tokio::test]
+async fn complete_returns_transport_err_on_clean_eof_without_done() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider =
+        ZaiProvider::new(ApiKey::new("sk-test-zai"), "glm-5.2").with_base_url(server.uri());
+    let req = CompletionRequest {
+        messages: vec![CompletionMessage::user("hi")],
+        max_output_tokens: None,
+        temperature: None,
+        effort: None,
+        tools: vec![],
+        reasoning: None,
+        params: None,
+    };
+
+    let err = provider.complete(req).await.unwrap_err();
+    assert!(
+        matches!(err, ProviderError::Transport(_)),
+        "expected Transport, got {err:?}"
+    );
+    assert!(err.is_retryable(), "a disconnect must be retryable");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("[DONE]"),
+        "names the missing terminal sentinel: {msg}"
+    );
+}
+
 /// Minimal happy-path SSE body for tests that only inspect the request.
 const OK_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
 

@@ -103,6 +103,7 @@ mod private_state_tests;
 #[cfg(test)]
 mod quarantine_tests;
 mod receipts;
+mod reconstruct;
 mod telemetry;
 #[cfg(test)]
 mod tests;
@@ -143,6 +144,7 @@ pub(crate) use private::{
     open_private_file, open_private_sqlite, read_private_to_string, write_private_atomic,
 };
 pub use receipts::{ContextBlockRow, ManifestBlockRow, StepManifestRow};
+pub use reconstruct::Reconstruction;
 pub use sessions::{SessionRecord, SessionRegistry, SessionStatus};
 pub use telemetry::TelemetryRow;
 
