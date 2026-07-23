@@ -165,7 +165,6 @@ pub fn media_type_for_path(path: &str) -> Option<&'static str> {
         .to_str()?
         .to_ascii_lowercase();
     let mime = match ext.as_str() {
-        // Images
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
@@ -175,9 +174,7 @@ pub fn media_type_for_path(path: &str) -> Option<&'static str> {
         "heic" => "image/heic",
         "heif" => "image/heif",
         "svg" => "image/svg+xml",
-        // Documents
         "pdf" => "application/pdf",
-        // Audio
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
         "m4a" => "audio/mp4",
@@ -186,7 +183,6 @@ pub fn media_type_for_path(path: &str) -> Option<&'static str> {
         "ogg" | "oga" => "audio/ogg",
         "opus" => "audio/opus",
         "aiff" | "aif" => "audio/aiff",
-        // Video
         "mp4" => "video/mp4",
         "mov" => "video/quicktime",
         "webm" => "video/webm",

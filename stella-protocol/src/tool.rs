@@ -32,8 +32,7 @@ pub struct ToolCall {
 }
 
 /// The output of running a tool — success or a typed, named failure. Never a
-/// bare string: every tool result is inspectable without string-sniffing
-/// (the isErrorResult() alignment lesson from the TS era).
+/// bare string: every tool result is inspectable without string-sniffing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolOutput {

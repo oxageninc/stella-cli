@@ -1,8 +1,6 @@
 //! The model-completion request/response envelope — the same shape for
 //! every provider adapter (Z.ai, Anthropic, OpenAI, Gemini, xAI, Bedrock,
-//! Vertex, OpenRouter, local). Mirrors the TS runtime's
-//! `apps/cli/src/runtime/types.ts` `CompletionRequest`/`CompletionResult`,
-//! port map.
+//! Vertex, OpenRouter, local).
 
 use serde::{Deserialize, Serialize};
 
@@ -184,9 +182,7 @@ pub struct CompletionRequest {
 }
 
 /// Token accounting for a single completion, normalized across providers
-/// into one envelope (the AI-SDK-v7
-/// usage-shape-breakage lesson: normalization lives in the adapter, not the
-/// caller).
+/// into one envelope: normalization lives in the adapter, not the caller.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompletionUsage {
     /// The adapter observed the provider's authoritative usage-bearing

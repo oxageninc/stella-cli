@@ -1,13 +1,10 @@
 //! The event vocabulary — plain enum variants flowing from `stella-core` to
 //! whichever renderer (TUI or the JSON serializer) is listening.
 //! `--output-format stream-json` is a `serde_json` serialization of this
-//! exact enum, one line per event: a stable, versioned machine interface
+//! exact enum, one line per event: a stable, versioned machine interface.
 //!
-//!
-//! This is deliberately a *subset* at Phase 0 (only what a bare
-//! provider-streaming spike needs); later phases append variants as the
-//! context/media/fleet crates land — additive only, never a breaking
-//! rename, once this ships past Phase 0.
+//! The vocabulary is additive-only: later variants are appended as the
+//! context/media/fleet crates land, never a breaking rename.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,7 +1,6 @@
 //! Typed provider errors. Provider adapters classify every failure as
 //! retryable or terminal at the source — the step-driver never re-derives
-//! that classification from a status code or string later
-//!
+//! that classification from a status code or string later.
 
 use thiserror::Error;
 
