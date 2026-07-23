@@ -11,11 +11,13 @@
 //!
 //! "Don't stop until the judge says the goal is met" still terminates on
 //! three backstops, each with a named reason in [`GoalOutcome::Unmet`]:
-//! the round cap ([`GoalConfig::max_rounds`]), the budget (judge spend is
-//! recorded against the same [`BudgetGuard`] as worker spend — a goal loop
-//! cannot out-spend its budget by hiding cost in assessments), and a turn
-//! abort (loop detection, retry exhaustion, step cap — anything that ends
-//! a turn uncleanly ends the goal loop too, never silently retried).
+//! the round cap ([`GoalConfig::max_rounds`]), the budget (worker and judge
+//! spend both accumulate on the guard's session axis, which
+//! [`BudgetGuard::begin_turn`] never resets — so a configured cap bounds
+//! the whole loop's total, not each round in isolation, and the judge
+//! cannot be out-spent by hiding cost in assessments), and a turn abort
+//! (loop detection, retry exhaustion, step cap — anything that ends a turn
+//! uncleanly ends the goal loop too, never silently retried).
 //!
 //! # Graceful degradation
 //!
@@ -589,6 +591,97 @@ mod tests {
             }
             other => panic!("expected Unmet, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn session_budget_caps_total_spend_across_rounds() {
+        // Issue #360: `--budget` must bound the whole loop, not each round.
+        // A judge that never passes would otherwise run every round, and
+        // each round's spend is individually under the cap — only the sum
+        // across rounds crosses it. The session axis (what
+        // `build_budget_guard` configures) enforces that sum; `begin_turn`,
+        // called at the top of every round, must not hand back the full
+        // limit again.
+        let worker = ScriptedProvider::new(vec![
+            Ok(text_result("round work", 0.02)),
+            Ok(text_result("round work", 0.02)),
+            Ok(text_result("round work", 0.02)),
+            Ok(text_result("round work", 0.02)),
+        ]);
+        let judge = ScriptedProvider::new(vec![
+            Ok(text_result(
+                r#"{"met": false, "reasoning": "keep going", "feedback": "more"}"#,
+                0.0,
+            )),
+            Ok(text_result(
+                r#"{"met": false, "reasoning": "keep going", "feedback": "more"}"#,
+                0.0,
+            )),
+            Ok(text_result(
+                r#"{"met": false, "reasoning": "keep going", "feedback": "more"}"#,
+                0.0,
+            )),
+        ]);
+        let tools = NoTools;
+        let engine = Engine::with_sleeper(&worker, &tools, EngineConfig::default(), &NoSleep);
+        let mut messages = vec![CompletionMessage::system("sys")];
+        // Mirrors `build_budget_guard(Some(0.05))`: the cap is on the session
+        // axis. (A per-turn axis here would reset each round and let the loop
+        // spend 0.02 × max_rounds — the pre-fix bug.)
+        let mut budget = BudgetGuard::new(BudgetMode::Enforced, None, Some(0.05));
+        let config = GoalConfig {
+            max_rounds: 8,
+            ..GoalConfig::default()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = engine
+            .run_goal(
+                &judge,
+                "unreachable goal",
+                &mut messages,
+                &mut budget,
+                &tx,
+                &config,
+            )
+            .await;
+
+        match outcome {
+            GoalOutcome::Unmet {
+                rounds,
+                reason,
+                cost_usd,
+            } => {
+                // Stopped well before the round cap, on the budget backstop…
+                assert!(
+                    rounds < config.max_rounds,
+                    "the loop ran to the round cap ({rounds}) instead of the budget"
+                );
+                assert!(
+                    reason.contains("budget"),
+                    "the abort reason should cite the budget: {reason}"
+                );
+                assert!(
+                    reason.contains("session"),
+                    "the abort reason must name the session axis: {reason}"
+                );
+                // …and total spend overshot the cap by at most one round.
+                assert!(
+                    cost_usd > 0.05,
+                    "the cap must actually be crossed: {cost_usd}"
+                );
+                assert!(
+                    cost_usd <= 0.07,
+                    "spend must not exceed the cap by more than one round: {cost_usd}"
+                );
+            }
+            other => panic!("expected a budget-bounded Unmet, got {other:?}"),
+        }
+        assert!(
+            budget.session_spent_usd() <= 0.07,
+            "session spend {} must stay bounded by ~the configured cap",
+            budget.session_spent_usd()
+        );
     }
 
     #[tokio::test]

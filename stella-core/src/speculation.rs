@@ -31,17 +31,27 @@
 //! all-read-only *prefix* of a step's calls is ever speculated — exactly
 //! the calls dispatch would have started first anyway.
 //!
-//! # What speculation deliberately does NOT change
+//! # Hooks and discarded work
 //!
 //! Speculative execution goes through the same `execute_with_repair` path
-//! as dispatch: the registry's policy-bus gates and the settings-declared
-//! `PreToolUse`/`PostToolUse` hooks all fire exactly as they would have —
-//! just earlier on the wall clock. A blocked call's error output is
-//! harvested the same way a success is. The one semantic difference is
-//! visible only on a stream that *fails after announcing*: those hooks
-//! observed (and the tool executed) a read-only call that never reached
-//! the transcript. That is the price of overlap, bounded to read-only
-//! tools on purpose.
+//! as dispatch, so the registry's policy-bus gates fire exactly as they
+//! would have — just earlier on the wall clock. Settings-declared
+//! `PreToolUse`/`PostToolUse` hooks are the exception: a tool any such hook
+//! matches is *excluded from speculation* (the gate's `hook_gated` set) and
+//! runs only on the committed dispatch path, so its hooks fire exactly once
+//! per committed call — never for a speculative attempt that later fails
+//! and is dropped, and `PreToolUse` still gates *before* the tool executes
+//! (#370). A hook-gated read-only call is skipped, not fenced: it is not a
+//! mutation, so the read-only calls after it stay speculation-safe.
+//!
+//! What speculation cannot avoid is *wasted* read-only work: a stream that
+//! fails after announcing, or a committed call that diverges from what was
+//! announced, leaves a pool entry whose tool already ran real I/O but whose
+//! result never reaches the transcript. That work is no longer silent — the
+//! engine emits one [`stella_protocol::AgentEvent::SpeculationDiscarded`]
+//! per dropped entry, so an event-log consumer can reconcile call counts
+//! with what actually executed. It is the price of overlap, bounded to
+//! read-only tools on purpose.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,7 +79,9 @@ pub(crate) struct SpeculativeResult {
 
 /// Completed speculative executions for one committed step, keyed by
 /// `call_id`. Dropped wholesale when a stream attempt fails — read-only
-/// work is safe to waste.
+/// work is safe to waste for the *workspace*, but the I/O still ran, so the
+/// driver accounts for every dropped entry with a `SpeculationDiscarded`
+/// event rather than losing it silently (#370).
 pub(crate) type SpeculationPool = HashMap<String, SpeculativeResult>;
 
 /// The observer handed to `Provider::complete_observed` — the engine's one
@@ -80,6 +92,14 @@ pub(crate) type SpeculationPool = HashMap<String, SpeculativeResult>;
 /// eventual `Text` event stays authoritative — see its protocol docs).
 pub(crate) struct SpeculationGate {
     read_only_tools: HashSet<String>,
+    /// Read-only tools that must NOT be speculated because a configured
+    /// `PreToolUse`/`PostToolUse` hook matches them: those hooks fire
+    /// exactly once, on the committed dispatch path, never for a
+    /// speculative attempt that may fail and be dropped (`PreToolUse` also
+    /// gates *before* execution there). Not a mutation — so unlike a fenced
+    /// call it does not stop speculation of later read-only calls; it is
+    /// simply skipped.
+    hook_gated: HashSet<String>,
     /// Set on the first non-read-only announcement; never cleared. See the
     /// module docs' ordering-safety section.
     fenced: AtomicBool,
@@ -94,11 +114,13 @@ pub(crate) struct SpeculationGate {
 impl SpeculationGate {
     pub(crate) fn new(
         read_only_tools: HashSet<String>,
+        hook_gated: HashSet<String>,
         tx: UnboundedSender<ToolCall>,
         events: impl Into<EventSender>,
     ) -> Self {
         Self {
             read_only_tools,
+            hook_gated,
             fenced: AtomicBool::new(false),
             tx,
             events: events.into(),
@@ -124,6 +146,12 @@ impl ToolCallObserver for SpeculationGate {
         }
         if !self.read_only_tools.contains(&call.name) {
             self.fenced.store(true, Ordering::Relaxed);
+            return;
+        }
+        // Read-only but hook-gated: never speculated (its hooks must fire
+        // once, at dispatch — #370), yet not a mutation, so it does not
+        // fence the read-only calls that follow it.
+        if self.hook_gated.contains(&call.name) {
             return;
         }
         // Adapters never announce a call whose input failed to parse, but
@@ -159,11 +187,23 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<ToolCall>,
         tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     ) {
+        gate_with_gated(names, &[])
+    }
+
+    fn gate_with_gated(
+        names: &[&str],
+        gated: &[&str],
+    ) -> (
+        SpeculationGate,
+        tokio::sync::mpsc::UnboundedReceiver<ToolCall>,
+        tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    ) {
         let (tx, rx) = unbounded_channel();
         let (events_tx, events_rx) = unbounded_channel();
         let read_only: HashSet<String> = names.iter().map(|s| s.to_string()).collect();
+        let hook_gated: HashSet<String> = gated.iter().map(|s| s.to_string()).collect();
         (
-            SpeculationGate::new(read_only, tx, events_tx),
+            SpeculationGate::new(read_only, hook_gated, tx, events_tx),
             rx,
             events_rx,
         )
@@ -222,6 +262,26 @@ mod tests {
             vec!["good".to_string()],
             "a malformed call belongs to the repair path; a read-only call \
              after it is still safe (nothing mutated)"
+        );
+    }
+
+    #[test]
+    fn a_hook_gated_read_is_skipped_but_does_not_fence_later_reads() {
+        // `grep` is read-only but matched by a configured hook, so it must
+        // never be speculated — yet it is not a mutation, so the read-only
+        // `read_file` calls on either side of it stay speculation-safe.
+        let (gate, mut rx, _events) = gate_with_gated(&["read_file", "grep"], &["grep"]);
+        gate.tool_call_streamed(&call("read_file", "c1"));
+        gate.tool_call_streamed(&call("grep", "c2"));
+        gate.tool_call_streamed(&call("read_file", "c3"));
+
+        let forwarded: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|c| c.call_id)
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec!["c1".to_string(), "c3".to_string()],
+            "a hook-gated read is skipped, never fences the reads around it"
         );
     }
 

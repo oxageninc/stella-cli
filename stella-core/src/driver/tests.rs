@@ -306,6 +306,218 @@ async fn a_divergent_committed_call_is_re_executed_not_harvested() {
     );
 }
 
+#[tokio::test]
+async fn a_divergent_committed_call_emits_a_harvest_mismatch_discard() {
+    // The announced read (a.rs) is speculated and runs real I/O; the
+    // committed call (b.rs) diverges, so the pooled result is rejected at
+    // harvest. That discarded execution must leave a trace on the wire so
+    // event-log consumers can reconcile call counts (#370).
+    let executed = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicU32::new(0));
+    let provider = SpeculatingProvider {
+        announce: read_call(serde_json::json!({"path": "a.rs"})),
+        commit: read_call(serde_json::json!({"path": "b.rs"})),
+        executed: executed.clone(),
+        wait_for_execution: true,
+        step: AtomicU32::new(0),
+    };
+    let tools = NotifyingReadTools {
+        calls: calls.clone(),
+        executed,
+    };
+
+    let (outcome, events) = run_speculation_turn(&provider, &tools).await;
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SpeculationDiscarded { call_id, name, reason }
+                if call_id == "c1" && name == "read_file" && reason == "harvest_mismatch"
+        )),
+        "a rejected divergent pool entry must emit SpeculationDiscarded(harvest_mismatch): {events:?}"
+    );
+}
+
+/// Announces `announce` during its stream, FAILS its first attempt with a
+/// retryable transport error (dropping that attempt's speculation pool),
+/// then on the retry commits `commit`; a final step returns plain text. On
+/// the failed attempt it waits (bounded by `first_attempt_wait_ms`) for the
+/// speculative execution to notify: when the call IS speculated the wait
+/// returns as soon as the tool ran, so the dropped attempt deterministically
+/// executed (and fired any hooks) before failing; when it is NOT speculated
+/// nothing notifies and the wait simply times out and the attempt fails.
+struct FlakySpeculatingProvider {
+    announce: ToolCall,
+    commit: ToolCall,
+    executed: Arc<tokio::sync::Notify>,
+    first_attempt_wait_ms: u64,
+    invocation: AtomicU32,
+}
+#[async_trait]
+impl Provider for FlakySpeculatingProvider {
+    fn id(&self) -> &str {
+        "flaky-speculating"
+    }
+    async fn complete(
+        &self,
+        _req: CompletionRequest,
+    ) -> Result<CompletionResultAlias, ProviderError> {
+        unreachable!("the engine must drive complete_observed, never bare complete")
+    }
+    async fn complete_observed(
+        &self,
+        _req: CompletionRequest,
+        observer: &dyn stella_protocol::ToolCallObserver,
+    ) -> Result<CompletionResultAlias, ProviderError> {
+        match self.invocation.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                observer.tool_call_streamed(&self.announce);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(self.first_attempt_wait_ms),
+                    self.executed.notified(),
+                )
+                .await;
+                Err(ProviderError::Transport("blip".into()))
+            }
+            1 => {
+                observer.tool_call_streamed(&self.announce);
+                Ok(CompletionResultAlias {
+                    text: String::new(),
+                    tool_calls: vec![self.commit.clone()],
+                    usage: CompletionUsage::reported_zero(),
+                    model: "flaky-speculating".into(),
+                    cost_usd: 0.0001,
+                    finish_reason: None,
+                })
+            }
+            _ => Ok(text_result("done")),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_attempts_speculative_pool_emits_discarded_events() {
+    // No hooks: the read IS speculated, so the failed first attempt runs it
+    // for real (the wait returns the moment it does) and then drops the
+    // pool. That completed-but-dropped execution must be reported (#370).
+    let executed = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicU32::new(0));
+    let input = serde_json::json!({"path": "a.rs"});
+    let provider = FlakySpeculatingProvider {
+        announce: read_call(input.clone()),
+        commit: read_call(input),
+        executed: executed.clone(),
+        first_attempt_wait_ms: 2_000,
+        invocation: AtomicU32::new(0),
+    };
+    let tools = NotifyingReadTools {
+        calls: calls.clone(),
+        executed,
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+    let mut messages = vec![CompletionMessage::user("read a.rs")];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        engine.run_turn(&mut messages, &mut budget, &tx),
+    )
+    .await
+    .expect("a hung turn means the pump/provider join deadlocked");
+    assert!(
+        matches!(outcome, TurnOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+
+    let events = drain_events(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SpeculationDiscarded { call_id, name, reason }
+                if call_id == "c1" && name == "read_file" && reason == "attempt_failed"
+        )),
+        "the dropped attempt's completed read must emit SpeculationDiscarded(attempt_failed): {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hooked_read_fires_its_hook_once_never_for_a_dropped_speculative_attempt() {
+    // A read-only tool with a configured PreToolUse hook. The first stream
+    // attempt announces it and then fails; the retry commits it. The hook
+    // must fire exactly ONCE — on the committed dispatch path — never for
+    // the dropped attempt. Regression: before the fix the read was
+    // speculated on the doomed attempt too, firing the hook a second time
+    // for a call that never reached the transcript (#370).
+    let executed = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicU32::new(0));
+    let input = serde_json::json!({"path": "a.rs"});
+    let provider = FlakySpeculatingProvider {
+        announce: read_call(input.clone()),
+        commit: read_call(input),
+        executed: executed.clone(),
+        // Pre-fix the dropped attempt speculates the read and fires the hook
+        // before this returns; post-fix the hooked read is never speculated,
+        // so nothing notifies and this bounded wait just times out.
+        first_attempt_wait_ms: 300,
+        invocation: AtomicU32::new(0),
+    };
+    let tools = NotifyingReadTools {
+        calls: calls.clone(),
+        executed,
+    };
+    let sleeper = NoopSleeper;
+    let payloads = Arc::new(TokioMutex::new(Vec::new()));
+    // exit 0: non-blocking, so the tool runs and the hook is a pure
+    // observation — what matters is how many times it is invoked.
+    let runner = RecordingHookRunner {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+        payloads: payloads.clone(),
+    };
+    let hooks = Hooks {
+        pre_tool_use: Some(vec![HookMatcher {
+            matcher: Some("read_file".into()),
+            hooks: vec![HookAction::new("audit-log")],
+        }]),
+        ..Hooks::default()
+    };
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper)
+        .with_hooks(&hooks, &runner);
+    let mut messages = vec![CompletionMessage::user("read a.rs")];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        engine.run_turn(&mut messages, &mut budget, &tx),
+    )
+    .await
+    .expect("a hung turn means the pump/provider join deadlocked");
+    assert!(
+        matches!(outcome, TurnOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+
+    let pre_fires = payloads
+        .lock()
+        .await
+        .iter()
+        .filter(|p| p.contains("\"event\":\"PreToolUse\""))
+        .count();
+    assert_eq!(
+        pre_fires, 1,
+        "PreToolUse must fire once per committed call, never for a dropped speculative attempt"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the hooked read must execute once, on the committed dispatch path"
+    );
+}
+
 /// A provider that streams its answer through the observer before
 /// committing it — the adapter side of token-level streaming.
 struct StreamingTextProvider;
