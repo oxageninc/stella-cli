@@ -130,16 +130,24 @@ fn defer_stream_terminal(
     }
 }
 
+/// Close out one execution's audit record. `files_before` is the session
+/// file-touch ledger length captured before this execution began: only paths
+/// first touched at or past it are attributed here, so a registry reused
+/// across turns (REPL, deck) records each execution's own file slice rather
+/// than the whole session. Citations, agent uses, and MCP usage are drained
+/// (each already single-execution); the file ledger is non-destructive because
+/// the episode recorders re-read it after this returns.
 pub(crate) fn record_execution_end(
     store: &Store,
     execution_id: i64,
     registry: &ToolRegistry,
+    files_before: usize,
     outcome_label: &str,
     cost_usd: f64,
     persistence_complete: bool,
 ) -> bool {
     let files_ok = store
-        .record_files_touched(execution_id, &file_touch_rows(registry))
+        .record_files_touched(execution_id, &file_touch_rows(registry, files_before))
         .is_ok();
     let citations_ok = store
         .record_memory_citations(execution_id, &memory_citation_rows(registry))
@@ -189,10 +197,20 @@ fn mcp_usage_rows(registry: &ToolRegistry) -> Vec<stella_store::McpUsageRow> {
         .collect()
 }
 
-fn file_touch_rows(registry: &ToolRegistry) -> Vec<stella_store::FileTouchRow> {
-    registry
-        .file_touch_telemetry()
+fn file_touch_rows(
+    registry: &ToolRegistry,
+    files_before: usize,
+) -> Vec<stella_store::FileTouchRow> {
+    // The ledger is session-cumulative and insertion-ordered by first touch,
+    // so the slice past the pre-execution watermark is exactly what this
+    // execution first touched — the same `split_off` split `record_turn_episode`
+    // takes over the same ledger. A path re-touched in a later execution stays
+    // attributed to the one that first touched it (an accepted approximation).
+    let mut telemetry = registry.file_touch_telemetry();
+    let watermark = files_before.min(telemetry.files_touched.len());
+    telemetry
         .files_touched
+        .split_off(watermark)
         .into_iter()
         .map(|record| stella_store::FileTouchRow {
             ops: record.crud_events.iter().map(|op| op.letter()).collect(),
@@ -463,6 +481,88 @@ mod stream_tests {
                 if model == "worker+reflection"
                     && (*cost_usd - 1.25).abs() < f64::EPSILON
         ));
+    }
+
+    #[tokio::test]
+    async fn files_touched_records_only_the_current_execution_slice() {
+        // A registry reused across turns (REPL, deck) carries a
+        // session-cumulative file-touch ledger. Each turn is its own execution,
+        // so the audit record for execution N must contain only the files that
+        // execution first touched — not everything since turn 1, and its line
+        // deltas must not re-count earlier turns' files.
+        let root = tempfile::tempdir().expect("root");
+        let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
+        let store = Store::in_memory().expect("store");
+
+        // Execution 1 touches a.rs (3 new lines). The watermark before it ran
+        // is 0, so its slice is exactly {a.rs}.
+        let files_before_1 = registry.files_touched().len();
+        assert_eq!(files_before_1, 0);
+        registry
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": "a.rs",
+                    "content": "a1\na2\na3\n",
+                    "reason": "turn 1",
+                }),
+            )
+            .await;
+        let exec1 = store
+            .begin_execution("deck", "turn 1", "anthropic", "claude")
+            .expect("begin 1");
+        assert!(record_execution_end(
+            &store,
+            exec1,
+            &registry,
+            files_before_1,
+            "completed",
+            0.0,
+            true,
+        ));
+
+        // Execution 2 touches only b.rs (1 new line). The ledger now holds both
+        // files, but the watermark captured before turn 2 is 1.
+        let files_before_2 = registry.files_touched().len();
+        assert_eq!(files_before_2, 1);
+        registry
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": "b.rs",
+                    "content": "b1\n",
+                    "reason": "turn 2",
+                }),
+            )
+            .await;
+        let exec2 = store
+            .begin_execution("deck", "turn 2", "anthropic", "claude")
+            .expect("begin 2");
+
+        // The slice recorded for turn 2 is exactly {b.rs} — a.rs (turn 1) is not
+        // re-claimed, and the line delta is b.rs's alone (1, not 3 + 1).
+        let turn2_rows = file_touch_rows(&registry, files_before_2);
+        assert_eq!(turn2_rows.len(), 1, "turn 2 records only its own files");
+        assert_eq!(turn2_rows[0].path, "b.rs");
+        assert_eq!(turn2_rows[0].lines_added, 1);
+        assert!(
+            turn2_rows.iter().all(|row| row.path != "a.rs"),
+            "turn 1's file must not appear in turn 2's audit slice"
+        );
+
+        assert!(record_execution_end(
+            &store,
+            exec2,
+            &registry,
+            files_before_2,
+            "completed",
+            0.0,
+            true,
+        ));
+
+        // One row per (execution, file): two executions each recorded one file.
+        // The cumulative bug would land three (a.rs under both executions).
+        assert_eq!(store.count("files_touched").expect("count"), 2);
     }
 
     #[test]

@@ -426,6 +426,7 @@ async fn run_worker(
     let calibration = agent::seed_calibration(&store, cfg);
     let execution = agent::begin_execution(&store, "deck-sub", &spec.prompt, cfg, Some(session_id));
     let execution_id = execution.as_ref().map(|(_, id)| *id);
+    let files_before = registry.files_touched().len();
 
     let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let forwarder = spawn_forwarder(
@@ -511,8 +512,15 @@ async fn run_worker(
         ),
     };
     if let Some((store, id)) = &execution {
-        let _ =
-            agent::record_execution_end(store, *id, &registry, label, cost, persistence_complete);
+        let _ = agent::record_execution_end(
+            store,
+            *id,
+            &registry,
+            files_before,
+            label,
+            cost,
+            persistence_complete,
+        );
         // Mirror the worker's final board (its own, session-scoped view) so
         // `tasks` queries see sub-agent boards too.
         let board = registry.task_board();

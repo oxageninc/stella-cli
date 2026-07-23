@@ -174,6 +174,7 @@ async fn run_pipeline_one_shot(
     // and can replay its journal after it ends.
     let mut presence = SessionPresence::announce(cfg, prompt);
     let execution = begin_execution(&store, "pipeline", prompt, cfg, Some(presence.id()));
+    let files_before = registry.files_touched().len();
 
     let (raw_tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (tx, durable_pre_persisted) = event_sender_for_run(raw_tx, format);
@@ -410,6 +411,7 @@ async fn run_pipeline_one_shot(
             store,
             *id,
             &registry,
+            files_before,
             outcome_label,
             cost + reflection_report.cost_usd,
             persistence_complete,
@@ -1863,6 +1865,7 @@ async fn run_turn(
     budget.begin_turn();
     let turn_start = Instant::now();
     let execution = begin_execution(store, kind, prompt, cfg, session);
+    let files_before = registry.files_touched().len();
 
     let (raw_tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (tx, durable_pre_persisted) = event_sender_for_run(raw_tx, format);
@@ -1933,6 +1936,7 @@ async fn run_turn(
             store,
             *id,
             registry,
+            files_before,
             outcome_label,
             cost,
             persistence_complete,
