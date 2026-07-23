@@ -40,7 +40,8 @@ use crate::config::Config;
 use crate::domains::{Domains, heuristic_domains, infer_domains};
 use crate::interactive::{InteractiveToolSet, SkillRegistry, default_ask_io};
 use crate::memory::{
-    ReflectionReport, SessionMemory, inject_recall_block, turn_warrants_reflection,
+    ReflectionReport, SessionMemory, inject_recall_block, should_reflect_on,
+    turn_warrants_reflection,
 };
 use crate::runtime::{SystemClock, TokioSleeper};
 use crate::tui;
@@ -489,7 +490,32 @@ async fn run_pipeline_one_shot(
 
             pipeline_status_result(&outcome.status)
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => {
+            // A hard pipeline error must still produce the JSON summary a
+            // `--output-format json` consumer contracted for: without this,
+            // stdout is empty, the collected event log is lost, and only
+            // stderr says anything (issue #373, item 2). Same shape as the
+            // success summary, `text: null`, spend read from the guard (the
+            // pipeline metered whatever it spent before failing).
+            if format == OutputFormat::Json {
+                let summary = serde_json::json!({
+                    "status": "error",
+                    "text": null,
+                    "cost_usd": budget.session_spent_usd(),
+                    "reason": e.to_string(),
+                    "model": format!("{}/{}", cfg.provider.id, cfg.model_id),
+                    "events": collected,
+                    "reflection": reflection_json(&reflection_report),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&summary).unwrap_or_else(|e| format!(
+                        "{{\"status\":\"error\",\"reason\":\"serialize: {e}\"}}"
+                    ))
+                );
+            }
+            Err(e.to_string())
+        }
     }
 }
 
@@ -663,9 +689,12 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                 Ok((_domains, _cost_usd)) => {
                     // A fresh index may name tables/types the schema gate
                     // should know about this session, not just the next one.
+                    // Warn-and-fall-through: a schema-index failure must not
+                    // skip the graph-tool enable, the memory reopen, or the
+                    // extensions reload below — those refreshes are
+                    // independent of it (issue #373, item 3).
                     if let Err(error) = populate_schema_index(&registry, &cfg.workspace_root) {
                         println!("  {} schema governance unavailable: {error}", "!".yellow());
-                        continue;
                     }
                     // The code graph now exists — expose the `graph_query` tool
                     // to the rest of this session (it is registered only when
@@ -775,9 +804,15 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                 &messages[turn_start..],
             )
             .await;
-            if let Err(e) = result {
+            if let Err(e) = &result {
                 eprintln!("  {} {}\n", "Error:".red().bold(), e);
-            } else if turn_warrants_reflection(&messages[turn_start..])
+            }
+            // Failures reflect too (minus the user's own soft stop) — the
+            // one-shot pipeline path has always treated a failed run as a
+            // high-value learning signal; interactive paths now match
+            // (issue #373, item 7).
+            if should_reflect_on(&result)
+                && turn_warrants_reflection(&messages[turn_start..])
                 && let Some(m) = &mut memory
             {
                 let mut report = m
@@ -786,7 +821,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                         &cfg.model_id,
                         &messages,
                         false,
-                        true,
+                        result.is_ok(),
                         remaining_budget(&budget),
                     )
                     .await;
@@ -854,9 +889,14 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             &messages[turn_start..],
         )
         .await;
-        if let Err(e) = result {
+        if let Err(e) = &result {
             eprintln!("  {} {}\n", "Error:".red().bold(), e);
-        } else if turn_warrants_reflection(&messages[turn_start..])
+        }
+        // Same reflect-on-failure policy as the `/goal` block above and the
+        // one-shot pipeline path (issue #373, item 7): a soft stop is a user
+        // choice and stays excluded; a real failure is a learning signal.
+        if should_reflect_on(&result)
+            && turn_warrants_reflection(&messages[turn_start..])
             && let Some(m) = &mut memory
         {
             let mut report = m
@@ -865,7 +905,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
                     &cfg.model_id,
                     &messages,
                     false,
-                    true,
+                    result.is_ok(),
                     remaining_budget(&budget),
                 )
                 .await;

@@ -178,6 +178,12 @@ pub(crate) async fn session_start_hook_context(cfg: &Config) -> Option<String> {
         &stella_core::hooks::HookPayload::session_start(cfg.workspace_root.display().to_string()),
     )
     .await;
+    // A SessionStart hook that failed stays non-fatal, but must not vanish:
+    // without this line a typo'd hook silently contributes no context all
+    // session and nothing ever says why (issue #373, item 6).
+    for diagnostic in &outcome.diagnostics {
+        eprintln!("  ! SessionStart {diagnostic}");
+    }
     (!outcome.output.is_empty()).then_some(outcome.output)
 }
 

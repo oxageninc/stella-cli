@@ -818,7 +818,7 @@ impl<'a> Engine<'a> {
         let mut in_flight = announced
             .map(|call| async move {
                 let started = std::time::Instant::now();
-                let output = self.execute_with_repair(&call).await;
+                let output = self.execute_with_repair(&call, None).await;
                 (call, output, started.elapsed().as_millis() as u64)
             })
             .buffer_unordered(MAX_CONCURRENT_TOOL_CALLS);
@@ -1126,7 +1126,7 @@ impl<'a> Engine<'a> {
                                 Some(s) => (index, call, s.output, s.duration_ms, true),
                                 None => {
                                     let started = std::time::Instant::now();
-                                    let output = self.execute_with_repair(call).await;
+                                    let output = self.execute_with_repair(call, Some(events)).await;
                                     let duration_ms = started.elapsed().as_millis() as u64;
                                     (index, call, output, duration_ms, false)
                                 }
@@ -1170,7 +1170,17 @@ impl<'a> Engine<'a> {
     /// and no `PreToolUse`/`PostToolUse` hook is fired for it. When no hooks
     /// are attached this is exactly the previous body:
     /// `self.tools.execute(...)`.
-    async fn execute_with_repair(&self, call: &ToolCall) -> ToolOutput {
+    ///
+    /// `events` carries non-blocking hook diagnostics (a hook that failed to
+    /// spawn, or exited non-zero on an event that cannot block) to the turn
+    /// stream as one non-fatal `Error` per call. `None` on the speculative
+    /// path: speculation emits no events until harvest, and a failed
+    /// attempt's hook noise must not reach the wire with it.
+    async fn execute_with_repair(
+        &self,
+        call: &ToolCall,
+        events: Option<&EventSender>,
+    ) -> ToolOutput {
         if call.input.is_null() {
             return ToolOutput::Error {
                 message: format!(
@@ -1183,7 +1193,7 @@ impl<'a> Engine<'a> {
         }
         match self.hooks {
             None => self.tools.execute(&call.name, &call.input).await,
-            Some(handle) => self.execute_with_hooks(handle, call).await,
+            Some(handle) => self.execute_with_hooks(handle, call, events).await,
         }
     }
 
@@ -1195,10 +1205,18 @@ impl<'a> Engine<'a> {
     /// executed and the model instead sees a `ToolOutput::Error` naming the
     /// block, exactly as the engine surfaces every other tool failure as
     /// model-visible data rather than an engine error. Otherwise the tool
-    /// runs and `PostToolUse` fires as a pure observation — its outcome is
-    /// discarded (it can never block or alter the result), so a failing
-    /// post-hook cannot abort the turn.
-    async fn execute_with_hooks(&self, handle: HooksHandle<'a>, call: &ToolCall) -> ToolOutput {
+    /// runs and `PostToolUse` fires as a pure observation — its outcome can
+    /// never block or alter the result, so a failing post-hook cannot abort
+    /// the turn. Non-blocking failures from either phase (spawn failures,
+    /// non-zero exits on events that cannot block) are no longer discarded:
+    /// they surface as one non-fatal `Error { retryable: true }` on the
+    /// turn stream when an event channel is present.
+    async fn execute_with_hooks(
+        &self,
+        handle: HooksHandle<'a>,
+        call: &ToolCall,
+        events: Option<&EventSender>,
+    ) -> ToolOutput {
         let pre = run_hooks(
             handle.runner,
             Some(handle.hooks),
@@ -1215,6 +1233,7 @@ impl<'a> Engine<'a> {
             };
             return ToolOutput::Error { message };
         }
+        let mut diagnostics = pre.diagnostics;
 
         let output = self.tools.execute(&call.name, &call.input).await;
 
@@ -1222,9 +1241,9 @@ impl<'a> Engine<'a> {
             ToolOutput::Ok { content } => content.clone(),
             ToolOutput::Error { message } => message.clone(),
         };
-        // Observation only — the outcome is intentionally ignored so a
-        // non-zero PostToolUse exit never blocks or rewrites the result.
-        let _ = run_hooks(
+        // Observation only — a non-zero PostToolUse exit never blocks or
+        // rewrites the result; its failures ride `diagnostics` instead.
+        let post = run_hooks(
             handle.runner,
             Some(handle.hooks),
             &HookPayload::post_tool_use(
@@ -1235,6 +1254,20 @@ impl<'a> Engine<'a> {
             ),
         )
         .await;
+        diagnostics.extend(post.diagnostics);
+
+        if !diagnostics.is_empty()
+            && let Some(events) = events
+        {
+            let _ = events.send(AgentEvent::Error {
+                message: format!(
+                    "hook problem(s) around tool `{}` (non-blocking): {}",
+                    call.name,
+                    diagnostics.join("; ")
+                ),
+                retryable: true,
+            });
+        }
 
         output
     }

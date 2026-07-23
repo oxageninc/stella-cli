@@ -1862,6 +1862,77 @@ async fn post_tool_use_hook_runs_after_the_tool_and_never_blocks() {
 }
 
 #[tokio::test]
+async fn non_blocking_hook_failure_surfaces_as_one_retryable_error_event() {
+    // A PostToolUse hook exiting non-zero stays non-blocking (pinned by the
+    // test above) but must no longer vanish: the dispatch path forwards the
+    // hook diagnostics as exactly one non-fatal Error event per tool call
+    // (issue #373, item 6).
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(vec![
+            Ok(tool_call_result("call_1", "bash")),
+            Ok(text_result("done")),
+        ]),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tools = CountingTools {
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let sleeper = NoopSleeper;
+    let payloads = Arc::new(TokioMutex::new(Vec::new()));
+    let runner = RecordingHookRunner {
+        exit_code: 3,
+        stdout: String::new(),
+        stderr: "post hook broke".into(),
+        payloads: payloads.clone(),
+    };
+    let hooks = Hooks {
+        post_tool_use: Some(vec![HookMatcher {
+            matcher: Some("*".into()),
+            hooks: vec![HookAction::new("exit 3")],
+        }]),
+        ..Hooks::default()
+    };
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper)
+        .with_hooks(&hooks, &runner);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("hi"),
+    ];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+    assert!(
+        matches!(outcome, TurnOutcome::Completed { .. }),
+        "a failing post-hook must never abort the turn: {outcome:?}"
+    );
+    let events = drain_events(&mut rx);
+    let hook_errors: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::Error { message, retryable: true } if message.contains("hook problem")
+            )
+        })
+        .collect();
+    assert_eq!(
+        hook_errors.len(),
+        1,
+        "exactly one non-fatal diagnostic event per affected call: {events:?}"
+    );
+    assert!(
+        matches!(
+            hook_errors[0],
+            AgentEvent::Error { message, .. }
+                if message.contains("bash") && message.contains("exited 3")
+        ),
+        "the event must name the tool and the failure: {hook_errors:?}"
+    );
+}
+
+#[tokio::test]
 async fn no_hooks_configured_leaves_the_turn_path_unchanged() {
     // With no hooks attached the tool executes normally and the turn
     // completes exactly as it did before the hooks seam existed — the

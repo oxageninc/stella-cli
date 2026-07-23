@@ -74,7 +74,9 @@ pub struct ReflectionLesson {
 mod reflection;
 #[cfg(test)]
 use reflection::parse_lessons;
-pub use reflection::{ReflectionReport, reflect_on_turn, turn_warrants_reflection};
+pub use reflection::{
+    ReflectionReport, reflect_on_turn, should_reflect_on, turn_warrants_reflection,
+};
 
 /// Session-scoped memory state: the context store, the CGP host that
 /// routes every recall (workspace memory + code graph as in-process CGP

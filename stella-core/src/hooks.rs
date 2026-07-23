@@ -284,6 +284,13 @@ pub struct HookRunOutcome {
     /// Concatenated stdout of every hook that ran to completion (used for
     /// `SessionStart` context).
     pub output: String,
+    /// Non-blocking failures observed while running the event's hooks: a
+    /// hook that failed to spawn, or exited non-zero on an event that
+    /// cannot block (`PostToolUse`, `SessionStart`). Empty means every
+    /// hook ran clean. Callers surface these as warnings — never as
+    /// errors — so a typo'd hook is visible instead of silently
+    /// contributing nothing all session.
+    pub diagnostics: Vec<String>,
 }
 
 impl HookRunOutcome {
@@ -296,6 +303,7 @@ impl HookRunOutcome {
             blocked: true,
             reason: Some(reason),
             output,
+            diagnostics: Vec::new(),
         }
     }
 }
@@ -333,6 +341,7 @@ pub async fn run_hooks(
 
     let payload_json = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
     let mut outputs: Vec<String> = Vec::new();
+    let mut diagnostics: Vec<String> = Vec::new();
 
     for matcher in selected {
         for action in &matcher.hooks {
@@ -342,16 +351,30 @@ pub async fn run_hooks(
                     if !trimmed_stdout.is_empty() {
                         outputs.push(trimmed_stdout.to_string());
                     }
-                    if payload.event == HookEvent::PreToolUse && result.exit_code != 0 {
+                    if result.exit_code != 0 {
+                        if payload.event == HookEvent::PreToolUse {
+                            let trimmed_stderr = result.stderr.trim();
+                            let reason = if !trimmed_stderr.is_empty() {
+                                trimmed_stderr.to_string()
+                            } else if !trimmed_stdout.is_empty() {
+                                trimmed_stdout.to_string()
+                            } else {
+                                format!("hook `{}` exited {}", action.command, result.exit_code)
+                            };
+                            return HookRunOutcome::blocked(reason, outputs.join("\n"));
+                        }
+                        // Non-blocking event: the failure must still leave a
+                        // trace (a broken hook silently contributing nothing
+                        // is the defect), so it lands in `diagnostics`.
                         let trimmed_stderr = result.stderr.trim();
-                        let reason = if !trimmed_stderr.is_empty() {
-                            trimmed_stderr.to_string()
-                        } else if !trimmed_stdout.is_empty() {
-                            trimmed_stdout.to_string()
-                        } else {
+                        diagnostics.push(if trimmed_stderr.is_empty() {
                             format!("hook `{}` exited {}", action.command, result.exit_code)
-                        };
-                        return HookRunOutcome::blocked(reason, outputs.join("\n"));
+                        } else {
+                            format!(
+                                "hook `{}` exited {}: {trimmed_stderr}",
+                                action.command, result.exit_code
+                            )
+                        });
                     }
                 }
                 Err(err) => {
@@ -359,7 +382,9 @@ pub async fn run_hooks(
                         return HookRunOutcome::blocked(err.to_string(), outputs.join("\n"));
                     }
                     // PostToolUse/SessionStart never block, even on a hook
-                    // that failed to run at all — keep going.
+                    // that failed to run at all — keep going, but record
+                    // the failure for the caller to surface as a warning.
+                    diagnostics.push(format!("hook `{}` failed to run: {err}", action.command));
                 }
             }
         }
@@ -369,6 +394,7 @@ pub async fn run_hooks(
         blocked: false,
         reason: None,
         output: outputs.join("\n"),
+        diagnostics,
     }
 }
 
@@ -619,6 +645,60 @@ mod tests {
         let out = run_hooks(&runner, Some(&hooks), &payload).await;
         assert!(!out.blocked);
         assert!(out.output.contains("done"));
+        // Non-blocking, but never silent: the non-zero exit must leave a
+        // diagnostic for the caller to surface (issue #373, item 6).
+        assert_eq!(out.diagnostics.len(), 1);
+        assert!(
+            out.diagnostics[0].contains("exited 3"),
+            "diagnostic must name the exit: {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_hooks_produce_no_diagnostics() {
+        let mut scripted = HashMap::new();
+        scripted.insert("echo ok".to_string(), ok(0, "ok", ""));
+        let runner = FakeHookRunner::new(scripted);
+        let hooks = Hooks {
+            session_start: Some(vec![HookMatcher {
+                matcher: None,
+                hooks: vec![HookAction::new("echo ok")],
+            }]),
+            ..Hooks::default()
+        };
+        let payload = HookPayload::session_start("/proj".to_string());
+        let out = run_hooks(&runner, Some(&hooks), &payload).await;
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    #[tokio::test]
+    async fn session_start_spawn_failure_lands_in_diagnostics_not_silence() {
+        let mut scripted = HashMap::new();
+        scripted.insert(
+            "typo-cmd".to_string(),
+            Err(HookExecError::SpawnFailed {
+                command: "typo-cmd".to_string(),
+                message: "No such file or directory".to_string(),
+            }),
+        );
+        let runner = FakeHookRunner::new(scripted);
+        let hooks = Hooks {
+            session_start: Some(vec![HookMatcher {
+                matcher: None,
+                hooks: vec![HookAction::new("typo-cmd")],
+            }]),
+            ..Hooks::default()
+        };
+        let payload = HookPayload::session_start("/proj".to_string());
+        let out = run_hooks(&runner, Some(&hooks), &payload).await;
+        assert!(!out.blocked, "SessionStart never blocks");
+        assert_eq!(out.diagnostics.len(), 1);
+        assert!(
+            out.diagnostics[0].contains("typo-cmd") && out.diagnostics[0].contains("failed to run"),
+            "diagnostic must name the hook and the failure: {:?}",
+            out.diagnostics
+        );
     }
 
     #[tokio::test]
