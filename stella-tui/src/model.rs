@@ -610,6 +610,9 @@ impl SessionModel {
                     cost_usd: *cost_usd,
                 });
             }
+            // Internal accounting for read-only speculation that never
+            // committed — no visible model state to update.
+            AgentEvent::SpeculationDiscarded { .. } => {}
         }
         self.evict_transcript_overflow();
     }

@@ -418,7 +418,10 @@ pub fn event_line(event: &AgentEvent) -> Option<EventLine> {
         // Context receipts (spec §4/§5) are observability, not transcript
         // narration — they never produce a rendered line.
         | AgentEvent::BlockRegistered { .. }
-        | AgentEvent::StepManifest { .. } => None,
+        | AgentEvent::StepManifest { .. }
+        // A discarded speculation is internal accounting for read-only work
+        // that never reached the transcript — observability, not narration.
+        | AgentEvent::SpeculationDiscarded { .. } => None,
         AgentEvent::Retry { attempt, reason } => Some(retry(*attempt, reason)),
         AgentEvent::Steered { text } => Some(steered(text)),
         AgentEvent::Compaction {
