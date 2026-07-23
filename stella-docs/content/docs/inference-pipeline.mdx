@@ -46,7 +46,8 @@ witness is authored only without `--test-command`.
 
 A fast, cheap classification call decides how much process the task deserves —
 a **lookup** ("what does this function do?") skips planning entirely, a
-**single-file** change gets a light path, a **multi-file** change gets the full
+**single concrete change** gets a light path (one execute turn, still verified), a
+**genuinely multi-step** task gets the full plan → scope-review → execute → verify → judge
 pipeline. Triage runs under a hard latency ceiling (10 seconds); if the model
 doesn't answer in time, Stella falls through to the full path rather than
 waiting. Triage can run on its own [configured model](/docs/configuration/agent-engine-config) —
@@ -136,7 +137,7 @@ stella run --test-command "cargo test -p pager" "fix the off-by-one in the pager
 ```
 
 - **Triage** (with recall running concurrently) classifies the prompt as a
-  single-file change: planning is skipped, verification is not. Recall's
+  single concrete change: planning is skipped, verification is not. Recall's
   frames land in the volatile block after the stable prefix.
 - **Scope review** doesn't fire — there is no plan to review.
 - **Witness** is skipped: `--test-command` already provides the

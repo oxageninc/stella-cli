@@ -75,7 +75,7 @@ agents, credentials).
 `.stella/skills/`, `.stella/settings.json`, `.stella/mcp.toml`, and
 `.stella/tools/` are team-shareable and version-control-friendly — with one caveat:
 if `.stella/settings.json` carries an inline `api_key`, keep it out of version control
-(prefer [`api_key_env` or `credentials.toml`](/docs/configuration/credentials)). The
+(prefer [`api_key_env` or `credentials.toml`](/docs/configuration/credentials)).
 Everything under `.stella/private/` is local state, including MCP OAuth
 tokens. `stella` generates `.stella/.gitignore` with `private/`; if the
 repository uses a root ignore file, exclude the whole private directory:

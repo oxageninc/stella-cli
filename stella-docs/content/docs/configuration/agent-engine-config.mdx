@@ -43,6 +43,10 @@ pin just the judge model while your user scope keeps everything else.
     // "on" = thinking mode chosen for you (on everywhere except triage).
     "reasoning_auto": "off",
 
+    // "on" = a headless run may proceed past scope review instead of
+    // aborting at the gate that has nobody to ask.
+    "headless_scope_bypass": "off",
+
     // Per-agent deep config. Set a field and it goes on the wire; leave it
     // out and the provider default applies.
     "agents": {

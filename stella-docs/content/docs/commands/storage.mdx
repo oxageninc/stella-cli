@@ -1,0 +1,37 @@
+---
+title: stella storage
+description: Inspect the storage map — every storage layer, namespace, relation, and field, with intent and boundaries from stella.storage.toml.
+---
+
+`stella storage` inspects the **storage map**: every storage layer, namespace, relation, and field in your workspace, annotated with intent and boundaries from `stella.storage.toml`. It reads the local index built by [`stella init`](/docs/commands/init) (`.stella/private/codegraph.db`) plus the manifest, so it is fully offline and needs no API key.
+
+## Synopsis
+
+```bash
+stella storage tree
+stella storage show <address>
+stella storage grep <name>
+stella storage drift
+```
+
+## What it does
+
+The storage map is Stella's vendor-agnostic index of where your data lives — SQL tables, key-value namespaces, document collections, and their fields — so the agent (and you) can reason about persistence without re-deriving the schema every time. It is the zero-drift companion to the [code graph](/docs/commands/graph): the code graph answers "who calls what," the storage map answers "what is stored where, and what does it mean."
+
+| Subcommand | Answers |
+| --- | --- |
+| `tree` | The full map — `layer → namespace → relation` tree, each with its declared intent. |
+| `show <address>` | One relation's card: fields, constraints, meaning, and provenance. Accepts a `store://` address, a bare address, or a relation name. |
+| `grep <name>` | Every relation and field whose normalized name contains the query. |
+| `drift` | A report-only drift check: near-duplicate relations, orphaned manifest meanings, and intent coverage. Changes nothing. |
+
+```bash
+stella storage tree
+stella storage show store://sqlite/main/users
+stella storage grep session
+stella storage drift
+```
+
+<Callout type="info">
+The map is only as current as the last [`stella init`](/docs/commands/init). Intent and boundaries come from `stella.storage.toml`; `stella storage drift` tells you where that manifest has fallen behind the code.
+</Callout>

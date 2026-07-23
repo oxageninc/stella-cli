@@ -1,0 +1,57 @@
+---
+title: stella auth
+description: Store, list, and remove BYOK provider keys in credentials.toml — the persistent home for your API keys.
+---
+
+`stella auth` manages the BYOK provider keys stored in `~/.config/stella/credentials.toml`. It is the command that *writes* the credentials file the [credential chain](/docs/configuration/credentials) reads from — a small, deliberate surface for a handful of keys, not a config language. It never prints a secret value and needs no model API key of its own.
+
+## Synopsis
+
+```bash
+stella auth set <provider> [--key <key> | --stdin]
+stella auth remove <provider>
+stella auth list
+```
+
+## What it does
+
+A key stored here persists across sessions and shells, so you don't re-export an environment variable every time. It sits near the end of the [credential chain](/docs/configuration/credentials): a key resolved from `--api-key`, an environment variable, or `settings.json` still takes precedence. Run [`stella config`](/docs/commands/config) or [`stella models`](/docs/commands/models) to see which source actually wins for a given provider.
+
+`<provider>` is a provider id — a built-in such as `zai`, `anthropic`, or `openai`, or a custom provider id you defined in [`settings.json`](/docs/configuration/settings).
+
+### `stella auth set <provider>`
+
+Store (or replace) a provider's key. With no flag, Stella shows an interactive masked prompt — the recommended path, since nothing lands in your shell history.
+
+| Flag | Meaning |
+| --- | --- |
+| `--key <key>` | Pass the key inline. **Visible in shell history and `ps` output** — prefer `--stdin` or the interactive prompt. Conflicts with `--stdin`. |
+| `--stdin` | Read the key from stdin (one trimmed line) — for scripts and secret managers. |
+
+```bash
+# Interactive, masked (recommended)
+stella auth set anthropic
+
+# From a secret manager, nothing in shell history
+printf '%s' "$MY_KEY" | stella auth set zai --stdin
+```
+
+### `stella auth remove <provider>`
+
+Forget a provider's stored key.
+
+```bash
+stella auth remove openai
+```
+
+### `stella auth list`
+
+List every provider with a key in `credentials.toml`, each with a redacted preview and its resolution source.
+
+```bash
+stella auth list
+```
+
+<Callout type="warn">
+Prefer the interactive prompt or `--stdin` over `--key`. A key passed with `--key` is visible in your shell history and in `ps` output. See [Credentials](/docs/configuration/credentials) for the full resolution chain and precedence.
+</Callout>

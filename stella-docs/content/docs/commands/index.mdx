@@ -25,17 +25,22 @@ stella chat
 | `stella init` | Analyze the workspace, infer its domain taxonomy, and build the code-graph index. |
 | `stella fleet <tasks...>` | Fan tasks out to a fleet of worker agents in one shared tree, coordinated by cooperative file claims. |
 | `stella graph <op> <target>` | Query the code graph built by `stella init` (offline, no API key). |
+| `stella storage <tree\|show\|grep\|drift>` | Inspect the [storage map](/docs/commands/storage) — layers, relations, and fields with intent (offline, no API key). |
+| `stella scripts <list\|run>` | List and run the project's [package-manager scripts](/docs/commands/scripts) via canonical verbs (offline, no API key). |
 | `stella models` | List configured providers and available models. |
 | `stella stats` | Summarize cost, tokens, and resolve rate per provider/model from local telemetry. |
 | `stella observe` | Serve the [Observatory dashboard](/docs/telemetry/dashboard) — your local telemetry in the browser, loopback-only. |
 | `stella memory` | Inspect memories through the citation loop, and promote one to a project rule. |
 | `stella mcp` | Manage MCP servers — search a registry, install, list, OAuth login, and show usage telemetry. |
 | `stella connect` | Connect GitHub or Linear via OAuth so the agent gains the [issue toolset](/docs/agent-tools). |
+| `stella auth <set\|remove\|list>` | Manage BYOK provider keys in [`credentials.toml`](/docs/commands/auth) (never prints a secret). |
 | `stella tools` | List every tool available to the agent this session. |
 | `stella config` | Show the fully resolved configuration. |
 | `stella version` | Print the version and exit. |
 
 Each command page in this section documents its usage synopsis, behavior, relevant flags, and realistic examples.
+
+One more subcommand, `stella telemetry` (`status` / `flush` / `rollover-discard`), manages the managed enterprise operational spool. It is disabled by default and requires a signed org-managed enrollment — see the [Enterprise telemetry boundary](/docs/telemetry#oxagen-enterprise-managed-export).
 
 ## Global flags
 

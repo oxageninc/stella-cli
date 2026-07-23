@@ -25,7 +25,7 @@ Tool names are their exact identifiers — the agent dispatches by name, and the
 
 ### Always available
 
-These 35 tools register in every session — no configuration, no prerequisites. Grouped by what they touch:
+These 38 tools register in every session — no configuration, no prerequisites. Grouped by what they touch:
 
 #### Files
 
@@ -42,11 +42,13 @@ These 35 tools register in every session — no configuration, no prerequisites.
 | --- | --- | --- |
 | `grep` | Search file contents with a regex (ripgrep-backed when available); once the code-graph index exists, matches carry a code-map footer. | Read-only |
 | `glob` | Find files by glob pattern, returned as workspace-relative paths. | Read-only |
+| `graph_query` | Query the indexed code graph instead of grepping: definitions, references, imports, importers, or a file's full graph neighborhood. Registers every session and builds its own code-graph index on first use. | Read-only |
 
 #### Context &amp; memory
 
 | Tool | Description | Access |
 | --- | --- | --- |
+| `project_overview` | Orient in the workspace: languages, entry points, and layout, in one read-only pass. | Read-only |
 | `gather_context` | Run one deterministic context sweep — grep patterns + file globs + code-graph symbol lookups + bounded excerpts — in a single call, saved as a reusable context pack. | Read-only |
 | `explorations` | List saved codebase explorations, or read one back by slice. | Read-only |
 | `save_exploration` | Persist an end-to-end map of a codebase slice for other agents to reuse. | Mutating |
@@ -62,6 +64,7 @@ These 35 tools register in every session — no configuration, no prerequisites.
 | `run_tests` | Run the project's tests with its own runner — `kind` picks unit/e2e/all, `filter` is runner-native. | Mutating |
 | `run_lint` | Run the project's own linter (cargo clippy, or the `lint` script); `fix` applies automatic fixes. | Mutating |
 | `format_code` | Run the project's own formatter (cargo fmt, or the `format` script); `check` verifies without rewriting. | Mutating |
+| `list_scripts` | List the verbs the project declares (Makefile targets, package.json scripts, cargo aliases) — the index `run_script` draws from. | Read-only |
 | `run_script` | Run a verb the project itself declares — a Makefile target, a package.json script, or a cargo alias — argv-style, never through a shell. | Mutating |
 
 #### Process control
@@ -103,7 +106,7 @@ These 35 tools register in every session — no configuration, no prerequisites.
 | `task_assign` | Delegate a board task to a parallel sub-agent — the briefing is passed verbatim, so write it self-contained. | Mutating |
 
 <Callout type="info">
-`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `gather_context`, `explorations`, `ci_status`, `repo_status`, `task_list`, and (when present) `graph_query`, `search_issues`, `get_issue`, `list_labels`, `list_members`, `web_search`, `web_fetch`, `web_extract_assets` — plus `search_skills`, `tool_search`, `skill_search`, and `mcp_search` at the session layer. (`web_download` writes a file, so it is mutating.)
+`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `graph_query`, `project_overview`, `list_scripts`, `gather_context`, `explorations`, `ci_status`, `repo_status`, `task_list`, and (when present) `search_issues`, `get_issue`, `list_labels`, `list_members`, `web_search`, `web_fetch`, `web_extract_assets` — plus `search_skills`, `tool_search`, `skill_search`, and `mcp_search` at the session layer. (`web_download` writes a file, so it is mutating.)
 </Callout>
 
 ### Conditionally registered
@@ -117,7 +120,6 @@ These appear only when their prerequisite is met:
 | `web_extract_assets` | Fetch a page and mine its design assets — stylesheets, scripts, images, fonts, plus design tokens (colors, font families, custom properties, `@font-face`) distilled from the CSS. | Read-only | The `web` opt-in (as above). |
 | `web_download` | Download a URL to a file inside the workspace (images, fonts, stylesheets, archives). | Mutating | The `web` opt-in (as above). |
 | `web_search` | Search the web and get ranked results (title, URL, snippet). | Read-only | The `web` opt-in **and** a BYOK search key (`BRAVE_API_KEY` or `TAVILY_API_KEY`) — the other three web tools need no key. |
-| `graph_query` | Query the indexed code graph instead of grepping: definitions, references, imports, importers, or a file's full graph neighborhood. | Read-only | `stella init` has built `.stella/private/codegraph.db` (also picked up mid-session once the graph exists). |
 | `generate_image` | Generate an image from a text prompt into `.stella/artifacts/`. | Mutating | An image-capable BYOK provider key is configured. |
 | `generate_video` | Submit an asynchronous text-to-video job. Video costs real money: any job with a positive estimated cost is denied unless `confirm_spend` is true. | Mutating | The configured media provider has a **video** adapter — an image-only key registers `generate_image` without the video pair. |
 | `poll_video` | Poll a video job, reconciling its state live against the provider. | Mutating | Same video-adapter condition as `generate_video`. |
@@ -212,7 +214,7 @@ The other three session tools are read-only **discovery** tools layered over the
 
 Set `STELLA_LEAN_TOOLS=1` to advertise only a lean core toolset (file CRUD, search, build/test/verify, `ask_user`, and `bash` when the opt-in has enabled it) plus the discovery tools; everything else stays out of the prompt until a `tool_search` surfaces it. Matched tools are *activated* — advertised for the rest of the session. Set the variable to a comma-separated list of tool names to choose your own core. A hidden tool called by name still executes, so lean mode trims prompt weight without ever gating a capability.
 
-All told: 35 always-on tools, up to 52 native tools with the `bash` and `web` opt-ins, the code graph, media keys, a search key, and an issue backend, plus the six session tools — before any custom script tools or MCP servers merge in.
+All told: 38 always-on tools, up to 54 native tools with the `bash` and `web` opt-ins, the code graph, media keys, a search key, and an issue backend, plus the six session tools — before any custom script tools or MCP servers merge in.
 
 ## Where to go next
 

@@ -10,7 +10,7 @@ List the configured providers and their available models, and manage the **live 
 ```bash
 stella models [global flags]
 stella models refresh [--force]
-stella models list [--provider <id>]
+stella models list [--provider <id>] [--all]
 ```
 
 ## What it does
@@ -34,14 +34,20 @@ stella models refresh
 stella models refresh --force
 ```
 
-### `stella models list [--provider <id>]`
+### `stella models list [--provider <id>] [--all]`
 
-List the models in the local catalog — slug, display name, context window, and current pricing — optionally filtered to one provider.
+List the models in the local catalog — slug, display name, context window, and current pricing — optionally filtered to one provider. By default the listing is scoped to providers whose credential resolves; add `--all` to include providers with no configured credential too.
 
 ```bash
 stella models list
 stella models list --provider anthropic
+stella models list --all
 ```
+
+| Flag | Effect |
+| --- | --- |
+| `--provider <id>` | Filter to a single provider. |
+| `--all` | Include providers with no configured credential (the listing is otherwise scoped to providers whose credential resolves). |
 
 <Callout type="info">
 Provider credentials are resolved through the credential chain: `--api-key` flag, then the provider env var (and aliases), then `settings.json`, then `~/.config/stella/credentials.toml`, and finally an interactive prompt on a TTY.

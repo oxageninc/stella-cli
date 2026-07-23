@@ -11,7 +11,7 @@ its own merge rule across the [scope hierarchy](#the-scope-hierarchy):
 | [`providers`](#the-providers-map) | Override any built-in provider — or define new ones | per field |
 | [`agent_engine_config`](/docs/configuration/agent-engine-config) | Per-agent models, gateways, prompts, effort, params | per field, per agent |
 | [`hooks`](#lifecycle-hooks) | Shell commands on lifecycle events | concatenate |
-| [`tools`](#the-tools-section) | Built-in tool switches (today: `bash`) | last scope wins |
+| [`tools`](#the-tools-section) | Built-in tool switches (`bash`, `web`) | last scope wins |
 | [`mcp`](#the-mcp-section) | MCP registry override | last scope wins |
 | [`authority`](#managed-authority-ceilings) | Managed ceilings for project prompts, custom tools, bash, web, and media approval | org-managed only; denial cannot be overridden |
 

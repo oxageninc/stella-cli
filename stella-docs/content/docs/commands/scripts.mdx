@@ -1,0 +1,54 @@
+---
+title: stella scripts
+description: List and run the project's package-manager scripts through Stella's canonical-verb index — the same frames the agent sees.
+---
+
+`stella scripts` lists and runs the project's package-manager scripts. Detection is deterministic static parsing of your manifests (cargo, npm/pnpm/yarn, uv, go, make, just, …), mapped onto canonical verbs — `install`, `build`, `start`, `test`, `lint`, `format`. It mirrors the [`list_scripts` and `run_script` tools](/docs/agent-tools) one-for-one, so a human at the CLI and the model inside a turn see the same script index. Offline: manifest parsing plus a local subprocess, no API key.
+
+## Synopsis
+
+```bash
+stella scripts list [--json] [--dir <path>]
+stella scripts run <script> [--dir <path>] [--timeout-secs <n>] [-- <args...>]
+```
+
+## What it does
+
+Instead of guessing that a repo uses `pnpm test` versus `cargo test` versus `make check`, Stella reads the manifests and presents one normalized index. The agent draws its verbs from exactly this index, which is why a run and a review agree on what "run the tests" means in your repo.
+
+### `stella scripts list`
+
+List detected scripts and their canonical verb bindings.
+
+| Flag | Meaning |
+| --- | --- |
+| `--json` | Emit the index as JSON (`schema_version` 1) for tooling. |
+| `--dir <path>` | Narrow to one workspace package directory. |
+
+```bash
+stella scripts list
+stella scripts list --json --dir apps/web
+```
+
+### `stella scripts run`
+
+Run a script by canonical verb or by qualified id (e.g. `test`, `pnpm:build`).
+
+| Flag / arg | Default | Meaning |
+| --- | --- | --- |
+| `<script>` | — | `install` \| `build` \| `start` \| `test` \| `lint` \| `format`, or a qualified id like `pnpm:build`. |
+| `--dir <path>` | — | Package dir when the id exists in several packages. |
+| `--timeout-secs <n>` | `600` | Abort the subprocess after this many seconds. |
+| `-- <args...>` | — | Extra args appended runner-natively (after `--` for npm-family runners). |
+
+```bash
+# Canonical verb
+stella scripts run test
+
+# Qualified id in a specific package, with extra args
+stella scripts run pnpm:build --dir apps/web -- --no-lint
+```
+
+<Callout type="info">
+The script index is what makes verbs like `test` and `build` portable across repos. It also powers the agent's own [`run_script`](/docs/agent-tools) tool, so the CLI and the model never disagree about how your project builds.
+</Callout>

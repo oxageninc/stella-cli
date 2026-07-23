@@ -77,7 +77,12 @@ stella models list --provider anthropic    # browse valid slugs + live pricing
   **model card versions** holding each pricing configuration. A refresh appends a new
   version only when pricing actually changed — the version history is real change
   history, and **the latest version is the pricing that displays everywhere** (cost
-  metering, `stella models list`, the deck's model picker).
+  metering, `stella models list`, the deck's model picker). On top of that master list,
+  `refresh` then overlays each configured provider's own live `/models` listing
+  (OpenRouter, Anthropic, Gemini, and any OpenAI-compatible endpoint), so newly-shipped
+  slugs and per-model pricing/capability come straight from the serving provider — this
+  overlay resolves through each provider's configured credential (only the models.dev
+  master list is keyless).
 - **Incremental.** The HTTP `ETag` is persisted and replayed; an unchanged list is one
   conditional request, zero writes. After your first explicit refresh, Stella re-syncs a
   stale list (>24h) automatically at startup — never before your first refresh (the

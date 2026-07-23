@@ -65,6 +65,7 @@ is the complete map; each row links to its detail page.
 | Shell commands on lifecycle events | `settings.json` `hooks` key | [Hooks](/docs/agent-tools/hooks) |
 | Per-agent engine models (worker/judge/triage) | `settings.json` `agent_engine_config` | [Agent engine config](/docs/configuration/agent-engine-config) |
 | Enable the raw `bash` tool (off by default) | `settings.json` `tools.bash: "on"` | [settings.json](/docs/configuration/settings#the-tools-section) |
+| Enable the `web` tool family — search/fetch/extract/download (off by default) | `settings.json` `tools.web: "on"` | [settings.json](/docs/configuration/settings#the-tools-section) |
 | Org-managed defaults for a fleet | `STELLA_MANAGED_SETTINGS` → a `settings.json` | [settings hierarchy](#the-settings-hierarchy) |
 | Trust a repo's project-scope hooks &amp; routing | `STELLA_TRUST_PROJECT=1` | [trust boundary](/docs/configuration/settings#the-project-trust-boundary) |
 | MCP servers to connect | `<workspace>/.stella/mcp.toml` | [MCP](/docs/agent-tools/mcp) |

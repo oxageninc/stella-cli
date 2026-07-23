@@ -18,6 +18,7 @@ Everything is on your disk, under `.stella/`:
 | `.stella/private/context.db` | The **bi-temporal** context store: episodes, reflection memories, domain facts |
 | `.stella/private/reflections.jsonl` | The reflection mining log — one JSON lesson per line |
 | `.stella/private/codegraph.db` | The tree-sitter code-graph index |
+| `.stella/explorations/*` | Saved **exploration maps** — reusable codebase-slice notes with per-file staleness |
 | `.stella/rules/*.md` | Rules — promoted memories and guard rules |
 | `.stella/skills/` | Project [skills](/docs/agent-tools/skills) |
 | `.stella/domains.toml` | The domain taxonomy — the shared tagging vocabulary |
@@ -231,6 +232,29 @@ files change, for exactly as long as the session runs.
   unresolved — an empty `importers` answer for a Rust file is a limitation,
   not a stale index.
 </Callout>
+
+## Exploration maps: understanding that outlives the turn
+
+Understanding a slice of a codebase is expensive — and most agents throw it
+away the moment the turn ends. Stella keeps it. When the agent works out how a
+subsystem fits together, it can call `save_exploration` to write a high-fidelity
+**exploration map** to `.stella/explorations/`; a later session (or a teammate)
+reads it back with the read-only `explorations` tool instead of re-deriving the
+same picture from scratch.
+
+Two properties make the maps trustworthy rather than stale notes:
+
+- **Per-file staleness.** Each map carries a `path → sha256` manifest, so Stella
+  can tell you *exactly which files* have changed since the map was written —
+  a per-file verdict, not a blunt "this might be old."
+- **Draft maps double as claims.** A map saved in *draft* status is also a
+  readable, in-flight claim: another session working the same area sees what's
+  already underway. If a session crashes, it leaves a legible note behind —
+  never a leaked lock. It coordinates [fleets](/docs/agent-fleets) the same way
+  cooperative file claims do, at the level of understanding rather than edits.
+
+Both surfaces are ordinary agent tools ([Agent Tools](/docs/agent-tools)), so a
+custom tool or an MCP server can read and write them too.
 
 ## The domain taxonomy
 

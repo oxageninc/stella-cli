@@ -91,7 +91,8 @@ Running `stella` on a real terminal opens the **Command Deck** — the tabbed
 TUI over the engine. Each prompt becomes a lead-agent turn; `/pipeline`
 toggles between staged turns (the default) and the raw step loop. The deck
 is more than a chat surface: prompts queue while a turn runs, `!` lines run
-shell commands in their own lane, Esc cancels, and tabs expose the session's
+shell commands in their own lane, `>` steers the turn in flight, Esc
+soft-stops (both below), and tabs expose the session's
 files, diff, code graph, skills, MCP servers, the AGENTS tab with live
 executions, and the SETTINGS tab's
 [config panel](/docs/configuration/agent-engine-config) with per-role model
@@ -103,6 +104,13 @@ Two things are unique to deck turns:
   FILES/DIFF tabs) and a task tap (the task board and sub-agent spawning).
 - **Cooperative claims.** The lead claims files on first write, so parallel
   workers in the same tree never fight over a file.
+- **Mid-turn steering & soft-cancel.** You don't have to wait for a turn to
+  finish to correct it. Type `>your note` and it lands at the next step
+  boundary as a real user message — a course-correction the model reads before
+  its next action, not an interrupt that throws away work. `Esc` is a *soft
+  stop*: it halts at the next boundary and keeps everything already completed.
+  `Esc Esc` cancels immediately and holds the queue. Steering beats
+  restarting: you keep the cache-warm context and only redirect it.
 
 `stella --plain` (or any non-TTY stdin/stdout, or `STELLA_PLAIN=1`) falls
 back to the **plain REPL**: the same per-prompt raw turns and the same

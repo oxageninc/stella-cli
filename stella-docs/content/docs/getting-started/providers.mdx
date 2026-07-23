@@ -64,6 +64,15 @@ For the selected provider, Stella resolves the API key in this order — **first
 5. Interactive prompt (on a TTY) — the entered key is saved to `credentials.toml`, so you
    are only prompted once
 
+<Callout type="info">
+  Before the env-var step (2) runs, Stella first loads project **dotenv files** into the
+  environment: `.env.<mode>.local` → `.env.local` → `.env`, most-specific first, and
+  **nearest-scope-wins** — confined to the enclosing git repository (never the home
+  directory or above). It never loads `.env.example` or a committed `.env.<mode>`, an
+  exported shell value always overrides a file value, and `STELLA_NO_ENV_FILE=1` disables
+  the whole mechanism.
+</Callout>
+
 See [Credentials](/docs/configuration/credentials) for the file format and precedence
 details.
 

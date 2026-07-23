@@ -39,7 +39,7 @@ done
 object — exactly what `stream-json` would have emitted line by line. The summary's other
 keys depend on the execution path: a default run goes through the staged pipeline and
 summarizes as `status`, `text`, `cost_usd`, `reason`, `task_class`, `verdict`,
-`revisions`, `candidates_run`, `model`, and `events`; a `--no-pipeline` (raw step-loop)
+`revisions`, `candidates_run`, `model`, `events`, and `reflection`; a `--no-pipeline` (raw step-loop)
 run summarizes as `status`, `text`, `cost_usd`, `reason`, `model`, and `events`, plus the
 top-level [`files_touched`](/docs/telemetry/files-touched) telemetry payload — which the
 pipeline summary does **not** carry.

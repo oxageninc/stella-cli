@@ -101,7 +101,7 @@ Which keys the final JSON object carries depends on which execution path ran:
 - **Default runs** go through the staged pipeline (triage, plan, execute, verify, judge).
   The pipeline's summary object has `status`, `text`, `cost_usd`, `reason`, `task_class`,
   `verdict` (`passed` / `deterministic` / `summary`), `revisions`, `candidates_run`,
-  `model`, and `events` — there is **no top-level `files_touched`**.
+  `model`, `events`, and `reflection` — there is **no top-level `files_touched`**.
 - **Raw runs** (`--no-pipeline`) fall back to the direct step-loop, whose summary has
   `status`, `text`, `cost_usd`, `reason`, `model`, and `events` — plus the full telemetry
   payload under `files_touched`.
