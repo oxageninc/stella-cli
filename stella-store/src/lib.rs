@@ -98,6 +98,7 @@ use stella_protocol::{AgentEvent, TaskItem, TaskStatus, ToolOutput};
 mod ddl;
 mod migrations;
 mod private;
+mod receipts;
 #[cfg(test)]
 mod private_state_tests;
 #[cfg(test)]
@@ -142,6 +143,7 @@ pub(crate) use private::{
     open_private_file, open_private_sqlite, read_private_to_string, write_private_atomic,
 };
 pub use sessions::{SessionRecord, SessionRegistry, SessionStatus};
+pub use receipts::{ContextBlockRow, ManifestBlockRow, StepManifestRow};
 pub use telemetry::TelemetryRow;
 
 /// FNV-1a/64 hex — a stable, dependency-free digest for prompt hashes and
