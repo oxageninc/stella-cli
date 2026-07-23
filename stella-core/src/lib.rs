@@ -24,7 +24,7 @@ pub mod loop_detect;
 pub mod mcp_usage;
 pub(crate) mod mining;
 pub mod ports;
-pub(crate) mod receipts;
+pub mod receipts;
 pub mod retry;
 pub mod router;
 pub mod rules;
