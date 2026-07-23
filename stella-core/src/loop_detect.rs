@@ -662,9 +662,8 @@ mod tests {
                 }),
             )
         };
-        let read_v = |content: &str| {
-            call("read_file", serde_json::json!({ "path": "a.rs" }), content)
-        };
+        let read_v =
+            |content: &str| call("read_file", serde_json::json!({ "path": "a.rs" }), content);
         let records = vec![
             read_v("v1"),
             drift_fail("v2"),

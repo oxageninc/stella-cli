@@ -95,16 +95,9 @@ impl ReadLedger {
     }
 }
 
+#[derive(Default)]
 pub struct ReadFile {
     ledger: Arc<ReadLedger>,
-}
-
-impl Default for ReadFile {
-    fn default() -> Self {
-        Self {
-            ledger: Arc::default(),
-        }
-    }
 }
 
 impl ReadFile {
