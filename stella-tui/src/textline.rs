@@ -865,6 +865,8 @@ mod tests {
                     uri: None,
                     method: None,
                     token_cost: 1,
+                    block_id: None,
+                    content_digest: None,
                 }],
                 provider_mix: vec![],
                 tokens: 1,
@@ -977,6 +979,8 @@ mod tests {
                 uri: None,
                 method: None,
                 token_cost: 120,
+                block_id: None,
+                content_digest: None,
             }],
             provider_mix: vec![ProviderShare {
                 provider: "code-graph".into(),
