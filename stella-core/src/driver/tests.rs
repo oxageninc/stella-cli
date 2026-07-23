@@ -338,6 +338,65 @@ async fn a_divergent_committed_call_emits_a_harvest_mismatch_discard() {
     );
 }
 
+/// #460: a step that speculates a read-only call and then trips an ENFORCED
+/// budget aborts the turn before `dispatch_completion` — the only place a
+/// committed step's pool is harvested or discarded — ever runs. The read that
+/// already executed would drop silently on the abort unwind; it must instead
+/// emit `SpeculationDiscarded(budget_abort)` so #370's accounting holds on the
+/// abort path too. Witness: this event is absent before the fix.
+#[tokio::test]
+async fn budget_abort_after_speculation_discards_the_pool() {
+    let executed = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicU32::new(0));
+    // announce == commit: on a non-aborting turn this read is *harvested*,
+    // never a harvest_mismatch — so a discard here can only be the budget path.
+    let provider = SpeculatingProvider {
+        announce: read_call(serde_json::json!({"path": "a.rs"})),
+        commit: read_call(serde_json::json!({"path": "a.rs"})),
+        executed: executed.clone(),
+        wait_for_execution: true,
+        step: AtomicU32::new(0),
+    };
+    let tools = NotifyingReadTools {
+        calls: calls.clone(),
+        executed,
+    };
+
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut messages = vec![CompletionMessage::user("read a.rs")];
+    // The step-0 cost ($0.0001) crosses the enforced $0.00005 turn limit, so
+    // `handle_committed_result` returns `AbortTurn` before the pool is harvested.
+    let mut budget = BudgetGuard::new(BudgetMode::Enforced, Some(0.00005), None);
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        engine.run_turn(&mut messages, &mut budget, &tx),
+    )
+    .await
+    .expect("a hung turn means speculation deadlocked the provider/pump join");
+    let events = drain_events(&mut rx);
+
+    assert!(
+        matches!(outcome, TurnOutcome::Aborted { .. }),
+        "the enforced budget aborts the turn: {outcome:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the read really ran — its I/O is exactly what the discard must account for"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SpeculationDiscarded { call_id, name, reason }
+                if call_id == "c1" && name == "read_file" && reason == "budget_abort"
+        )),
+        "the pool dropped on the budget-abort unwind must emit \
+         SpeculationDiscarded(budget_abort): {events:?}"
+    );
+}
+
 /// Announces `announce` during its stream, FAILS its first attempt with a
 /// retryable transport error (dropping that attempt's speculation pool),
 /// then on the retry commits `commit`; a final step returns plain text. On

@@ -245,6 +245,10 @@ const SPECULATION_DISCARD_ATTEMPT_FAILED: &str = "attempt_failed";
 /// dispatch because the committed call diverged from what was announced, or
 /// no committed call ever claimed it.
 const SPECULATION_DISCARD_HARVEST_MISMATCH: &str = "harvest_mismatch";
+/// `SpeculationDiscarded.reason` — a committed step's pool ran read-only I/O
+/// but the turn aborted on an enforced budget before `dispatch_completion`
+/// could harvest it, so it is discarded on the abort unwind instead (#460).
+const SPECULATION_DISCARD_BUDGET_ABORT: &str = "budget_abort";
 
 /// One committed model call plus the step-scoped context the phases after
 /// it consume: the pre-call raw token estimate (drift feedback + telemetry
@@ -507,6 +511,18 @@ impl<'a> Engine<'a> {
                 &mut budget_warnings,
                 events,
             ) {
+                // The budget-abort unwind never reaches `dispatch_completion`,
+                // which is where a committed step's speculation pool is
+                // otherwise harvested or discarded. Any read-only calls this
+                // step already speculated would drop silently here — account
+                // for them so #370's guarantee holds on the abort path too
+                // (#460). `handle_committed_result` only borrows `committed`,
+                // so the pool is still ours to move.
+                self.discard_speculation_pool(
+                    committed.speculation,
+                    SPECULATION_DISCARD_BUDGET_ABORT,
+                    events,
+                );
                 return aborted;
             }
 
@@ -1169,14 +1185,16 @@ impl<'a> Engine<'a> {
     }
 
     /// Emit `SpeculationDiscarded` for every entry a committed step's pool
-    /// left un-harvested — read-only calls that ran real I/O off a divergent
-    /// stream but never appeared in the committed transcript (#370).
-    fn discard_speculation_pool(&self, pool: SpeculationPool, events: &EventSender) {
+    /// left un-harvested — read-only calls that ran real I/O but never made it
+    /// into the committed transcript (#370). `reason` names why the pool was
+    /// dropped (harvest mismatch on the normal path, budget abort on the
+    /// enforced-limit unwind) so the accounting stays reconcilable per site.
+    fn discard_speculation_pool(&self, pool: SpeculationPool, reason: &str, events: &EventSender) {
         for (call_id, result) in pool {
             let _ = events.send(AgentEvent::SpeculationDiscarded {
                 call_id,
                 name: result.name,
-                reason: SPECULATION_DISCARD_HARVEST_MISMATCH.to_string(),
+                reason: reason.to_string(),
             });
         }
     }
@@ -1347,7 +1365,11 @@ impl<'a> Engine<'a> {
             // read-only calls off a divergent stream (announced, then dropped
             // from the commit): none are harvested here, so account for the
             // discarded I/O rather than dropping the pool silently (#370).
-            self.discard_speculation_pool(speculation, events);
+            self.discard_speculation_pool(
+                speculation,
+                SPECULATION_DISCARD_HARVEST_MISMATCH,
+                events,
+            );
             // A turn that produced neither a tool call NOR any visible text is
             // never a real completion: the model was cut off at its output
             // limit (usually mid-reasoning) or returned nothing at all.
@@ -1540,7 +1562,7 @@ impl<'a> Engine<'a> {
         }
         // Any pool entry no committed call ever claimed ran real I/O that
         // never reached the transcript — account for it, don't drop it (#370).
-        self.discard_speculation_pool(speculation, events);
+        self.discard_speculation_pool(speculation, SPECULATION_DISCARD_HARVEST_MISMATCH, events);
         indexed.sort_by_key(|(index, _)| *index);
         indexed.into_iter().map(|(_, result)| result).collect()
     }
