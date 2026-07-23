@@ -12,6 +12,7 @@ pub mod ci;
 pub mod code_map;
 pub mod custom;
 pub mod delete;
+pub mod diagnostics;
 pub mod edit;
 pub mod exec;
 pub mod exploration;

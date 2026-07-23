@@ -126,6 +126,7 @@ pub const RESERVED_NAMES: &[&str] = &[
     "verify_done",
     "build_project",
     "run_tests",
+    "diagnostics",
     // The project scripts index (docs/design/scripts-index.md)
     "list_scripts",
     "run_script",

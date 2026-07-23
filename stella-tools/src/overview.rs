@@ -257,15 +257,14 @@ fn scripts_section(scripts: &ScriptIndex) -> Value {
     if scripts.is_empty() {
         return json!({ "detected": false });
     }
-    let verbs: serde_json::Map<String, Value> =
-        ["install", "build", "start", "test", "lint", "format"]
-            .iter()
-            .filter_map(|verb| {
-                scripts
-                    .verb_entry(verb)
-                    .map(|entry| ((*verb).to_string(), json!(entry.command.clone())))
-            })
-            .collect();
+    let verbs: serde_json::Map<String, Value> = crate::scripts::VERBS
+        .iter()
+        .filter_map(|verb| {
+            scripts
+                .verb_entry(verb)
+                .map(|entry| ((*verb).to_string(), json!(entry.command.clone())))
+        })
+        .collect();
     json!({
         "detected": true,
         "runners": scripts.detected_runners(),
@@ -392,6 +391,13 @@ mod tests {
                 .iter()
                 .any(|r| r == "cargo"),
             "cargo detected from the manifest alone: {scripts}"
+        );
+        // The fast-typecheck path is discoverable from the overview: the
+        // `check` verb rides the same index the diagnostics tool uses.
+        assert_eq!(
+            scripts["verbs"]["check"],
+            serde_json::json!("cargo check --workspace"),
+            "{scripts}"
         );
     }
 

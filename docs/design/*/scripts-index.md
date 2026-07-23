@@ -1,7 +1,7 @@
 # Project scripts index
 
-Every workspace has the same six jobs — install, build, start, test, lint,
-format — spelled differently by every package manager. Today the agent
+Every workspace has the same seven jobs — install, build, check, start,
+test, lint, format — spelled differently by every package manager. Today the agent
 rediscovers that spelling with model calls: read `package.json`, guess the
 package manager, compose a `bash` command. This spec makes the mapping a
 deterministic index computed by Stella itself, so listing and running a
@@ -40,7 +40,7 @@ code path in the workspace.
   because tree-sitter over the tree is expensive; manifest parsing is not.
   Nothing persisted means nothing to go stale or be lost.)
 - **Byte-stable output.** Canonical verbs render in the fixed order
-  `install, build, start, test, lint, format`; all other entries sort by
+  `install, build, check, start, test, lint, format`; all other entries sort by
   `id`. Same workspace state ⇒ byte-identical prompt section, tool frame,
   and CLI output. The prompt section is computed once at session start and
   never mutated mid-session (same contract as memories, `AGENTS.md`
@@ -74,7 +74,7 @@ in the fixed order below; **all** matching ecosystems contribute entries
 
 | # | Marker (in package dir) | Runner | Script enumeration (static parse) | Synthesized verbs |
 | --- | --- | --- | --- | --- |
-| 1 | `Cargo.toml` | `cargo` | `[alias]` entries from `.cargo/config.toml` (root only) | install→`cargo fetch`, build→`cargo build --workspace`, start→`cargo run` (only if a default-run binary exists), test→`cargo test --workspace`, lint→`cargo clippy --workspace --all-targets`, format→`cargo fmt` |
+| 1 | `Cargo.toml` | `cargo` | `[alias]` entries from `.cargo/config.toml` (root only) | install→`cargo fetch`, build→`cargo build --workspace`, check→`cargo check --workspace`, start→`cargo run` (only if a default-run binary exists), test→`cargo test --workspace`, lint→`cargo clippy --workspace --all-targets`, format→`cargo fmt` |
 | 2 | `package.json` | `pnpm` if `pnpm-lock.yaml`, `yarn` if `yarn.lock`, `bun` if `bun.lock`/`bun.lockb`, else `npm` | the `scripts` object → `<pm> run <name>` | install→`<pm> install` |
 | 3 | `deno.json` / `deno.jsonc` | `deno` | the `tasks` object → `deno task <name>` | install→`deno install` |
 | 4 | `pyproject.toml` | `uv` if `uv.lock` or `[tool.uv]`, `poetry` if `poetry.lock` or `[tool.poetry]`, else `uv` | `[project.scripts]` entry points → `<runner> run <name>` | install→`uv sync` / `poetry install`; test→`<runner> run pytest`, lint→`<runner> run ruff check`, format→`<runner> run ruff format` — each only if that tool appears in the declared dependencies (incl. dependency groups) |
@@ -95,13 +95,14 @@ member packages carry their `dir` and execute with cwd = that directory.
 
 ### Canonical verb resolution
 
-The six verbs are a resolution layer over qualified ids, computed
+The seven verbs are a resolution layer over qualified ids, computed
 deterministically per package:
 
 | Verb | Explicit script names matched (exact, first match wins) | Fallback |
 | --- | --- | --- |
 | `install` | `install`, `setup`, `bootstrap` | synthesized install of each ecosystem |
 | `build` | `build`, `compile`, `dist` | synthesized (cargo/go) |
+| `check` | `check`, `typecheck`, `type-check` | synthesized (`cargo check`) |
 | `start` | `start`, `dev`, `serve` | synthesized (`cargo run`) |
 | `test` | `test`, `tests` | synthesized (cargo/go/uv) |
 | `lint` | `lint` | synthesized (clippy/vet/ruff) |
@@ -137,7 +138,7 @@ below.
   "type": "object",
   "required": ["script"],
   "properties": {
-    "script": { "type": "string", "description": "Canonical verb (install|build|start|test|lint|format), qualified id like pnpm:build, or unique declared script/target/alias name" },
+    "script": { "type": "string", "description": "Canonical verb (install|build|check|start|test|lint|format), qualified id like pnpm:build, or unique declared script/target/alias name" },
     "dir": { "type": "string", "description": "Package dir when the id exists in several packages; default workspace root" },
     "args": { "type": "array", "items": { "type": "string" }, "description": "Appended runner-natively (after `--` for npm-family)" },
     "timeout_secs": { "type": "integer" }
@@ -171,7 +172,7 @@ format  → cargo fmt
 23 more scripts (make:docs, pnpm:deck, …): call list_scripts.
 ```
 
-Only the six verb bindings render inline; everything else is a count plus
+Only the verb bindings render inline; everything else is a count plus
 up to three sorted teaser ids. The section is capped at 1,500 characters
 (oversized verb commands truncate with `…`), keeping the stable prefix
 cheap. An empty index renders nothing — no section, no noise.
@@ -179,7 +180,7 @@ cheap. An empty index renders nothing — no section, no noise.
 ## Index JSON Schema
 
 Emitted by `stella scripts list --json`; `schema_version` bumps on any
-shape change.
+shape change (2 = the `check` verb joined the set).
 
 ```json
 {
@@ -189,12 +190,13 @@ shape change.
   "additionalProperties": false,
   "required": ["schema_version", "verbs", "scripts"],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "verbs": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "install": { "type": "string" }, "build": { "type": "string" },
+        "check": { "type": "string" },
         "start": { "type": "string" }, "test": { "type": "string" },
         "lint": { "type": "string" }, "format": { "type": "string" }
       },
@@ -213,7 +215,7 @@ shape change.
           "command": { "type": "string", "minLength": 1, "description": "Exact command run_script executes, cwd = dir" },
           "dir": { "type": "string", "description": "Workspace-relative package dir; \".\" = root" },
           "source": { "type": "string", "description": "Workspace-relative manifest path, or \"synthesized\"" },
-          "verb": { "type": "string", "enum": ["install", "build", "start", "test", "lint", "format"], "description": "Present only on the entry each verb binds to" },
+          "verb": { "type": "string", "enum": ["install", "build", "check", "start", "test", "lint", "format"], "description": "Present only on the entry each verb binds to" },
           "raw": { "type": "string", "description": "The manifest's own definition (e.g. the package.json script body), when one exists" }
         }
       }
@@ -228,8 +230,8 @@ Stella's own workspace (`Cargo.toml` + `package.json`/pnpm + `Makefile`):
 
 ```json
 {
-  "schema_version": 1,
-  "verbs": { "install": "cargo:install", "build": "cargo:build", "test": "cargo:test", "lint": "cargo:lint", "format": "cargo:format" },
+  "schema_version": 2,
+  "verbs": { "install": "cargo:install", "build": "cargo:build", "check": "cargo:check", "test": "cargo:test", "lint": "cargo:lint", "format": "cargo:format" },
   "scripts": [
     { "id": "cargo:build", "runner": "cargo", "name": "build", "command": "cargo build --workspace", "dir": ".", "source": "synthesized", "verb": "build" },
     { "id": "cargo:test", "runner": "cargo", "name": "test", "command": "cargo test --workspace", "dir": ".", "source": "synthesized", "verb": "test" },

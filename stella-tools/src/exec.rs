@@ -3,7 +3,7 @@
 //! truncation. Two entry points: [`run`] shells out via `bash -c`
 //! (`verify_done`, `build_project`, `run_tests`, the opt-in `bash` tool);
 //! [`run_argv`] execs an argv vector directly with NO shell anywhere
-//! (`run_script`, `run_lint`, `format_code`).
+//! (`run_script`, `run_lint`, `format_code`, `diagnostics`).
 
 use std::time::Duration;
 
@@ -91,7 +91,9 @@ pub(crate) async fn run(
 ) -> Result<(i32, String), String> {
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(command);
-    drive(cmd, command, dir, timeout_secs, &[]).await
+    drive(cmd, command, dir, timeout_secs, &[])
+        .await
+        .map(|(code, output)| (code, truncate_middle(output)))
 }
 
 /// Run a repository-owned GitHub CLI command while preserving only GitHub
@@ -113,6 +115,7 @@ pub(crate) async fn run_github(
         crate::subprocess_env::GITHUB_CLI_AUTH_ENV_VARS,
     )
     .await
+    .map(|(code, output)| (code, truncate_middle(output)))
 }
 
 /// Run `program` with `args` DIRECTLY — argv exec, no shell anywhere — in
@@ -121,6 +124,23 @@ pub(crate) async fn run_github(
 /// model-supplied string is ever shell-interpreted. Same process-group
 /// spawn, timeout kill, and truncation as [`run`].
 pub(crate) async fn run_argv(
+    program: &str,
+    args: &[String],
+    dir: &std::path::Path,
+    timeout_secs: u64,
+) -> Result<(i32, String), String> {
+    run_argv_untruncated(program, args, dir, timeout_secs)
+        .await
+        .map(|(code, output)| (code, truncate_middle(output)))
+}
+
+/// [`run_argv`] without the middle-out truncation — for callers that PARSE
+/// the full output into a bounded structure of their own (`diagnostics`
+/// consuming a `--message-format=json` stream: truncating the raw stream
+/// would sever JSON lines and silently drop the very records the parse
+/// exists to keep). Peak memory is unchanged — `wait_with_output` buffers
+/// everything before truncation would apply anyway.
+pub(crate) async fn run_argv_untruncated(
     program: &str,
     args: &[String],
     dir: &std::path::Path,
@@ -159,8 +179,10 @@ impl Drop for GroupKillGuard {
     }
 }
 
-/// Shared spawn/wait/kill/truncate body of [`run`] and [`run_argv`] —
-/// `command` is the human-readable command line for error messages.
+/// Shared spawn/wait/kill body of [`run`] and [`run_argv`] — `command` is
+/// the human-readable command line for error messages. Output is returned
+/// UNTRUNCATED; the wrappers apply [`truncate_middle`] except
+/// [`run_argv_untruncated`], whose callers parse the full stream.
 async fn drive(
     mut cmd: Command,
     command: &str,
@@ -230,10 +252,7 @@ async fn drive(
         }
         combined.push_str(&stderr);
     }
-    Ok((
-        output.status.code().unwrap_or(-1),
-        truncate_middle(combined),
-    ))
+    Ok((output.status.code().unwrap_or(-1), combined))
 }
 
 /// [`run`] with the PASSED/FAILED framing shared by `build_project`,

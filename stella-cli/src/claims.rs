@@ -22,8 +22,8 @@
 //!    process cannot release its own).
 //!
 //! The build lane is the one **transient** claim: `run_tests` /
-//! `build_project` — and the manifest-verb executors that can rewrite the
-//! tree (`run_lint`, `format_code`, `run_script`) — serialize under the
+//! `build_project` / `diagnostics` — and the manifest-verb executors that
+//! can rewrite the tree (`run_lint`, `format_code`, `run_script`) — serialize under the
 //! well-known pseudo-path [`BUILD_CLAIM`] for the duration of the call
 //! only (with a bounded wait, not a hard refusal — build contention is
 //! routine, edit contention is signal). This kills the phantom-failure
@@ -175,7 +175,12 @@ impl ToolExecutor for ClaimTap<'_> {
         // never observes a formatter/linter/script mid-rewrite.
         if matches!(
             name,
-            "run_tests" | "build_project" | "run_lint" | "format_code" | "run_script"
+            "run_tests"
+                | "build_project"
+                | "diagnostics"
+                | "run_lint"
+                | "format_code"
+                | "run_script"
         ) {
             let mut waited = 0u64;
             let acquired = loop {
@@ -287,10 +292,13 @@ mod tests {
         let inner = Passthrough(std::sync::Mutex::new(Vec::new()));
         let tap = ClaimTap::new(&inner, Some(store.clone()), "ses-1/lead");
         let input = serde_json::json!({});
-        // Every tree-rewriting executor rides the lane, not just tests.
+        // Every tree-rewriting executor rides the lane, not just tests —
+        // and `diagnostics`, which rewrites nothing but must never observe
+        // a sibling's half-written tree (phantom errors).
         for tool in [
             "run_tests",
             "build_project",
+            "diagnostics",
             "run_lint",
             "format_code",
             "run_script",

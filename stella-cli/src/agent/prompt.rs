@@ -16,7 +16,7 @@ You have these tools available:
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
 - run_lint / format_code: Run the project's own linter/formatter (cargo clippy/fmt, or the package.json lint/format scripts)
-- run_script: Run a script the project itself declares, by canonical verb (install/build/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
+- run_script: Run a script the project itself declares, by canonical verb (install/build/check/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
 - list_scripts: The full project scripts index — every detected script and its canonical verb binding; read-only, nothing executes
 - start_process / read_output / send_stdin / stop_process: Manage long-running processes (dev servers, REPLs, watchers) from an argv vector; one-shot commands belong in build_project/run_tests/run_script
 - repo_status / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
@@ -24,6 +24,7 @@ You have these tools available:
 - grep: Search file contents with regex (shells to ripgrep)
 - glob: Find files matching a glob pattern
 - build_project: Build with the workspace's own toolchain (cargo/npm/go/make)
+- diagnostics: Fast typecheck — runs the toolchain's native machine-readable check (cargo check / tsc / eslint / ruff) and returns structured file:line:col records with severity and rule code, grouped by file; much cheaper than build_project when you only need to know what broke
 - run_tests: Run the workspace's test suite
 - verify_done: The definition of done — replays a new test against the previous code in a shadow worktree; it must fail there and pass on your change (WITNESS CONFIRMED). Use it to prove a change actually works, not just that the suite is green.
 - ask_user: Ask the user a multiple-choice question when a decision is genuinely theirs to make (2-6 options; the UI always adds a free-text option automatically — never add an "Other" option yourself)
@@ -55,7 +56,7 @@ You have these tools available:
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
 - run_lint / format_code: Run the project's own linter/formatter (cargo clippy/fmt, or the package.json lint/format scripts)
-- run_script: Run a script the project itself declares, by canonical verb (install/build/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
+- run_script: Run a script the project itself declares, by canonical verb (install/build/check/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
 - list_scripts: The full project scripts index — every detected script and its canonical verb binding; read-only, nothing executes
 - start_process / read_output / send_stdin / stop_process: Manage long-running processes (dev servers, REPLs, watchers) from an argv vector; one-shot commands belong in build_project/run_tests/run_script
 - repo_status / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
@@ -64,6 +65,7 @@ You have these tools available:
 - grep: Search file contents with regex (shells to ripgrep)
 - glob: Find files matching a glob pattern
 - build_project: Build with the workspace's own toolchain (cargo/npm/go/make)
+- diagnostics: Fast typecheck — runs the toolchain's native machine-readable check (cargo check / tsc / eslint / ruff) and returns structured file:line:col records with severity and rule code, grouped by file; much cheaper than build_project when you only need to know what broke
 - run_tests: Run the workspace's test suite
 - verify_done: The definition of done, replays a new test against the previous code in a shadow worktree; it must fail there and pass on your change (WITNESS CONFIRMED). Use it to prove a change actually works, not just that the suite is green.
 - ask_user: Ask the user a multiple-choice question when a decision is genuinely theirs to make (2-6 options; the UI always adds a free-text option automatically, never add an "Other" option yourself)

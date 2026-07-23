@@ -311,7 +311,7 @@ enum Command {
 
     /// List or run the project's package-manager scripts — deterministic
     /// static detection (cargo/npm/uv/go/make/just/…) mapped onto canonical
-    /// verbs (install/build/start/test/lint/format). Offline: manifest
+    /// verbs (install/build/check/start/test/lint/format). Offline: manifest
     /// parsing plus a local subprocess, needs no API key.
     Scripts {
         #[command(subcommand)]
@@ -764,7 +764,7 @@ enum ScriptsCmd {
     },
     /// Run a script by canonical verb or qualified id (e.g. test, pnpm:build)
     Run {
-        /// install|build|start|test|lint|format, or a qualified id
+        /// install|build|check|start|test|lint|format, or a qualified id
         script: String,
 
         /// Package dir when the id exists in several packages

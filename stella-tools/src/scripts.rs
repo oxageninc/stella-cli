@@ -1,6 +1,6 @@
 //! Project scripts index — static, deterministic detection of
-//! package-manager scripts across ecosystems, mapped onto six canonical
-//! verbs (`install`, `build`, `start`, `test`, `lint`, `format`).
+//! package-manager scripts across ecosystems, mapped onto seven canonical
+//! verbs (`install`, `build`, `check`, `start`, `test`, `lint`, `format`).
 //!
 //! Spec: `docs/design/scripts-index.md`. Three surfaces share this module:
 //! the byte-stable `## Project scripts` prompt section, the
@@ -22,7 +22,9 @@ use crate::exec;
 use crate::registry::Tool;
 
 /// The canonical verbs, in the fixed render/resolution order.
-pub const VERBS: [&str; 6] = ["install", "build", "start", "test", "lint", "format"];
+pub const VERBS: [&str; 7] = [
+    "install", "build", "check", "start", "test", "lint", "format",
+];
 
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 /// Workspace-member enumeration cap — overflow is counted, not enumerated.
@@ -100,6 +102,7 @@ fn verb_aliases(verb: &str) -> &'static [&'static str] {
     match verb {
         "install" => &["install", "setup", "bootstrap"],
         "build" => &["build", "compile", "dist"],
+        "check" => &["check", "typecheck", "type-check"],
         "start" => &["start", "dev", "serve"],
         "test" => &["test", "tests"],
         "lint" => &["lint"],
@@ -349,11 +352,12 @@ impl ScriptIndex {
         s.trim_end().to_string()
     }
 
-    /// The machine frame (`stella scripts list --json`), schema_version 1 —
-    /// shape pinned by `docs/design/scripts-index.md`.
+    /// The machine frame (`stella scripts list --json`), schema_version 2
+    /// (2 = the `check` verb joined the set) — shape pinned by
+    /// `docs/design/scripts-index.md`.
     pub fn to_json(&self) -> Value {
         serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "verbs": self.verbs,
             "scripts": self.scripts,
         })
@@ -528,8 +532,9 @@ fn quoted_name(name: &str) -> String {
 
 /// The package manager for a dir with `package.json`, from its lockfile —
 /// falling back to the workspace root's pm for lockfile-less members
-/// (hoisted-lockfile monorepos).
-fn node_pm(dir: &Path, inherited: Option<&'static str>) -> &'static str {
+/// (hoisted-lockfile monorepos). Shared with `crate::diagnostics`, which
+/// composes its tsc/eslint exec command from the same pm choice.
+pub(crate) fn node_pm(dir: &Path, inherited: Option<&'static str>) -> &'static str {
     if dir.join("pnpm-lock.yaml").exists() {
         "pnpm"
     } else if dir.join("yarn.lock").exists() {
@@ -600,14 +605,7 @@ fn detect_python(dir: &Path, rel: &str, out: &mut Vec<ScriptEntry>) {
     let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
         return;
     };
-    let tool = |name: &str| doc.get("tool").and_then(|t| t.get(name));
-    let runner: &'static str = if dir.join("uv.lock").exists() || tool("uv").is_some() {
-        "uv"
-    } else if dir.join("poetry.lock").exists() || tool("poetry").is_some() {
-        "poetry"
-    } else {
-        "uv"
-    };
+    let runner = python_runner(dir, &doc);
     let source = manifest_path(rel, "pyproject.toml");
     if let Some(scripts) = doc
         .get("project")
@@ -657,11 +655,25 @@ fn detect_python(dir: &Path, rel: &str, out: &mut Vec<ScriptEntry>) {
     }
 }
 
+/// The Python script runner for a dir with a parsed `pyproject.toml`: `uv`
+/// on a uv marker, `poetry` on a poetry marker, `uv` by default. Shared
+/// with `crate::diagnostics`.
+pub(crate) fn python_runner(dir: &Path, doc: &toml::Value) -> &'static str {
+    let tool = |name: &str| doc.get("tool").and_then(|t| t.get(name));
+    if dir.join("uv.lock").exists() || tool("uv").is_some() {
+        "uv"
+    } else if dir.join("poetry.lock").exists() || tool("poetry").is_some() {
+        "poetry"
+    } else {
+        "uv"
+    }
+}
+
 /// Whether `pyproject.toml` declares `tool_name` anywhere dependencies live:
 /// `[project] dependencies`, `[project.optional-dependencies]`,
 /// `[dependency-groups]`, `[tool.poetry.dependencies]`, or
 /// `[tool.poetry.group.*.dependencies]`.
-fn has_python_dep(doc: &toml::Value, tool_name: &str) -> bool {
+pub(crate) fn has_python_dep(doc: &toml::Value, tool_name: &str) -> bool {
     let mut names: Vec<String> = Vec::new();
     let mut push_reqs = |value: Option<&toml::Value>| {
         if let Some(reqs) = value.and_then(|v| v.as_array()) {
@@ -771,6 +783,12 @@ fn detect_cargo(root: &Path, out: &mut Vec<ScriptEntry>) {
         "cargo",
         "build",
         "cargo build --workspace",
+        ".",
+    ));
+    out.push(synthesized(
+        "cargo",
+        "check",
+        "cargo check --workspace",
         ".",
     ));
     out.push(synthesized("cargo", "test", "cargo test --workspace", "."));
@@ -1122,7 +1140,7 @@ fn expand_member_pattern(root: &Path, pattern: &str, dirs: &mut BTreeSet<String>
 
 // Verb resolution
 
-/// Bind the six canonical verbs over the sorted entries (root package only):
+/// Bind the canonical verbs over the sorted entries (root package only):
 /// (1) an explicit script in the first-ranked ecosystem, (2) that
 /// ecosystem's synthesized default, (3) explicit scripts of later-ranked
 /// ecosystems. Synthesized defaults of later ecosystems never bind.
@@ -1183,8 +1201,9 @@ impl Tool for ListScripts {
         ToolSchema {
             name: "list_scripts".into(),
             description: "List the project's indexed package-manager scripts and their \
-                          canonical verb bindings (install/build/start/test/lint/format). \
-                          Static manifest detection — nothing is executed."
+                          canonical verb bindings \
+                          (install/build/check/start/test/lint/format). Static manifest \
+                          detection — nothing is executed."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -1213,9 +1232,9 @@ impl Tool for RunScript {
         ToolSchema {
             name: "run_script".into(),
             description: "Run an indexed project script by canonical verb \
-                          (install|build|start|test|lint|format) or qualified id (e.g. \
-                          pnpm:build, make:lint — see list_scripts). Executes only indexed \
-                          entries; for arbitrary shell, use bash."
+                          (install|build|check|start|test|lint|format) or qualified id \
+                          (e.g. pnpm:build, make:lint — see list_scripts). Executes only \
+                          indexed entries; for arbitrary shell, use bash."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -1309,6 +1328,35 @@ mod tests {
         assert_eq!(alias.command, "cargo xt");
         assert_eq!(alias.raw.as_deref(), Some("test --workspace"));
         assert_eq!(alias.source, ".cargo/config.toml");
+    }
+
+    #[test]
+    fn check_verb_synthesizes_for_cargo_and_binds_explicit_typecheck() {
+        // Cargo: the synthesized fast typecheck binds `check`.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        );
+        let index = ScriptIndex::detect_blocking(dir.path());
+        assert_eq!(index.verbs.get("check").unwrap(), "cargo:check");
+        assert_eq!(
+            index.verb_entry("check").unwrap().command,
+            "cargo check --workspace"
+        );
+
+        // Node: an explicit `typecheck` script binds the verb via its alias,
+        // and `run_script {"script": "check"}` resolves to it.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts": {"typecheck": "tsc --noEmit"}}"#,
+        );
+        let index = ScriptIndex::detect_blocking(dir.path());
+        assert_eq!(index.verbs.get("check").unwrap(), "npm:typecheck");
+        assert_eq!(index.resolve("check", None).unwrap().id, "npm:typecheck");
     }
 
     #[test]

@@ -62,6 +62,7 @@ These 38 tools register in every session — no configuration, no prerequisites.
 | `verify_done` | Prove a change is done: the test command must pass on the new code and fail on `git HEAD`. Runs in a shadow worktree and never edits your working tree. | Mutating |
 | `build_project` | Build the workspace with its own toolchain (cargo/npm/go/make), or a custom command. | Mutating |
 | `run_tests` | Run the project's tests with its own runner — `kind` picks unit/e2e/all, `filter` is runner-native. | Mutating |
+| `diagnostics` | Fast typecheck: run the toolchain's native machine-readable check (`cargo check` / `tsc` / `eslint` / `ruff`) and return structured file:line:col diagnostics with severity and rule code, grouped by file. | Read-only |
 | `run_lint` | Run the project's own linter (cargo clippy, or the `lint` script); `fix` applies automatic fixes. | Mutating |
 | `format_code` | Run the project's own formatter (cargo fmt, or the `format` script); `check` verifies without rewriting. | Mutating |
 | `list_scripts` | List the verbs the project declares (Makefile targets, package.json scripts, cargo aliases) — the index `run_script` draws from. | Read-only |

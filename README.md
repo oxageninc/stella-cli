@@ -367,6 +367,7 @@ are also accepted case-insensitively.
 | `grep` · `glob` | Regex content search (ripgrep) · glob file discovery (fd) |
 | `graph_query` | Query the indexed code graph: symbol definitions/references, file imports/importers/neighborhood — auto-built at session start, refreshed live |
 | `build_project` · `run_tests` | Build/test with the workspace's toolchain (cargo/npm/go/make) |
+| `diagnostics` | Fast typecheck: the toolchain's native machine-readable check (`cargo check` / `tsc` / `eslint` / `ruff`) parsed into structured file:line:col records, grouped by file |
 | `run_lint` · `format_code` | The project's own linter/formatter (cargo clippy/fmt, or package.json `lint`/`format` scripts), spawned argv-style — no shell |
 | `run_script` | Run a verb the project itself declares (Makefile target, package.json script, cargo alias); unknown names list the discovered vocabulary |
 | `start_process` · `read_output` · `send_stdin` · `stop_process` | Long-running processes (dev servers, REPLs, watchers) from an argv vector — capped output ring, SIGTERM-then-kill stop, reaped at session end |

@@ -1467,6 +1467,7 @@ mod tests {
             "verify_done",
             "build_project",
             "run_tests",
+            "diagnostics",
             "run_lint",
             "format_code",
             "list_scripts",
@@ -1504,7 +1505,7 @@ mod tests {
         }
         // `bash` is NOT in the default surface — it is the settings opt-in.
         assert!(!names.contains(&"bash".to_string()), "{names:?}");
-        assert_eq!(names.len(), 46, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 47, "unexpected tool count: {names:?}");
     }
 
     // bash opt-in (default OFF everywhere)
@@ -1629,7 +1630,7 @@ mod tests {
     fn issue_tools_absent_without_a_configured_backend() {
         let (_root, reg) = bare_registry(None);
         let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
-        assert_eq!(names.len(), 38, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 39, "unexpected tool count: {names:?}");
         for absent in [
             "create_issue",
             "update_issue",
@@ -1764,6 +1765,7 @@ mod tests {
                     | "glob"
                     | "gather_context"
                     | "explorations"
+                    | "diagnostics"
                     | "list_scripts"
                     | "ci_status"
                     | "search_issues"

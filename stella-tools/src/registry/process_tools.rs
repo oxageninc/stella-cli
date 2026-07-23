@@ -16,6 +16,7 @@ pub(super) fn builtins(
         Arc::new(crate::verify::VerifyDone),
         Arc::new(crate::project::BuildProject),
         Arc::new(crate::project::RunTests),
+        Arc::new(crate::diagnostics::Diagnostics),
         Arc::new(crate::project::RunLint),
         Arc::new(crate::project::FormatCode),
         Arc::new(crate::scripts::RunScript),
