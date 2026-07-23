@@ -278,6 +278,18 @@ impl CodeGraph {
         store::busiest_file(&self.inner.read_guard())
     }
 
+    /// Up to `limit` files nothing imports — binaries, scripts, tests, dead
+    /// code: exactly the set worth reading first when orienting in an
+    /// unfamiliar tree. Computed as one SQL anti-join, so the cost is
+    /// independent of index size — callers need no file-count cap, unlike
+    /// the per-file [`importers_of`] scan this replaces. Shallowest path
+    /// first, then lexicographic; empty on an empty index.
+    ///
+    /// [`importers_of`]: CodeGraph::importers_of
+    pub fn entry_points(&self, limit: usize) -> Result<Vec<String>, GraphError> {
+        store::entry_points(&self.inner.read_guard(), limit)
+    }
+
     /// Every indexed file path (root-relative, forward-slash), sorted. The
     /// deck's Graph tab lists these in its file picker so a user can re-root
     /// the neighborhood on any file, not only the [`busiest_file`] default.
@@ -484,5 +496,43 @@ mod tests {
     fn all_files_is_empty_on_an_empty_index() {
         let (graph, _ws, _dbdir) = open_graph();
         assert!(graph.all_files().unwrap().is_empty());
+    }
+
+    /// `entry_points` is the single-query anti-join orientation relies on: a
+    /// file some resolved import edge points at is excluded, the rest come
+    /// back shallowest-first, and `limit` truncates that stable order.
+    #[test]
+    fn entry_points_excludes_imported_files_and_orders_shallowest_first() {
+        let ws = TempDir::new().unwrap();
+        let dbdir = TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("lib")).unwrap();
+        std::fs::write(
+            ws.path().join("main.ts"),
+            "import { help } from \"./lib/helper\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.path().join("lib").join("helper.ts"),
+            "export function help() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.path().join("lib").join("lonely.ts"),
+            "export function alone() {}\n",
+        )
+        .unwrap();
+        let graph = CodeGraph::open(ws.path(), &dbdir.path().join("context.db")).unwrap();
+        graph.index_all().unwrap();
+
+        assert_eq!(
+            graph.entry_points(12).unwrap(),
+            vec!["main.ts".to_string(), "lib/lonely.ts".to_string()],
+            "imported files excluded, roots before nested files"
+        );
+        assert_eq!(
+            graph.entry_points(1).unwrap(),
+            vec!["main.ts".to_string()],
+            "the limit truncates the same stable order"
+        );
     }
 }
