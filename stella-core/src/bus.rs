@@ -58,14 +58,16 @@
 //!
 //! The bus is plain synchronous logic over owned data: registration lists,
 //! an atomic sequence counter, and inline dispatch. Timestamping reads the
-//! system clock (a pure computation over `SystemTime`, not I/O in the
-//! architectural sense — no filesystem, no network, no processes).
+//! system clock (a pure computation over `SystemTime`), and observer dispatch
+//! reads a monotonic `Instant` to enforce the per-handler latency budget
+//! (#459) — both are clock reads, not I/O in the architectural sense (no
+//! filesystem, no network, no processes).
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -171,6 +173,10 @@ pub mod names {
     pub const EXTENSION_LOADED: &str = "extension.loaded";
     pub const EXTENSION_UNLOADED: &str = "extension.unloaded";
     pub const EXTENSION_ERROR: &str = "extension.error";
+    /// An observer was quarantined (skipped for the rest of the session) after
+    /// repeatedly overrunning its per-dispatch time budget — a resilience
+    /// signal so a wedged extension can't silently stall the emitting thread.
+    pub const EXTENSION_QUARANTINED: &str = "extension.quarantined";
     pub const TELEMETRY_EVENT_QUEUED: &str = "telemetry.event.queued";
     pub const TELEMETRY_EVENT_FLUSHED: &str = "telemetry.event.flushed";
     pub const TELEMETRY_EVENT_FAILED: &str = "telemetry.event.failed";
@@ -262,6 +268,7 @@ pub mod names {
         EXTENSION_LOADED,
         EXTENSION_UNLOADED,
         EXTENSION_ERROR,
+        EXTENSION_QUARANTINED,
         TELEMETRY_EVENT_QUEUED,
         TELEMETRY_EVENT_FLUSHED,
         TELEMETRY_EVENT_FAILED,
@@ -414,6 +421,14 @@ struct Registration<H: ?Sized> {
     id: u64,
     pattern: String,
     handler: Arc<H>,
+    /// Consecutive over-budget dispatches, reset by any within-budget run.
+    /// **Observer path only** — [`HookBus::dispatch`] is the sole reader/writer;
+    /// blocking policy hooks carry these fields inertly and are never timed or
+    /// skipped (a slow `Deny` must run). See [`SLOW_OBSERVER_BUDGET`] (#459).
+    overruns: Arc<AtomicU32>,
+    /// Set once `overruns` reaches [`SLOW_OBSERVER_QUARANTINE_AFTER`]; the
+    /// handler is then skipped on every future dispatch. Observers only.
+    quarantined: Arc<AtomicBool>,
 }
 
 /// A live hook registration. Dropping it unsubscribes (cleanup-safe by
@@ -478,6 +493,23 @@ struct AmbientContext {
 /// bounded so a hot broken handler cannot grow memory without limit.
 const MAX_RECENT_FAILURES: usize = 64;
 
+/// Default per-dispatch latency budget for an **observer** (#459). Observers
+/// run inline on the emitting (often tool-execution) thread, so a handler that
+/// runs longer than this stalls the whole turn for that long — a synchronous
+/// closure cannot be interrupted mid-run. Generous on purpose: only a
+/// genuinely wedged handler (a synchronous webhook, an audit write on a stuck
+/// disk) exceeds it, so healthy audit/telemetry observers are never touched.
+/// Overridable via [`HookBus::with_slow_observer_budget`]. Blocking policy
+/// hooks are **never** timed or skipped — a slow `Deny` must still run.
+const SLOW_OBSERVER_BUDGET: Duration = Duration::from_millis(500);
+
+/// How many *consecutive* over-budget dispatches quarantine an observer
+/// (skip it for the rest of the session). Requiring several in a row — not one
+/// blip — keeps a transient slow-disk hiccup from silently and permanently
+/// disabling a compliance/audit journaler. A single within-budget run resets
+/// the streak.
+const SLOW_OBSERVER_QUARANTINE_AFTER: u32 = 3;
+
 struct BusInner {
     session_id: String,
     sequence: AtomicU64,
@@ -486,6 +518,9 @@ struct BusInner {
     blockers: Mutex<Vec<Registration<BlockingFn>>>,
     context: Mutex<AmbientContext>,
     recent_failures: Mutex<VecDeque<ExtensionFailure>>,
+    /// The per-observer-dispatch latency budget (#459). Immutable for the
+    /// bus's lifetime; defaults to [`SLOW_OBSERVER_BUDGET`].
+    slow_observer_budget: Duration,
 }
 
 /// The session-scoped hook bus. Cheap to clone (shared inner); every clone
@@ -497,6 +532,16 @@ pub struct HookBus {
 
 impl HookBus {
     pub fn new(session_id: impl Into<String>) -> Self {
+        Self::with_slow_observer_budget(session_id, SLOW_OBSERVER_BUDGET)
+    }
+
+    /// Like [`HookBus::new`] but with an explicit observer latency budget
+    /// (#459). Hosts that tolerate slower observers can widen it; tests use a
+    /// tiny budget to exercise quarantine without real-time sleeps.
+    pub fn with_slow_observer_budget(
+        session_id: impl Into<String>,
+        slow_observer_budget: Duration,
+    ) -> Self {
         Self {
             inner: Arc::new(BusInner {
                 session_id: session_id.into(),
@@ -506,6 +551,7 @@ impl HookBus {
                 blockers: Mutex::new(Vec::new()),
                 context: Mutex::new(AmbientContext::default()),
                 recent_failures: Mutex::new(VecDeque::new()),
+                slow_observer_budget,
             }),
         }
     }
@@ -552,6 +598,8 @@ impl HookBus {
                 id,
                 pattern: pattern.to_string(),
                 handler: Arc::new(handler),
+                overruns: Arc::new(AtomicU32::new(0)),
+                quarantined: Arc::new(AtomicBool::new(false)),
             });
         HookSubscription {
             bus: Arc::downgrade(&self.inner),
@@ -582,6 +630,9 @@ impl HookBus {
                 id,
                 pattern: pattern.to_string(),
                 handler: Arc::new(handler),
+                // Inert for blocking hooks — never timed or quarantined.
+                overruns: Arc::new(AtomicU32::new(0)),
+                quarantined: Arc::new(AtomicBool::new(false)),
             });
         HookSubscription {
             bus: Arc::downgrade(&self.inner),
@@ -741,7 +792,8 @@ impl HookBus {
     /// a handler unsubscribed *during* a dispatch may still receive the
     /// in-flight event.
     fn dispatch(&self, event: &HookEvent) {
-        let matching: Vec<(String, Arc<ObserverFn>)> = {
+        #[allow(clippy::type_complexity)]
+        let matching: Vec<(String, Arc<ObserverFn>, Arc<AtomicU32>, Arc<AtomicBool>)> = {
             let observers = self
                 .inner
                 .observers
@@ -750,11 +802,28 @@ impl HookBus {
             observers
                 .iter()
                 .filter(|r| pattern_matches(&r.pattern, &event.name))
-                .map(|r| (r.pattern.clone(), r.handler.clone()))
+                .map(|r| {
+                    (
+                        r.pattern.clone(),
+                        r.handler.clone(),
+                        r.overruns.clone(),
+                        r.quarantined.clone(),
+                    )
+                })
                 .collect()
         };
-        for (pattern, handler) in matching {
+        for (pattern, handler, overruns, quarantined) in matching {
+            // A handler that persistently overran its latency budget is
+            // skipped so it can't keep stalling the emitting (tool) thread on
+            // every event (#459). This is the **observer** path only — blocking
+            // policy hooks (`emit_blocking`) are never timed or skipped, since
+            // silently dropping a slow `Deny` would be a policy hole.
+            if quarantined.load(Ordering::Relaxed) {
+                continue;
+            }
+            let started = Instant::now();
             let outcome = catch_unwind(AssertUnwindSafe(|| handler(event)));
+            let elapsed = started.elapsed();
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(message)) => self.report_failure(&pattern, event, message),
@@ -762,7 +831,63 @@ impl HookBus {
                     self.report_failure(&pattern, event, panic_message(panic));
                 }
             }
+            // The overrun still ran to completion (a synchronous closure can't
+            // be interrupted mid-run), so this dispatch stalled; quarantining
+            // only protects *future* events. Require several consecutive
+            // overruns so a single slow-disk blip doesn't disable a healthy
+            // audit/telemetry observer.
+            if elapsed > self.inner.slow_observer_budget {
+                let streak = overruns.fetch_add(1, Ordering::Relaxed) + 1;
+                if streak >= SLOW_OBSERVER_QUARANTINE_AFTER
+                    && !quarantined.swap(true, Ordering::Relaxed)
+                {
+                    self.report_quarantine(&pattern, event, elapsed, streak);
+                }
+            } else {
+                overruns.store(0, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// Record and announce an observer quarantine (#459): a visible
+    /// `extension.quarantined` event plus an entry in the failure log, so a
+    /// disabled observer is never a silent gap. Emitting re-enters the bus
+    /// (handlers may re-emit); the just-quarantined handler is already flagged,
+    /// so it is skipped for this event too.
+    fn report_quarantine(&self, pattern: &str, event: &HookEvent, elapsed: Duration, streak: u32) {
+        let message = format!(
+            "observer '{pattern}' quarantined after {streak} consecutive dispatches over the \
+             {}ms budget (last {}ms) — skipped for the rest of the session",
+            self.inner.slow_observer_budget.as_millis(),
+            elapsed.as_millis(),
+        );
+        {
+            let mut log = self
+                .inner
+                .recent_failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if log.len() == MAX_RECENT_FAILURES {
+                log.pop_front();
+            }
+            log.push_back(ExtensionFailure {
+                pattern: pattern.to_string(),
+                event_name: event.name.clone(),
+                message: message.clone(),
+                timestamp: now_iso8601_utc(),
+            });
+        }
+        self.emit(HookEventDraft {
+            name: names::EXTENSION_QUARANTINED.to_string(),
+            payload: serde_json::json!({
+                "pattern": pattern,
+                "overruns": streak,
+                "last_ms": elapsed.as_millis(),
+                "budget_ms": self.inner.slow_observer_budget.as_millis(),
+            }),
+            turn_id: event.turn_id.clone(),
+            agent_id: event.agent_id.clone(),
+        });
     }
 
     /// Log one isolated handler failure and surface it as an
@@ -860,17 +985,52 @@ pub fn bridge_policy_plane(
     })
 }
 
-/// An observer that forwards every envelope into a `tokio` channel — the
-/// bridge from the bus's inline delivery to an extension's own async task:
-/// `bus.on("*", forward_to(tx)).detach()`.
-pub fn forward_to(
-    sender: tokio::sync::mpsc::UnboundedSender<HookEvent>,
-) -> impl Fn(&HookEvent) -> ObserverResult + Send + Sync + 'static {
-    move |event| {
-        sender
-            .send(event.clone())
-            .map_err(|_| "forward_to receiver dropped".to_string())
+/// The running count of envelopes [`forward_to`] dropped because its bounded
+/// channel was full. A slow or wedged consumer's back-pressure surfaces here
+/// as an observable number the host can read, instead of as unbounded memory
+/// growth or as back-pressure onto the emitting (tool) thread.
+#[derive(Clone, Default)]
+pub struct ForwardDropped(Arc<AtomicU64>);
+
+impl ForwardDropped {
+    /// How many envelopes have been dropped so far (monotonic).
+    pub fn count(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
     }
+}
+
+/// An observer that forwards every envelope into a **bounded** `tokio` channel
+/// — the bridge from the bus's inline delivery to an extension's own async
+/// task: `let (fwd, dropped) = forward_to(tx); bus.on("*", fwd).detach();`.
+///
+/// The bus dispatches synchronously on the emitting (often tool-execution)
+/// thread, so it can neither `.await` a full channel nor block on it. The
+/// overflow policy is therefore **drop-newest**: a full channel drops the
+/// incoming envelope and bumps the returned [`ForwardDropped`] counter, so a
+/// consumer that can't keep up degrades to a countable gap rather than
+/// back-pressuring execution or growing memory without bound. (The bounded
+/// `tokio` sender cannot evict its own queue head, so the issue's "drop-oldest"
+/// is not reachable from a synchronous producer.) A *closed* receiver is a real
+/// failure and still surfaces as `Err`.
+pub fn forward_to(
+    sender: tokio::sync::mpsc::Sender<HookEvent>,
+) -> (
+    impl Fn(&HookEvent) -> ObserverResult + Send + Sync + 'static,
+    ForwardDropped,
+) {
+    let dropped = ForwardDropped::default();
+    let counter = dropped.clone();
+    let observer = move |event: &HookEvent| match sender.try_send(event.clone()) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            counter.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Err("forward_to receiver dropped".to_string())
+        }
+    };
+    (observer, dropped)
 }
 
 /// Whether `pattern` matches `name`: `*` matches everything; `ns.*`
@@ -1189,7 +1349,7 @@ mod tests {
 
     #[test]
     fn catalog_has_every_documented_name_without_duplicates() {
-        assert_eq!(names::ALL.len(), 87);
+        assert_eq!(names::ALL.len(), 88);
         let unique: std::collections::HashSet<&str> = names::ALL.iter().copied().collect();
         assert_eq!(unique.len(), names::ALL.len(), "duplicate catalog name");
         for name in names::ALL {
@@ -1722,17 +1882,100 @@ mod tests {
     // ---- forwarding ------------------------------------------------------
 
     #[tokio::test]
-    async fn forward_to_bridges_events_into_a_tokio_channel() {
+    async fn forward_to_bridges_events_into_a_bounded_channel() {
         let bus = HookBus::new("s");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        bus.on("file.*", forward_to(tx)).detach();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (fwd, dropped) = forward_to(tx);
+        bus.on("file.*", fwd).detach();
         bus.emit_named(names::FILE_CREATED, serde_json::json!({"path": "a"}));
         let event = rx.recv().await.unwrap();
         assert_eq!(event.name, "file.created");
-        // A dropped receiver turns into an isolated failure, not a crash.
+        assert_eq!(dropped.count(), 0, "a keeping-up consumer drops nothing");
+        // A closed receiver is a real failure surfaced as an isolated error.
         drop(rx);
         bus.emit_named(names::FILE_DELETED, Value::Null);
         assert_eq!(bus.recent_failures().len(), 1);
+    }
+
+    /// #459 (Part 2): a wedged consumer must not back-pressure the emitting
+    /// thread or grow memory without bound (the old `UnboundedSender`). A full
+    /// bounded channel drops-newest and counts, and a full channel is a policy
+    /// outcome, not a handler failure — so no `extension.error` storm.
+    #[tokio::test]
+    async fn forward_to_drops_newest_when_the_bounded_channel_is_full() {
+        let bus = HookBus::new("s");
+        // `_rx` is never drained but stays alive, so the channel fills (Full),
+        // it is not closed (which would be a real Err).
+        let (tx, _rx) = tokio::sync::mpsc::channel(2);
+        let (fwd, dropped) = forward_to(tx);
+        bus.on("file.*", fwd).detach();
+        for _ in 0..10 {
+            bus.emit_named(names::FILE_CREATED, Value::Null);
+        }
+        assert_eq!(
+            dropped.count(),
+            8,
+            "the 2-slot channel takes 2, then drops the other 8"
+        );
+        assert!(
+            bus.recent_failures().is_empty(),
+            "a full channel is a drop, not a failure: {:?}",
+            bus.recent_failures()
+        );
+    }
+
+    /// #459 (Part 1): an observer that persistently overruns its latency
+    /// budget is quarantined — a visible event fires and it is skipped on
+    /// every later event, so it can't keep stalling the emitting (tool) thread.
+    /// Positive direction only (a tiny budget + a handler that sleeps ~10x past
+    /// it), to stay non-flaky under CI load.
+    #[test]
+    fn a_persistently_slow_observer_is_quarantined_then_skipped() {
+        let bus = HookBus::with_slow_observer_budget("s", Duration::from_millis(10));
+        let slow_calls = Arc::new(AtomicU32::new(0));
+        let sc = slow_calls.clone();
+        bus.on("file.created", move |_event| {
+            sc.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(())
+        })
+        .detach();
+        let quarantine_events = Arc::new(AtomicU32::new(0));
+        let qc = quarantine_events.clone();
+        bus.on(names::EXTENSION_QUARANTINED, move |_event| {
+            qc.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .detach();
+
+        // Each of these overruns; the streak reaches the quarantine threshold.
+        for _ in 0..SLOW_OBSERVER_QUARANTINE_AFTER {
+            bus.emit_named(names::FILE_CREATED, Value::Null);
+        }
+        assert_eq!(
+            slow_calls.load(Ordering::Relaxed),
+            SLOW_OBSERVER_QUARANTINE_AFTER,
+            "the slow handler ran on each event up to quarantine"
+        );
+        assert_eq!(
+            quarantine_events.load(Ordering::Relaxed),
+            1,
+            "a single, visible extension.quarantined event fired"
+        );
+        assert!(
+            bus.recent_failures()
+                .iter()
+                .any(|f| f.message.contains("quarantined")),
+            "the quarantine is recorded for the postmortem log"
+        );
+
+        // Quarantined: a further event must skip the slow handler entirely.
+        bus.emit_named(names::FILE_CREATED, Value::Null);
+        assert_eq!(
+            slow_calls.load(Ordering::Relaxed),
+            SLOW_OBSERVER_QUARANTINE_AFTER,
+            "a quarantined observer is never invoked again"
+        );
     }
 
     // ---- payload hygiene --------------------------------------------------
