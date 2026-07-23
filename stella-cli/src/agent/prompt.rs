@@ -14,6 +14,7 @@ You have these tools available:
 - read_file: Read a file with line numbers (supports offset/limit for ranges)
 - write_file: Create or overwrite a file (creates parent dirs)
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
+- apply_edits: Apply a batch of exact-substring edits — across multiple files — in ONE transactional call: every edit validates first, and if any fails nothing is written (dry_run previews). Use it for coordinated multi-file changes (a rename touching several files) instead of a chain of edit_file calls.
 - delete_file: Delete a file within the workspace
 - run_lint / format_code: Run the project's own linter/formatter (cargo clippy/fmt, or the package.json lint/format scripts)
 - run_script: Run a script the project itself declares, by canonical verb (install/build/check/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
@@ -55,6 +56,7 @@ You have these tools available:
 - read_file: Read a file with line numbers (supports offset/limit for ranges)
 - write_file: Create or overwrite a file (creates parent dirs)
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
+- apply_edits: Apply a batch of exact-substring edits — across multiple files — in ONE transactional call: every edit validates first, and if any fails nothing is written (dry_run previews). Use it for coordinated multi-file changes (a rename touching several files) instead of a chain of edit_file calls.
 - delete_file: Delete a file within the workspace
 - run_lint / format_code: Run the project's own linter/formatter (cargo clippy/fmt, or the package.json lint/format scripts)
 - run_script: Run a script the project itself declares, by canonical verb (install/build/check/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
