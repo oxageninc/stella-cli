@@ -64,6 +64,40 @@ const BUILD_POLL_MS: u64 = 500;
 /// Claims older than this are swept at session start (crash hygiene).
 pub(crate) const STALE_CLAIM_MAX_AGE_SECS: u64 = 6 * 3600;
 
+/// The pid embedded in a holder identity's owner prefix — every writer's
+/// identity is `<owner>/<lane-or-task>` where the owner ends in the minting
+/// process's pid (`ses-<ms>-<pid>`, `fleet-<ms>-<pid>`). `None` when the
+/// identity doesn't parse; the caller must then assume the holder is alive.
+fn holder_pid(holder: &str) -> Option<u32> {
+    holder.split('/').next()?.rsplit('-').next()?.parse().ok()
+}
+
+/// Whether `pid` is a live process — the same probe the session registry
+/// uses for its dead-pid downgrade: `kill(pid, 0)`, with EPERM still
+/// meaning alive. Elsewhere: assume alive (a stale refusal beats reaping a
+/// live rival's claims).
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // `pid_t` is signed: a pid that doesn't fit must read as dead — an
+        // `as` cast would wrap it negative, and `kill(-N, 0)` probes
+        // process GROUP N, which can spuriously report alive.
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        if pid == 0 {
+            return false;
+        }
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// The tools whose successful call mutates the path in their `path` input.
 /// In the DEFAULT configuration this coverage is complete for file writes:
 /// `bash` — historically the documented hole, since a shell can write
@@ -130,6 +164,26 @@ impl<'a> ClaimTap<'a> {
             .unwrap_or_else(|p| p.into_inner())
             .insert(path.to_string());
     }
+
+    /// Free `path`'s claim set when its holder's process is dead — the gap
+    /// the age-based sweep leaves: a crashed/killed writer's claims would
+    /// otherwise refuse rivals for up to [`STALE_CLAIM_MAX_AGE_SECS`]. All
+    /// of the dead holder's claims go at once (a dead process cannot be
+    /// mid-edit on any of them). `true` means something was released and
+    /// the caller should retry its acquire; an unparsable holder identity
+    /// is assumed alive.
+    fn reap_dead_holder(&self, store: &Store, path: &str) -> bool {
+        let Some(rival) = store.file_lock_holder(path).ok().flatten() else {
+            return false;
+        };
+        let Some(pid) = holder_pid(&rival) else {
+            return false;
+        };
+        if pid_alive(pid) {
+            return false;
+        }
+        store.release_file_locks_for_holder(&rival).is_ok()
+    }
 }
 
 #[async_trait]
@@ -144,11 +198,17 @@ impl ToolExecutor for ClaimTap<'_> {
         };
 
         // Lock on first write: refuse (naming the holder) instead of
-        // clobbering a sibling's in-flight work.
+        // clobbering a sibling's in-flight work. A conflict is only honored
+        // while its holder's process is alive — a dead process's leftover
+        // claim is reaped and the acquire retried once.
         if let Some(path) = mutating_path(name, input)
             && !self.already_held(path)
         {
-            match store.acquire_file_lock(path, &self.holder) {
+            let mut acquired = store.acquire_file_lock(path, &self.holder);
+            if matches!(acquired, Ok(false)) && self.reap_dead_holder(store, path) {
+                acquired = store.acquire_file_lock(path, &self.holder);
+            }
+            match acquired {
                 Ok(true) => self.mark_held(path),
                 Ok(false) => {
                     let rival = store
@@ -186,6 +246,9 @@ impl ToolExecutor for ClaimTap<'_> {
             let acquired = loop {
                 match store.acquire_file_lock(BUILD_CLAIM, &self.holder) {
                     Ok(true) => break true,
+                    // A dead process cannot release the lane; reap it and
+                    // retry immediately instead of waiting out the bound.
+                    Ok(false) if self.reap_dead_holder(store, BUILD_CLAIM) => {}
                     Ok(false) if waited < BUILD_WAIT_MS => {
                         tokio::time::sleep(std::time::Duration::from_millis(BUILD_POLL_MS)).await;
                         waited += BUILD_POLL_MS;
@@ -319,5 +382,88 @@ mod tests {
         let tap = ClaimTap::new(&inner, None, "ses-1/lead");
         let input = serde_json::json!({ "path": "src/lib.rs" });
         assert!(!tap.execute("write_file", &input).await.is_error());
+    }
+
+    #[test]
+    fn holder_pids_parse_from_deck_and_fleet_identities_only() {
+        assert_eq!(holder_pid("ses-1753-4242/lead"), Some(4242));
+        assert_eq!(holder_pid("ses-1753-4242/req:1"), Some(4242));
+        assert_eq!(holder_pid("fleet-1753-77/t1"), Some(77));
+        // Anything else must read as "unknown → assume alive".
+        assert_eq!(holder_pid("lead"), None);
+        assert_eq!(holder_pid("agent-one/x"), None);
+        assert_eq!(holder_pid(""), None);
+    }
+
+    // A pid that cannot belong to a live process: `pid_t::try_from` rejects
+    // it outright, so the liveness probe is deterministic (unix only — the
+    // non-unix fallback assumes every pid alive).
+    #[cfg(unix)]
+    const DEAD_HOLDER: &str = "ses-1753-4294967294/lead";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dead_holders_claims_are_reaped_at_conflict_time() {
+        // The age-based sweep would honor this leftover for up to 6h; a
+        // conflict must instead notice the holder's process is gone, free
+        // its whole claim set, and let the rival proceed.
+        let store = store();
+        store.acquire_file_lock("src/lib.rs", DEAD_HOLDER).unwrap();
+        store
+            .acquire_file_lock("src/other.rs", DEAD_HOLDER)
+            .unwrap();
+        let inner = Passthrough(std::sync::Mutex::new(Vec::new()));
+        let tap = ClaimTap::new(&inner, Some(store.clone()), "ses-2/req:1");
+        let input = serde_json::json!({ "path": "src/lib.rs", "content": "x" });
+
+        assert!(!tap.execute("write_file", &input).await.is_error());
+        assert_eq!(
+            store.file_lock_holder("src/lib.rs").unwrap(),
+            Some("ses-2/req:1".to_string()),
+            "the rival now holds the reaped path"
+        );
+        assert_eq!(
+            store.file_lock_holder("src/other.rs").unwrap(),
+            None,
+            "the dead holder's whole claim set went at once"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn build_lane_reaps_a_dead_holder_instead_of_waiting() {
+        // (Paused clock: on a regression this auto-advances through the
+        // bounded wait instead of stalling the suite, and the refusal below
+        // fails the assert.)
+        let store = store();
+        store.acquire_file_lock(BUILD_CLAIM, DEAD_HOLDER).unwrap();
+        let inner = Passthrough(std::sync::Mutex::new(Vec::new()));
+        let tap = ClaimTap::new(&inner, Some(store.clone()), "ses-2/lead");
+
+        assert!(
+            !tap.execute("run_tests", &serde_json::json!({}))
+                .await
+                .is_error(),
+            "a dead process must not hold the build lane"
+        );
+        // Transient as ever: released again after the call.
+        assert!(store.acquire_file_lock(BUILD_CLAIM, "ses-3/lead").unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_live_holders_claim_still_refuses_rivals() {
+        // This process's own pid in the holder identity: alive, so the reap
+        // must not fire and the refusal must stand.
+        let store = store();
+        let live_holder = format!("ses-1753-{}/lead", std::process::id());
+        store.acquire_file_lock("src/lib.rs", &live_holder).unwrap();
+        let inner = Passthrough(std::sync::Mutex::new(Vec::new()));
+        let tap = ClaimTap::new(&inner, Some(store.clone()), "ses-2/req:1");
+        let input = serde_json::json!({ "path": "src/lib.rs", "content": "x" });
+
+        match tap.execute("write_file", &input).await {
+            ToolOutput::Error { message } => assert!(message.contains(&live_holder), "{message}"),
+            other => panic!("a live holder's claim must refuse, got {other:?}"),
+        }
     }
 }
