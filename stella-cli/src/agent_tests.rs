@@ -122,6 +122,37 @@ fn assemble_system_prompt_carries_a_byte_stable_scripts_section() {
     );
 }
 
+/// Zero-call orientation (issue #328): over a pre-indexed workspace, the
+/// interactive system prompt carries the project map — languages, layout,
+/// entry points — baked into the byte-stable prefix, so orientation costs no
+/// model round-trip and is unconditional rather than left to the model's
+/// discretion. Two assemblies over the same index state must be
+/// byte-identical: that is the invariant that lets the whole prefix ride the
+/// provider's prompt cache (AGENTS.md invariant #7).
+#[test]
+fn assemble_system_prompt_bakes_a_byte_stable_orientation_map() {
+    let root = graph_fixture();
+
+    let authority = crate::settings::AuthorityPolicy {
+        project_prompts_allowed: true,
+        ..crate::settings::AuthorityPolicy::default()
+    };
+    let rules = crate::rules::ResolvedRules::default();
+    let first = assemble_system_prompt(SYSTEM_PROMPT, root.path(), &authority, &rules);
+    let second = assemble_system_prompt(SYSTEM_PROMPT, root.path(), &authority, &rules);
+    assert_eq!(
+        first, second,
+        "same index state ⇒ identical bytes (the prompt-cache invariant)"
+    );
+    assert!(first.contains("## Project map"), "{first}");
+    assert!(first.contains("Languages: rust"), "{first}");
+    assert!(
+        first.contains("Layout (2 indexed files): 2 at the root"),
+        "the slow-churning skeleton includes the top-level layout: {first}"
+    );
+    assert!(first.contains("Entry points:"), "{first}");
+}
+
 /// Build a real code-graph index in a tempdir: `hub.rs` (three symbols) is
 /// busiest, `leaf.rs` (one) is not. Returns the workspace root tempdir.
 fn graph_fixture() -> tempfile::TempDir {

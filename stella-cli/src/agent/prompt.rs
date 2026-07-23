@@ -182,8 +182,10 @@ fn append_project_scripts(prompt: &mut String, workspace_root: &std::path::Path)
 }
 
 /// The project-map section of [`assemble_system_prompt`]: the graph-derived
-/// languages, entry points, and storage — the complement of the scripts
-/// section above. Read-only (`stella_tools::overview::render_orientation_block`
+/// languages, top-level layout, entry points, and storage — the complement
+/// of the scripts section above, and bounded by construction so it stays
+/// useful on monorepos far past a few hundred files (issue #328). Read-only
+/// (`stella_tools::overview::render_orientation_block`
 /// opens an existing index and never builds one), so it adds nothing to
 /// first-response latency; it appears once the session's background index
 /// build has completed (or immediately when the workspace was pre-indexed,

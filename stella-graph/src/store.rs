@@ -680,6 +680,23 @@ pub(crate) fn importers_of(conn: &Connection, rel: &str) -> Result<Vec<String>, 
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// Up to `limit` files that no resolved import edge points at — the
+/// entry-point set. One query whatever the index size (the anti-join rides
+/// the `code_graph_imports_to` index), unlike the per-file `importers_of`
+/// scan this replaces, which forced callers to cap orientation at a few
+/// hundred files. Shallowest path first, then lexicographic, so the
+/// truncated list is stable and leads with the roots worth reading first.
+pub(crate) fn entry_points(conn: &Connection, limit: usize) -> Result<Vec<String>, GraphError> {
+    let mut stmt = conn.prepare(
+        "SELECT f.path FROM code_graph_files f \
+         WHERE NOT EXISTS (SELECT 1 FROM code_graph_imports i WHERE i.to_path = f.path) \
+         ORDER BY LENGTH(f.path) - LENGTH(REPLACE(f.path, '/', '')), f.path \
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// All indexed file paths (used by the linear reference scan).
 pub(crate) fn all_files(conn: &Connection) -> Result<Vec<String>, GraphError> {
     let mut stmt = conn.prepare("SELECT path FROM code_graph_files ORDER BY path")?;

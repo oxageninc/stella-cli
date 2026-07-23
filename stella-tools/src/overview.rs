@@ -12,7 +12,7 @@
 //! detection), the code graph, the storage/schema snapshot, and the domain
 //! taxonomy. No model call, no shell, no grep.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -22,13 +22,16 @@ use stella_protocol::{ToolOutput, ToolSchema};
 use crate::registry::Tool;
 use crate::scripts::ScriptIndex;
 
-/// Deriving entry points costs one `importers_of` query per file, so it is
-/// bounded: past this many files the roots list is omitted rather than
-/// silently truncated into a half-truth.
-const ENTRY_POINT_SCAN_LIMIT: usize = 400;
-
-/// Entry points reported at most, newest-shallowest first.
+/// Entry points reported at most, shallowest first. The derivation is one
+/// SQL anti-join (`CodeGraph::entry_points`) whatever the repository size,
+/// so this bounds the rendered list, never the scan — a monorepo past a few
+/// hundred files gets the same roots a small tree does.
 const MAX_ENTRY_POINTS: usize = 12;
+
+/// Top-level directories named in the layout summary at most. Past this the
+/// remainder collapses to a count, so a monorepo with hundreds of packages
+/// still renders a few dozen deterministic tokens.
+const MAX_TOP_LEVEL_DIRS: usize = 12;
 
 pub struct ProjectOverview;
 
@@ -81,10 +84,16 @@ impl Tool for ProjectOverview {
 /// `project_overview` explicitly.
 ///
 /// Deliberately the complement of the script index (which the prompt already
-/// injects separately): languages, entry points, and storage — the shape of
-/// the code the model would otherwise spend grep/glob/read_file turns
-/// discovering. Kept to a few lines so it stays cheap in the cache-stable
-/// system prefix.
+/// injects separately): languages, top-level layout, entry points, and
+/// storage — the slow-churning skeleton the model would otherwise spend
+/// grep/glob/read_file turns discovering. Fine detail that changes within a
+/// session stays with `graph_query`/`read_file`; everything here is derived
+/// from `codegraph.db`, so the block is byte-stable for a given index state
+/// and kept to a few lines so it stays cheap in the cache-stable system
+/// prefix. Every line is bounded by construction (issue #328): entry points
+/// come from one SQL anti-join and the layout collapses past
+/// [`MAX_TOP_LEVEL_DIRS`], so a monorepo far beyond a few hundred files
+/// renders the same useful map a small tree does.
 pub fn render_orientation_block(root: &Path) -> Option<String> {
     let path = stella_store::existing_workspace_private_sqlite_path(root, "codegraph.db")
         .ok()
@@ -113,14 +122,13 @@ pub fn render_orientation_block(root: &Path) -> Option<String> {
         ));
     }
 
-    // Same bound as `code_section`: deriving entry points costs one
-    // `importers_of` query per file, so past the scan limit we skip the line
-    // rather than pay an unbounded per-file scan on the first-response path.
-    if all_files.len() <= ENTRY_POINT_SCAN_LIMIT {
-        let entry_points = entry_point_paths(&graph, &all_files);
-        if !entry_points.is_empty() {
-            lines.push(format!("Entry points: {}", entry_points.join(", ")));
-        }
+    if let Some(layout) = top_level_summary(&all_files) {
+        lines.push(layout);
+    }
+
+    let entry_points = graph.entry_points(MAX_ENTRY_POINTS).unwrap_or_default();
+    if !entry_points.is_empty() {
+        lines.push(format!("Entry points: {}", entry_points.join(", ")));
     }
 
     let storage = graph.storage_snapshot();
@@ -210,28 +218,12 @@ fn code_section(graph: &stella_graph::CodeGraph) -> Value {
         }
     }
 
-    let mut section = json!({
+    json!({
         "languages": languages.into_iter().collect::<Vec<_>>(),
         "busiest_file": graph.busiest_file().unwrap_or(None),
-    });
-    let map = section.as_object_mut().expect("object literal");
-
-    if files.len() > ENTRY_POINT_SCAN_LIMIT {
-        map.insert(
-            "entry_points".into(),
-            json!(format!(
-                "omitted — {} indexed files exceeds the {} scan limit; \
-                 use graph_query importers to check a specific file",
-                files.len(),
-                ENTRY_POINT_SCAN_LIMIT
-            )),
-        );
-        return section;
-    }
-
-    let roots = entry_point_paths(graph, &files);
-    map.insert("entry_points".into(), json!(roots));
-    section
+        "top_level": top_level_summary(&files),
+        "entry_points": graph.entry_points(MAX_ENTRY_POINTS).unwrap_or_default(),
+    })
 }
 
 fn storage_section(snapshot: &stella_graph::StorageSnapshot) -> Value {
@@ -302,23 +294,44 @@ fn domains_section(root: &Path) -> Value {
     json!(names)
 }
 
-/// Files nothing imports — a binary, a script, a test, or dead code, which is
-/// exactly the set worth reading first. Bounded and stably ordered
-/// (shallowest path first) so both the tool and the prompt block agree.
-fn entry_point_paths(graph: &stella_graph::CodeGraph, files: &[String]) -> Vec<String> {
-    let mut roots: Vec<String> = files
-        .iter()
-        .filter(|file| {
-            graph
-                .importers_of(Path::new(file))
-                .map(|importers| importers.is_empty())
-                .unwrap_or(false)
-        })
-        .cloned()
+/// One line summarizing where the code lives: top-level directories by
+/// indexed-file count (largest first, ties by name), the remainder and any
+/// root-level files collapsed to counts. Derived from the index's sorted
+/// file list, so it is deterministic for a given index state — and it never
+/// degrades: past [`MAX_TOP_LEVEL_DIRS`] the summary collapses instead of
+/// disappearing, which is what keeps the injected map useful on a monorepo.
+fn top_level_summary(files: &[String]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut dir_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut root_files = 0usize;
+    for file in files {
+        match file.split_once('/') {
+            Some((dir, _)) => *dir_counts.entry(dir).or_default() += 1,
+            None => root_files += 1,
+        }
+    }
+    let mut dirs: Vec<(&str, usize)> = dir_counts.into_iter().collect();
+    dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let omitted = dirs.len().saturating_sub(MAX_TOP_LEVEL_DIRS);
+    dirs.truncate(MAX_TOP_LEVEL_DIRS);
+
+    let mut parts: Vec<String> = dirs
+        .into_iter()
+        .map(|(dir, count)| format!("{dir}/ ({count})"))
         .collect();
-    roots.sort_by_key(|path| (path.matches('/').count(), path.clone()));
-    roots.truncate(MAX_ENTRY_POINTS);
-    roots
+    if omitted > 0 {
+        parts.push(format!("+{omitted} more dirs"));
+    }
+    if root_files > 0 {
+        parts.push(format!("{root_files} at the root"));
+    }
+    Some(format!(
+        "Layout ({} indexed files): {}",
+        files.len(),
+        parts.join(", ")
+    ))
 }
 
 /// Extension → language label, matching the grammars the indexer actually
@@ -445,8 +458,50 @@ mod tests {
         assert!(block.contains("Project map"), "{block}");
         assert!(block.contains("Languages: rust"), "{block}");
         assert!(
+            block.contains("Layout (2 indexed files): 2 at the root"),
+            "the layout line summarizes where the code lives: {block}"
+        );
+        assert!(
             block.contains("Entry points:"),
             "a file nothing imports is an entry point: {block}"
+        );
+    }
+
+    /// Issue #328 witness: past the old 400-file scan limit the map must stay
+    /// useful — entry points are still derived (one SQL anti-join, no
+    /// file-count cap) and the bounded layout line is still present, in both
+    /// the tool output and the injected prompt block. Pre-#328, this fixture
+    /// rendered no entry points anywhere and an "omitted" note in the tool.
+    #[test]
+    fn orientation_stays_useful_past_the_old_400_file_scan_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(dir.path().join("main.rs"), "pub fn main() {}\n").unwrap();
+        for i in 0..420 {
+            std::fs::write(src.join(format!("f{i:03}.rs")), "pub fn f() {}\n").unwrap();
+        }
+
+        let out = build_overview(dir.path());
+        assert!(
+            out["index"]["files"].as_u64().unwrap_or(0) > 400,
+            "the fixture must exceed the old scan limit: {}",
+            out["index"]
+        );
+        let entry_points = out["code"]["entry_points"]
+            .as_array()
+            .expect("entry points stay a real list, never an 'omitted' note");
+        assert_eq!(
+            entry_points.first(),
+            Some(&serde_json::json!("main.rs")),
+            "shallowest first: {entry_points:?}"
+        );
+
+        let block = render_orientation_block(dir.path()).expect("an indexed workspace renders");
+        assert!(block.contains("Entry points: main.rs"), "{block}");
+        assert!(
+            block.contains("Layout (421 indexed files): src/ (420), 1 at the root"),
+            "{block}"
         );
     }
 
