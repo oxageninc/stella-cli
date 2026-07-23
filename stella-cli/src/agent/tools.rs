@@ -42,9 +42,26 @@ pub(crate) fn custom_tool_report_for_scopes(
     }
 }
 
-/// Repo-structure summary via `git ls-files` for the planner's split context.
+/// Repo-structure summary for the planner's split context: the `git
+/// ls-files` tree plus, when a code-graph index exists, the graph-derived
+/// orientation complement (languages, entry points, storage relations) —
+/// so the plan names the relevant files instead of leaving the worker to
+/// rediscover them (#342 seam 2).
 pub(crate) struct GitRepoStructure {
     pub(crate) root: std::path::PathBuf,
+}
+
+/// Compose the planner's structure summary from the raw file tree and the
+/// optional graph-derived orientation block. Pure so the composition is
+/// directly testable: no orientation (no index yet) leaves the tree
+/// byte-identical, and an empty tree (not a git repo) still surfaces the
+/// orientation alone.
+fn compose_structure_summary(tree: String, orientation: Option<String>) -> String {
+    match orientation {
+        Some(block) if tree.is_empty() => block,
+        Some(block) => format!("{tree}\n\n{block}"),
+        None => tree,
+    }
 }
 
 #[async_trait::async_trait]
@@ -58,12 +75,20 @@ impl RepoStructurePort for GitRepoStructure {
         }
         scrub_model_subprocess(&mut cmd);
         let output = cmd.output().await;
-        match output {
+        let tree = match output {
             Ok(out) if out.status.success() => {
                 render_file_tree(&String::from_utf8_lossy(&out.stdout), 200)
             }
             _ => String::new(),
-        }
+        };
+        // Read-only like the system-prompt seam: renders only from an
+        // EXISTING index (never builds one inline), is bounded and
+        // byte-stable for a given index state, and simply appears once the
+        // session's background graph build has landed.
+        compose_structure_summary(
+            tree,
+            stella_tools::overview::render_orientation_block(&self.root),
+        )
     }
 }
 
@@ -573,6 +598,23 @@ mod tests {
         CostDecision, ImageRequest, MediaArtifact, MediaCapabilities, MediaError, MediaJob,
         MediaJobStatus, MediaKind, MediaProvider, MediaSpendGate, MediaSpendRequest, VideoRequest,
     };
+
+    #[test]
+    fn structure_summary_composition_is_stable_without_an_index() {
+        // No orientation (no code-graph index yet): the tree is
+        // byte-identical to the pre-#342 output. With one: appended after a
+        // blank line, and a tree-less workspace still gets the orientation.
+        let tree = "src/\n  main.rs\n".to_string();
+        assert_eq!(compose_structure_summary(tree.clone(), None), tree);
+        assert_eq!(
+            compose_structure_summary(tree.clone(), Some("Languages: rust".into())),
+            format!("{tree}\n\nLanguages: rust")
+        );
+        assert_eq!(
+            compose_structure_summary(String::new(), Some("Languages: rust".into())),
+            "Languages: rust"
+        );
+    }
 
     #[test]
     fn witness_fingerprint_hashes_complete_bytes_not_size_and_mtime() {
