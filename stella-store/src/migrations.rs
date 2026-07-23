@@ -44,8 +44,6 @@ pub(crate) const MIGRATIONS: [Migration; 10] = [
     // v4 → v5: the skill_usage invocation log (purely additive — SKILLS tab).
     migrate_v4_to_v5,
     // v5 → v6: the additive `mcp_usage` table (per-call MCP tool telemetry).
-    // Renumbered from v4 at cascade-merge behind the agent_uses (v4) and
-    // skill_usage (v5) migrations; SCHEMA_VERSION follows MIGRATIONS.len().
     migrate_v5_to_v6,
     // v6 → v7: the data-plane tables (all purely additive) — `tool_calls`
     // (normalized per-call log), `execution_reflection` (per-turn self-review
