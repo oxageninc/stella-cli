@@ -146,7 +146,7 @@ pub enum Inbound {
     SessionReset { agent: AgentId },
     /// A refreshed code-graph snapshot for the Graph tab. Unlike the other
     /// variants this is **not** a folded event — the graph is an out-of-band
-    /// read-model (see `COMMAND_DECK_DESIGN.md` → "The purity boundary"). It
+    /// read-model — out-of-band, not folded from events. It
     /// rides the inbound channel only because that is the driver→deck path;
     /// [`crate::deck_ui::ingest_inbound`] applies it straight to the view
     /// state (`DeckUi::graph`) and the model fold ignores it. The driver
@@ -1003,8 +1003,7 @@ impl std::fmt::Debug for Secret {
 
 /// The agent-control verbs surfaced by the dashboard. `Stop` maps to a clean
 /// `UserInput::Cancel` today; `Pause`/`Resume`/`Restart` are RESERVED for
-/// the fleet supervisor seam (see `COMMAND_DECK_DESIGN.md` → "Backend
-/// seams") — the deck driver currently drops them, so no key is bound to
+/// the fleet supervisor seam — the deck driver currently drops them, so no key is bound to
 /// them (a keypress that visibly does nothing is worse than no key).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentControl {

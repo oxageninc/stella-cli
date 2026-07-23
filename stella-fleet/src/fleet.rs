@@ -21,7 +21,7 @@
 //! channel shapes the deck's sub-sessions use), and the fleet exposes the
 //! matching verbs, [`Fleet::pause_task`] / [`Fleet::resume_task`] /
 //! [`Fleet::stop_task`]. This closes the "fleet supervisor seam"
-//! `COMMAND_DECK_DESIGN.md` and `command_deck.rs` named as the follow-up:
+//! `command_deck.rs` named as the follow-up:
 //! per-worker pause/stop now exists at the fleet layer, not just for deck
 //! sub-session lanes. Restart is deliberately not a fleet verb —
 //! [`Fleet::dispatch`] is re-runnable, so a restart is the caller

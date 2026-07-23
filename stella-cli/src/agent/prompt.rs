@@ -131,10 +131,12 @@ pub(crate) fn assemble_system_prompt(
     // state that can carry preinstalled prompt steering across trials.
     if crate::settings::filesystem_settings_disabled() {
         append_project_scripts(&mut prompt, workspace_root);
+        append_project_orientation(&mut prompt, workspace_root);
         return prompt;
     }
     if authority.project_prompts_allowed {
         append_project_scripts(&mut prompt, workspace_root);
+        append_project_orientation(&mut prompt, workspace_root);
         append_workspace_memories(&mut prompt, workspace_root);
         append_exploration_index(&mut prompt, workspace_root);
     }
@@ -174,6 +176,23 @@ fn append_exploration_index(prompt: &mut String, workspace_root: &std::path::Pat
 fn append_project_scripts(prompt: &mut String, workspace_root: &std::path::Path) {
     let index = stella_tools::scripts::ScriptIndex::detect_blocking(workspace_root);
     if let Some(section) = index.render_prompt_section() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&section);
+    }
+}
+
+/// The project-map section of [`assemble_system_prompt`]: the graph-derived
+/// languages, entry points, and storage — the complement of the scripts
+/// section above. Read-only (`stella_tools::overview::render_orientation_block`
+/// opens an existing index and never builds one), so it adds nothing to
+/// first-response latency; it appears once the session's background index
+/// build has completed (or immediately when the workspace was pre-indexed,
+/// as the benchmark adapter does). Byte-stable for a given index state, so it
+/// keeps the cache-stable system prefix stable. The point is fewer
+/// grep/glob/read_file discovery turns: the model starts knowing the shape of
+/// the code.
+fn append_project_orientation(prompt: &mut String, workspace_root: &std::path::Path) {
+    if let Some(section) = stella_tools::overview::render_orientation_block(workspace_root) {
         prompt.push_str("\n\n");
         prompt.push_str(&section);
     }

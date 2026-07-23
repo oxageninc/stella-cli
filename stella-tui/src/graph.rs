@@ -8,7 +8,7 @@
 //!
 //! The snapshot is one of the two labeled **out-of-band read-models**: it is
 //! not folded from `AgentEvent`s (a graph's structure isn't in the per-session
-//! event stream). See `COMMAND_DECK_DESIGN.md` → "The purity boundary".
+//! event stream).
 
 /// A queried neighborhood of the code graph, ready to draw.
 #[derive(Clone, Debug, Default, PartialEq)]

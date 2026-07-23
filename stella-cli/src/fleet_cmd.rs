@@ -22,8 +22,7 @@
 //! engine's step boundary via a `TurnGate`. `stella fleet` itself drives
 //! workers to completion — the control verbs (`Fleet::pause_task` /
 //! `resume_task` / `stop_task`) exist for a supervisor; surfacing fleet
-//! tasks as controllable deck lanes is the named follow-up in
-//! `COMMAND_DECK_DESIGN.md`.
+//! tasks as controllable deck lanes is the named follow-up.
 //!
 //! Worktrees are deliberately left in place after the run — the branches
 //! (`fleet/<task>`) carry the work product for the user to review and merge.

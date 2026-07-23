@@ -70,6 +70,80 @@ impl Tool for ProjectOverview {
     }
 }
 
+/// A compact, deterministic orientation block for the system prompt, or
+/// `None` when there is no usable index.
+///
+/// Read-only on purpose: it opens an **existing** index and never builds one,
+/// so it can be called during system-prompt assembly without ever blocking
+/// the first response on an index build (which would defeat the point of a
+/// fast first turn). When the index is absent — a fresh session before the
+/// background build finishes — it returns `None` and the model can still call
+/// `project_overview` explicitly.
+///
+/// Deliberately the complement of the script index (which the prompt already
+/// injects separately): languages, entry points, and storage — the shape of
+/// the code the model would otherwise spend grep/glob/read_file turns
+/// discovering. Kept to a few lines so it stays cheap in the cache-stable
+/// system prefix.
+pub fn render_orientation_block(root: &Path) -> Option<String> {
+    let path = stella_store::existing_workspace_private_sqlite_path(root, "codegraph.db")
+        .ok()
+        .flatten()?;
+    let graph = stella_graph::CodeGraph::open(root, &path).ok()?;
+
+    let files = graph.file_count().unwrap_or(0);
+    if files == 0 {
+        return None;
+    }
+
+    let mut lines =
+        vec!["## Project map (indexed — you do not need to grep/glob to find this)".to_string()];
+
+    let all_files = graph.all_files().unwrap_or_default();
+    let mut languages: BTreeSet<&'static str> = BTreeSet::new();
+    for file in &all_files {
+        if let Some(language) = language_of(file) {
+            languages.insert(language);
+        }
+    }
+    if !languages.is_empty() {
+        lines.push(format!(
+            "Languages: {}",
+            languages.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    // Same bound as `code_section`: deriving entry points costs one
+    // `importers_of` query per file, so past the scan limit we skip the line
+    // rather than pay an unbounded per-file scan on the first-response path.
+    if all_files.len() <= ENTRY_POINT_SCAN_LIMIT {
+        let entry_points = entry_point_paths(&graph, &all_files);
+        if !entry_points.is_empty() {
+            lines.push(format!("Entry points: {}", entry_points.join(", ")));
+        }
+    }
+
+    let storage = graph.storage_snapshot();
+    if !storage.is_empty() {
+        let layers: Vec<String> = storage.layers.iter().map(|l| l.key.clone()).collect();
+        let layer_note = if layers.is_empty() {
+            String::new()
+        } else {
+            format!(" across {}", layers.join(", "))
+        };
+        lines.push(format!(
+            "Storage: {} relation(s){layer_note}",
+            storage.relations.len()
+        ));
+    }
+
+    // Only the header means nothing worth injecting.
+    if lines.len() == 1 {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
 /// Assemble the overview. Total by construction: every source degrades to
 /// its empty shape, because an orientation call that errors sends the agent
 /// straight back to the glob loop this exists to replace.
@@ -155,20 +229,7 @@ fn code_section(graph: &stella_graph::CodeGraph) -> Value {
         return section;
     }
 
-    // A file nothing imports is a root: a binary, a script, a test, or dead
-    // code — which is exactly the set worth reading first.
-    let mut roots: Vec<String> = files
-        .iter()
-        .filter(|file| {
-            graph
-                .importers_of(Path::new(file))
-                .map(|importers| importers.is_empty())
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
-    roots.sort_by_key(|path| (path.matches('/').count(), path.clone()));
-    roots.truncate(MAX_ENTRY_POINTS);
+    let roots = entry_point_paths(graph, &files);
     map.insert("entry_points".into(), json!(roots));
     section
 }
@@ -239,6 +300,25 @@ fn domains_section(root: &Path) -> Value {
         })
         .unwrap_or_default();
     json!(names)
+}
+
+/// Files nothing imports — a binary, a script, a test, or dead code, which is
+/// exactly the set worth reading first. Bounded and stably ordered
+/// (shallowest path first) so both the tool and the prompt block agree.
+fn entry_point_paths(graph: &stella_graph::CodeGraph, files: &[String]) -> Vec<String> {
+    let mut roots: Vec<String> = files
+        .iter()
+        .filter(|file| {
+            graph
+                .importers_of(Path::new(file))
+                .map(|importers| importers.is_empty())
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    roots.sort_by_key(|path| (path.matches('/').count(), path.clone()));
+    roots.truncate(MAX_ENTRY_POINTS);
+    roots
 }
 
 /// Extension → language label, matching the grammars the indexer actually
@@ -332,6 +412,41 @@ mod tests {
         assert_eq!(
             out["domains"],
             serde_json::json!(["scheduling", "transport"])
+        );
+    }
+
+    #[test]
+    fn orientation_block_is_none_without_an_index_and_never_builds_one() {
+        // Read-only: it must not create an index during system-prompt
+        // assembly, or it would block the first response on a build.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+        assert!(render_orientation_block(dir.path()).is_none());
+        assert!(
+            !crate::graph::graph_db_path(dir.path()).exists(),
+            "the read-only block must not build an index"
+        );
+    }
+
+    #[test]
+    fn orientation_block_reports_languages_and_entry_points_from_an_existing_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "mod helper;\npub fn main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("helper.rs"), "pub fn help() {}\n").unwrap();
+        // Build the index first (what the session background build / adapter
+        // `stella init` does), THEN render read-only.
+        let _ = build_overview(dir.path());
+
+        let block = render_orientation_block(dir.path()).expect("an indexed workspace renders");
+        assert!(block.contains("Project map"), "{block}");
+        assert!(block.contains("Languages: rust"), "{block}");
+        assert!(
+            block.contains("Entry points:"),
+            "a file nothing imports is an entry point: {block}"
         );
     }
 

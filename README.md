@@ -1,12 +1,14 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockups/lockup-horizontal-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="docs/brand/lockups/lockup-horizontal-light.svg">
-    <img src="docs/brand/lockups/lockup-horizontal-light.svg" alt="Stella" width="420">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/stella-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/brand/stella-logo-light.svg">
+    <img src="docs/brand/stella-logo-light.svg" alt="Stella" width="420">
   </picture>
 </p>
 
-<p align="center"><strong>Open Source. Zero Telemetry Egress by Default. BYOK. RUST. and Damn Good.</strong></p>
+<p align="center"><strong>Agents forget. Fleets drift. Stella doesn't.</strong></p>
+<p align="center">Open Source · Rust · BYOK · No Phone Home</p>
+
 <p align="center">
   <a href="https://github.com/macanderson/stella/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/macanderson/stella/ci.yml?branch=main&style=flat-square&logo=github&label=ci" alt="CI status"></a>
   <a href="https://github.com/macanderson/stella/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/macanderson/stella/release.yml?style=flat-square&logo=github&label=release" alt="Release status"></a>
