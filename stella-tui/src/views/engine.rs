@@ -1,9 +1,7 @@
 //! The ENGINE panel — the config editor the SETTINGS tab hosts full-width,
 //! for `settings.json` → `agent_engine_config`: the global routing toggles
 //! plus the per-agent model / prompt / sampling overrides for the four
-//! pipeline agents (default · worker · judge · triage). Formerly the
-//! `/engine` popup, then the AGENTS tab's right column; the same content now
-//! lives on SETTINGS ([`crate::views::settings`]), the home of all config.
+//! pipeline agents (default · worker · judge · triage).
 //!
 //! Ownership mirrors the MCP and SKILLS surfaces: the **driver** owns the
 //! settings files on disk and pushes [`crate::envelope::Inbound::EngineConfig`]

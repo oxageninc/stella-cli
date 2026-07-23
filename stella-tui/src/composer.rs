@@ -263,7 +263,7 @@ impl Composer {
         }
     }
 
-    // ---- Cursor motion (textarea semantics) --------------------------------
+    // Cursor motion (textarea semantics)
 
     /// One character left.
     pub fn move_left(&mut self) {
@@ -441,9 +441,7 @@ fn byte_at_char_col(line: &str, col: usize) -> usize {
         .unwrap_or(line.len())
 }
 
-// ---------------------------------------------------------------------------
 // Enter classification + shared textarea key handling
-// ---------------------------------------------------------------------------
 
 /// What an `⏎` keypress means for the composer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,9 +509,7 @@ pub fn handle_edit_key(key: KeyEvent, composer: &mut Composer) -> bool {
     true
 }
 
-// ---------------------------------------------------------------------------
 // Soft-wrap layout (pure, so both renderers and the tests share one truth)
-// ---------------------------------------------------------------------------
 
 /// The composer soft-wrapped to a viewport width: every visual row plus the
 /// cursor's position among them. Hard breaks (`\n`) and soft wraps both
@@ -859,7 +855,7 @@ mod tests {
         assert_eq!(line_count("solo"), 1);
     }
 
-    // ---- Textarea semantics -------------------------------------------------
+    // Textarea semantics
 
     fn typed(text: &str) -> Composer {
         let mut c = Composer::new();
@@ -991,7 +987,7 @@ mod tests {
         ));
     }
 
-    // ---- Soft-wrap layout ---------------------------------------------------
+    // Soft-wrap layout
 
     #[test]
     fn layout_soft_wraps_long_lines_and_hard_breaks_newlines() {

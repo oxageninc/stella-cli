@@ -33,9 +33,8 @@ fn full_deck_frame_composes_every_band_at_80_cols() {
         ui.composer.insert_char(c);
     }
 
-    // 190 (was 160, before that 120) so the now-wider statline (CACHE +
-    // PIPELINE, then SAVED + WARMTH for #267/#269) still has room for the
-    // ethos chip, which is dropped first.
+    // 190 so the wider statline (CACHE + PIPELINE, then SAVED + WARMTH for
+    // #267/#269) still has room for the ethos chip, which is dropped first.
     for (w, h) in [(80u16, 24u16), (190, 40)] {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| render_deck(&model, &mut ui, f)).unwrap();
@@ -291,7 +290,7 @@ fn composer_footer_reports_a_held_queue() {
 #[test]
 fn statline_shows_labeled_cells_and_the_ethos_chip() {
     // A wide terminal fits every cell plus the (chrome) ethos chip. 160
-    // (was 120) leaves room for the CACHE + PIPELINE cells added to the row.
+    // leaves room for the CACHE + PIPELINE cells added to the row.
     let model = running_model_with_queue();
     let ui = DeckUi::default();
     let area = Rect::new(0, 0, 160, 2);

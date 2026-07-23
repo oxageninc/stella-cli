@@ -880,9 +880,8 @@ mod tests {
 
     #[test]
     fn header_shows_the_turn_clock_not_the_word_stella() {
-        // The workspace-name title used to sit to the right of `running`; in the
-        // stella repo that literally read "stella". It is now the turn clock —
-        // the header must show the h:mm:ss readout and no longer the word.
+        // The header shows the turn clock's h:mm:ss readout, not a workspace-name
+        // title — which in the stella repo would literally read "stella".
         let mut model = WorkspaceModel::new();
         model.apply_inbound(&Inbound::Register(AgentMeta::new("lead", "stella", 0)));
         // A plain event flips the agent to `Running` (so the label reads

@@ -237,8 +237,8 @@ fn waiting_input_status_stops_the_clock_after_init_or_handled_command() {
 
     // `/init` and other handled commands send `PromptStarted` (the deck
     // doesn't classify commands until after) then `Status { WaitingInput }`
-    // — but no `Complete`/`Error` event. Before the fix the clock ran
-    // forever; now `WaitingInput` via `Status` freezes it.
+    // — but no `Complete`/`Error` event, so `WaitingInput` via `Status`
+    // must freeze the clock (which would otherwise run forever).
     w.now_ms = 1_000;
     w.apply_inbound(&prompt_started("lead", "/init"));
     assert_eq!(w.agents[0].turn_started_ms, Some(1_000));

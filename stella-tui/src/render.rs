@@ -88,12 +88,12 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
     };
     let composer_area = bands[idx];
 
-    // ---- HUD.
+    // HUD.
     guarded_panel(frame, hud_area, "hud", |buf| {
         render_hud(&model.hud, hud_area, buf)
     });
 
-    // ---- Main: transcript (left) + files/diff (right).
+    // Main: transcript (left) + files/diff (right).
     let cols = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(main_area);
     let transcript_area = cols[0];
@@ -111,7 +111,7 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
         render_transcript(t_lines, t_window.clone(), following, transcript_area, buf)
     });
 
-    // ---- Right pane: diff viewer when open, else the files-touched panel.
+    // Right pane: diff viewer when open, else the files-touched panel.
     let (diff_total, diff_inner_h) = if ui.diff_open {
         let file = model.files.get(ui.selected_file);
         let diff_text = file.and_then(|f| f.latest_diff.as_deref());
@@ -145,7 +145,7 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
         (0, 0)
     };
 
-    // ---- Scope-review card (when a gate is pending).
+    // Scope-review card (when a gate is pending).
     if let (Some(area), Some(proposal)) = (scope_area, model.pending_scope_review.as_ref()) {
         let answered = ui.scope_answered;
         guarded_panel(frame, area, "scope-review", |buf| {
@@ -153,7 +153,7 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
         });
     }
 
-    // ---- Ask-user card (when a question is pending).
+    // Ask-user card (when a question is pending).
     if let (Some(area), Some(prompt)) = (ask_area, model.pending_ask_user.as_ref()) {
         let answered = ui.ask_answered;
         guarded_panel(frame, area, "ask-user", |buf| {
@@ -161,7 +161,7 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
         });
     }
 
-    // ---- Composer.
+    // Composer.
     let composer_focused = ui.focus == PanelFocus::Composer;
     let composer_blank = ui.composer.is_blank();
     let enter_submits = ui.enter_submits;
@@ -176,7 +176,7 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
         )
     });
 
-    // ---- Slash-command popup, floating just above the composer (drawn last
+    // Slash-command popup, floating just above the composer (drawn last
     // so it sits over the transcript, Crush-style, instead of reflowing it).
     let slash = ui.composer.slash_menu(&ui.slash_commands);
     if let Some(menu) = slash.filter(|m| !m.is_empty()) {
@@ -206,9 +206,7 @@ pub(crate) fn inner_width(area: Rect) -> usize {
     area.width.saturating_sub(2) as usize
 }
 
-// ---------------------------------------------------------------------------
 // Word-aware line wrapping (pre-wrap so scroll math stays line-exact, L-T4)
-// ---------------------------------------------------------------------------
 
 /// Coalesce adjacent same-styled characters into spans for compact output.
 fn styled_chars_to_spans(chars: Vec<(char, Style)>) -> Vec<Span<'static>> {
@@ -234,9 +232,7 @@ fn styled_chars_to_spans(chars: Vec<(char, Style)>) -> Vec<Span<'static>> {
     spans
 }
 
-// ---------------------------------------------------------------------------
 // Panel panic boundary (L-T7)
-// ---------------------------------------------------------------------------
 
 /// Render one panel into a throwaway buffer under `catch_unwind`; on panic,
 /// substitute a visible error card. See the module docs for the soundness
@@ -308,9 +304,7 @@ fn error_card(area: Rect, label: &str, message: &str) -> Buffer {
     buf
 }
 
-// ---------------------------------------------------------------------------
 // Panels
-// ---------------------------------------------------------------------------
 
 pub(crate) fn render_hud(hud: &Hud, area: Rect, buf: &mut Buffer) {
     let mut spans: Vec<Span<'static>> = vec![
@@ -717,9 +711,7 @@ fn render_composer(
         .render(area, buf);
 }
 
-// ---------------------------------------------------------------------------
 // Two-column transcript layout
-// ---------------------------------------------------------------------------
 
 /// Width of the right-aligned label column: 20 chars for `[name]` (right-aligned),
 /// then `:` and one space. Content always begins at column 22.
@@ -890,9 +882,7 @@ fn push_labeled_block(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Pure content builders (unit-tested directly)
-// ---------------------------------------------------------------------------
 
 /// The full visual-line list for the transcript. Each entry is rendered with
 /// per-entry wrapping so continuation lines respect the label column. An
@@ -1469,9 +1459,7 @@ fn file_line(file: &FileState, selected: bool) -> Line<'static> {
     ])
 }
 
-// ---------------------------------------------------------------------------
 // Labels — wording in `crate::textline`; only palette mapping lives here
-// ---------------------------------------------------------------------------
 
 fn spend_color(hud: &Hud) -> Color {
     match hud.limit_usd {

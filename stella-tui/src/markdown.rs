@@ -262,8 +262,7 @@ fn strip_numbered(lead: &str) -> Option<&str> {
 /// * **H1** is a filled ember-gold pill — near-black [`theme::GROUND`] text on
 ///   an [`theme::AURORA_CYAN`] background, with a space of padding each side so
 ///   it reads as a solid title bar. This is the deliberate high-contrast
-///   replacement for the old washed-out heading (and, in the skill preview,
-///   the unreadable baby-blue-behind-white that `tui-markdown` used to draw).
+///   replacement for the old washed-out heading.
 /// * **H2** is bold ember-gold text (no fill).
 /// * **H3+** is bold primary-ink text.
 fn heading_line(content: &str, level: usize) -> Line<'static> {
@@ -420,8 +419,7 @@ mod tests {
 
     #[test]
     fn no_baby_blue_cyan_in_rendered_markdown() {
-        // Links used to render in the cool cyan `RUN`; that token is now violet,
-        // so nothing markdown emits should carry the old baby-blue values.
+        // Nothing markdown emits should carry these old baby-blue cyan values.
         const OLD_CYANS: [ratatui::style::Color; 2] = [
             ratatui::style::Color::Rgb(0x60, 0xBF, 0xD6),
             ratatui::style::Color::Rgb(126, 197, 214),

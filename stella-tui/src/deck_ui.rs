@@ -5377,7 +5377,7 @@ mod tests {
         ui
     }
 
-    // ---- AGENTS tab: INSTALLED AGENTS pane -------------------------------
+    // AGENTS tab: INSTALLED AGENTS pane
 
     fn installed_entry(name: &str, version: u32) -> InstalledAgentEntry {
         InstalledAgentEntry {

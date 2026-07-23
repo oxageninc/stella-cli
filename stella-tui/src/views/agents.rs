@@ -7,8 +7,8 @@
 //! - **INSTALLED AGENTS** ([`crate::views::installed`]): the agents
 //!   configured on disk at the user/project level.
 //!
-//! The `agent_engine_config` editor that used to occupy this tab's right
-//! column now lives full-width on the SETTINGS tab ([`crate::views::settings`]).
+//! The `agent_engine_config` editor lives full-width on the SETTINGS tab
+//! ([`crate::views::settings`]).
 //!
 //! Every color comes from [`crate::theme`]; every number is read straight off
 //! [`crate::deck::AgentEntry`] (no shadow state, no re-derivation of what the
@@ -44,8 +44,7 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
         return;
     }
     // The one-line secondary nav, then the active pane below it — the pane
-    // fills the whole tab now that the engine-config panel has moved to
-    // SETTINGS.
+    // fills the whole tab.
     let bands = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
     render_pane_nav(ui.agents_pane, bands[0], buf);
 

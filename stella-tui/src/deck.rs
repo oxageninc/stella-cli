@@ -57,7 +57,7 @@ impl DeckTab {
     /// every tab added later must follow (e.g. `SKILLS`, `MCP`).
     /// `Agents` renders as AGENTS: the executions dashboard paired with the
     /// installed-agents view. `Settings` is the home of all config — it hosts
-    /// the `agent_engine_config` editor that used to share the Agents tab.
+    /// the `agent_engine_config` editor.
     pub fn title(self) -> &'static str {
         match self {
             DeckTab::Session => "SESSION",

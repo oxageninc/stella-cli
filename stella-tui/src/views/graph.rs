@@ -80,9 +80,7 @@ fn render_empty(area: Rect, buf: &mut Buffer) {
     Paragraph::new(line).render(row, buf);
 }
 
-// ---------------------------------------------------------------------------
 // Left: node list
-// ---------------------------------------------------------------------------
 
 fn render_node_list(snapshot: &GraphSnapshot, cursor: usize, area: Rect, buf: &mut Buffer) {
     // Advertise the file picker in the title (the "/ files" affordance) when a
@@ -135,9 +133,7 @@ fn node_list_line(node: &GraphNode, selected: bool) -> Line<'static> {
     ])
 }
 
-// ---------------------------------------------------------------------------
 // Right: detail panel (+ bonus sketch when there's room)
-// ---------------------------------------------------------------------------
 
 /// Below this height (rows) + width (cols), the spatial sketch is skipped —
 /// a cramped canvas reads as noise, not a diagram, and the list+detail view
@@ -245,9 +241,7 @@ fn passive(kind: &str) -> String {
     format!("{past} by")
 }
 
-// ---------------------------------------------------------------------------
 // Bonus: a small spatial node-edge sketch
-// ---------------------------------------------------------------------------
 
 /// Roughly compensates for terminal cells being taller than they are wide, so
 /// nodes placed on a unit circle read as a ring rather than a tall ellipse.
