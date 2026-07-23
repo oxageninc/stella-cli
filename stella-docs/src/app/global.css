@@ -194,3 +194,178 @@
     animation: none;
   }
 }
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Command Deck — the interactive, live fleet demo on the landing page.
+ *
+ * The one place the neutral brand spends color: STATUS. Stella's own TUI marks
+ * a run's outcome — done / needs input / failed — with the same green / amber /
+ * red it uses in the terminal, and those are FUNCTIONAL, not decorative (the
+ * same exception the docs already make for callouts). So here, and only here,
+ * color enters — and only as work RESOLVES. A queued task is muted, a running
+ * task is neutral foreground (a calm pulse, no hue), and color arrives at the
+ * moment a task proves out. Emphasis still comes from contrast and motion; the
+ * color earns its place by carrying meaning, exactly like the CLI it mirrors.
+ *
+ * Each token is mode-aware so it clears AA on both true-white and true-black.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --deck-ok: #0f9d63; /* done — green, 3.7:1 on paper; the real TUI's success */
+  --deck-warn: #b0740a; /* needs input — amber, readable on paper */
+  --deck-bad: #d61f52; /* failed — red, readable on paper */
+  --deck-run: var(--stella-accent); /* running — neutral foreground, no hue */
+  --deck-queued: #a1a1a1; /* queued — muted gray */
+}
+
+.dark {
+  --deck-ok: #3fd69b; /* SUCCESS_BRIGHT — the exact CLI green, glows on black */
+  --deck-warn: #f4b24a; /* WARNING_BRIGHT */
+  --deck-bad: #ff5c8a; /* DANGER_BRIGHT */
+  --deck-queued: #6b7280;
+}
+
+.deck-mono {
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+  font-variant-ligatures: none;
+}
+
+/* Window chrome — same "traffic lights" language as the hero terminal card, so
+ * the deck reads as another window of the same tool. */
+.deck-window {
+  box-shadow:
+    0 1px 0 0 color-mix(in oklch, var(--color-fd-foreground) 4%, transparent),
+    0 18px 50px -28px color-mix(in oklch, var(--color-fd-foreground) 28%, transparent);
+}
+
+/* Scenario tabs (fleet / goal). Selected = inverted primary, matching the CTA. */
+.deck-tab {
+  color: var(--color-fd-muted-foreground);
+  border: 1px solid transparent;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease,
+    border-color 0.15s ease;
+}
+.deck-tab:hover {
+  color: var(--color-fd-foreground);
+  background: var(--color-fd-accent);
+}
+.deck-tab[data-active="true"] {
+  color: var(--color-fd-foreground);
+  background: var(--color-fd-accent);
+  border-color: var(--color-fd-border);
+}
+
+.deck-prompt {
+  color: var(--stella-accent);
+}
+
+/* A worker row entering the roster — a soft rise + fade, never a bounce. */
+.deck-row {
+  animation: deck-row-in 0.4s ease-out both;
+}
+@keyframes deck-row-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Status dot. Base is a hollow ring (queued); modifiers fill it per outcome. */
+.deck-dot {
+  width: 0.62rem;
+  height: 0.62rem;
+  border-radius: 9999px;
+  border: 1.5px solid var(--deck-queued);
+  background: transparent;
+  flex: none;
+}
+.deck-dot[data-status="running"] {
+  border-color: var(--deck-run);
+  background: var(--deck-run);
+  animation: deck-pulse 1.5s ease-in-out infinite;
+}
+.deck-dot[data-status="done"] {
+  border-color: var(--deck-ok);
+  background: var(--deck-ok);
+}
+.deck-dot[data-status="needs-input"] {
+  border-color: var(--deck-warn);
+  background: var(--deck-warn);
+  animation: deck-pulse 1.5s ease-in-out infinite;
+}
+.deck-dot[data-status="failed"] {
+  border-color: var(--deck-bad);
+  background: var(--deck-bad);
+}
+
+@keyframes deck-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 color-mix(in oklch, var(--deck-run) 45%, transparent);
+  }
+  50% {
+    opacity: 0.7;
+    box-shadow: 0 0 0 3px transparent;
+  }
+}
+
+/* Status label text picks up the outcome color. */
+.deck-status[data-status="running"] {
+  color: var(--color-fd-foreground);
+}
+.deck-status[data-status="queued"] {
+  color: var(--deck-queued);
+}
+.deck-status[data-status="done"] {
+  color: var(--deck-ok);
+}
+.deck-status[data-status="needs-input"] {
+  color: var(--deck-warn);
+}
+.deck-status[data-status="failed"] {
+  color: var(--deck-bad);
+}
+
+/* Stage chip — the pipeline stage a running worker is in. */
+.deck-stage {
+  color: var(--color-fd-muted-foreground);
+  border: 1px solid var(--color-fd-border);
+  background: var(--color-fd-background);
+}
+
+/* Budget meter — fills smoothly as metered spend accrues. */
+.deck-meter {
+  background: var(--color-fd-border);
+  border-radius: 9999px;
+  overflow: hidden;
+}
+.deck-meter-fill {
+  background: var(--stella-accent);
+  border-radius: 9999px;
+  transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.deck-meter-fill[data-over="true"] {
+  background: var(--deck-warn);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .deck-row {
+    animation: none;
+  }
+  .deck-dot[data-status="running"],
+  .deck-dot[data-status="needs-input"] {
+    animation: none;
+  }
+  .deck-meter-fill {
+    transition: none;
+  }
+}

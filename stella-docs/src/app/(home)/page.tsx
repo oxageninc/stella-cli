@@ -11,6 +11,7 @@ import {
   Wrench,
   Gauge,
 } from "lucide-react";
+import { CommandDeck, HeroTerminal } from "@/components/command-deck";
 
 /** The Stella star mark, inline so it inherits `currentColor` and flips with
  *  the theme (ink on paper, snow on black) — no per-mode asset needed. */
@@ -92,7 +93,7 @@ export default function HomePage() {
           </p>
 
           <div className="mt-9 w-full max-w-xl">
-            <TerminalCard />
+            <HeroTerminal />
           </div>
 
           <div className="mt-8 flex w-full max-w-xs flex-col items-stretch gap-3 sm:max-w-none sm:flex-row sm:items-center sm:justify-center">
@@ -127,6 +128,35 @@ export default function HomePage() {
               </p>
             </div>
           ))}
+        </div>
+      </section>
+
+      {/* Command Deck — the signature: watch a run actually happen */}
+      <section className="border-t border-fd-border bg-fd-muted/40">
+        <div className="mx-auto w-full max-w-5xl px-4 py-16 sm:py-20">
+          <div className="mb-8 flex flex-col items-start gap-3 sm:mb-10">
+            <span className="inline-flex items-center gap-2 rounded-full border border-fd-border bg-fd-background px-3 py-1 text-xs font-medium text-fd-muted-foreground">
+              <Gauge className="size-3.5" aria-hidden />
+              The command deck, live
+            </span>
+            <h2 className="max-w-2xl text-balance text-2xl font-semibold tracking-tight sm:text-3xl">
+              Don&apos;t take our word for it. Watch the work.
+            </h2>
+            <p className="max-w-2xl text-sm leading-relaxed text-fd-muted-foreground sm:text-base">
+              This is Stella&apos;s real supervisor: a roster of agents moving through the
+              staged pipeline, every dollar metered against a budget, every result
+              proven before it counts as done. Switch between a{" "}
+              <span className="font-medium text-fd-foreground">fleet</span> fanning tasks
+              out in parallel and a single{" "}
+              <span className="font-medium text-fd-foreground">goal</span> run driving to
+              green.
+            </p>
+          </div>
+          <CommandDeck />
+          <p className="mt-4 text-center text-xs text-fd-muted-foreground">
+            An illustrative run — the states, stages, and budget accounting are Stella&apos;s
+            own.
+          </p>
         </div>
       </section>
 
@@ -221,32 +251,6 @@ export default function HomePage() {
         </div>
       </footer>
     </main>
-  );
-}
-
-function TerminalCard() {
-  return (
-    <div className="overflow-hidden rounded-xl border border-fd-border bg-fd-card text-left shadow-sm">
-      <div className="flex items-center gap-1.5 border-b border-fd-border px-4 py-2.5">
-        <span className="size-2.5 rounded-full bg-fd-muted-foreground/30" />
-        <span className="size-2.5 rounded-full bg-fd-muted-foreground/30" />
-        <span className="size-2.5 rounded-full bg-fd-muted-foreground/30" />
-        <span className="ml-2 text-xs text-fd-muted-foreground">zsh — stella</span>
-      </div>
-      <div className="lp-terminal space-y-1 px-4 py-4 text-sm">
-        <p>
-          <span className="lp-prompt">$ </span>
-          <span className="text-fd-foreground">export ANTHROPIC_API_KEY=…</span>
-        </p>
-        <p>
-          <span className="lp-prompt">$ </span>
-          <span className="text-fd-foreground">
-            stella run &quot;fix the failing test&quot;
-          </span>
-          <span className="lp-caret ml-1 align-baseline" aria-hidden />
-        </p>
-      </div>
-    </div>
   );
 }
 
