@@ -7,6 +7,7 @@
 //! for subsequent file operations (L-S2).
 
 pub mod agent_use;
+pub mod apply_edits;
 pub mod bash;
 pub mod ci;
 pub mod code_map;

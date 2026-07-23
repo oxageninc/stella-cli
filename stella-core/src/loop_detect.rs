@@ -644,6 +644,41 @@ mod tests {
     }
 
     #[test]
+    fn drift_attributed_edit_recovery_is_not_a_loop() {
+        // #331: when `edit_file` attributes a match failure to an
+        // out-of-band file change, the error embeds the CURRENT content —
+        // so as long as the file keeps changing, the outputs differ and the
+        // legitimate read→edit-retry recovery is progress by construction.
+        // Only when the file stops changing (and the model keeps replaying
+        // the same failing edit verbatim) do outputs repeat byte-identically
+        // and detection rightly fires. Pins the contract that the drift echo
+        // is what keeps recovery progress-eligible.
+        let drift_fail = |content: &str| {
+            record(
+                "edit_file",
+                serde_json::json!({ "path": "a.rs", "old": "x", "new": "y" }),
+                Some(ToolOutput::Error {
+                    message: format!("old_string not found — the file CHANGED; current: {content}"),
+                }),
+            )
+        };
+        let read_v =
+            |content: &str| call("read_file", serde_json::json!({ "path": "a.rs" }), content);
+        let records = vec![
+            read_v("v1"),
+            drift_fail("v2"),
+            read_v("v2"),
+            drift_fail("v3"),
+            read_v("v3"),
+            drift_fail("v4"),
+        ];
+        assert_eq!(
+            detect_loop(&records, LoopDetectionConfig::default()),
+            LoopVerdict::NoLoop
+        );
+    }
+
+    #[test]
     fn healthy_varied_sequence_is_not_a_loop() {
         // A realistic productive trajectory: no false positives.
         let records = vec![
