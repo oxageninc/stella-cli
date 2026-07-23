@@ -2,8 +2,12 @@
 //! Four mechanisms, applied least-lossy first:
 //!
 //! 1. **Dedup of repeated identical tool outputs** (L-E3): a byte-identical
-//!    tool output appearing more than once keeps only its latest copy; the
-//!    older ones are stubbed with a pointer.
+//!    tool output appearing more than once keeps only its earliest copy; the
+//!    later ones are stubbed with a pointer. Keeping the EARLIEST copy is
+//!    deliberate: byte-identical content is position-independent, so the
+//!    stub lands in the newest part of the conversation and the provider
+//!    prompt-cache prefix stays byte-identical (#372). Supersession below is
+//!    the opposite — it is about staleness, so it keeps the latest.
 //! 2. **Supersession**: when the SAME call (same tool name, byte-identical
 //!    input) ran more than once, only the latest result reflects current
 //!    state — the older ones are stale by construction (a re-read after an
@@ -61,7 +65,7 @@ const AGE_KEEP_CHARS: usize = 800;
 fn dedup_stub() -> String {
     // Models can't see message indices — point at the surviving copy in
     // terms they can act on.
-    "[identical output repeated — the full content appears again in a more recent tool result]"
+    "[identical output repeated — the full content already appears in an earlier tool result]"
         .to_string()
 }
 
@@ -127,12 +131,15 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
     // assistant tool calls and must never be evicted or deduped away.
     let last_tool_idx = messages.iter().rposition(|m| m.role == MessageRole::Tool);
 
-    // Pass 1: dedup byte-identical Ok outputs (keep the LATEST copy).
-    // Walk from the end, recording seen content; stub earlier duplicates.
+    // Pass 1: dedup byte-identical Ok outputs (keep the EARLIEST copy).
+    // Byte-identical content is position-independent, so keeping the first
+    // occurrence and stubbing later ones frees the same tokens while leaving
+    // the prompt prefix — and the provider prompt cache built over it —
+    // untouched (#372). Walk forward, recording first occurrences.
     {
         let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        // First record positions of latest occurrence.
-        for (idx, message) in messages.iter().enumerate().rev() {
+        // First record positions of the earliest occurrence.
+        for (idx, message) in messages.iter().enumerate() {
             if message.role != MessageRole::Tool {
                 continue;
             }
@@ -144,7 +151,7 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
                 }
             }
         }
-        // Then stub every earlier duplicate.
+        // Then stub every later duplicate.
         for (idx, message) in messages.iter_mut().enumerate() {
             if Some(idx) == last_tool_idx || message.role != MessageRole::Tool {
                 continue;
@@ -152,7 +159,7 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
             for result in &mut message.tool_results {
                 if let ToolOutput::Ok { content } = &result.output
                     && let Some(&kept_at) = seen.get(content)
-                    && kept_at > idx
+                    && kept_at < idx
                 {
                     deduped_blocks.push(id_of(&result.call_id));
                     result.output = ToolOutput::Ok {
@@ -183,15 +190,17 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
                 );
             }
         }
-        // Latest tool-message index per invocation key.
-        let mut latest: HashMap<&str, usize> = HashMap::new();
+        // Latest tool-message index — and that result's call_id — per
+        // invocation key. The call_id lets the staleness check below compare
+        // ORIGINAL content identities even after pass 1 stubbed a copy.
+        let mut latest: HashMap<&str, (usize, String)> = HashMap::new();
         for (idx, message) in messages.iter().enumerate() {
             if message.role != MessageRole::Tool {
                 continue;
             }
             for result in &message.tool_results {
                 if let Some(key) = invocation.get(result.call_id.as_str()) {
-                    latest.insert(key.as_str(), idx);
+                    latest.insert(key.as_str(), (idx, result.call_id.clone()));
                 }
             }
         }
@@ -211,7 +220,18 @@ pub fn compact(messages: &mut [CompletionMessage], budget_tokens: u64) -> Option
                 let ToolOutput::Ok { content } = &result.output else {
                     continue;
                 };
-                if content.len() > 200 && latest.get(key.as_str()).copied() > Some(idx) {
+                let Some((latest_idx, latest_call)) = latest.get(key.as_str()) else {
+                    continue;
+                };
+                // A later run whose output was byte-identical is redundancy,
+                // not staleness — pass 1 already stubbed the later copy, and
+                // stubbing this one too would destroy BOTH copies. Compare
+                // ORIGINAL content identities (captured before pass 1 could
+                // replace the later copy with a stub).
+                if content.len() > 200
+                    && *latest_idx > idx
+                    && id_of(latest_call) != id_of(&result.call_id)
+                {
                     stale.push((idx, result.call_id.clone()));
                 }
             }
@@ -470,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn dedups_identical_outputs_keeping_the_latest() {
+    fn dedups_identical_outputs_keeping_the_earliest() {
         let repeated = "same big output ".repeat(100);
         let mut messages = vec![
             CompletionMessage::system("sys"),
@@ -488,17 +508,49 @@ mod tests {
         // from the eviction test above.
         let report = compact(&mut messages, 700).expect("should compact");
         assert!(report.deduped >= 1);
-        // Earlier copy (idx 2) stubbed with a pointer to the later one.
+        // The EARLIEST copy (idx 2) survives byte-identical, so the prompt
+        // prefix — and the provider cache built over it — is untouched (#372).
         match &messages[2].tool_results[0].output {
+            ToolOutput::Ok { content } => assert_eq!(content, &repeated),
+            _ => panic!("earliest copy must be intact"),
+        }
+        // The later copy (idx 4) is stubbed with a pointer to the earlier one.
+        match &messages[4].tool_results[0].output {
             ToolOutput::Ok { content } => {
-                assert!(content.contains("repeated"), "got: {content}")
+                assert!(content.contains("earlier tool result"), "got: {content}")
             }
             _ => panic!("expected dedup stub"),
         }
-        // Later copy (idx 4) intact.
-        match &messages[4].tool_results[0].output {
+    }
+
+    #[test]
+    fn identical_rerun_is_deduped_not_superseded() {
+        // The SAME call (name + byte-identical input) run twice returning
+        // byte-identical output is redundancy, not staleness: pass 1 stubs
+        // the later copy and pass 2 must NOT then stub the surviving earlier
+        // copy — that would destroy both (#372 interplay guard).
+        let repeated = "identical contents ".repeat(100);
+        let mut messages = vec![
+            CompletionMessage::system("sys"),
+            assistant_with_call_on("c1", "src/lib.rs"),
+            tool_msg("c1", repeated.clone()),
+            assistant_with_call_on("c2", "src/lib.rs"),
+            tool_msg("c2", repeated.clone()),
+            assistant_with_call("c3"),
+            tool_msg("c3", "different".into()),
+        ];
+        let report = compact(&mut messages, 700).expect("should compact");
+        assert_eq!(report.superseded, 0, "{report:?}");
+        assert!(report.deduped >= 1, "{report:?}");
+        match &messages[2].tool_results[0].output {
             ToolOutput::Ok { content } => assert_eq!(content, &repeated),
-            _ => panic!("later copy must be intact"),
+            _ => panic!("earliest copy must survive intact"),
+        }
+        match &messages[4].tool_results[0].output {
+            ToolOutput::Ok { content } => {
+                assert!(content.contains("earlier tool result"), "got: {content}")
+            }
+            _ => panic!("expected a dedup stub on the later copy"),
         }
     }
 
