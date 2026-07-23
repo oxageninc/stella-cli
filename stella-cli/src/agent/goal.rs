@@ -296,7 +296,11 @@ pub async fn run_goal_cmd(
                 .await;
         }
     }
-    if outcome.is_ok()
+    // Reflect on success AND failure, matching the one-shot path above — a
+    // failed goal run is a prime learning signal (root-cause prompt via
+    // `succeeded=false`). Only a user-chosen soft stop is excluded
+    // (issue #373, item 7).
+    if crate::memory::should_reflect_on(&outcome)
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
@@ -306,7 +310,7 @@ pub async fn run_goal_cmd(
                 &cfg.model_id,
                 &messages,
                 false,
-                true,
+                outcome.is_ok(),
                 crate::agent::remaining_budget(&budget),
             )
             .await;
@@ -515,8 +519,9 @@ async fn run_goal_pipeline_turn(
     // Route the goal-loop judge. The pipeline's verify judge is the same role;
     // both want independence from the worker. An engine-config judge pin
     // (explicit or auto_mode) wins; otherwise the discovery-based
-    // cross-family routing applies exactly as before.
-    let configured = crate::config::discover_configured_providers();
+    // cross-family routing applies exactly as before. (`configured` from the
+    // wiring block above is reused — same disk state, nothing mutates it
+    // in between; issue #373, item 4.)
     let engine_judge: Option<(&dyn Provider, String)> = wiring
         .pins
         .get(Role::Judge)
@@ -587,9 +592,13 @@ async fn run_goal_pipeline_turn(
         let recall: &dyn ContextRecallPort = &no_recall;
         let hook_runner = ShellHookRunner;
 
-        // The goal judge engine, built once and reused across rounds — shares
-        // the session calibration (keyed per model, so a cross-family judge
-        // learns its own drift) and a read-only view of the same tools.
+        // The goal judge's provider/tool/config bundle. NOT reused across
+        // rounds in any load-bearing way: `Engine::assess` constructs a
+        // fresh inner engine (and re-wraps the tools in `ReadOnlyTools`) on
+        // every call — this outer engine only carries the judge provider,
+        // the read-only tool view, the judge tuning, and the session
+        // calibration (keyed per model, so a cross-family judge learns its
+        // own drift) into each assessment.
         let read_only = stella_core::ports::ReadOnlyTools::new(&tools);
         let judge_engine = Engine::with_sleeper(
             judge,

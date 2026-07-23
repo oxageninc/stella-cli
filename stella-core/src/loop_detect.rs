@@ -43,10 +43,13 @@ pub struct LoopDetectionConfig {
 }
 
 impl Default for LoopDetectionConfig {
-    /// Three consecutive identical calls, or three full A-B cycles (12
-    /// calls of the 20-iteration cap in the interim CLI loop) — enough to
-    /// rule out coincidence without flagging a legitimately-repeated
-    /// read-then-fix-then-verify pattern.
+    /// Three consecutive identical calls, or three full A-B cycles (six
+    /// calls) — enough to rule out coincidence without flagging a
+    /// legitimately-repeated read-then-fix-then-verify pattern. These
+    /// thresholds are the PRIMARY stuck-turn defense and fire orders of
+    /// magnitude before the step-driver's belt-and-suspenders backstop
+    /// (`EngineConfig::max_steps`, 200 by default), so a stuck turn costs
+    /// a handful of wasted calls, never a whole cap's worth.
     fn default() -> Self {
         Self {
             exact_repeat_threshold: 3,

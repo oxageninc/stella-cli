@@ -1520,6 +1520,7 @@ mod tests {
             "send_stdin",
             "stop_process",
             "repo_status",
+            "repo_diff",
             "repo_commit",
             "repo_push",
             "repo_pull",
@@ -1873,6 +1874,7 @@ mod tests {
                     | "list_labels"
                     | "list_members"
                     | "repo_status"
+                    | "repo_diff"
             );
             assert_eq!(
                 schema.read_only, expected,

@@ -19,7 +19,7 @@ You have these tools available:
 - run_script: Run a script the project itself declares, by canonical verb (install/build/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
 - list_scripts: The full project scripts index — every detected script and its canonical verb binding; read-only, nothing executes
 - start_process / read_output / send_stdin / stop_process: Manage long-running processes (dev servers, REPLs, watchers) from an argv vector; one-shot commands belong in build_project/run_tests/run_script
-- repo_status / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
+- repo_status / repo_diff / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, hunk-level diffs of your pending changes (review what you ACTUALLY changed before committing), pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
 - graph_query: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. The index is built automatically at session start and refreshes live as files change.
 - grep: Search file contents with regex (shells to ripgrep)
 - glob: Find files matching a glob pattern
@@ -58,7 +58,7 @@ You have these tools available:
 - run_script: Run a script the project itself declares, by canonical verb (install/build/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
 - list_scripts: The full project scripts index — every detected script and its canonical verb binding; read-only, nothing executes
 - start_process / read_output / send_stdin / stop_process: Manage long-running processes (dev servers, REPLs, watchers) from an argv vector; one-shot commands belong in build_project/run_tests/run_script
-- repo_status / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
+- repo_status / repo_diff / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, hunk-level diffs of your pending changes (review what you ACTUALLY changed before committing), pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
 - project_overview: CALL THIS FIRST on an unfamiliar repository. One call, no arguments: returns the language, the build/test/lint commands, the entry-point files, the storage schema, and the domain map in a single JSON object. It replaces the usual opening burst of glob/grep/read_file — you cannot reproduce a failure until you know how this project builds and tests, and this is how you learn that in one step instead of ten.
 - graph_query: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. Each call brings the index up to date with the working tree first, so it also sees files you just wrote. For symbol and dependency questions it is precise and cheaper than grep.
 - grep: Search file contents with regex (shells to ripgrep)
@@ -182,8 +182,10 @@ fn append_project_scripts(prompt: &mut String, workspace_root: &std::path::Path)
 }
 
 /// The project-map section of [`assemble_system_prompt`]: the graph-derived
-/// languages, entry points, and storage — the complement of the scripts
-/// section above. Read-only (`stella_tools::overview::render_orientation_block`
+/// languages, top-level layout, entry points, and storage — the complement
+/// of the scripts section above, and bounded by construction so it stays
+/// useful on monorepos far past a few hundred files (issue #328). Read-only
+/// (`stella_tools::overview::render_orientation_block`
 /// opens an existing index and never builds one), so it adds nothing to
 /// first-response latency; it appears once the session's background index
 /// build has completed (or immediately when the workspace was pre-indexed,

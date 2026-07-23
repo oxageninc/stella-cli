@@ -24,6 +24,7 @@ pub(super) fn builtins(
         Arc::new(crate::process::SendStdin(processes.clone())),
         Arc::new(crate::process::StopProcess(processes)),
         Arc::new(crate::repo::RepoStatusTool(repo.clone())),
+        Arc::new(crate::repo::RepoDiffTool(repo.clone())),
         Arc::new(crate::repo::RepoCommit(repo.clone())),
         Arc::new(crate::repo::RepoPush(repo.clone())),
         Arc::new(crate::repo::RepoPull(repo.clone())),

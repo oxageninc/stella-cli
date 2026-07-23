@@ -22,6 +22,22 @@ pub fn turn_warrants_reflection(turn_messages: &[CompletionMessage]) -> bool {
         .any(|message| !message.tool_calls.is_empty())
 }
 
+/// Whether a finished interactive turn should feed reflection at all.
+/// Failures ARE reflected on — a failed turn is a high-value learning
+/// signal, and the one-shot pipeline path has always treated it as one —
+/// EXCEPT a user-chosen soft stop, which is not a failure: reflecting on
+/// it would teach the memory that deliberate interruptions are errors.
+/// (`contains`, not `==`: goal paths wrap the turn's abort reason in their
+/// own prefix.) Callers still pass `result.is_ok()` as
+/// `reflect_and_record`'s `succeeded` flag so a failure is recorded AS a
+/// failure.
+pub fn should_reflect_on(result: &Result<(), String>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(reason) => !reason.contains(stella_core::SOFT_STOP_REASON),
+    }
+}
+
 pub async fn reflect_on_turn(
     provider: &dyn Provider,
     model_hint: &str,

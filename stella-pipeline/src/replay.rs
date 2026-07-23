@@ -256,6 +256,15 @@ pub fn event_signature(event: &AgentEvent) -> String {
             let done = tasks.iter().filter(|t| !t.status.is_open()).count();
             format!("task_update:tasks={},resolved={done}", tasks.len())
         }
+        // Context receipts are additive observability (spec §4/§5), excluded
+        // from the structural comparison below just like TextDelta — a golden
+        // stream recorded before receipts existed has none, so they must not
+        // shift the aligned positions. The signatures exist only to keep this
+        // function total; they capture occurrence + shape, never volatile ids.
+        AgentEvent::BlockRegistered { kind, .. } => format!("block_registered:{kind:?}"),
+        AgentEvent::StepManifest { blocks, .. } => {
+            format!("step_manifest:blocks={}", blocks.len())
+        }
     }
 }
 
@@ -289,7 +298,17 @@ pub fn structural_diff(left: &[AgentEvent], right: &[AgentEvent]) -> Vec<StreamD
     // is volatile — the authoritative `Text` event that follows them is the
     // structural record. Diff indices therefore address the delta-free
     // sequence.
-    let keep = |e: &&AgentEvent| !matches!(e, AgentEvent::TextDelta { .. });
+    // Context receipts (BlockRegistered/StepManifest) join TextDelta in the
+    // exclusion set: they are additive observability a pre-receipt golden
+    // stream does not carry, so keeping them would shift every later position.
+    let keep = |e: &&AgentEvent| {
+        !matches!(
+            e,
+            AgentEvent::TextDelta { .. }
+                | AgentEvent::BlockRegistered { .. }
+                | AgentEvent::StepManifest { .. }
+        )
+    };
     let left: Vec<&AgentEvent> = left.iter().filter(keep).collect();
     let right: Vec<&AgentEvent> = right.iter().filter(keep).collect();
     let mut diffs = Vec::new();

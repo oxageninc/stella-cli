@@ -311,6 +311,18 @@ impl CodeGraph {
         store::busiest_file(&self.inner.read_guard())
     }
 
+    /// Up to `limit` files nothing imports — binaries, scripts, tests, dead
+    /// code: exactly the set worth reading first when orienting in an
+    /// unfamiliar tree. Computed as one SQL anti-join, so the cost is
+    /// independent of index size — callers need no file-count cap, unlike
+    /// the per-file [`importers_of`] scan this replaces. Shallowest path
+    /// first, then lexicographic; empty on an empty index.
+    ///
+    /// [`importers_of`]: CodeGraph::importers_of
+    pub fn entry_points(&self, limit: usize) -> Result<Vec<String>, GraphError> {
+        store::entry_points(&self.inner.read_guard(), limit)
+    }
+
     /// Every indexed file path (root-relative, forward-slash), sorted. The
     /// deck's Graph tab lists these in its file picker so a user can re-root
     /// the neighborhood on any file, not only the [`busiest_file`] default.

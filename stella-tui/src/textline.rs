@@ -414,7 +414,11 @@ pub fn event_line(event: &AgentEvent) -> Option<EventLine> {
         | AgentEvent::Reasoning { .. }
         | AgentEvent::ToolStart { .. }
         | AgentEvent::ToolResult { .. }
-        | AgentEvent::UsageIncomplete { .. } => None,
+        | AgentEvent::UsageIncomplete { .. }
+        // Context receipts (spec §4/§5) are observability, not transcript
+        // narration — they never produce a rendered line.
+        | AgentEvent::BlockRegistered { .. }
+        | AgentEvent::StepManifest { .. } => None,
         AgentEvent::Retry { attempt, reason } => Some(retry(*attempt, reason)),
         AgentEvent::Steered { text } => Some(steered(text)),
         AgentEvent::Compaction {
@@ -865,6 +869,8 @@ mod tests {
                     uri: None,
                     method: None,
                     token_cost: 1,
+                    block_id: None,
+                    content_digest: None,
                 }],
                 provider_mix: vec![],
                 tokens: 1,
@@ -977,6 +983,8 @@ mod tests {
                 uri: None,
                 method: None,
                 token_cost: 120,
+                block_id: None,
+                content_digest: None,
             }],
             provider_mix: vec![ProviderShare {
                 provider: "code-graph".into(),

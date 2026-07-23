@@ -11,10 +11,10 @@
 use rusqlite::{Connection, params};
 
 use crate::ddl::{
-    AGENT_USES_DDL, EXECUTION_REFLECTION_DDL, EXECUTIONS_DDL, MCP_USAGE_DDL, MEMORY_CITATIONS_DDL,
-    PULL_REQUESTS_DDL, REFLECTIONS_DDL, RULES_TABLE, SKILL_USAGE_DDL, TABLES, TASKS_DDL,
-    TELEMETRY_INDEX, TOOL_CALLS_DDL, UNCHANGED_TABLES, events_ddl, files_touched_ddl,
-    telemetry_ddl,
+    AGENT_USES_DDL, CONTEXT_BLOCKS_DDL, EXECUTION_REFLECTION_DDL, EXECUTIONS_DDL, MCP_USAGE_DDL,
+    MEMORY_CITATIONS_DDL, PULL_REQUESTS_DDL, REFLECTIONS_DDL, RULES_TABLE, SKILL_USAGE_DDL,
+    STEP_MANIFEST_DDL, STEP_RECEIPT_DDL, TABLES, TASKS_DDL, TELEMETRY_INDEX, TOOL_CALLS_DDL,
+    UNCHANGED_TABLES, events_ddl, files_touched_ddl, telemetry_ddl,
 };
 use crate::{Result, StoreError};
 
@@ -28,7 +28,7 @@ pub(crate) type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// a file at `user_version` i to i + 1. Fresh files never run these — they
 /// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
 /// directly.
-pub(crate) const MIGRATIONS: [Migration; 10] = [
+pub(crate) const MIGRATIONS: [Migration; 11] = [
     // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
     // their write paths have always assumed.
     migrate_v0_to_v1,
@@ -57,6 +57,11 @@ pub(crate) const MIGRATIONS: [Migration; 10] = [
     migrate_v8_to_v9,
     // v9 → v10: explicit pending/complete/incomplete execution lifecycle.
     migrate_v9_to_v10,
+    // v10 → v11: the context-receipts plane — `context_blocks` (the block
+    // registry), `step_manifest` (per-step ordered receipt), and `step_receipt`
+    // (the manifest header). All purely additive; no existing table changes
+    // shape.
+    migrate_v10_to_v11,
 ];
 
 /// The schema version this build writes — the `PRAGMA user_version` of
@@ -85,6 +90,9 @@ pub(crate) fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()>
     tx.execute_batch(REFLECTIONS_DDL)?;
     tx.execute_batch(TASKS_DDL)?;
     tx.execute_batch(PULL_REQUESTS_DDL)?;
+    tx.execute_batch(CONTEXT_BLOCKS_DDL)?;
+    tx.execute_batch(STEP_MANIFEST_DDL)?;
+    tx.execute_batch(STEP_RECEIPT_DDL)?;
     Ok(())
 }
 
@@ -394,6 +402,17 @@ fn migrate_v9_to_v10(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// v10 → v11: the context-receipts plane (spec §4/§5). Three purely additive
+/// tables — `context_blocks`, `step_manifest`, `step_receipt` — and their
+/// indexes. No existing table changes shape, so no §7 rebuild; `IF NOT EXISTS`
+/// also tolerates a partial file that somehow already grew them.
+fn migrate_v10_to_v11(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(CONTEXT_BLOCKS_DDL)?;
+    tx.execute_batch(STEP_MANIFEST_DDL)?;
+    tx.execute_batch(STEP_RECEIPT_DDL)?;
+    Ok(())
+}
+
 /// Run one migration in its own transaction, stamping `user_version` before
 /// commit so version and shape can never disagree on disk. The caller has
 /// already suspended foreign-key enforcement (a no-op inside a
@@ -492,5 +511,53 @@ mod tests {
                 ("incomplete".into(), false),
             ]
         );
+    }
+
+    #[test]
+    fn v11_migration_adds_the_receipts_tables_additively_to_an_existing_store() {
+        // Start from a minimal v10-shaped file with a live execution row: the
+        // migration must add the three receipts tables without touching it.
+        let mut conn = Connection::open_in_memory().expect("db");
+        conn.execute_batch(
+            "CREATE TABLE executions (id INTEGER PRIMARY KEY, kind TEXT);
+             INSERT INTO executions (id, kind) VALUES (1, 'run');",
+        )
+        .expect("v10 schema");
+
+        apply_migration(&mut conn, migrate_v10_to_v11, 11).expect("migrate");
+
+        // The pre-existing row is untouched.
+        let kind: String = conn
+            .query_row("SELECT kind FROM executions WHERE id = 1", [], |r| r.get(0))
+            .expect("execution preserved");
+        assert_eq!(kind, "run");
+
+        // All three tables now exist and accept a row at the new shape.
+        for table in ["context_blocks", "step_manifest", "step_receipt"] {
+            assert!(table_exists(&conn, table).unwrap(), "{table} missing");
+        }
+        conn.execute_batch(
+            "INSERT INTO context_blocks
+               (execution_id, block_id, kind, origin_turn, origin_step, token_cost, content_digest)
+               VALUES (1, 'blk_x', 'tool_result', 0, 2, 40, 'sha256:ab');
+             INSERT INTO step_manifest
+               (execution_id, turn_instance, step, ordinal, block_id, cache_zone, resident_since_step)
+               VALUES (1, 0, 2, 0, 'blk_x', 'cacheable', 2);
+             INSERT INTO step_receipt
+               (execution_id, turn_instance, step, provider, model, call_role,
+                effective_budget_tokens, calibration_factor, estimated_input_tokens)
+               VALUES (1, 0, 2, 'anthropic', 'opus', 'worker', 136363, 1.1, 40);",
+        )
+        .expect("new tables accept rows at the v11 shape");
+    }
+
+    #[test]
+    fn v11_migration_is_idempotent_on_a_partial_file() {
+        // A partial file that somehow already grew one receipts table must not
+        // fail the migration (IF NOT EXISTS tolerance).
+        let mut conn = Connection::open_in_memory().expect("db");
+        conn.execute_batch(CONTEXT_BLOCKS_DDL).expect("pre-grown");
+        apply_migration(&mut conn, migrate_v10_to_v11, 11).expect("migrate is idempotent");
+        assert!(table_exists(&conn, "step_manifest").unwrap());
     }
 }

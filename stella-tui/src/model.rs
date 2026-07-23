@@ -579,6 +579,11 @@ impl SessionModel {
             // transcript row is a display enhancement, tracked as follow-up).
             AgentEvent::StepUsage { .. }
             | AgentEvent::UsageIncomplete { .. }
+            // Context receipts (spec §4/§5) are consumed by the store/inspector,
+            // not folded into TUI panel state — the model stays a pure function
+            // of the user-visible event sequence.
+            | AgentEvent::BlockRegistered { .. }
+            | AgentEvent::StepManifest { .. }
             | AgentEvent::GoalVerdict { .. } => {}
             AgentEvent::Error { message, retryable } => {
                 self.pending_scope_review = None;
@@ -1251,6 +1256,8 @@ mod tests {
                 uri: None,
                 method: None,
                 token_cost: 100,
+                block_id: None,
+                content_digest: None,
             }],
             provider_mix: vec![ProviderShare {
                 provider: "code-graph".into(),

@@ -371,7 +371,7 @@ are also accepted case-insensitively.
 | `run_lint` · `format_code` | The project's own linter/formatter (cargo clippy/fmt, or package.json `lint`/`format` scripts), spawned argv-style — no shell |
 | `run_script` | Run a verb the project itself declares (Makefile target, package.json script, cargo alias); unknown names list the discovered vocabulary |
 | `start_process` · `read_output` · `send_stdin` · `stop_process` | Long-running processes (dev servers, REPLs, watchers) from an argv vector — capped output ring, SIGTERM-then-kill stop, reaped at session end |
-| `repo_status` · `repo_commit` · `repo_push` · `repo_pull` · `repo_rollback` | Vendor-neutral repository tools: structured status, pathspec-explicit commits, pushes that structurally refuse the default branch (never forced), fast-forward-only pulls, restore-named-paths rollback |
+| `repo_status` · `repo_diff` · `repo_commit` · `repo_push` · `repo_pull` · `repo_rollback` | Vendor-neutral repository tools: structured status, hunk-level pending-change diffs for pre-commit self-review, pathspec-explicit commits, pushes that structurally refuse the default branch (never forced), fast-forward-only pulls, restore-named-paths rollback |
 | `verify_done` | Replay new test files against `git HEAD` to prove the change works |
 | `explorations` · `save_exploration` | Shared codebase maps — explore once, reuse everywhere |
 | `save_memory` | Persist a lesson into every future session's system prompt |

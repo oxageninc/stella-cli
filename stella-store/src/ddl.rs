@@ -12,7 +12,7 @@
 
 /// Every table the store owns — the allowlist for [`Store::count`](crate::Store::count) and the
 /// fresh-file probe in [`Store::migrate`](crate::Store::migrate).
-pub(crate) const TABLES: [&str; 17] = [
+pub(crate) const TABLES: [&str; 20] = [
     "executions",
     "events",
     "telemetry",
@@ -30,6 +30,9 @@ pub(crate) const TABLES: [&str; 17] = [
     "reflections",
     "tasks",
     "pull_requests",
+    "context_blocks",
+    "step_manifest",
+    "step_receipt",
 ];
 
 /// `executions` DDL at [`SCHEMA_VERSION`](crate::migrations::SCHEMA_VERSION) — the spine every other table
@@ -356,4 +359,71 @@ pub(crate) const PULL_REQUESTS_DDL: &str = "CREATE TABLE IF NOT EXISTS pull_requ
        ci_status TEXT,
        updated_at INTEGER NOT NULL,
        UNIQUE(url)
+     );";
+
+/// `context_blocks` DDL at [`SCHEMA_VERSION`](crate::migrations::SCHEMA_VERSION)
+/// — the context-receipts block registry (v11, spec §4). One row per durable,
+/// individually attributable unit that entered a step's prompt, born once and
+/// keyed by its content-addressed `block_id` (`blk_…`). Content-free: it stores
+/// a `content_digest`, never the payload bytes — the preimage lives in the
+/// originating event in the journal. `call_id`/`memory_id` are the join keys
+/// back to the tool call or memory node that produced the block.
+/// UNIQUE via PRIMARY KEY (execution_id, block_id): a block is registered once
+/// per execution; a byte-identical block re-entering context resolves to the
+/// same id, so the second registration is an idempotent no-op, not data.
+pub(crate) const CONTEXT_BLOCKS_DDL: &str = "CREATE TABLE IF NOT EXISTS context_blocks (
+       execution_id INTEGER NOT NULL,
+       block_id TEXT NOT NULL,
+       kind TEXT NOT NULL,
+       origin_turn INTEGER NOT NULL,
+       origin_step INTEGER NOT NULL,
+       call_id TEXT,
+       memory_id TEXT,
+       token_cost INTEGER NOT NULL,
+       content_digest TEXT NOT NULL,
+       citation_label TEXT,
+       first_seen_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       PRIMARY KEY (execution_id, block_id)
+     );
+     CREATE INDEX IF NOT EXISTS context_blocks_by_memory
+       ON context_blocks(memory_id, execution_id);";
+
+/// `step_manifest` DDL at [`SCHEMA_VERSION`](crate::migrations::SCHEMA_VERSION)
+/// — the per-step request manifest, normalized one row per (step, block) in
+/// wire order (v11, spec §5). This is the receipt that makes any past step
+/// reconstructable: replaying the fold + this ordering yields exactly what the
+/// model saw. PRIMARY KEY (execution_id, turn_instance, step, ordinal) is the
+/// wire position; the second index is the reverse lookup (every step a given
+/// block was resident) that cost-of-carry and eviction analysis read.
+pub(crate) const STEP_MANIFEST_DDL: &str = "CREATE TABLE IF NOT EXISTS step_manifest (
+       execution_id INTEGER NOT NULL,
+       turn_instance INTEGER NOT NULL,
+       step INTEGER NOT NULL,
+       ordinal INTEGER NOT NULL,
+       block_id TEXT NOT NULL,
+       cache_zone TEXT NOT NULL,
+       resident_since_step INTEGER NOT NULL,
+       PRIMARY KEY (execution_id, turn_instance, step, ordinal)
+     );
+     CREATE INDEX IF NOT EXISTS step_manifest_by_block
+       ON step_manifest(execution_id, block_id);";
+
+/// `step_receipt` DDL at [`SCHEMA_VERSION`](crate::migrations::SCHEMA_VERSION)
+/// — the manifest header, one row per committed step (v11, spec §5/§12): which
+/// model served it, and the budget the compaction pass actually compared
+/// against (raw budget / calibration factor), so the receipt's numbers line up
+/// with the decision that was made. The per-zone cache columns (spec §7) are
+/// added additively by a later migration; this is the increment-1 header only.
+/// PRIMARY KEY (execution_id, turn_instance, step): one receipt per step.
+pub(crate) const STEP_RECEIPT_DDL: &str = "CREATE TABLE IF NOT EXISTS step_receipt (
+       execution_id INTEGER NOT NULL,
+       turn_instance INTEGER NOT NULL,
+       step INTEGER NOT NULL,
+       provider TEXT NOT NULL,
+       model TEXT NOT NULL,
+       call_role TEXT NOT NULL,
+       effective_budget_tokens INTEGER NOT NULL,
+       calibration_factor REAL NOT NULL,
+       estimated_input_tokens INTEGER NOT NULL,
+       PRIMARY KEY (execution_id, turn_instance, step)
      );";

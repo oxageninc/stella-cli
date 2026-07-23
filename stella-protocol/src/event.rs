@@ -91,6 +91,60 @@ pub enum UsageIncompleteReason {
     Cancelled,
 }
 
+/// The semantic kind of one context block — one durable, individually
+/// attributable unit that can enter the model's prompt. Finer-grained than a
+/// `CompletionMessage`: a tool message holding several results decomposes into
+/// one `ToolResult` block per `call_id`. See the session-telemetry-receipts
+/// spec (`docs/design/session-telemetry-receipts-spec.md`, §4). Forward-compat:
+/// an unknown kind read from a newer emitter deserializes to [`BlockKind::Other`]
+/// rather than failing the whole event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockKind {
+    /// Message index 0 — the stable system prefix, never compacted.
+    SystemPrefix,
+    /// The user's task text.
+    UserGoal,
+    /// A context frame injected by recall (memory/graph/file).
+    RecalledFrame,
+    /// Model prose.
+    AssistantText,
+    /// An assistant tool-call request.
+    ToolCall,
+    /// A tool output (Ok or Error).
+    ToolResult,
+    /// A mid-turn injected user (steering) message.
+    Steered,
+    /// An overflow-summarizer replacement span.
+    Summary,
+    /// A multimodal attachment (image/doc/audio/video).
+    Attachment,
+    /// A kind this reader does not recognize (written by a newer emitter).
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+/// A block's cache position relative to the provider's prompt-cache
+/// breakpoints. Stella keeps the system prefix byte-stable and places volatile
+/// recall after it (L-E8), so a block's zone is computable from its position at
+/// manifest time. A structural hint at emission; reconciled against reported
+/// usage by cache attribution (spec §7). Forward-compat via [`CacheZone::Other`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheZone {
+    /// At/before the system-block breakpoint — should cache-hit every step.
+    StablePrefix,
+    /// Before the conversation-tail breakpoint — cacheable across steps.
+    #[default]
+    Cacheable,
+    /// After the last breakpoint — recomputed every step by construction.
+    Volatile,
+    /// A zone this reader does not recognize (written by a newer emitter).
+    #[serde(other)]
+    Other,
+}
+
 /// One event in the turn's stream. Every stage boundary emits an event;
 /// nothing user-visible is derived from internal state that isn't also in
 /// this stream.
@@ -281,6 +335,52 @@ pub enum AgentEvent {
         upserts: u32,
         superseded: u32,
     },
+    /// A context block first became eligible to enter the prompt (spec §4).
+    /// Content-free on the wire: carries a digest + provenance, never the
+    /// payload bytes — the bytes already live in the originating event
+    /// (`ToolResult`, `Text`, …) or, for recalled frames, the local block
+    /// registry. This is the birth record that makes the per-step manifest an
+    /// index over the fold rather than a parallel content store. Additive:
+    /// consumers recorded before receipts existed simply never see it.
+    BlockRegistered {
+        /// `blk_<24 hex of sha256(kind \0 content)>`. Byte-identical blocks
+        /// share an id, so dedup/supersession become identities not counts.
+        block_id: String,
+        kind: BlockKind,
+        origin: BlockOrigin,
+        /// Estimated tokens at birth (the engine's estimator).
+        token_cost: u32,
+        /// `"sha256:<full hex>"` — verifies the preimage on reconstruction.
+        content_digest: String,
+        /// Human label for recall frames / memory nodes, when the block has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        citation_label: Option<String>,
+    },
+    /// The ordered receipt of exactly what the model saw on one step (spec §5):
+    /// the block sequence sent, in wire order, plus the budget the compaction
+    /// pass actually compared against this step. Emitted immediately before the
+    /// step's model call commits. Content-free (block ids + small ints); the
+    /// preimages are resolved from the fold at inspection time. This is the
+    /// record that makes any past step reconstructable and auditable.
+    StepManifest {
+        /// Monotonic per session — groups the steps of one `run_turn`.
+        turn_instance: u32,
+        step: usize,
+        role: ModelCallRole,
+        provider: String,
+        model: String,
+        /// Blocks in wire order; index 0 is the system prefix.
+        blocks: Vec<ManifestEntry>,
+        /// The budget the compaction pass actually compared against THIS step —
+        /// the raw budget divided by the model's calibration factor. Evented so
+        /// the receipt's numbers line up with the decision that was made (the
+        /// `Compaction` event's raw before/after do not, on their own — #364).
+        effective_budget_tokens: u64,
+        /// The per-model calibration factor applied to the raw budget.
+        calibration_factor: f64,
+        /// Sum of block token costs, pre-call (the engine's raw estimate).
+        estimated_input_tokens: u64,
+    },
     /// A verification verdict — from the deterministic ladder (flip oracle,
     /// touched-tests-green) or the model judge (L-E11: deterministic-first;
     /// model judges handle only inconclusive evidence).
@@ -409,6 +509,48 @@ pub struct ContextFrameRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     pub token_cost: u32,
+    /// The registry id (`blk_…`) of this frame as a context block, when
+    /// receipts are enabled. Joins the frame to its manifest membership and,
+    /// for memory frames, to the write→citation loop (spec §5.3, §9). Absent on
+    /// streams recorded before receipts existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<String>,
+    /// `"sha256:<hex>"` of the exact injected text. The digest rides the wire;
+    /// the content itself is journaled only locally (never exported), closing
+    /// the recall-content gap G1 without widening the content-free export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+}
+
+/// Where a context block came from — the provenance stamped once at a block's
+/// birth (spec §4). The join hub: a `RecalledFrame` carries the `memory_id` it
+/// was recalled from; a `ToolResult`/`ToolCall` carries its `call_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockOrigin {
+    /// Monotonic per session — the `run_turn` that produced the block.
+    pub turn_instance: u32,
+    /// The step within that turn.
+    pub step: usize,
+    /// Tool-call correlation id, for `ToolCall`/`ToolResult` blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    /// The `nod_…` memory node id, for a `RecalledFrame` that is a memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_id: Option<String>,
+}
+
+/// One block's membership in a step's manifest (spec §5): its id, its cache
+/// zone at that step, its estimated token cost, and how long it has been
+/// resident. Residency × cost is what makes cost-of-carry a real number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    pub block_id: String,
+    /// Cache position class relative to the last stable breakpoint.
+    #[serde(default)]
+    pub cache_zone: CacheZone,
+    pub token_cost: u32,
+    /// The step this block first entered a manifest — drives cost-of-carry.
+    pub resident_since_step: usize,
 }
 
 /// One provider's share of a recall's frame mix.
@@ -719,6 +861,8 @@ mod tests {
                 uri: Some("file:///repo/stella-core/src/driver.rs".into()),
                 method: Some("tree-sitter/symbol-extract".into()),
                 token_cost: 120,
+                block_id: None,
+                content_digest: None,
             }],
             provider_mix: vec![ProviderShare {
                 provider: "code-graph".into(),
@@ -1072,5 +1216,102 @@ mod tests {
         assert_eq!(roundtrip["type"], "usage_incomplete");
         assert_eq!(roundtrip["reason"], "timeout");
         assert_eq!(roundtrip.as_object().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn block_registered_roundtrips_and_is_content_free() {
+        let event = AgentEvent::BlockRegistered {
+            block_id: "blk_0123456789abcdef01234567".into(),
+            kind: BlockKind::ToolResult,
+            origin: BlockOrigin {
+                turn_instance: 2,
+                step: 5,
+                call_id: Some("call_9".into()),
+                memory_id: None,
+            },
+            token_cost: 480,
+            content_digest: "sha256:deadbeef".into(),
+            citation_label: None,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "block_registered");
+        assert_eq!(value["kind"], "tool_result");
+        assert_eq!(value["origin"]["call_id"], "call_9");
+        // Content-free: the payload bytes never appear, only a digest.
+        assert!(
+            value.get("content").is_none() && value.get("output").is_none(),
+            "block_registered must not carry payload bytes: {value}"
+        );
+        let back: AgentEvent = serde_json::from_str(&value.to_string()).unwrap();
+        match back {
+            AgentEvent::BlockRegistered { block_id, kind, .. } => {
+                assert_eq!(block_id, "blk_0123456789abcdef01234567");
+                assert_eq!(kind, BlockKind::ToolResult);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_manifest_preserves_block_order_and_the_effective_budget() {
+        let event = AgentEvent::StepManifest {
+            turn_instance: 1,
+            step: 3,
+            role: ModelCallRole::Worker,
+            provider: "anthropic".into(),
+            model: "claude-opus".into(),
+            blocks: vec![
+                ManifestEntry {
+                    block_id: "blk_sys".into(),
+                    cache_zone: CacheZone::StablePrefix,
+                    token_cost: 1200,
+                    resident_since_step: 0,
+                },
+                ManifestEntry {
+                    block_id: "blk_tail".into(),
+                    cache_zone: CacheZone::Volatile,
+                    token_cost: 90,
+                    resident_since_step: 3,
+                },
+            ],
+            effective_budget_tokens: 136_363,
+            calibration_factor: 1.1,
+            estimated_input_tokens: 1290,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "step_manifest");
+        // Order is load-bearing — the manifest IS the wire sequence.
+        assert_eq!(value["blocks"][0]["block_id"], "blk_sys");
+        assert_eq!(value["blocks"][1]["block_id"], "blk_tail");
+        assert_eq!(value["effective_budget_tokens"], 136_363);
+        let back: AgentEvent = serde_json::from_str(&value.to_string()).unwrap();
+        match back {
+            AgentEvent::StepManifest { blocks, .. } => {
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[0].cache_zone, CacheZone::StablePrefix);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_frame_ref_without_receipt_fields_still_parses() {
+        // A recall frame recorded before receipts existed carries no block_id
+        // or content_digest — it must still deserialize (additive contract).
+        let old = r#"{"citation_label":"auth module","source":"stella-context","token_cost":42}"#;
+        let frame: ContextFrameRef = serde_json::from_str(old).unwrap();
+        assert_eq!(frame.citation_label, "auth module");
+        assert!(frame.block_id.is_none());
+        assert!(frame.content_digest.is_none());
+    }
+
+    #[test]
+    fn unknown_block_kind_degrades_to_other_not_a_parse_error() {
+        // A newer emitter may name a block kind this reader has never heard of.
+        // The additive contract requires it to degrade, not reject the event.
+        let kind: BlockKind = serde_json::from_str("\"some_future_kind\"").unwrap();
+        assert_eq!(kind, BlockKind::Other);
+        let zone: CacheZone = serde_json::from_str("\"some_future_zone\"").unwrap();
+        assert_eq!(zone, CacheZone::Other);
     }
 }

@@ -3124,6 +3124,7 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "stella-protocol",
  "thiserror 2.0.19",
  "tokio",

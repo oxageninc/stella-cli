@@ -598,8 +598,16 @@ impl WorkspaceModel {
         }
         // Streaming previews never reach the trace: one row per token would
         // churn the whole capped ring during a single answer, and the
-        // authoritative `Text` event lands the same content as one row.
-        if !matches!(event, AgentEvent::TextDelta { .. }) {
+        // authoritative `Text` event lands the same content as one row. Context
+        // receipts (spec §4/§5) are excluded for the same reason — one
+        // BlockRegistered per block per step would swamp the ring — and are
+        // consumed by the store/inspector, not the live deck.
+        if !matches!(
+            event,
+            AgentEvent::TextDelta { .. }
+                | AgentEvent::BlockRegistered { .. }
+                | AgentEvent::StepManifest { .. }
+        ) {
             let (kind, summary) = trace_of(event);
             self.trace.push(TraceRow {
                 ts: now,
@@ -955,6 +963,15 @@ fn trace_of(ev: &AgentEvent) -> (TraceKind, String) {
             superseded,
             ..
         } => (TraceKind::Context, format!("+{upserts} ~{superseded}")),
+        // Receipts are filtered out of the trace ring above (apply_event's
+        // guard); these arms exist only to keep this mapping total.
+        AgentEvent::BlockRegistered { kind, .. } => {
+            (TraceKind::Context, format!("block {kind:?}").to_lowercase())
+        }
+        AgentEvent::StepManifest { step, blocks, .. } => (
+            TraceKind::Context,
+            format!("manifest step {step}: {} blocks", blocks.len()),
+        ),
         AgentEvent::JudgeVerdict { passed, .. } => (
             TraceKind::Verdict,
             if *passed {

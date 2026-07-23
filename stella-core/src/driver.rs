@@ -74,6 +74,7 @@ use crate::event_sender::EventSender;
 use crate::hooks::{HookPayload, HookRunner, Hooks, run_hooks};
 use crate::loop_detect::{LoopDetectionConfig, detect_loop};
 use crate::ports::ToolExecutor;
+use crate::receipts::ReceiptLedger;
 use crate::retry::{RetryOutcome, RetryPolicy, Sleeper, retry_with_backoff_observed};
 use crate::speculation::{SpeculationGate, SpeculationPool, SpeculativeResult};
 use crate::{AccountedCall, AccountedCallError, run_accounted_call};
@@ -127,6 +128,13 @@ pub struct EngineConfig {
     /// the `"."` default keeps hook-free turns unaffected. Only read when
     /// hooks are actually configured.
     pub cwd: String,
+    /// Monotonic per-session turn index stamped onto this turn's context
+    /// receipts (`BlockRegistered`/`StepManifest`, spec §3). Groups a
+    /// `run_turn`'s steps across executions in one session without an
+    /// event-order correlation. `0` when the caller does not track turns
+    /// (the receipt is still valid — `(execution_id, step)` disambiguates
+    /// within an execution).
+    pub turn_instance: u32,
 }
 
 impl Default for EngineConfig {
@@ -149,6 +157,7 @@ impl Default for EngineConfig {
             summarize_keep_recent: 8,
             max_steps: 200,
             cwd: ".".to_string(),
+            turn_instance: 0,
         }
     }
 }
@@ -376,6 +385,10 @@ impl<'a> Engine<'a> {
         // `CalibrationMap::factor` then falls back to the session's single
         // seeded entry.
         let mut calibration_model: Option<String> = None;
+        // Per-turn context-receipt state: block registry + residency, carried
+        // by reference into each model call. Stack-local — the engine holds no
+        // receipt state of its own.
+        let mut receipts = ReceiptLedger::new(self.config.turn_instance);
 
         for step in 0..self.config.max_steps {
             // Pause parks HERE — after the previous step fully settled and
@@ -411,6 +424,10 @@ impl<'a> Engine<'a> {
             total_cost_usd += self
                 .run_compaction_pass(messages, calibration_model.as_deref(), budget, events)
                 .await;
+            // The manifest reports the budget compaction just compared against.
+            let (effective_budget, calibration_factor) =
+                self.effective_compaction_budget(calibration_model.as_deref());
+            receipts.set_effective_budget(effective_budget, calibration_factor);
 
             if let Some(aborted) = self.check_loop_detection(messages, total_cost_usd, events) {
                 return aborted;
@@ -419,7 +436,10 @@ impl<'a> Engine<'a> {
                 return aborted;
             }
 
-            let committed = match self.run_model_call(step, messages, budget, events).await {
+            let committed = match self
+                .run_model_call(step, messages, budget, &mut receipts, events)
+                .await
+            {
                 Ok(committed) => committed,
                 Err(reason) => {
                     return TurnOutcome::Aborted {
@@ -476,6 +496,25 @@ impl<'a> Engine<'a> {
     ///
     /// Returns the summarizer's spend (0.0 on the overwhelmingly common
     /// no-summarization path) so `run_turn` folds it into the turn total.
+    /// The compaction budget this turn's next step will actually compare
+    /// against, and the calibration factor that produced it. Single source of
+    /// truth for both the compaction pass and the step manifest, so the
+    /// receipt's `effective_budget_tokens` is exactly the number the decision
+    /// used (#364 item 1). Returns the configured budget with factor `1.0`
+    /// when calibration is off.
+    fn effective_compaction_budget(&self, calibration_model: Option<&str>) -> (u64, f64) {
+        match self.calibration {
+            Some(calibration) => {
+                let factor = calibration.factor(calibration_model);
+                (
+                    (self.config.compaction_budget_tokens as f64 / factor) as u64,
+                    factor,
+                )
+            }
+            None => (self.config.compaction_budget_tokens, 1.0),
+        }
+    }
+
     async fn run_compaction_pass(
         &self,
         messages: &mut Vec<CompletionMessage>,
@@ -483,13 +522,7 @@ impl<'a> Engine<'a> {
         budget: &mut BudgetGuard,
         events: &EventSender,
     ) -> f64 {
-        let compaction_budget = match self.calibration {
-            Some(calibration) => {
-                (self.config.compaction_budget_tokens as f64
-                    / calibration.factor(calibration_model)) as u64
-            }
-            None => self.config.compaction_budget_tokens,
-        };
+        let (compaction_budget, _factor) = self.effective_compaction_budget(calibration_model);
         if let Some(report) = compact(messages, compaction_budget) {
             let _ = events.send(AgentEvent::Compaction {
                 before_tokens: report.before_tokens,
@@ -651,6 +684,7 @@ impl<'a> Engine<'a> {
         step: usize,
         messages: &[CompletionMessage],
         budget: &mut BudgetGuard,
+        receipts: &mut ReceiptLedger,
         events: &EventSender,
     ) -> Result<CommittedStep, String> {
         let tools_schema = self.tools.schemas();
@@ -771,6 +805,20 @@ impl<'a> Engine<'a> {
             });
         }
 
+        // The context receipt for this step: register any newly-seen blocks,
+        // then the ordered manifest of exactly what was sent. Emitted just
+        // before StepUsage so the pair — what the model saw, what it cost —
+        // lands together at the settled boundary, and the served model/provider
+        // are already known.
+        receipts.emit_step_receipt(
+            messages,
+            step,
+            self.call_role,
+            self.provider.id(),
+            &result.model,
+            events,
+        );
+
         // Cost and usage settle at one no-await boundary. Speculative tool
         // work may still be draining; cancellation in that interval must not
         // preserve spend while losing its per-call accounting envelope.
@@ -818,7 +866,7 @@ impl<'a> Engine<'a> {
         let mut in_flight = announced
             .map(|call| async move {
                 let started = std::time::Instant::now();
-                let output = self.execute_with_repair(&call).await;
+                let output = self.execute_with_repair(&call, None).await;
                 (call, output, started.elapsed().as_millis() as u64)
             })
             .buffer_unordered(MAX_CONCURRENT_TOOL_CALLS);
@@ -1126,7 +1174,7 @@ impl<'a> Engine<'a> {
                                 Some(s) => (index, call, s.output, s.duration_ms, true),
                                 None => {
                                     let started = std::time::Instant::now();
-                                    let output = self.execute_with_repair(call).await;
+                                    let output = self.execute_with_repair(call, Some(events)).await;
                                     let duration_ms = started.elapsed().as_millis() as u64;
                                     (index, call, output, duration_ms, false)
                                 }
@@ -1170,7 +1218,17 @@ impl<'a> Engine<'a> {
     /// and no `PreToolUse`/`PostToolUse` hook is fired for it. When no hooks
     /// are attached this is exactly the previous body:
     /// `self.tools.execute(...)`.
-    async fn execute_with_repair(&self, call: &ToolCall) -> ToolOutput {
+    ///
+    /// `events` carries non-blocking hook diagnostics (a hook that failed to
+    /// spawn, or exited non-zero on an event that cannot block) to the turn
+    /// stream as one non-fatal `Error` per call. `None` on the speculative
+    /// path: speculation emits no events until harvest, and a failed
+    /// attempt's hook noise must not reach the wire with it.
+    async fn execute_with_repair(
+        &self,
+        call: &ToolCall,
+        events: Option<&EventSender>,
+    ) -> ToolOutput {
         if call.input.is_null() {
             return ToolOutput::Error {
                 message: format!(
@@ -1183,7 +1241,7 @@ impl<'a> Engine<'a> {
         }
         match self.hooks {
             None => self.tools.execute(&call.name, &call.input).await,
-            Some(handle) => self.execute_with_hooks(handle, call).await,
+            Some(handle) => self.execute_with_hooks(handle, call, events).await,
         }
     }
 
@@ -1195,10 +1253,18 @@ impl<'a> Engine<'a> {
     /// executed and the model instead sees a `ToolOutput::Error` naming the
     /// block, exactly as the engine surfaces every other tool failure as
     /// model-visible data rather than an engine error. Otherwise the tool
-    /// runs and `PostToolUse` fires as a pure observation — its outcome is
-    /// discarded (it can never block or alter the result), so a failing
-    /// post-hook cannot abort the turn.
-    async fn execute_with_hooks(&self, handle: HooksHandle<'a>, call: &ToolCall) -> ToolOutput {
+    /// runs and `PostToolUse` fires as a pure observation — its outcome can
+    /// never block or alter the result, so a failing post-hook cannot abort
+    /// the turn. Non-blocking failures from either phase (spawn failures,
+    /// non-zero exits on events that cannot block) are no longer discarded:
+    /// they surface as one non-fatal `Error { retryable: true }` on the
+    /// turn stream when an event channel is present.
+    async fn execute_with_hooks(
+        &self,
+        handle: HooksHandle<'a>,
+        call: &ToolCall,
+        events: Option<&EventSender>,
+    ) -> ToolOutput {
         let pre = run_hooks(
             handle.runner,
             Some(handle.hooks),
@@ -1215,6 +1281,7 @@ impl<'a> Engine<'a> {
             };
             return ToolOutput::Error { message };
         }
+        let mut diagnostics = pre.diagnostics;
 
         let output = self.tools.execute(&call.name, &call.input).await;
 
@@ -1222,9 +1289,9 @@ impl<'a> Engine<'a> {
             ToolOutput::Ok { content } => content.clone(),
             ToolOutput::Error { message } => message.clone(),
         };
-        // Observation only — the outcome is intentionally ignored so a
-        // non-zero PostToolUse exit never blocks or rewrites the result.
-        let _ = run_hooks(
+        // Observation only — a non-zero PostToolUse exit never blocks or
+        // rewrites the result; its failures ride `diagnostics` instead.
+        let post = run_hooks(
             handle.runner,
             Some(handle.hooks),
             &HookPayload::post_tool_use(
@@ -1235,6 +1302,20 @@ impl<'a> Engine<'a> {
             ),
         )
         .await;
+        diagnostics.extend(post.diagnostics);
+
+        if !diagnostics.is_empty()
+            && let Some(events) = events
+        {
+            let _ = events.send(AgentEvent::Error {
+                message: format!(
+                    "hook problem(s) around tool `{}` (non-blocking): {}",
+                    call.name,
+                    diagnostics.join("; ")
+                ),
+                retryable: true,
+            });
+        }
 
         output
     }

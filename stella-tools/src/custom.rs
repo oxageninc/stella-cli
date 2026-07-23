@@ -114,6 +114,7 @@ pub const RESERVED_NAMES: &[&str] = &[
     "stop_process",
     // Vendor-neutral repository tools
     "repo_status",
+    "repo_diff",
     "repo_commit",
     "repo_push",
     "repo_pull",

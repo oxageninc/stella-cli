@@ -484,15 +484,26 @@ pub fn replay_session(
 ) {
     let mut last_status: std::collections::HashMap<String, AgentStatus> =
         std::collections::HashMap::new();
+    // First-appearance order for the downgrade pass below — same convention
+    // as [`journal_lanes`]. Iterating the map directly would replay the
+    // synthetic `Killed` statuses in a nondeterministic order run-to-run,
+    // undermining byte-for-byte replay of the deck trace surface.
+    let mut lane_order: Vec<String> = Vec::new();
     for record in records {
         if let Some(inbound) = replay_inbound(record, started_ms) {
             match &inbound {
                 Inbound::Register(meta) => {
+                    if !last_status.contains_key(&meta.id) {
+                        lane_order.push(meta.id.clone());
+                    }
                     last_status
                         .entry(meta.id.clone())
                         .or_insert(AgentStatus::Queued);
                 }
                 Inbound::Status { agent, status } => {
+                    if !last_status.contains_key(agent) {
+                        lane_order.push(agent.clone());
+                    }
                     last_status.insert(agent.clone(), *status);
                 }
                 _ => {}
@@ -500,7 +511,8 @@ pub fn replay_session(
             let _ = deck_tx.send(inbound);
         }
     }
-    for (agent, status) in last_status {
+    for agent in lane_order {
+        let status = last_status[&agent];
         if agent != lead
             && !matches!(
                 status,
@@ -653,6 +665,60 @@ mod tests {
             "non-lead lanes, deduplicated, first-appearance order"
         );
         assert!(journal_lanes(&[], "lead").is_empty());
+    }
+
+    #[test]
+    fn stale_lane_downgrades_replay_in_first_appearance_order_deterministically() {
+        // Two non-lead lanes left in live statuses, first appearing as
+        // "req:9" then "req:1" — adversarial against both alphabetical and
+        // hash order. The synthetic `Killed` downgrades must come back in
+        // first-appearance order on EVERY replay: a `HashMap` iteration
+        // here previously made the deck trace surface differ run-to-run
+        // (issue #373, item 5).
+        let records = || {
+            vec![
+                JournalRecord::Register {
+                    agent: "lead".into(),
+                    title: "t".into(),
+                    role: "lead".into(),
+                    model: None,
+                },
+                JournalRecord::Status {
+                    agent: "req:9".into(),
+                    status: "running".into(),
+                },
+                JournalRecord::Status {
+                    agent: "req:1".into(),
+                    status: "running".into(),
+                },
+            ]
+        };
+        let downgrades = |records: Vec<JournalRecord>| -> Vec<String> {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            replay_session(records, 0, "lead", &tx);
+            drop(tx);
+            // The replayed stream itself carries no `Killed` (both lanes
+            // journaled "running"), so filtering for `Killed` isolates
+            // exactly the synthetic downgrades.
+            let mut order = Vec::new();
+            while let Ok(inbound) = rx.try_recv() {
+                if let Inbound::Status {
+                    agent,
+                    status: AgentStatus::Killed,
+                } = inbound
+                {
+                    order.push(agent);
+                }
+            }
+            order
+        };
+        for _ in 0..16 {
+            assert_eq!(
+                downgrades(records()),
+                vec!["req:9".to_string(), "req:1".to_string()],
+                "downgrade order must be first-appearance, every run"
+            );
+        }
     }
 
     #[test]

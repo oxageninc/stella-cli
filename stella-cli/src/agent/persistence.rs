@@ -217,6 +217,17 @@ fn memory_citation_rows(registry: &ToolRegistry) -> Vec<stella_store::MemoryCita
         .collect()
 }
 
+/// Serialize a serde enum (BlockKind / CacheZone / ModelCallRole) to its stable
+/// snake_case tag for storage, falling back to `"unknown"` if it somehow does
+/// not serialize to a string. Keeps the store string-typed while the wire
+/// carries the real enum.
+fn enum_tag<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 pub(crate) fn warn_store_write_failed(what: &str) {
     eprintln!(
         "  {} store write failed — {what} for this execution is incomplete",
@@ -287,6 +298,67 @@ pub(crate) fn persist_event(
         crate::model_catalog::note_wire_model(actual_provider, model);
     } else if matches!(event, AgentEvent::UsageIncomplete { .. }) {
         usage_complete = false;
+    } else if let AgentEvent::BlockRegistered {
+        block_id,
+        kind,
+        origin,
+        token_cost,
+        content_digest,
+        citation_label,
+    } = event
+    {
+        // Context receipts (spec §4). Best-effort — a receipt write failure
+        // never fails the paid-call accounting boundary (these rows are
+        // observability, not billing), and the block also survives verbatim in
+        // the generic `events` table via record_event above.
+        let _ = store.record_context_block(
+            execution_id,
+            &ContextBlockRow {
+                block_id: block_id.clone(),
+                kind: enum_tag(kind),
+                origin_turn: origin.turn_instance,
+                origin_step: origin.step as u64,
+                call_id: origin.call_id.clone(),
+                memory_id: origin.memory_id.clone(),
+                token_cost: *token_cost,
+                content_digest: content_digest.clone(),
+                citation_label: citation_label.clone(),
+            },
+        );
+    } else if let AgentEvent::StepManifest {
+        turn_instance,
+        step,
+        role,
+        provider,
+        model,
+        blocks,
+        effective_budget_tokens,
+        calibration_factor,
+        estimated_input_tokens,
+    } = event
+    {
+        let _ = store.record_step_manifest(
+            execution_id,
+            &StepManifestRow {
+                turn_instance: *turn_instance,
+                step: *step as u64,
+                provider: provider.clone(),
+                model: model.clone(),
+                call_role: enum_tag(role),
+                effective_budget_tokens: *effective_budget_tokens,
+                calibration_factor: *calibration_factor,
+                estimated_input_tokens: *estimated_input_tokens,
+                blocks: blocks
+                    .iter()
+                    .map(|b| ManifestBlockRow {
+                        block_id: b.block_id.clone(),
+                        cache_zone: enum_tag(&b.cache_zone),
+                        token_cost: b.token_cost,
+                        resident_since_step: b.resident_since_step as u64,
+                    })
+                    .collect(),
+            },
+        );
     }
     let complete = recorded && telemetry_ok && usage_complete;
     if !complete {
@@ -387,5 +459,66 @@ mod stream_tests {
                 if model == "worker+reflection"
                     && (*cost_usd - 1.25).abs() < f64::EPSILON
         ));
+    }
+
+    #[test]
+    fn receipt_events_persist_into_queryable_block_and_manifest_rows() {
+        // The increment-1 promise, end to end: a BlockRegistered + StepManifest
+        // pair flowing through persist_event lands as queryable receipt rows,
+        // and the manifest reconstructs the step's block order with token_cost
+        // joined back from the block registry.
+        use stella_protocol::{BlockKind, BlockOrigin, CacheZone, ManifestEntry, ModelCallRole};
+        let store = Store::in_memory().expect("store");
+        let id = store
+            .begin_execution("run", "p", "anthropic", "opus")
+            .expect("exec");
+
+        let registered = AgentEvent::BlockRegistered {
+            block_id: "blk_tool1".into(),
+            kind: BlockKind::ToolResult,
+            origin: BlockOrigin {
+                turn_instance: 0,
+                step: 0,
+                call_id: Some("c1".into()),
+                memory_id: None,
+            },
+            token_cost: 40,
+            content_digest: "sha256:abc".into(),
+            citation_label: None,
+        };
+        assert!(persist_event(&store, id, 0, &registered, "anthropic"));
+
+        let manifest = AgentEvent::StepManifest {
+            turn_instance: 0,
+            step: 0,
+            role: ModelCallRole::Worker,
+            provider: "anthropic".into(),
+            model: "opus".into(),
+            blocks: vec![ManifestEntry {
+                block_id: "blk_tool1".into(),
+                cache_zone: CacheZone::Volatile,
+                token_cost: 40,
+                resident_since_step: 0,
+            }],
+            effective_budget_tokens: 136_363,
+            calibration_factor: 1.1,
+            estimated_input_tokens: 40,
+        };
+        assert!(persist_event(&store, id, 1, &manifest, "anthropic"));
+
+        // The block registry row, with its call_id join key and snake_case kind.
+        let blocks = store.context_blocks(id).expect("blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_id, "blk_tool1");
+        assert_eq!(blocks[0].call_id.as_deref(), Some("c1"));
+        assert_eq!(blocks[0].kind, "tool_result");
+
+        // The manifest reconstructs the step's ordered blocks, token_cost joined
+        // back from context_blocks.
+        let entries = store.step_manifest(id, 0, 0).expect("manifest");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].block_id, "blk_tool1");
+        assert_eq!(entries[0].cache_zone, "volatile");
+        assert_eq!(entries[0].token_cost, 40);
     }
 }

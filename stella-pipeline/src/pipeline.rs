@@ -2014,6 +2014,11 @@ impl<'a> Pipeline<'a> {
                 uri: f.uri.clone(),
                 method: f.method.clone(),
                 token_cost: f.token_cost,
+                // Frame-granular block ids are populated in the memory-join
+                // increment (spec §9). Engine-level receipts (increment 1) do
+                // not split the recalled user message into per-frame blocks.
+                block_id: None,
+                content_digest: None,
             })
             .collect();
         self.emit(AgentEvent::ContextRecall {
