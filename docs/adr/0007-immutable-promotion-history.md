@@ -1,8 +1,8 @@
 # ADR 0007: Immutable Promotion History
 
-- Status: Proposed — needs human confirmation
+- Status: Accepted — ratified by repository owner 2026-07-23 (was: Proposed)
 - Date: 2026-07-23
-- Deciders: (Phase 0 baseline)
+- Deciders: repository owner (ratified 2026-07-23)
 
 ## Context
 
@@ -28,7 +28,11 @@ mapping — `observe`/`advisory` → `advisory`; `required`/`blocking` → `bloc
 enforcement states. Also frame "Context PR" as UX over the
 `record_proposal → promotion_event` pipeline, not a second mechanism.
 
-This mapping requires human sign-off before Phase 6.
+**Ratified by the repository owner on 2026-07-23:** adopt the 4→2 mapping
+(`observe`/`advisory` → `advisory`; `required`/`blocking` → `blocking`).
+`DirectiveEnforcement` has exactly two values (`advisory`, `blocking`); the four
+levels may survive only as UI labels over those two enforcement states, never as
+a second enforcement enum.
 
 ## Consequences
 
@@ -40,6 +44,6 @@ locked first.
 
 ## Open questions
 
-**Needs human confirmation:** ratify the 4→2 enforcement mapping (vs. retaining
-four levels as a UI ramp) before Phase 6, since it freezes the
-`DirectiveEnforcement` enum.
+Resolved 2026-07-23: the repository owner ratified the **4→2** enforcement
+mapping. `DirectiveEnforcement` freezes on two values (`advisory`, `blocking`);
+the four levels may appear only as UI labels over them.

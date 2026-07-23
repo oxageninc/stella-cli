@@ -44,7 +44,11 @@ kinds is a regression to reject in review.
 
 ## Open questions
 
-Related open item (do not resolve here): `Origin` arity disagrees inside the
-canonical pair — §7.1 lists five (`user, system, observed, inferred, imported`)
-but the §8.6 directive example permits four (drops `observed`). Likely a
-deliberate per-kind narrowing; verify before the enum freezes in Phase 1.
+Resolved (spec-verified 2026-07-23): `Origin` has the **five** portable values
+`user, system, observed, inferred, imported` for **all** record families,
+including directives. Lifecycle §7.1 lists all five (line 628), and the normative
+origin→derivation_kind table (§ line 952) is family-uniform and explicitly
+admits `observed`. The §8.6 directive example using only four is **illustrative,
+not a per-kind narrowing** — there is no rule forbidding an `observed` directive.
+Freeze the 5-value enum in Phase 1. (Any future directive-specific narrowing
+would be a new decision, not implied by the current spec.)

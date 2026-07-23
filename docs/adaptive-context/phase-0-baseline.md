@@ -272,14 +272,17 @@ defined in the protocol types but **unused** here. Phase 4 wires them.
 
 ## 8. Open questions carried into later phases
 
-- **SharingScope arity** (→ ADR 0002): canonical pair disagrees (4 values vs 3).
-  Roadmap resolution: 4-value set authoritative (`workspace` first-class). Needs
-  human sign-off before the Phase 1 enum freeze.
-- **`Origin` arity**: §7.1 lists five (`user`, `system`, `observed`, `inferred`,
-  `imported`); the §8.6 directive example permits four (drops `observed`).
-  Verify the per-kind narrowing is deliberate before freezing.
-- **Enforcement 4→2 mapping** (→ ADR 0007): `context-prs-spec` uses 4 levels,
-  the plan uses 2. Lock the mapping before Phase 6.
+- ~~**SharingScope arity**~~ (→ ADR 0002): **Resolved 2026-07-23** — owner
+  ratified the 4-value set (`user, repository, workspace, organization`); §21's
+  3-value line superseded. Phase 1 enum freezes on four.
+- ~~**`Origin` arity**~~: **Resolved 2026-07-23 (spec-verified)** — the full
+  5-value set (`user, system, observed, inferred, imported`) is authoritative for
+  all families; the normative origin→derivation_kind table (§ line 952) is
+  family-uniform and admits `observed`. The §8.6 directive example (four values)
+  is illustrative, not a per-kind narrowing.
+- ~~**Enforcement 4→2 mapping**~~ (→ ADR 0007): **Resolved 2026-07-23** — owner
+  ratified the 4→2 mapping; `DirectiveEnforcement` is 2-value (`advisory`,
+  `blocking`); the four levels survive only as UI labels.
 - **World-time columns**: `valid_from`/`valid_to` are written but never read.
   Decide in Phase 3 whether to make the store truly bi-temporal (valid-time
   queries) or document them as advisory metadata.

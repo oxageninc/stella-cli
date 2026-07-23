@@ -1,8 +1,8 @@
 # ADR 0002: Scope vs. Sharing
 
-- Status: Proposed — needs human confirmation
+- Status: Accepted — ratified by repository owner 2026-07-23 (was: Proposed)
 - Date: 2026-07-23
-- Deciders: (Phase 0 baseline)
+- Deciders: repository owner (ratified 2026-07-23)
 
 ## Context
 
@@ -29,8 +29,9 @@ user, repository, and organization") is judged stale. Repository and workspace
 are not synonyms: a repository is a VCS/Git identity; a workspace is a
 provider-managed security principal spanning resources (§7.3).
 
-This resolution is **not** ratified. It requires human sign-off before the enum
-is frozen in Phase 1.
+**Ratified by the repository owner on 2026-07-23:** the four-value set is
+authoritative and the enum may be frozen on it in Phase 1. §21's three-value
+line is superseded.
 
 ## Consequences
 
@@ -41,5 +42,6 @@ reviewer instead confirms the three-value set, the `workspace` publication path
 
 ## Open questions
 
-**Needs human confirmation:** ratify the 4-value `SharingScope` (accepting §21
-as stale) versus the 3-value set, before the enum is frozen in Phase 1.
+Resolved 2026-07-23: the repository owner ratified the **4-value** `SharingScope`
+(`user, repository, workspace, organization`); §21's 3-value line is superseded.
+The Phase 1 enum freezes on the four values.
