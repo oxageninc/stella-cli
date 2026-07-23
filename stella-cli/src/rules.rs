@@ -326,7 +326,7 @@ mod tests {
         std::fs::write(dir.join(name), contents).unwrap();
     }
 
-    // ---- FsRuleSource ----
+    // FsRuleSource
 
     #[test]
     fn fs_source_reads_md_files_name_sorted_and_skips_absent_dirs() {
@@ -361,7 +361,7 @@ mod tests {
         );
     }
 
-    // ---- load_rules_from: the production directories + precedence ----
+    // load_rules_from: the production directories + precedence
 
     /// The authoring-format contract (module docs): every frontmatter key a
     /// writer — hand authoring, rule promotion, or an extension via the
@@ -555,7 +555,7 @@ mod tests {
         );
     }
 
-    // ---- store-backed rules (the extension write path) ----
+    // store-backed rules (the extension write path)
 
     #[test]
     fn store_rules_load_and_any_rule_file_overrides_them_by_id() {
@@ -623,7 +623,7 @@ mod tests {
         );
     }
 
-    // ---- Tier-2 enforcement through the wired tool boundary ----
+    // Tier-2 enforcement through the wired tool boundary
 
     #[tokio::test]
     async fn a_tier2_guard_blocks_a_violating_edit_through_the_wired_boundary() {

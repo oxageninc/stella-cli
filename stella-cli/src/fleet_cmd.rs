@@ -890,7 +890,7 @@ mod tests {
         assert!(out.ends_with('…'));
     }
 
-    // ---- the worker's control lines (stella-fleet WorkerControls) -------
+    // the worker's control lines (stella-fleet WorkerControls)
 
     #[tokio::test]
     async fn watch_gate_parks_while_paused_and_releases_on_resume_or_teardown() {
@@ -995,7 +995,7 @@ mod tests {
         assert!(store.execution_rollup(id, root.path()).unwrap().is_none());
     }
 
-    // ---- the post-fanout PR/CI watch (--watch) --------------------------
+    // the post-fanout PR/CI watch (--watch)
 
     use std::sync::{Arc, Mutex};
 

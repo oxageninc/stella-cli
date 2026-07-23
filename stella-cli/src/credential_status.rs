@@ -173,7 +173,7 @@ mod tests {
         ))
     }
 
-    // ---- status_for: the actual #249 root-cause witness -----------------
+    // status_for: the actual #249 root-cause witness
     //
     // Before this module existed, `stella models`/`stella config` never
     // consulted the credentials file at all when deciding "configured or
@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(status.source_label, None);
     }
 
-    // ---- label_for: source distinction + .env file attribution ----------
+    // label_for: source distinction + .env file attribution
 
     #[test]
     fn label_for_settings_json_is_distinct_from_credentials_toml() {
@@ -295,7 +295,7 @@ mod tests {
         assert!(env_files_summary(&Loaded::default()).is_none());
     }
 
-    // ---- provider_config_for: unknown-id fallback for `stella auth list` ---
+    // provider_config_for: unknown-id fallback for `stella auth list`
 
     #[test]
     fn provider_config_for_unknown_id_derives_the_conventional_env_var() {

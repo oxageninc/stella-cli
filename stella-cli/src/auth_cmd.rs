@@ -225,7 +225,7 @@ mod tests {
         assert!(validate_provider_id("has space").is_err());
     }
 
-    // ---- set: witness for masked stdout + 0600 perms on disk ------------
+    // set: witness for masked stdout + 0600 perms on disk
 
     #[test]
     fn set_in_stores_the_key_but_never_echoes_it_in_the_confirmation_message() {
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(file.get("zai/glm"), None);
     }
 
-    // ---- remove -----------------------------------------------------------
+    // remove
 
     #[test]
     fn remove_from_reports_success_and_actually_drops_the_entry() {
@@ -316,7 +316,7 @@ mod tests {
         assert!(message.contains("nothing to remove"));
     }
 
-    // ---- list: masked, and consistent with the #249 source labels -------
+    // list: masked, and consistent with the #249 source labels
 
     #[test]
     fn list_lines_shows_a_redacted_preview_never_the_raw_value() {

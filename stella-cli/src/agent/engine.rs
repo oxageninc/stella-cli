@@ -111,11 +111,9 @@ pub(crate) enum PipelineApprovalCapability {
 /// Which approval capability a one-shot host run can actually service, given
 /// the output format and whether stdin/stdout are real terminals. A pure
 /// function over already-observed booleans (rather than calling
-/// `IsTerminal` itself) so the exact condition is directly unit-testable —
-/// this is the seam a prior squash-merge (#284 x #297/#276) silently
-/// dropped from `run_pipeline_one_shot`, collapsing it to a bare `is_text`
-/// check with no test to catch the regression. Stdio approval requires a
-/// text-safe renderer PLUS both terminal handles: stdin must accept the
+/// `IsTerminal` itself) so the exact condition is directly unit-testable.
+/// Stdio approval requires a text-safe renderer PLUS both terminal handles:
+/// stdin must accept the
 /// decision and stdout must present the prompt. A redirected/piped
 /// text-format run is still rendered as text, but must stay headless and
 /// fail closed at scope review — never read stdin for a decision no one is
@@ -194,9 +192,7 @@ pub(crate) async fn with_session_hook_context(mut system_prompt: String, cfg: &C
     system_prompt
 }
 
-// -----------------------------------------------------------------------
 // Pipeline port adapters
-// -----------------------------------------------------------------------
 
 /// Everything `agent_engine_config` resolves for one pipeline run: the
 /// role router inputs (profiles + pins), owned adapters for roles routed
@@ -322,8 +318,7 @@ fn pin_role(
 ///   `pipeline_worker_model`/`agents.worker.*`
 ///   ([`crate::engine_config::model_spec_for`]) when configured and its
 ///   provider is credentialed; unset or unroutable falls back to the
-///   session default `worker_ref` (issue #276 — previously the worker
-///   always rode `worker_ref` regardless of these settings).
+///   session default `worker_ref` (issue #276).
 /// - TRIAGE and JUDGE pins come from their configured model specs the same
 ///   way, but always fall back to the (possibly worker-overridden) worker
 ///   model on any failure — the pre-existing behavior.

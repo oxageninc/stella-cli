@@ -256,11 +256,9 @@ pub fn assistant_response(text: &str) {
 
 /// Print a cost summary for a turn. `AgentEvent::Complete` (the source of
 /// this data under `stella_core::Engine`) carries `model`/`cost_usd` only —
-/// no per-turn token breakdown, unlike the old ad-hoc loop's manual
-/// accumulation — so this is deliberately narrower than the Phase 0/1
-/// version. Real per-role token/cost accounting lives in `BudgetTick`
-/// (`render_event` below), which fires after every call, not just at
-/// turn-end.
+/// no per-turn token breakdown — so this is deliberately narrow. Real
+/// per-role token/cost accounting lives in `BudgetTick` (`render_event`
+/// below), which fires after every call, not just at turn-end.
 pub fn cost_summary(cost_usd: f64, model: &str, elapsed: Duration) {
     println!(
         "\n  {} {} · {} · {:.1}s",

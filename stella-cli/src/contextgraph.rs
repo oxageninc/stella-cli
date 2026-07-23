@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(ids, vec!["plane-graph"]);
     }
 
-    // ---- CGP conformance -------------------------------------------------
+    // CGP conformance
     //
     // The providers this host registers are green on the protocol's own
     // conformance suite (§3.6), verified in-tree — not merely asserted to be

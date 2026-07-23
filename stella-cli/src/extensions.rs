@@ -34,9 +34,7 @@ use stella_tui::SlashCommand;
 /// (an entry in an earlier directory wins a real name collision).
 const SOURCE_DIRS: [&str; 2] = [".claude", ".agents"];
 
-// ============================================================================
 // Scanning + symlink sync
-// ============================================================================
 
 /// The per-directory definition file each kind accepts alongside flat
 /// `<slug>.md` (the `npx skills` ecosystem layout, generalized).
@@ -333,9 +331,7 @@ fn emit_sync_outcome(scope: &str, outcome: &SyncOutcome, emit: &mut dyn FnMut(St
     }
 }
 
-// ============================================================================
 // Loading
-// ============================================================================
 
 /// Read one kind's definition files from `dir`: flat `<slug>.md` plus the
 /// nested `<slug>/<nested_file>` layout, both read *through* symlinks (that
@@ -633,9 +629,7 @@ fn skill_invocation_prompt(skill: &Skill, args: &str) -> String {
     out
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -75,9 +75,7 @@ pub fn agents_dir_for(scope: AgentScope, workspace_root: &Path) -> Result<PathBu
     }
 }
 
-// ============================================================================
 // Discovery
-// ============================================================================
 
 /// One definition entry found in an agents dir: its slug (the versioning
 /// key) and the canonical file the loader reads.
@@ -159,9 +157,7 @@ pub fn find_slug(dir: &Path, name: &str) -> Option<String> {
     })
 }
 
-// ============================================================================
 // Versions + pin
-// ============================================================================
 
 /// The `.versions/<slug>` directory for one agent.
 fn versions_dir(agents_dir: &Path, slug: &str) -> PathBuf {
@@ -374,9 +370,7 @@ fn write_pin(agents_dir: &Path, slug: &str, version: u32) -> Result<(), String> 
     std::fs::write(&pin, format!("{version}\n")).map_err(|e| format!("{}: {e}", pin.display()))
 }
 
-// ============================================================================
 // Create from prompt (LLM-assisted)
-// ============================================================================
 
 /// A parsed LLM-drafted agent definition, ready to install.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,9 +489,7 @@ fn strip_fences(text: &str) -> String {
     lines.join("\n")
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -513,7 +505,7 @@ mod tests {
         std::fs::write(path, content).unwrap();
     }
 
-    // ---- discovery ----
+    // discovery
 
     #[test]
     fn discover_lists_both_scopes_with_toolbelt_and_scope_tags() {
@@ -565,7 +557,7 @@ mod tests {
         assert!(discover(None, &tmp.path().join("nope")).is_empty());
     }
 
-    // ---- versioning + pin ----
+    // versioning + pin
 
     #[test]
     fn save_creates_a_new_version_pins_it_and_preserves_the_old_one() {
@@ -736,7 +728,7 @@ mod tests {
         assert_eq!(find_slug(&dir, "nope"), None);
     }
 
-    // ---- creation ----
+    // creation
 
     #[test]
     fn creation_messages_carry_the_format_contract_and_the_description() {

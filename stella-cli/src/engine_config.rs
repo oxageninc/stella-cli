@@ -22,9 +22,7 @@ use crate::settings::{
     Toggle,
 };
 
-// ---------------------------------------------------------------------
 // Model specs
-// ---------------------------------------------------------------------
 
 /// A parsed model setting: which provider serves it (when known) and the
 /// provider-native slug sent verbatim on the wire.
@@ -204,9 +202,7 @@ pub fn auto_judge_spec(
     best.map(|(_, _, _, spec)| spec)
 }
 
-// ---------------------------------------------------------------------
 // Per-agent tuning
-// ---------------------------------------------------------------------
 
 /// The resolved request-shaping settings for one agent: what lands on the
 /// engine config / completion requests once the auto modes are applied.
@@ -289,9 +285,7 @@ fn split_params(
     (params.temperature, params.max_tokens, rider)
 }
 
-// ---------------------------------------------------------------------
 // Per-model effort vocabulary
-// ---------------------------------------------------------------------
 
 /// What the catalog knows about `provider/model`'s reasoning support.
 /// `None` when the model is unknown to the catalog OR known without
@@ -381,9 +375,7 @@ pub fn unsupported_effort_notice(
     }
 }
 
-// ---------------------------------------------------------------------
 // Enum ↔ string (the TUI edits strings; settings/serde hold enums)
-// ---------------------------------------------------------------------
 
 pub fn effort_to_str(effort: ReasoningEffort) -> &'static str {
     match effort {
@@ -442,9 +434,7 @@ pub fn service_tier_from_str(raw: &str) -> Option<ServiceTier> {
     }
 }
 
-// ---------------------------------------------------------------------
 // Settings ↔ TUI snapshot
-// ---------------------------------------------------------------------
 
 /// The TUI's role vocabulary mapped onto the settings' — same order, so
 /// `EngineConfigState::agents[i]` is `EngineAgentKind::ALL[i]`.

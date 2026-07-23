@@ -790,8 +790,8 @@ mod tests {
 
     #[tokio::test]
     async fn install_skill_lands_in_the_project_scope_not_the_workspace_root() {
-        // THE cli-skills P1: the agent tool used to run the registry CLI
-        // directly against the workspace, so the skill was written wherever the
+        // The agent tool ran the registry CLI directly against the workspace,
+        // so the skill was written wherever the
         // CLI defaults (a global `~/.config/stella/skills` symlink) — the tool
         // reported success yet the skill never showed up in the project's list.
         // The fix mirrors the command deck: stage the install into a private

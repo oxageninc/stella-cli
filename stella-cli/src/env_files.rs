@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(find_base(home, Some(home)), None);
     }
 
-    // ---- Loaded::file_for (stella config's "which file, which name") ----
+    // Loaded::file_for (stella config's "which file, which name")
 
     #[test]
     fn file_for_attributes_a_loaded_name_to_its_source_file_and_nothing_else() {

@@ -480,7 +480,7 @@ async fn deck_ask_io_passes_free_text_through_verbatim() {
     assert_eq!(result.unwrap(), "actually do it my way");
 }
 
-// ── Double-Esc hold ─────────────────────────────────────────────────────
+// Double-Esc hold
 
 /// Single Esc: the plain cancel retains the prompt but never parks
 /// dispatch — "interrupt current, run next" is unchanged.
@@ -543,7 +543,7 @@ fn stray_stop_and_hold_is_a_no_op() {
     assert!(!dispatch.held());
 }
 
-// ── ISSUES tab: entity-hit assembly ─────────────────────────────────────
+// ISSUES tab: entity-hit assembly
 
 #[test]
 fn member_and_label_hits_carry_kind_insert_and_description() {

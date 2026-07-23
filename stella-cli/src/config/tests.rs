@@ -1,14 +1,11 @@
 use super::*;
 
-/// Regression test for the bug fixed alongside this test: every
-/// provider's `default_model` here must resolve against
+/// Every provider's `default_model` here must resolve against
 /// `stella_model::catalog::Catalog::seed()`, or `build_provider`'s
 /// catalog check (`agent.rs`) would hard-error on first use of a
-/// provider whose default was never added to the seed — exactly what
-/// happened for several of these rows before the catalog was completed.
-/// Uses the provider-scoped resolver, same as `build_provider`, so a
-/// default that only exists under a *different* provider's row still
-/// fails here.
+/// provider whose default was never added to the seed. Uses the
+/// provider-scoped resolver, same as `build_provider`, so a default that
+/// only exists under a *different* provider's row still fails here.
 #[test]
 fn every_provider_default_model_resolves_against_the_catalog_seed() {
     let catalog = stella_model::catalog::Catalog::seed();
@@ -584,13 +581,13 @@ fn discovery_style_resolution_accepts_the_settings_literal_key() {
 
 /// Issue #249's source-display requirement: a settings.json literal and a
 /// real credentials.toml entry are two DIFFERENT stores, and a caller
-/// showing "where did this come from" must be able to tell them apart. On
-/// origin/main both cases reported the same `CredentialSource::ConfigFile`,
-/// which is what let `stella config` conflate "declared in settings.json"
-/// with "stored in credentials.toml". This constructs a provider with BOTH
-/// present (the settings literal must win per the documented precedence)
-/// and asserts the resolved source is the settings-specific variant, not
-/// the file one — the file's differing value proves which one actually won.
+/// showing "where did this come from" must be able to tell them apart. A
+/// single `CredentialSource::ConfigFile` for both would conflate "declared
+/// in settings.json" with "stored in credentials.toml". This constructs a
+/// provider with BOTH present (the settings literal must win per the
+/// documented precedence) and asserts the resolved source is the
+/// settings-specific variant, not the file one — the file's differing value
+/// proves which one actually won.
 #[test]
 fn settings_json_literal_is_reported_distinctly_from_a_real_credentials_toml_entry() {
     let provider = ProviderConfig {

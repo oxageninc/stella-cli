@@ -1,5 +1,5 @@
-//! SKILLS-tab helper cluster split out of `command_deck.rs` to keep that
-//! file a manageable size. Pure relocation — no behavior change.
+//! SKILLS-tab helper cluster: the deck's skill vocabulary, npx-skills
+//! registry parsing, and install/preview/authoring ops.
 use super::*;
 
 /// The deck's slash vocabulary: the productized commands (🔒) followed by
@@ -17,7 +17,7 @@ pub(super) fn deck_slash_commands(
     commands
 }
 
-// ── SKILLS tab: driver-side ops (the deck routes `WorkspaceInput::Skill`) ────
+// SKILLS tab: driver-side ops (the deck routes `WorkspaceInput::Skill`)
 
 /// Snapshot the installed skills across BOTH scopes into an [`Inbound::Skills`].
 pub(super) fn skills_snapshot(workspace_root: &std::path::Path, status: Option<String>) -> Inbound {

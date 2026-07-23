@@ -84,9 +84,7 @@ fn store_for_command() -> Result<Arc<CatalogStore>, String> {
     Ok(store)
 }
 
-// ---------------------------------------------------------------------
 // Vocabulary mapping & derivations
-// ---------------------------------------------------------------------
 
 /// models.dev provider id → stella provider id. Only the three ids whose
 /// stella names differ are mapped; everything else matches verbatim (which
@@ -396,9 +394,7 @@ fn ensure_seed_floor(store: &CatalogStore) {
     }
 }
 
-// ---------------------------------------------------------------------
 // Provider-native discovery (each provider's own /models endpoint)
-// ---------------------------------------------------------------------
 
 /// Fetch `provider`'s own live model listing, dispatched on its wire
 /// dialect. Vertex and Bedrock have no key-shaped credential to list with
@@ -499,9 +495,7 @@ async fn refresh_native_provider(
     Ok((models.len(), counts))
 }
 
-// ---------------------------------------------------------------------
 // Bootstrap & runtime catalog
-// ---------------------------------------------------------------------
 
 /// Which tool dialect a provider's catalog rows carry — from the
 /// provider's wire dialect (the catalog field is informational; adapter
@@ -701,9 +695,7 @@ fn install_runtime_catalog(store: &CatalogStore) {
     Catalog::install_runtime(Catalog::with_entries(entries));
 }
 
-// ---------------------------------------------------------------------
 // Validation
-// ---------------------------------------------------------------------
 
 /// The anti-invalid-slug gate — called by `build_provider_parts` for every
 /// provider before any wire call. The decision ladder:
@@ -807,9 +799,7 @@ fn unknown_model_message(store: &CatalogStore, provider_id: &str, model_id: &str
     message
 }
 
-// ---------------------------------------------------------------------
 // Telemetry alias learning
-// ---------------------------------------------------------------------
 
 /// Register the model string a provider echoed on the wire, if it isn't
 /// joinable yet. Called from the telemetry write path — must never slow it
@@ -867,9 +857,7 @@ pub(crate) fn note_wire_model(provider_id: &str, wire_model: &str) {
     }
 }
 
-// ---------------------------------------------------------------------
 // Commands: `stella models refresh` / `stella models list` / status
-// ---------------------------------------------------------------------
 
 /// One refresh pass: conditional fetch (persisted ETag), map, batch-apply,
 /// record the sync. `force` drops the validator to re-download even an

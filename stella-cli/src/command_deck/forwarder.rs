@@ -1,8 +1,6 @@
-//! Durable event forwarding from engine turns into command-deck lanes —
-//! split out of `command_deck.rs` (already over its file-size ratchet; not a
-//! file to grow) so `spawn_forwarder`, the one seam shared by every deck
-//! lane (the lead's turns and every `crate::subsession` worker), only needs
-//! a call site.
+//! Durable event forwarding from engine turns into command-deck lanes.
+//! `spawn_forwarder` is the one seam shared by every deck lane (the lead's
+//! turns and every `crate::subsession` worker).
 
 use std::sync::Arc;
 

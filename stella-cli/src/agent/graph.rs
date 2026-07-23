@@ -1,5 +1,5 @@
-//! Code-graph build cluster split out of `agent.rs` to keep that file a
-//! manageable size. Pure relocation — no behavior change.
+//! Code-graph build cluster: workspace index construction and the
+//! session-lifetime live watcher.
 use super::*;
 
 /// Build the workspace code-graph index into `.stella/private/codegraph.db` (the
