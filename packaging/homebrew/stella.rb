@@ -16,8 +16,8 @@
 class Stella < Formula
   desc "Fast, BYOK, model-agnostic terminal coding agent"
   homepage "https://github.com/macanderson/stella"
-  url "https://github.com/macanderson/stella.git", tag: "v0.4.75"
-  version "0.4.75"
+  url "https://github.com/macanderson/stella.git", tag: "v0.4.77"
+  version "0.4.77"
   license "MIT OR Apache-2.0"
   head "https://github.com/macanderson/stella.git", branch: "main"
 
