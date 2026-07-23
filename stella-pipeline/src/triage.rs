@@ -203,16 +203,78 @@ pub fn classify_conversational(text: &str) -> bool {
     false
 }
 
-/// Whether the input should take the conversational (no-work) path. Triage's
-/// `chat` classification only stands when the deterministic floor found no
-/// positive task signal — the same asymmetry [`resolve_task_class`] relies on:
-/// the deterministic layer can only ever *add* work, so it may **veto** "this
-/// is just chat" (raising a real task back onto the work path) but never
-/// manufacture it. A cheap triage model that over-eagerly calls a real task
-/// "chat" is overruled the moment the goal carries an enumeration, conjoined
-/// imperatives, or cross-cutting scope words.
+/// Whether the input should take the conversational (no-work) path.
+///
+/// Two independent routes, because betting the whole fix on a cheap triage
+/// model choosing `chat` is fragile — the model that shipped this bug
+/// *recognized* `hi` was odd and forced a task class anyway:
+///
+/// 1. **Deterministic** ([`is_bare_greeting`]): an unmistakable bare greeting
+///    (`hi`, `hello`, `thanks`, an empty submit) routes to chat with no model
+///    opinion needed. EXACT whole-message match only — never prefix/substring
+///    — so `hey, fix the login bug` can never be swallowed.
+/// 2. **Model**: triage said `chat`, and the deterministic floor found no
+///    positive task signal to overrule it. Same asymmetry
+///    [`resolve_task_class`] relies on: the deterministic layer can only ever
+///    *add* work, so it may **veto** "this is just chat" (raising a real task
+///    back onto the work path) but never manufacture it. An over-eager `chat`
+///    on a goal carrying an enumeration, conjoined imperatives, or
+///    cross-cutting scope is overruled.
 pub fn resolve_conversational(model_says_chat: bool, goal: &str) -> bool {
-    model_says_chat && deterministic_floor(goal) == TaskClass::SimpleLookup
+    is_bare_greeting(goal)
+        || (model_says_chat && deterministic_floor(goal) == TaskClass::SimpleLookup)
+}
+
+/// Whether the whole message is nothing but a greeting / acknowledgement — the
+/// deterministic half of [`resolve_conversational`]. Normalizes (trim,
+/// lowercase, strip surrounding punctuation and quotes) then requires an EXACT
+/// match against a small fixed set. Whole-message only by construction: a real
+/// task that merely *opens* with a greeting (`hey, fix the login bug`) keeps
+/// its trailing words and so never matches. An empty/whitespace-only submit
+/// counts too — it is not a task.
+fn is_bare_greeting(goal: &str) -> bool {
+    let normalized = goal
+        .trim()
+        .trim_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '.' | '!' | '?' | ',' | '"' | '\'' | '`' | ':')
+        })
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
+        return true;
+    }
+    const GREETINGS: &[&str] = &[
+        "hi",
+        "hii",
+        "hiya",
+        "hello",
+        "hey",
+        "heya",
+        "yo",
+        "sup",
+        "hey there",
+        "hi there",
+        "hello there",
+        "howdy",
+        "greetings",
+        "hi stella",
+        "hey stella",
+        "hello stella",
+        "gm",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "thanks",
+        "thank you",
+        "thankyou",
+        "thx",
+        "ty",
+        "cheers",
+        "ok thanks",
+        "ok thank you",
+        "nice",
+        "cool",
+    ];
+    GREETINGS.contains(&normalized.as_str())
 }
 
 /// Parse a triage model's classification response into a [`TaskClass`].
@@ -609,15 +671,50 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_vetoes_conversational_when_there_is_task_signal() {
-        // A bare greeting has no task signal → chat stands.
-        assert!(resolve_conversational(true, "hi"));
-        assert!(resolve_conversational(true, "hey there, how are you?"));
-        // The model has to say chat in the first place.
-        assert!(!resolve_conversational(false, "hi"));
-        // But positive task signal overrules an over-eager `chat`: an
-        // enumeration, conjoined imperatives, or cross-cutting scope is real
-        // work no matter what the cheap triage model guessed.
+    fn a_bare_greeting_is_conversational_without_any_model_opinion() {
+        // The deterministic route: no model answer needed for an unmistakable
+        // greeting — the fix must not hinge on a cheap model choosing `chat`.
+        assert!(resolve_conversational(false, "hi"));
+        assert!(resolve_conversational(false, "  Hi!  "));
+        assert!(resolve_conversational(false, "hello"));
+        assert!(resolve_conversational(false, "thanks"));
+        assert!(resolve_conversational(false, ""));
+    }
+
+    #[test]
+    fn is_bare_greeting_matches_whole_message_only() {
+        for g in [
+            "hi", "Hi", "  hi  ", "hi!", "hello.", "HELLO", "hey", "yo",
+            "hey there", "thanks", "thank you", "thankyou", "ty", "", "   ",
+            "hi stella", "\"hi\"", "gm", "good morning",
+        ] {
+            assert!(is_bare_greeting(g), "{g:?} should be a bare greeting");
+        }
+        // NOT greetings: a real task that merely opens with one, or anything
+        // with trailing content. Whole-message match, never prefix/substring.
+        for g in [
+            "hey, fix the login bug",
+            "hi, can you refactor the parser",
+            "fix the parser",
+            "hello world function",
+            "hey there, add a test",
+            "thanks for nothing, delete the file",
+            "high",         // superstring of "hi"
+            "history",
+        ] {
+            assert!(!is_bare_greeting(g), "{g:?} must NOT be a bare greeting");
+        }
+    }
+
+    #[test]
+    fn the_floor_vetoes_an_over_eager_model_chat_when_there_is_task_signal() {
+        // Model says chat, no task signal, not a bare greeting → chat stands.
+        assert!(resolve_conversational(true, "what's your favorite color"));
+        // Model silent AND not a greeting → not conversational.
+        assert!(!resolve_conversational(false, "what does the retry policy do?"));
+        // Positive task signal overrules an over-eager `chat`: an enumeration,
+        // conjoined imperatives, or cross-cutting scope is real work no matter
+        // what the cheap triage model guessed.
         assert!(!resolve_conversational(
             true,
             "add the field and then update the migration"
