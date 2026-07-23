@@ -157,9 +157,7 @@ impl SqliteMediaOperationJournal {
         connection
             .busy_timeout(std::time::Duration::from_secs(2))
             .map_err(|error| journal_error(format!("cannot configure journal: {error}")))?;
-        connection
-            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-            .and_then(|_| connection.execute_batch(SCHEMA))
+        initialize_journal_database(&connection)
             .map_err(|error| journal_error(format!("cannot initialize journal: {error}")))?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -354,6 +352,35 @@ impl MediaOperationJournal for SqliteMediaOperationJournal {
             .map_err(sql_error)?;
         transaction.commit().map_err(sql_error)?;
         Ok(())
+    }
+}
+
+/// Runs the idempotent first-open statements, absorbing `SQLITE_BUSY`.
+///
+/// Converting a fresh rollback-journal database into WAL needs an exclusive
+/// lock, and SQLite skips the busy handler on that upgrade to avoid deadlock,
+/// so a concurrent first-open gets an immediate `SQLITE_BUSY` that
+/// `busy_timeout` never absorbs. Back off until the winner finishes; the
+/// loser then observes WAL mode and the existing schema.
+fn initialize_journal_database(connection: &Connection) -> Result<(), rusqlite::Error> {
+    const BUSY_ATTEMPTS: u32 = 40;
+    const BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let mut attempts = 0;
+    loop {
+        let result = connection
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .and_then(|_| connection.execute_batch(SCHEMA));
+        match result {
+            Err(error)
+                if attempts < BUSY_ATTEMPTS
+                    && error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) =>
+            {
+                attempts += 1;
+                std::thread::sleep(BUSY_BACKOFF);
+            }
+            result => return result,
+        }
     }
 }
 
