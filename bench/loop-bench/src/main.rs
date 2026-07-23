@@ -440,7 +440,6 @@ fn print_table(reports: &[TrialReport]) {
     println!("  verdicts: {tally}");
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
