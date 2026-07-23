@@ -177,10 +177,10 @@ fn main() {
         std::process::exit(2);
     }
 
-    if !args.analyze_only {
-        if let Err(code) = run_harbor(&args, &tasks) {
-            eprintln!("harbor run failed (exit {code}); analyzing whatever landed");
-        }
+    if !args.analyze_only
+        && let Err(code) = run_harbor(&args, &tasks)
+    {
+        eprintln!("harbor run failed (exit {code}); analyzing whatever landed");
     }
 
     let job_dir = Path::new(&args.jobs_dir).join(&args.job_name);
@@ -375,8 +375,8 @@ fn truncate(s: &str, n: usize) -> String {
 
 fn print_table(reports: &[TrialReport]) {
     println!(
-        "\n{:<24} {:>8} {:>6} {:>6} {:>5} {:>4} {:>4}  {}",
-        "task", "verdict", "calls", "tools", "wr", "ov", "gq", "reward"
+        "\n{:<24} {:>8} {:>6} {:>6} {:>5} {:>4} {:>4}  reward",
+        "task", "verdict", "calls", "tools", "wr", "ov", "gq"
     );
     println!("{}", "─".repeat(84));
     let mut solved = 0usize;
@@ -509,7 +509,7 @@ mod tests {
         // clean `complete` (exited via budget/step-cap). Reward wins.
         let mut stream = String::from(r#"{"type":"stage","name":"execute"}"#);
         for _ in 0..50 {
-            stream.push_str("\n");
+            stream.push('\n');
             stream.push_str(r#"{"type":"tool_start","call":{"name":"edit_file"}}"#);
         }
         let mut r = distill_events("busy", &stream);
