@@ -10,7 +10,7 @@
 //!
 //! The scoring/fusion/packing steps are plain synchronous functions over owned
 //! data — brute-force top-k cosine is fine at
-//! CLI-local scale; an ANN accelerator is a size-threshold follow-up per
+//! CLI-local scale; an ANN accelerator is a size-threshold follow-up.
 //! They are property-tested at the bottom of the file.
 
 use std::collections::{HashMap, HashSet};
@@ -25,7 +25,7 @@ use crate::store::{
 };
 
 /// Provenance `kind` marking a frame's domain tag, so a citation view can show
-/// the domains a frame belongs to (scope update: "tag data rides provenance").
+/// the domains a frame belongs to.
 pub(crate) const DOMAIN_PROVENANCE_KIND: &str = "domain";
 
 /// Provider identity stamped into frame provenance.
@@ -113,7 +113,7 @@ impl ContextStore {
         self.recall_scoped(q, &[]).await
     }
 
-    /// Hybrid retrieval scoped to `domains` (scope update): fuse → dedup →
+    /// Hybrid retrieval scoped to `domains`: fuse → dedup →
     /// diversify → budget-pack → coverage gate. When `domains` is non-empty it
     /// **filters out** nodes tagged exclusively with out-of-scope domains AND
     /// **boosts** relevance by domain overlap (a frame sharing more of the
@@ -740,7 +740,7 @@ mod tests {
         }
     }
 
-    // --- End-to-end recall over a real store (public-API integration) -------
+    // End-to-end recall over a real store (public-API integration)
 
     use crate::clock::FixedClock;
     use crate::embed::HashEmbedder;

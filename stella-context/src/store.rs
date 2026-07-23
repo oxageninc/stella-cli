@@ -103,7 +103,7 @@ CREATE TABLE embedder_fingerprint (
 );
 ";
 
-/// The v2 schema (scope update): workspace **domains** as first-class tags, and
+/// The v2 schema: workspace **domains** as first-class tags, and
 /// a **memory** record type (reflections). Domains are a normalized table plus
 /// indexable junctions — never a JSON blob — so "everything in domain X" is a
 /// key-lookup, not a scan. A domain tag rides node and edge/fact rows (and, via
@@ -605,11 +605,9 @@ async fn warm_index(
     Ok(embedded)
 }
 
-// ---------------------------------------------------------------------------
 // Low-level accessors (pub(crate)) shared by retrieval.rs and writeback.rs.
 // All take a `&Connection` (a `&Transaction` derefs to one), so a caller can
 // batch many of them inside a single transaction.
-// ---------------------------------------------------------------------------
 
 /// Lowercase hex of raw bytes. Replaces `format!("{:x}", digest)`: digest
 /// 0.11 (sha2 0.11) returns an `Output` array that no longer implements
@@ -1045,12 +1043,10 @@ pub(crate) fn insert_memory(
     Ok(id)
 }
 
-// ---------------------------------------------------------------------------
-// Domains: a normalized table + indexable junctions (scope update). Tagging is
+// Domains: a normalized table + indexable junctions. Tagging is
 // idempotent; unknown domain names are auto-created (the workspace's `stella
 // init` domains arrive as data, so a write may reference a name before an
 // explicit definition with a description exists).
-// ---------------------------------------------------------------------------
 
 /// Insert a domain by name (idempotent), optionally setting/refreshing its
 /// description. Returns its rowid.

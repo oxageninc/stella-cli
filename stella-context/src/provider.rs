@@ -23,7 +23,7 @@ use crate::store::{ContextStore, NodeKind};
 /// processes / HTTP endpoints; the built-in store resolves in-process.
 #[async_trait]
 pub trait ContextProvider: Send + Sync {
-    /// Identity and data-flow declaration surfaced at install/consent time
+    /// Identity and data-flow declaration surfaced at install/consent time.
     /// A host gates `egress` providers
     /// on explicit consent using this.
     fn info(&self) -> ProviderInfo;

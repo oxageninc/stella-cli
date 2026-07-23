@@ -344,7 +344,7 @@ impl ContextStore {
         let now = self.clock().now_rfc3339();
         let fingerprint = self.fingerprint().id();
 
-        // --- Phase A: decide what to embed (async, no lock held) ------------
+        // Phase A: decide what to embed (async, no lock held).
         // Gather every distinct piece of embeddable content in this delta.
         let mut contents: Vec<(String, String)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -397,7 +397,7 @@ impl ContextStore {
             }
         }
 
-        // --- Phase B: one transaction for all writes (`L-L1`) ---------------
+        // Phase B: one transaction for all writes (`L-L1`).
         let mut receipt = UpsertReceipt {
             embeddings_computed: new_vectors.len(),
             embeddings_reused: reused.len(),

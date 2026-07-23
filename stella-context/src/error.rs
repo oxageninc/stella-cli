@@ -29,7 +29,7 @@ pub enum ContextError {
     MissingCitation { id: String },
 
     /// Retrieval was asked to mix embeddings from two different embedders.
-    /// and `L-C2`: retrieval never mixes fingerprints
+    /// `L-C2`: retrieval never mixes fingerprints
     /// — a stored vector under a stale fingerprint is invisible, never
     /// silently compared against a fresh query vector.
     #[error("embedder fingerprint mismatch: query is `{query}`, candidate is `{candidate}`")]

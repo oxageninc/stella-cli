@@ -4,7 +4,7 @@
 //!
 //! # Why a hashing embedder is the default
 //!
-//! and risk register R14 make the *product*
+//! Risk register R14 makes the *product*
 //! default a local ONNX model (bge-small-class, ~130 MB, checksum-pinned
 //! weight fetch + a native runtime). That is the tracked follow-up. Shipping
 //! it is a supply-chain and binary-size decision that must not block the
