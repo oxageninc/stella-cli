@@ -100,6 +100,7 @@ pub const RESERVED_NAMES: &[&str] = &[
     "read_symbol",
     "write_file",
     "edit_file",
+    "apply_edits",
     "delete_file",
     // Search
     "grep",

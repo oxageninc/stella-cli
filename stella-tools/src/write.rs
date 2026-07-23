@@ -1,12 +1,28 @@
 //! `write_file` — create or overwrite a file, creating parent dirs.
+//! Successful writes record the written bytes in the session's read-state
+//! ledger (#331): the model knows the content it just produced, so its own
+//! write must never be misattributed later as out-of-band drift.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use stella_protocol::tool::{ToolOutput, ToolSchema};
 
+use crate::read::ReadLedger;
 use crate::registry::Tool;
 
-pub struct WriteFile;
+#[derive(Default)]
+pub struct WriteFile {
+    ledger: Arc<ReadLedger>,
+}
+
+impl WriteFile {
+    /// Construct sharing the registry's read-state ledger.
+    pub fn with_ledger(ledger: Arc<ReadLedger>) -> Self {
+        Self { ledger }
+    }
+}
 
 #[async_trait]
 impl Tool for WriteFile {
@@ -66,6 +82,7 @@ impl Tool for WriteFile {
 
         match tokio::fs::write(&full_path, content).await {
             Ok(()) => {
+                self.ledger.record_known(root, path, content);
                 let bytes = content.len();
                 ToolOutput::Ok {
                     content: format!("wrote {bytes} bytes to {path}"),
@@ -86,7 +103,7 @@ mod tests {
     async fn writes_file_and_creates_parent_dirs() {
         let dir = std::env::temp_dir();
         let path = format!("stella_write_test_{}/sub/dir/file.txt", std::process::id());
-        let result = WriteFile
+        let result = WriteFile::default()
             .execute(
                 &serde_json::json!({"path": path, "content": "hello stella"}),
                 &dir,
@@ -107,7 +124,7 @@ mod tests {
     #[tokio::test]
     async fn path_escape_returns_error() {
         let dir = std::env::temp_dir();
-        let result = WriteFile
+        let result = WriteFile::default()
             .execute(
                 &serde_json::json!({"path": "../../etc/bad", "content": "x"}),
                 &dir,
@@ -119,7 +136,7 @@ mod tests {
     #[tokio::test]
     async fn missing_content_returns_error() {
         let dir = std::env::temp_dir();
-        let result = WriteFile
+        let result = WriteFile::default()
             .execute(&serde_json::json!({"path": "ok.txt"}), &dir)
             .await;
         assert!(result.is_error());

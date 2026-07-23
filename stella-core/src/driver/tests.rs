@@ -2457,6 +2457,77 @@ async fn session_start_hooks_run_via_the_helper_not_per_turn() {
     assert!(payloads[0].contains("\"event\":\"SessionStart\""));
 }
 
+#[test]
+fn read_tally_footer_does_not_blind_loop_detection() {
+    // `read_file` appends "read K\u{d7} this session" — different bytes on
+    // EVERY read of an unchanged file. Comparison must see through the
+    // footer, or the module-doc thrash (read → failing edit → read, and a
+    // bare reread spiral) can never satisfy the byte-identical-output
+    // requirement and detection is structurally blind for read_file.
+    let read_call = |id: &str| CompletionMessage {
+        role: MessageRole::Assistant,
+        content: String::new(),
+        tool_calls: vec![ToolCall {
+            call_id: id.into(),
+            name: "read_file".into(),
+            input: serde_json::json!({ "path": "a.rs" }),
+        }],
+        tool_results: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let read_result = |id: &str, body: &str, count: usize| CompletionMessage {
+        role: MessageRole::Tool,
+        content: String::new(),
+        tool_calls: Vec::new(),
+        tool_results: vec![stella_protocol::ToolResult {
+            call_id: id.into(),
+            output: ToolOutput::Ok {
+                content: format!(
+                    "     1\tfn {body}() {{}}\n\n(1/1 lines shown \u{b7} read {count}\u{d7} this session)"
+                ),
+            },
+        }],
+        attachments: Vec::new(),
+    };
+
+    // Unchanged file reread four times: only the tally differs → a loop.
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("go"),
+    ];
+    for count in 1..=4usize {
+        let id = format!("c{count}");
+        messages.push(read_call(&id));
+        messages.push(read_result(&id, "same", count));
+    }
+    let verdict = detect_loop(
+        &recent_call_records(&messages),
+        LoopDetectionConfig::default(),
+    );
+    assert!(
+        verdict.is_loop(),
+        "identical rereads must be a loop despite the tally footer: {verdict:?}"
+    );
+
+    // Content that genuinely changes between reads stays progress.
+    let mut changing = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("go"),
+    ];
+    for count in 1..=4usize {
+        let id = format!("d{count}");
+        changing.push(read_call(&id));
+        changing.push(read_result(&id, &format!("v{count}"), count));
+    }
+    assert_eq!(
+        detect_loop(
+            &recent_call_records(&changing),
+            LoopDetectionConfig::default()
+        ),
+        crate::loop_detect::LoopVerdict::NoLoop
+    );
+}
+
 mod audit_fixes;
 mod task4;
 mod usage_completeness;

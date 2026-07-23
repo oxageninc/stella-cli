@@ -5,16 +5,21 @@
 //! the file is read into memory first, so a single pathologically long line is
 //! still read in full.
 //!
-//! The tool also keeps the session's per-file read tally: every successful
-//! read increments a counter keyed by the file's normalized
+//! The tool also keeps the session's read-state ledger ([`ReadLedger`]): every
+//! successful read records a per-file tally (reported in the tool output) and
+//! the sha256 of the bytes that were current at read time. The hash is the
+//! read→edit drift oracle's baseline (#331): `edit_file` compares it against
+//! current disk bytes to attribute a failed match to an out-of-band change
+//! instead of a generic not-found. Reads are keyed by the file's normalized
 //! workspace-relative path (so `src/./a.rs` and `src/a.rs` count as one
-//! file), and the running count is reported in the tool output. One
-//! [`ReadFile`] instance lives per registry, so the tally is per session by
-//! construction; the audit-grade equivalent (one `R` event per read) lands in
-//! the registry's file-touch ledger.
+//! file). One ledger lives per registry, shared by `read_file`, `read_symbol`
+//! (which reads through this same tool), `edit_file`, and `write_file` — so
+//! the ledger tracks the content the model last *saw*, whichever surface
+//! showed (or produced) it. The audit-grade equivalent (one `R` event per
+//! read) lands in the registry's file-touch ledger.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -26,30 +31,86 @@ use crate::registry::Tool;
 /// the cap honestly when a symbol's span exceeds it.
 pub(crate) const MAX_LINES: usize = 2000;
 
-#[derive(Default)]
-pub struct ReadFile {
-    /// Per-session read counts by normalized workspace-relative path.
-    counts: Mutex<HashMap<String, u64>>,
+/// Per-file record of what the model last saw: how many times the file was
+/// read, and the sha256 of the file's full content the last time the model
+/// saw it (via a read, or via its own successful edit/write).
+#[derive(Debug, Clone, Default)]
+struct ReadState {
+    reads: u64,
+    sha256: String,
 }
 
-impl ReadFile {
+/// Session-scoped ledger of the last file content the model has *seen*.
+///
+/// Updated by successful reads (`read_file` and `read_symbol`) and by the
+/// model's own successful mutations (`edit_file`, `write_file` — the model
+/// knows the content it just produced). A mismatch between an entry's hash
+/// and current disk bytes therefore means the file changed out-of-band since
+/// the model last looked — the read→edit drift signal (#331).
+#[derive(Default)]
+pub struct ReadLedger {
+    states: Mutex<HashMap<String, ReadState>>,
+}
+
+impl ReadLedger {
+    /// Record one successful read of `path` whose full content was `content`,
+    /// returning the new per-file read count.
+    pub fn record_read(&self, root: &std::path::Path, path: &str, content: &str) -> u64 {
+        let mut states = self.states.lock().unwrap_or_else(|p| p.into_inner());
+        let state = states.entry(normalized_key(root, path)).or_default();
+        state.reads += 1;
+        state.sha256 = crate::staleness::hex_sha256(content.as_bytes());
+        state.reads
+    }
+
+    /// Record content the model produced or was shown for `path` without
+    /// counting a read — a successful `edit_file`/`write_file`, or the fresh
+    /// content echoed inside a drift-attributed error.
+    pub fn record_known(&self, root: &std::path::Path, path: &str, content: &str) {
+        let mut states = self.states.lock().unwrap_or_else(|p| p.into_inner());
+        let state = states.entry(normalized_key(root, path)).or_default();
+        state.sha256 = crate::staleness::hex_sha256(content.as_bytes());
+    }
+
     /// How many times `path` (under any workspace-relative spelling) has been
     /// successfully read this session.
     pub fn read_count(&self, root: &std::path::Path, path: &str) -> u64 {
-        self.counts
+        self.states
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(&normalized_key(root, path))
-            .copied()
+            .map(|s| s.reads)
             .unwrap_or(0)
     }
 
-    /// Record one successful read of `path`, returning the new total.
-    fn tally(&self, root: &std::path::Path, path: &str) -> u64 {
-        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        let count = counts.entry(normalized_key(root, path)).or_insert(0);
-        *count += 1;
-        *count
+    /// sha256 of the content the model last saw for `path` — `None` when the
+    /// file was never read (or written) through the ledger this session.
+    pub fn last_seen_sha(&self, root: &std::path::Path, path: &str) -> Option<String> {
+        self.states
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&normalized_key(root, path))
+            .map(|s| s.sha256.clone())
+            .filter(|sha| !sha.is_empty())
+    }
+}
+
+#[derive(Default)]
+pub struct ReadFile {
+    ledger: Arc<ReadLedger>,
+}
+
+impl ReadFile {
+    /// Construct sharing the registry's read-state ledger, so edits and
+    /// writes see the hashes this tool records.
+    pub fn with_ledger(ledger: Arc<ReadLedger>) -> Self {
+        Self { ledger }
+    }
+
+    /// How many times `path` (under any workspace-relative spelling) has been
+    /// successfully read this session.
+    pub fn read_count(&self, root: &std::path::Path, path: &str) -> u64 {
+        self.ledger.read_count(root, path)
     }
 }
 
@@ -115,8 +176,11 @@ impl Tool for ReadFile {
             Ok(content) => {
                 // Count every successful read — including a past-end offset,
                 // which still read the file — so the tally matches the
-                // ledger's one-R-event-per-successful-read rule.
-                let reads = self.tally(root, path);
+                // ledger's one-R-event-per-successful-read rule. The hash is
+                // of the FULL content (even for a ranged read): drift asks
+                // "has the file changed since the model looked", and the
+                // whole file was current at that moment.
+                let reads = self.ledger.record_read(root, path, &content);
                 let lines: Vec<&str> = content.lines().collect();
                 let start = offset.unwrap_or(1).saturating_sub(1);
                 let end = start.saturating_add(limit).min(lines.len());
@@ -242,6 +306,45 @@ mod tests {
             .await;
         assert!(missing.is_error());
         assert_eq!(tool.read_count(dir.path(), "ghost.rs"), 0);
+    }
+
+    #[tokio::test]
+    async fn read_records_last_seen_hash_even_for_ranged_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
+        let ledger = Arc::new(ReadLedger::default());
+        let tool = ReadFile::with_ledger(ledger.clone());
+
+        assert_eq!(ledger.last_seen_sha(dir.path(), "a.rs"), None);
+        let out = tool
+            .execute(
+                &serde_json::json!({"path": "a.rs", "offset": 2, "limit": 1}),
+                dir.path(),
+            )
+            .await;
+        assert!(!out.is_error(), "{out:?}");
+        // The hash covers the FULL file content current at read time, not
+        // just the displayed range — drift asks about the file, not the view.
+        assert_eq!(
+            ledger.last_seen_sha(dir.path(), "a.rs"),
+            Some(crate::staleness::hex_sha256(b"one\ntwo\nthree\n")),
+        );
+
+        // An out-of-band change is visible as a hash mismatch…
+        std::fs::write(dir.path().join("a.rs"), "rewritten\n").unwrap();
+        assert_ne!(
+            ledger.last_seen_sha(dir.path(), "a.rs"),
+            Some(crate::staleness::hex_sha256(b"rewritten\n")),
+        );
+        // …until the next read refreshes the baseline.
+        let again = tool
+            .execute(&serde_json::json!({"path": "a.rs"}), dir.path())
+            .await;
+        assert!(!again.is_error());
+        assert_eq!(
+            ledger.last_seen_sha(dir.path(), "a.rs"),
+            Some(crate::staleness::hex_sha256(b"rewritten\n")),
+        );
     }
 
     #[tokio::test]
