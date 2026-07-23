@@ -45,16 +45,33 @@
 //!    an `observed` directive. That narrowing is left as a **flagged validator,
 //!    not implemented here**, because it refines the "uniform 5" resolution.
 
+pub mod context_use;
+pub mod contract;
 pub mod hash;
 pub mod kind;
+pub mod outcome;
+pub mod representation;
 pub mod scope;
 pub mod temporal;
 
+pub use context_use::{
+    ContextEvaluationMethod, ContextInfluenceStage, ContextOutcomeRelation, ContextUse,
+    ContextUseEvaluation, ContextUseFeedback, ContextUseKind, EvidenceLink, MissingContextDetected,
+    MissingContextKind,
+};
+pub use contract::{
+    ArtifactContract, ContractValidation, Requirement, RequirementKind, RequirementResult,
+    RequirementStatus, ValidationStatus,
+};
 pub use hash::{RecordHashError, record_hash};
 pub use kind::{
     ConstraintEffect, ContextRecordKind, DirectiveEnforcement, DirectiveKind, DirectivePriority,
     EffectiveStatus, KnowledgeKind, MemoryKind, Origin, PromotionAction, RecordProposalKind,
     RecordProposalStatus, RecordStatus,
+};
+pub use outcome::{CompletionStatus, CorrectnessStatus, OutcomeAssessment, OutcomeAssessmentLevel};
+pub use representation::{
+    ContentFidelity, InlineContentRequirement, MinimumContentFidelity, Representation,
 };
 pub use scope::{Scope, SharingScope};
 pub use temporal::{TemporalInterval, TemporalQuery};
@@ -125,4 +142,20 @@ pub enum RecordValidationError {
         /// The `Scope` id it requires.
         required_id: &'static str,
     },
+    /// A named cross-field invariant was violated. `rule` is a stable dotted
+    /// identifier (e.g. `not_helpful.requires_observable_effect`) so the many
+    /// intra-record rules stay self-documenting and testable without a variant
+    /// each.
+    #[error("invariant violated: {rule}")]
+    Invariant {
+        /// The stable rule identifier that failed.
+        rule: &'static str,
+    },
+}
+
+impl RecordValidationError {
+    /// Shorthand for [`RecordValidationError::Invariant`].
+    pub(crate) fn invariant(rule: &'static str) -> Self {
+        Self::Invariant { rule }
+    }
 }
