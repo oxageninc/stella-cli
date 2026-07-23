@@ -129,8 +129,9 @@ bench/warm-memory/
 rust-project.json
 # Generated deck render dump (written by stella-tui/tests/deck_snapshot.rs)
 deck-snapshots.txt
-# macOS custom-folder-icon marker
-Icon
+# macOS custom-folder-icon marker (the real filename is "Icon\r" — a bare
+# "Icon" pattern never matches it)
+Icon?
 
 # Local verification / audit artifacts — never tracked
 verifications/
