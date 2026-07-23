@@ -16,24 +16,17 @@ use serde_json::{Value, json};
 /// The user-tier stella data dir. Mirrors `stella_store::usage::data_dir` —
 /// kept as a copy because the observatory deliberately does not link
 /// `stella-store` (whose `Store::open` runs migrations, i.e. writes).
-/// `STELLA_DATA_DIR` overrides; otherwise the platform data dir.
+/// `STELLA_DATA_DIR` overrides, then `STELLA_HOME`; otherwise `~/.stella`
+/// on every platform (`USERPROFILE` stands in for `HOME` on Windows).
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("STELLA_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join("Library/Application Support/stella");
+    if let Some(dir) = std::env::var_os("STELLA_HOME") {
+        return PathBuf::from(dir);
     }
-    #[cfg(target_os = "windows")]
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        return PathBuf::from(appdata).join("stella");
-    }
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(xdg).join("stella");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/share/stella");
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        return PathBuf::from(home).join(".stella");
     }
     PathBuf::from(".")
 }

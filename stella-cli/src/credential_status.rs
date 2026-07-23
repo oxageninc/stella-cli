@@ -7,7 +7,7 @@
 //! command never blocks on a prompt). Before this module existed, `stella
 //! models`/`stella config` hand-rolled a narrower check that only looked at
 //! env vars and a settings.json literal — silently ignoring
-//! `~/.config/stella/credentials.toml`, so a provider keyed ONLY there
+//! `~/.stella/credentials.toml`, so a provider keyed ONLY there
 //! showed as unconfigured even though `stella run` resolved it fine. Routing
 //! every status check through `resolve_provider_key` closes that gap for
 //! good: the display can no longer disagree with real behavior because it

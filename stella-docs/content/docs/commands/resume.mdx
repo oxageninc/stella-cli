@@ -13,7 +13,7 @@ stella resume [id] [--list] [global flags]
 
 ## What it does
 
-Every deck session registers itself in a machine-wide registry — one JSON file per session under the platform data dir (`~/Library/Application Support/stella/sessions/` on macOS; `STELLA_DATA_DIR` overrides), with the session's durable state journaled beside it. `stella resume` picks a session from that registry and reopens it in the deck:
+Every deck session registers itself in a machine-wide registry — one JSON file per session under the user-level stella home (`~/.stella/sessions/` on every platform; `STELLA_DATA_DIR` overrides), with the session's durable state journaled beside it. `stella resume` picks a session from that registry and reopens it in the deck:
 
 - **`stella resume`** (no id) reopens the most recently active resumable session **of the current workspace**. If there is none, it says so and points you at `--list`.
 - **`stella resume <id>`** reopens one specific session by its registry id — ids are minted at session start as `ses-<ms>-<pid>` and shown by `--list`.

@@ -5,7 +5,7 @@ description: Connect GitHub or Linear via OAuth (or a pasted key) so the issue t
 
 Establish a tracker connection so Stella can search, read, create, comment on, label, assign, and change the status of issues — from the agent's tools (`search_issues`, `get_issue`, `create_issue`, `update_issue`, `close_issue`, `list_labels`, `list_members`, `start_work_on_issue`) and from the Command Deck's **Issues** tab.
 
-Connecting is explicit and opt-in: Stella never talks to a tracker unless you ran `stella connect` (or configured `LINEAR_API_KEY` / the `gh` CLI yourself). Credentials are stored **owner-only (0600)** in `~/.config/stella/integrations.json` — user-global, like `credentials.toml`, because an account connection belongs to you, not to one workspace.
+Connecting is explicit and opt-in: Stella never talks to a tracker unless you ran `stella connect` (or configured `LINEAR_API_KEY` / the `gh` CLI yourself). Credentials are stored **owner-only (0600)** in `~/.stella/integrations.json` — user-global, like `credentials.toml`, because an account connection belongs to you, not to one workspace.
 
 ## Synopsis
 

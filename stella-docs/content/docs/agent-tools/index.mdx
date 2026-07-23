@@ -13,7 +13,7 @@ To see everything available to the agent in the current session — built-ins, d
 stella tools
 ```
 
-This reflects the live session: it accounts for custom tools discovered in `.stella/tools/` and `~/.config/stella/tools/`, and for any tools merged in from configured MCP servers.
+This reflects the live session: it accounts for custom tools discovered in `.stella/tools/` and `~/.stella/tools/`, and for any tools merged in from configured MCP servers.
 
 ## The built-in catalog
 
@@ -167,9 +167,9 @@ With the opt-in, three tools register with **no key required**:
 
 #### Logging in to sites (`web_auth.toml`)
 
-To fetch pages behind a login — your subscriptions, a paywalled news site, an internal tool — give Stella your own session in `~/.config/stella/web_auth.toml` (override the path with `STELLA_WEB_AUTH_FILE`). Cookies and headers are injected per domain at request time and **never appear in tool output**, so the secrets stay out of the model's context.
+To fetch pages behind a login — your subscriptions, a paywalled news site, an internal tool — give Stella your own session in `~/.stella/web_auth.toml` (override the path with `STELLA_WEB_AUTH_FILE`). Cookies and headers are injected per domain at request time and **never appear in tool output**, so the secrets stay out of the model's context.
 
-```toml title="~/.config/stella/web_auth.toml"
+```toml title="~/.stella/web_auth.toml"
 # Optional: override the default `stella/<version>` User-Agent for all requests.
 [defaults]
 user_agent = "Mozilla/5.0 (compatible; my-research-bot)"

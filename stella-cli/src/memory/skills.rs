@@ -51,17 +51,11 @@ pub(crate) fn workspace_skills_dir(workspace_root: &Path) -> String {
         .to_string()
 }
 
-/// `~/.config/stella/skills` — the user-global skills directory (empty
+/// `~/.stella/skills` — the user-global skills directory (empty
 /// string without a home, which the loader skips silently).
 fn user_skills_dir() -> String {
     crate::settings::user_home_dir()
-        .map(|home| {
-            home.join(".config")
-                .join("stella")
-                .join("skills")
-                .display()
-                .to_string()
-        })
+        .map(|home| home.join(".stella").join("skills").display().to_string())
         .unwrap_or_default()
 }
 

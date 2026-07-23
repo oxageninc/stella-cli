@@ -13,7 +13,7 @@
 //! The sync runs at both scopes, mirroring the settings/skills chain:
 //!
 //! - **workspace**: `<root>/{.claude,.agents}/<kind>` → `<root>/.stella/<kind>`
-//! - **user**: `~/{.claude,.agents}/<kind>` → `~/.config/stella/<kind>`
+//! - **user**: `~/{.claude,.agents}/<kind>` → `~/.stella/<kind>`
 //!
 //! so definitions installed for other agents at either level are visible to
 //! stella after `stella init` (or `/init`). The loaders then read the
@@ -217,7 +217,7 @@ impl SyncOutcome {
 }
 
 /// Adopt every command/skill/agent found under `source_roots` (in precedence
-/// order) into `dest_root` (`.stella` or `~/.config/stella`) as symlinks.
+/// order) into `dest_root` (`.stella` or `~/.stella`) as symlinks.
 /// Idempotent: symlink sources, already-present names, duplicate names, and
 /// unloadable entries (namespace directories with no nested definition
 /// file) are skipped by the plan
@@ -273,10 +273,10 @@ fn create_symlink(_target: &Path, _dest: &Path) -> std::io::Result<()> {
     ))
 }
 
-/// The user-global stella config root (`~/.config/stella`), or `None`
+/// The user-global stella config root (`~/.stella`), or `None`
 /// without a home directory.
 pub(crate) fn user_config_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("stella"))
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".stella"))
 }
 
 /// Run the sync at both scopes and report through `emit` — the shared init
@@ -579,7 +579,7 @@ impl CustomExtensions {
     pub fn render_agent_list(&self) -> String {
         if self.agents.is_empty() {
             return "no custom agents found — add markdown definitions to .stella/agents/ \
-                    or ~/.config/stella/agents/ (or run /init to adopt .claude/.agents ones)"
+                    or ~/.stella/agents/ (or run /init to adopt .claude/.agents ones)"
                 .to_string();
         }
         let mut out = format!("custom agents ({}):\n", self.agents.len());
@@ -876,7 +876,7 @@ mod tests {
         let home = tmp.path().join("home");
         let workspace = tmp.path().join("workspace");
         write(
-            &home.join(".config/stella/commands/user.md"),
+            &home.join(".stella/commands/user.md"),
             "---\ndescription: user command\n---\nUSER_COMMAND_BODY",
         );
         write(
@@ -884,7 +884,7 @@ mod tests {
             "---\ndescription: project command\n---\nPROJECT_COMMAND_BODY",
         );
         write(
-            &home.join(".config/stella/agents/user.md"),
+            &home.join(".stella/agents/user.md"),
             "---\nname: user-agent\ndescription: user agent\n---\nUSER_AGENT_BODY",
         );
         write(

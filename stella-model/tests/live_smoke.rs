@@ -7,7 +7,7 @@
 //!
 //! **Gate**: every test here is a no-op unless `STELLA_LIVE_SMOKE=1` is set
 //! (see [`live_smoke_enabled`]) AND that provider's own credential resolves
-//! (env var, or a `~/.config/stella/credentials.toml` entry — the same two
+//! (env var, or a `~/.stella/credentials.toml` entry — the same two
 //! non-interactive steps `stella-cli`'s chain uses, see [`resolve_key`]).
 //! Neither condition met -> the test prints why to stderr and returns
 //! `Ok` (a clean skip, never a failure) — so `cargo test`/`make gate`/CI's
@@ -69,7 +69,7 @@ fn live_smoke_enabled() -> bool {
 }
 
 /// Resolve `env_var`'s (and, in order, each of `aliases`') credential from
-/// the process environment, then `~/.config/stella/credentials.toml` —
+/// the process environment, then `~/.stella/credentials.toml` —
 /// the same two non-interactive steps of `stella-cli`'s chain
 /// (`ApiKey::resolve` + alias fallback), minus the CLI-flag and
 /// interactive-prompt steps, neither of which make sense for an
@@ -113,7 +113,7 @@ fn armed_key_locked(provider_id: &str, env_var: &str, aliases: &[&str]) -> Optio
             };
             eprintln!(
                 "[live_smoke] {provider_id}: skipped — no {env_var}{alias_note} env var and no \
-                 `{provider_id}` entry in ~/.config/stella/credentials.toml"
+                 `{provider_id}` entry in ~/.stella/credentials.toml"
             );
             None
         }

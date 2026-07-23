@@ -17,14 +17,14 @@ use std::time::UNIX_EPOCH;
 
 use serde_json::{Value, json};
 
-/// The user-scope stella config dir (`~/.config/stella`), the same path
+/// The user-scope stella config dir (`~/.stella`), the same path
 /// `stella-cli`'s settings loader uses. `STELLA_CONFIG_DIR` overrides for
 /// tests.
 pub fn user_config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("STELLA_CONFIG_DIR") {
         return Some(PathBuf::from(dir));
     }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("stella"))
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".stella"))
 }
 
 /// The org-managed settings path — mirrors `stella-cli`'s

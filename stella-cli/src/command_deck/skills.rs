@@ -146,7 +146,7 @@ fn parse_count_token(tok: &str) -> Option<u64> {
 /// Run `npx skills add <id>` in an isolated temp dir, then adopt the produced
 /// skill into `scope`. Running in a temp cwd (not the workspace) makes the
 /// destination ours to control — that is how "install for me →
-/// ~/.config/stella/skills" lands there despite the registry CLI's fixed cwd.
+/// ~/.stella/skills" lands there despite the registry CLI's fixed cwd.
 async fn install_skill(
     registry: &SkillRegistry,
     scope: SkillScope,

@@ -3,7 +3,7 @@
 //!
 //! A developer gives the agent a new tool by dropping a TOML manifest next to
 //! a script. At CLI startup every manifest under `.stella/tools/` (workspace)
-//! and `~/.config/stella/tools/` (user-global) is discovered automatically and
+//! and `~/.stella/tools/` (user-global) is discovered automatically and
 //! advertised to the model alongside the native tools ([`crate::registry`]).
 //! No flags, no registry edits — a bash script plus a ten-line manifest is a
 //! working agent tool. Rich or stateful integrations use an MCP server
@@ -66,7 +66,7 @@
 //! # Discovery precedence
 //!
 //! Workspace (`<root>/.stella/tools/`) is scanned before user-global
-//! (`$HOME/.config/stella/tools/`); on a name collision the workspace tool
+//! (`$HOME/.stella/tools/`); on a name collision the workspace tool
 //! wins and the global one is reported as a [`ToolDiagnostic`]. A malformed
 //! manifest never aborts discovery — it becomes a typed per-file diagnostic so
 //! `stella tools` can show developers exactly which file is broken and why. A
@@ -351,7 +351,7 @@ pub fn discover_in_scopes(
         dirs.push(workspace_root.join(".stella").join("tools"));
     }
     if let Some(home) = home {
-        dirs.push(home.join(".config").join("stella").join("tools"));
+        dirs.push(home.join(".stella").join("tools"));
     }
 
     for dir in dirs {
@@ -837,7 +837,7 @@ command = []"#;
     }
 
     fn global_tools(home: &Path) -> PathBuf {
-        home.join(".config").join("stella").join("tools")
+        home.join(".stella").join("tools")
     }
 
     #[test]

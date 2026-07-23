@@ -702,6 +702,8 @@ mod tests {
                     spent_usd: 0.5,
                     limit_usd: None,
                     mode: stella_protocol::BudgetMode::Observed,
+                    session_spent_usd: None,
+                    session_limit_usd: None,
                 },
             },
             JournalRecord::Pipeline { on: false },
@@ -711,6 +713,8 @@ mod tests {
                     spent_usd: 1.25,
                     limit_usd: None,
                     mode: stella_protocol::BudgetMode::Observed,
+                    session_spent_usd: None,
+                    session_limit_usd: None,
                 },
             },
         ];

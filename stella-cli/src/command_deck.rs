@@ -398,6 +398,12 @@ pub async fn run_deck_session(
             }
         },
     );
+    // A release-build panic aborts before any `Drop` or `catch_unwind` runs
+    // (the workers' panic catch included), so this hook is the journal's
+    // only flush point on that path — the terminal is restored by
+    // stella-tui's own hook the same way.
+    let _journal_panic_guard =
+        crate::session_persist::JournalPanicGuard::install(journal_sink.clone());
     let _tee = crate::session_persist::spawn_journal_tee(
         raw_rx,
         deck_tx.clone(),
@@ -1267,6 +1273,7 @@ pub async fn run_deck_session(
                         &active_rules,
                         &registry_options,
                         execution.clone(),
+                        files_before,
                         &in_tx,
                         &ask_io,
                         &sup_tx,
@@ -1287,6 +1294,7 @@ pub async fn run_deck_session(
                         &calibration,
                         cfg,
                         execution.clone(),
+                        files_before,
                         &in_tx,
                         &ask_io,
                         &sup_tx,
@@ -1701,6 +1709,7 @@ pub async fn run_deck_session(
                         store,
                         *id,
                         registry.as_ref(),
+                        files_before,
                         "cancelled",
                         cancelled_cost,
                         false,
@@ -1775,6 +1784,13 @@ pub async fn run_deck_session(
             .await;
         }
     }
+
+    // Quitting (Ctrl-C included) must not orphan live workers as detached
+    // threads that die mid-tool at process exit: signal every stop and wait
+    // — bounded — for their endings, so drop-guards run, executions close
+    // out, notifications land, and their claims release instead of blocking
+    // rivals until the age-based sweep.
+    subsession::shutdown_workers(&mut subs, &mut sup_rx, subsession::QUIT_JOIN_DEADLINE).await;
 
     // The session is over — leave the registry record in its terminal state
     // and the durable state current. (A crash never reaches here; readers
@@ -2252,7 +2268,21 @@ fn handle_supervisor_msg(
 ) {
     match msg {
         SupervisorMsg::SpawnTask(request) => {
-            if subs.has_slot() {
+            // A task's lane is its identity: a second worker on a live lane
+            // would share (and corrupt) its channels, so a re-assign of an
+            // in-flight task is reported instead of spawned.
+            if subs.is_live(&subsession::task_lane(&request.task_id)) {
+                let _ = in_tx.send(Inbound::Event {
+                    agent: LEAD.to_string(),
+                    event: AgentEvent::Text {
+                        delta: format!(
+                            "note: task #{} already has a live worker — the duplicate \
+                             task_assign was not dispatched",
+                            request.task_id
+                        ),
+                    },
+                });
+            } else if subs.has_slot() {
                 subsession::spawn_task_worker(
                     &request,
                     subs,
@@ -2269,14 +2299,18 @@ fn handle_supervisor_msg(
         }
         SupervisorMsg::Ended {
             lane,
+            generation,
             execution_id,
             cost_usd,
             end,
         } => {
-            subs.ended(&lane);
+            // Only the generation that ended frees the lane — a late Ended
+            // from a replaced worker must not steal its replacement's slot
+            // (or, below, respawn the lane a second time).
+            let freed = subs.ended(&lane, generation);
             // A Restart that arrived while this worker was live respawns it
             // now — restart takes the freed slot ahead of parked spawns.
-            if pending_restarts.remove(&lane) {
+            if freed && pending_restarts.remove(&lane) {
                 let _ = subsession::respawn(
                     &lane,
                     subs,
@@ -2324,6 +2358,11 @@ fn handle_supervisor_msg(
             while subs.has_slot()
                 && let Some(request) = pending_spawns.pop_front()
             {
+                // A parked duplicate of a task whose worker is (still) live
+                // is dropped for the same reason as at arrival.
+                if subs.is_live(&subsession::task_lane(&request.task_id)) {
+                    continue;
+                }
                 subsession::spawn_task_worker(
                     &request,
                     subs,
@@ -3728,6 +3767,7 @@ async fn run_lead_turn(
     calibration: &CalibrationMap,
     cfg: &Config,
     execution: Option<(Arc<Store>, i64)>,
+    files_before: usize,
     in_tx: &UnboundedSender<Inbound>,
     ask_io: &DeckAskUserIo,
     sup_tx: &UnboundedSender<SupervisorMsg>,
@@ -3811,6 +3851,7 @@ async fn run_lead_turn(
             store,
             *id,
             registry,
+            files_before,
             outcome_label,
             cost,
             persistence_complete,
@@ -3875,6 +3916,7 @@ async fn run_lead_pipeline_turn(
     active_rules: &crate::rules::ResolvedRules,
     registry_options: &stella_tools::RegistryOptions,
     execution: Option<(Arc<Store>, i64)>,
+    files_before: usize,
     in_tx: &UnboundedSender<Inbound>,
     ask_io: &DeckAskUserIo,
     sup_tx: &UnboundedSender<SupervisorMsg>,
@@ -3997,6 +4039,7 @@ async fn run_lead_pipeline_turn(
             store,
             *id,
             registry,
+            files_before,
             outcome_label,
             cost,
             persistence_complete,

@@ -250,7 +250,7 @@ fn trusted_engine_json_replaces_adversarial_project_engine_settings() {
 fn benchmark_mode_skips_malformed_filesystem_credentials_but_keeps_engine_override() {
     let _env = crate::test_env::lock();
     let dir = tempfile::tempdir().unwrap();
-    let credential_dir = dir.path().join(".config/stella");
+    let credential_dir = dir.path().join(".stella");
     std::fs::create_dir_all(&credential_dir).unwrap();
     std::fs::write(
         credential_dir.join("credentials.toml"),

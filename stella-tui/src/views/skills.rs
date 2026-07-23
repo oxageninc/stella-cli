@@ -285,7 +285,7 @@ fn render_overlay(ui: &DeckUi, area: Rect, buf: &mut Buffer) {
                     ".stella/skills — travels with the repo",
                     !*user,
                 ),
-                choose("[u] User", "~/.config/stella/skills — global to you", *user),
+                choose("[u] User", "~/.stella/skills — global to you", *user),
                 Line::default(),
                 Line::from(Span::styled(
                     "←/→ or p/u choose · ⏎ confirm · esc cancel",

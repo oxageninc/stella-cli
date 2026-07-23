@@ -1957,3 +1957,82 @@ fn open_hardens_a_fresh_dot_stella_dir() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn telemetry_replicates_to_the_hub_and_heals_missed_turns() {
+    fn call(step: u64) -> TelemetryRow {
+        TelemetryRow {
+            step,
+            provider: "zai".into(),
+            call_role: "worker".into(),
+            model: "glm-5.2".into(),
+            input_tokens: 1_000,
+            estimated_input_tokens: 900,
+            output_tokens: 100,
+            cache_read_tokens: 600,
+            cache_miss_tokens: 400,
+            cache_write_tokens: 0,
+            cost_usd: 0.001,
+            duration_ms: 800,
+            retries: 0,
+            tool_calls: 1,
+            usage_complete: true,
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let hub = usage::UsageStore::in_memory().unwrap();
+    let id = store
+        .begin_execution("goal", "p", "zai", "glm-5.2")
+        .unwrap();
+    store.record_telemetry(id, &call(0)).unwrap();
+    store.record_telemetry(id, &call(1)).unwrap();
+
+    // First replication ships everything above cursor 0 — full fidelity,
+    // not a rollup, and without requiring the execution to be finished.
+    assert_eq!(
+        store
+            .replicate_telemetry_to_usage(&hub, tmp.path())
+            .unwrap(),
+        2
+    );
+    let project_id = usage::project_id_for(tmp.path());
+    assert_eq!(hub.telemetry_cursor(&project_id).unwrap(), 2);
+    let totals = hub.global_telemetry_totals(None).unwrap();
+    assert_eq!(totals.len(), 1);
+    assert_eq!(totals[0].calls, 2);
+    assert_eq!(totals[0].org_id, None, "unregistered → NULL org");
+
+    // Rows recorded while the hub was unreachable are healed by the NEXT
+    // replication — the durable-cursor property the old lossy rollup lacked.
+    store.record_telemetry(id, &call(2)).unwrap();
+    assert_eq!(
+        store
+            .replicate_telemetry_to_usage(&hub, tmp.path())
+            .unwrap(),
+        1
+    );
+    assert_eq!(hub.telemetry_cursor(&project_id).unwrap(), 3);
+    assert_eq!(hub.global_telemetry_totals(None).unwrap()[0].calls, 3);
+
+    // Nothing new → nothing shipped, cursor stays.
+    assert_eq!(
+        store
+            .replicate_telemetry_to_usage(&hub, tmp.path())
+            .unwrap(),
+        0
+    );
+
+    // Registered workspaces stamp their scope onto subsequent rows.
+    identity::register_workspace(tmp.path(), Some("ws-cloud-1")).unwrap();
+    store.record_telemetry(id, &call(3)).unwrap();
+    assert_eq!(
+        store
+            .replicate_telemetry_to_usage(&hub, tmp.path())
+            .unwrap(),
+        1
+    );
+    let scope = identity::TelemetryScope::resolve(tmp.path());
+    assert_eq!(scope.workspace_id.as_deref(), Some("ws-cloud-1"));
+}

@@ -7,7 +7,7 @@
 //! Same directories the loaders (`crate::extensions`) read:
 //!
 //! - **project**: `<workspace>/.stella/agents/`
-//! - **user**: `~/.config/stella/agents/`
+//! - **user**: `~/.stella/agents/`
 //!
 //! A definition is either a flat `<slug>.md` or a nested `<slug>/AGENT.md`
 //! (markdown with `name:`/`description:`/`tools:` frontmatter, parsed by
@@ -59,7 +59,7 @@ pub fn project_agents_dir(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".stella").join("agents")
 }
 
-/// The user-scope agents directory (`~/.config/stella/agents`), or `None`
+/// The user-scope agents directory (`~/.stella/agents`), or `None`
 /// without a home directory.
 pub fn user_agents_dir() -> Option<PathBuf> {
     crate::extensions::user_config_root().map(|root| root.join("agents"))
@@ -511,7 +511,7 @@ mod tests {
     fn discover_lists_both_scopes_with_toolbelt_and_scope_tags() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("ws/.stella/agents");
-        let user = tmp.path().join("home/.config/stella/agents");
+        let user = tmp.path().join("home/.stella/agents");
         write(
             &project.join("reviewer.md"),
             &agent_md("reviewer", Some("Read, Grep"), "Review diffs."),

@@ -22,19 +22,29 @@
 //! flight emits one `Cancelled` envelope from a drop guard
 //! ([`CancelUsageGuard`]) armed for exactly that window.
 //!
-//! # Retry never re-executes a mutating tool call
+//! # Retry re-executes only read-only tool calls, never a mutating one
 //!
 //! [`crate::retry::retry_with_backoff_observed`] wraps the model call
 //! (`Provider::complete_observed`) together with that attempt's speculation
-//! pump (`crate::speculation`): read-only calls announced by the stream may
-//! execute inside a failed attempt and execute again when the retry
-//! re-announces them — discarded work, safe precisely because they are
-//! read-only. MUTATING tool execution happens exactly once, after a model
-//! call has already succeeded and returned tool calls to run — it is never
-//! inside the retried closure. A retried step therefore structurally
-//! cannot re-execute a non-idempotent (mutating) tool call; see the
-//! property test `retry_never_re_executes_a_tool_call` below, which proves
-//! it by counting real executions against a flaky scripted provider.
+//! pump (`crate::speculation`). The exactly-once guarantee is scoped to
+//! MUTATING tools: a mutating call runs once, after a model call has
+//! already succeeded and returned tool calls to run — never inside the
+//! retried closure — so a retried step structurally cannot re-execute a
+//! non-idempotent tool. See the property test
+//! `retry_never_re_executes_a_tool_call` below, which proves it by counting
+//! real executions against a flaky scripted provider.
+//!
+//! READ-ONLY tools carry no such guarantee: a read-only call announced by
+//! the stream DOES execute inside the retried attempt closure and can run
+//! more than once per step (a failed attempt runs it, the retry re-announces
+//! and runs it again). That is safe for the *workspace* — read-only calls
+//! mutate nothing — but a maintainer must not assume a read-only tool with
+//! an observable side channel (a network read, a rate-limited API, a write
+//! to internal state like `codegraph.db`) runs at most once. See
+//! `crate::speculation` for the read-only overlap semantics: user hooks are
+//! excluded from that overlap so they still fire exactly once per committed
+//! call, and every speculative execution that never commits is reported as a
+//! `SpeculationDiscarded` event so the I/O it ran stays accountable (#370).
 //!
 //! # Budget is checked between steps, never mid-tool
 //!
@@ -67,12 +77,12 @@ use stella_protocol::{
     ProviderError, ReasoningEffort, StageKind, ToolCall, ToolOutput, ToolResult,
 };
 
-use crate::budget::{BudgetGuard, BudgetOutcome};
+use crate::budget::{BudgetAxis, BudgetGuard, BudgetOutcome};
 use crate::compaction::compact;
 use crate::estimator::{CalibrationMap, estimate_conversation_tokens};
 use crate::event_sender::EventSender;
-use crate::hooks::{HookPayload, HookRunner, Hooks, run_hooks};
-use crate::loop_detect::{LoopDetectionConfig, detect_loop};
+use crate::hooks::{HookEvent, HookPayload, HookRunner, Hooks, run_hooks, select_matchers};
+use crate::loop_detect::{CallRecord, LoopDetectionConfig, detect_loop};
 use crate::ports::ToolExecutor;
 use crate::receipts::ReceiptLedger;
 use crate::retry::{RetryOutcome, RetryPolicy, Sleeper, retry_with_backoff_observed};
@@ -81,7 +91,7 @@ use crate::{AccountedCall, AccountedCallError, run_accounted_call};
 use tokio::sync::mpsc::UnboundedSender;
 
 mod settlement;
-use settlement::{check_budget, record_settled_cost};
+use settlement::{BudgetWarnings, check_budget, emit_budget_warning, record_settled_cost};
 
 /// Everything about a turn's execution that isn't the provider/tools
 /// themselves: prompt shape, retry/compaction/loop tuning, and hard
@@ -226,6 +236,15 @@ pub struct Engine<'a> {
 /// are I/O-bound (process spawns, file reads), so this caps descriptor and
 /// process pressure, not CPU.
 const MAX_CONCURRENT_TOOL_CALLS: usize = 8;
+
+/// `SpeculationDiscarded.reason` — a speculative pool was dropped because
+/// its stream attempt failed (or the turn was cancelled) before its
+/// read-only work could be harvested.
+const SPECULATION_DISCARD_ATTEMPT_FAILED: &str = "attempt_failed";
+/// `SpeculationDiscarded.reason` — a speculative pool entry was rejected at
+/// dispatch because the committed call diverged from what was announced, or
+/// no committed call ever claimed it.
+const SPECULATION_DISCARD_HARVEST_MISMATCH: &str = "harvest_mismatch";
 
 /// One committed model call plus the step-scoped context the phases after
 /// it consume: the pre-call raw token estimate (drift feedback + telemetry
@@ -380,15 +399,25 @@ impl<'a> Engine<'a> {
         });
 
         let mut total_cost_usd = 0.0f64;
+        // Observed-mode budget warnings dedup per axis for this turn — a
+        // breach otherwise re-warns on every settled call after it.
+        let mut budget_warnings = BudgetWarnings::default();
         // The model string of the last committed step, for reading the
         // per-model drift correction. `None` until the first result lands —
         // `CalibrationMap::factor` then falls back to the session's single
         // seeded entry.
         let mut calibration_model: Option<String> = None;
+        // Whether this turn already spent its one stuck-loop steering
+        // warning ([`Engine::check_loop_detection`]) — the next detection
+        // aborts instead of warning again.
+        let mut loop_steered = false;
         // Per-turn context-receipt state: block registry + residency, carried
         // by reference into each model call. Stack-local — the engine holds no
         // receipt state of its own.
         let mut receipts = ReceiptLedger::new(self.config.turn_instance);
+        // Per-turn overflow-summarizer latch: stops a persistently failing
+        // cheap summarizer re-firing every step for the rest of the turn.
+        let mut summarizer_health = SummarizerHealth::default();
 
         for step in 0..self.config.max_steps {
             // Pause parks HERE — after the previous step fully settled and
@@ -418,26 +447,45 @@ impl<'a> Engine<'a> {
                     };
                 }
             }
-            if let Some(aborted) = check_budget(budget, total_cost_usd, events) {
+            if let Some(aborted) =
+                check_budget(budget, total_cost_usd, &mut budget_warnings, events)
+            {
                 return aborted;
             }
             total_cost_usd += self
-                .run_compaction_pass(messages, calibration_model.as_deref(), budget, events)
+                .run_compaction_pass(
+                    messages,
+                    calibration_model.as_deref(),
+                    budget,
+                    &mut summarizer_health,
+                    events,
+                )
                 .await;
             // The manifest reports the budget compaction just compared against.
             let (effective_budget, calibration_factor) =
                 self.effective_compaction_budget(calibration_model.as_deref());
             receipts.set_effective_budget(effective_budget, calibration_factor);
 
-            if let Some(aborted) = self.check_loop_detection(messages, total_cost_usd, events) {
+            if let Some(aborted) =
+                self.check_loop_detection(messages, &mut loop_steered, total_cost_usd, events)
+            {
                 return aborted;
             }
-            if let Some(aborted) = check_budget(budget, total_cost_usd, events) {
+            if let Some(aborted) =
+                check_budget(budget, total_cost_usd, &mut budget_warnings, events)
+            {
                 return aborted;
             }
 
             let committed = match self
-                .run_model_call(step, messages, budget, &mut receipts, events)
+                .run_model_call(
+                    step,
+                    messages,
+                    budget,
+                    &mut receipts,
+                    &mut budget_warnings,
+                    events,
+                )
                 .await
             {
                 Ok(committed) => committed,
@@ -451,9 +499,14 @@ impl<'a> Engine<'a> {
             calibration_model = Some(committed.result.model.clone());
             total_cost_usd += committed.result.cost_usd;
 
-            if let Some(aborted) =
-                self.handle_committed_result(step, &committed, total_cost_usd, messages, events)
-            {
+            if let Some(aborted) = self.handle_committed_result(
+                step,
+                &committed,
+                total_cost_usd,
+                messages,
+                &mut budget_warnings,
+                events,
+            ) {
                 return aborted;
             }
 
@@ -520,6 +573,7 @@ impl<'a> Engine<'a> {
         messages: &mut Vec<CompletionMessage>,
         calibration_model: Option<&str>,
         budget: &mut BudgetGuard,
+        health: &mut SummarizerHealth,
         events: &EventSender,
     ) -> f64 {
         let (compaction_budget, _factor) = self.effective_compaction_budget(calibration_model);
@@ -541,7 +595,9 @@ impl<'a> Engine<'a> {
         if self.config.summarize_overflow
             && crate::estimator::estimate_conversation_tokens(messages) > compaction_budget
         {
-            return self.summarize_overflow_span(messages, budget, events).await;
+            return self
+                .summarize_overflow_span(messages, budget, health, events)
+                .await;
         }
         0.0
     }
@@ -552,6 +608,7 @@ impl<'a> Engine<'a> {
         &self,
         messages: &mut Vec<CompletionMessage>,
         budget: &mut BudgetGuard,
+        health: &mut SummarizerHealth,
         events: &EventSender,
     ) -> f64 {
         let before_tokens = crate::estimator::estimate_conversation_tokens(messages);
@@ -584,6 +641,13 @@ impl<'a> Engine<'a> {
         if end <= start || end - start < 4 {
             return 0.0;
         }
+        // Give-up latch: once the summarizer has failed this many steps in a
+        // row this turn, stop re-firing it — each attempt is a completion and
+        // its latency. The next model call overflows and surfaces one clear
+        // failure instead of one per remaining step.
+        if health.is_latched() {
+            return 0.0;
+        }
         let rendered = crate::summarize::render_span_for_summary(&messages[start..end]);
         let request = CompletionRequest {
             messages: vec![
@@ -604,7 +668,10 @@ impl<'a> Engine<'a> {
                 role: stella_protocol::ModelCallRole::Summarization,
                 model_hint: "unknown".into(),
                 request,
-                retry_policy: RetryPolicy::deterministic(),
+                // The last line of defense before a terminal context
+                // overflow — a transient blip here must be retried, not
+                // fast-failed into an oversized, doomed next call.
+                retry_policy: RetryPolicy::standard(),
                 timeout: None,
                 estimated_input_tokens,
             },
@@ -615,18 +682,73 @@ impl<'a> Engine<'a> {
         .await
         {
             Ok(result) => result,
-            Err(AccountedCallError::Budget { result, .. }) => return result.cost_usd,
-            Err(AccountedCallError::Provider(_) | AccountedCallError::Timeout) => return 0.0,
+            // The summary was generated and paid for before the budget
+            // tripped. Splicing it in only shrinks the context the resumed
+            // session reloads, so apply it rather than discard the spend.
+            Err(AccountedCallError::Budget { result, .. }) => {
+                let text = result.text.trim();
+                if !text.is_empty() {
+                    self.apply_overflow_summary(messages, start, end, before_tokens, text, events);
+                }
+                return result.cost_usd;
+            }
+            // A silent 0.0 hid a failing summarizer that re-fired every step
+            // until the provider hard-failed. Surface it and count it toward
+            // the give-up latch.
+            Err(AccountedCallError::Provider(e)) => {
+                health.record_failure();
+                let _ = events.send(AgentEvent::Error {
+                    message: format!("overflow summarizer failed ({e}); context left intact"),
+                    retryable: true,
+                });
+                return 0.0;
+            }
+            Err(AccountedCallError::Timeout) => {
+                health.record_failure();
+                let _ = events.send(AgentEvent::Error {
+                    message: "overflow summarizer timed out; context left intact".to_string(),
+                    retryable: true,
+                });
+                return 0.0;
+            }
         };
         let cost_usd = result.cost_usd;
-        if result.text.trim().is_empty() {
+        let text = result.text.trim();
+        if text.is_empty() {
+            // An empty summary shrinks nothing, so the next step re-fires on
+            // the same span — the same non-progress the error paths latch
+            // against, and just as invisible if left unannounced.
+            health.record_failure();
+            let _ = events.send(AgentEvent::Error {
+                message: "overflow summarizer returned an empty summary; context left intact"
+                    .to_string(),
+                retryable: true,
+            });
             return cost_usd;
         }
+        health.reset();
+        self.apply_overflow_summary(messages, start, end, before_tokens, text, events);
+        cost_usd
+    }
+
+    /// Splice `text` (trimmed, non-empty) over `messages[start..end]` as the
+    /// overflow summary and announce the resulting shrink. Shared by the
+    /// normal path and the budget-abort path: a paid summary is applied even
+    /// when the turn is about to abort, since it only shrinks the context the
+    /// resumed session reloads.
+    fn apply_overflow_summary(
+        &self,
+        messages: &mut Vec<CompletionMessage>,
+        start: usize,
+        end: usize,
+        before_tokens: u64,
+        text: &str,
+        events: &EventSender,
+    ) {
         let replaced = end - start;
         let summary = CompletionMessage::user(format!(
             "{SUMMARY_MARKER_PREFIX} to fit context — full detail was compacted away; \
-             re-read files or re-run tools for specifics]\n\n{}",
-            result.text.trim()
+             re-read files or re-run tools for specifics]\n\n{text}"
         ));
         messages.splice(start..end, std::iter::once(summary));
         let _ = events.send(AgentEvent::Compaction {
@@ -638,33 +760,75 @@ impl<'a> Engine<'a> {
             aged: 0,
             summarized: replaced,
         });
-        cost_usd
     }
 
     /// Loop detection, before spending a model call on a step that's
-    /// already stuck. `Some` is the turn's clean abort.
+    /// already stuck. Progress-aware: each call is paired with the output
+    /// it produced ([`recent_call_records`]), so only repeats and cycles
+    /// with byte-identical outputs count — legitimate polling (identical
+    /// input, changing output) never trips it (`crate::loop_detect`).
+    ///
+    /// Steer first, abort second: the FIRST detection of a turn injects a
+    /// warning through the same seam as user steering — a user-role
+    /// message the model answers this very step, plus its `Steered`
+    /// transcript event — and lets the turn continue. Only a detection
+    /// after that warning is the turn's clean abort (`Some`): the model
+    /// was told, kept looping anyway, and more steps would be pure waste.
     fn check_loop_detection(
         &self,
-        messages: &[CompletionMessage],
+        messages: &mut Vec<CompletionMessage>,
+        loop_steered: &mut bool,
         total_cost_usd: f64,
         events: &EventSender,
     ) -> Option<TurnOutcome> {
-        let recent_calls = recent_tool_calls(messages);
-        let verdict = detect_loop(&recent_calls, self.config.loop_detection);
+        let records = recent_call_records(messages);
+        let verdict = detect_loop(&records, self.config.loop_detection);
         if !verdict.is_loop() {
             return None;
         }
         let reason = verdict
             .evidence()
             .unwrap_or_else(|| "loop detected".to_string());
+        if !*loop_steered {
+            *loop_steered = true;
+            let text = format!(
+                "{LOOP_STEER_PREFIX}] you appear to be looping: {reason}. Repeating the \
+                 same call cannot produce new information — change strategy: vary the \
+                 arguments, try a different tool, or report what is blocking you. If you \
+                 keep looping, the turn will be aborted."
+            );
+            let _ = events.send(AgentEvent::Steered { text: text.clone() });
+            messages.push(CompletionMessage::user(text));
+            return None;
+        }
+        let reason = format!("stuck-loop detected (persisted after a steering warning): {reason}");
         let _ = events.send(AgentEvent::Error {
             message: reason.clone(),
             retryable: false,
         });
         Some(TurnOutcome::Aborted {
-            reason: format!("stuck-loop detected: {reason}"),
+            reason,
             cost_usd: total_cost_usd,
         })
+    }
+
+    /// Whether any configured `PreToolUse`/`PostToolUse` hook matches
+    /// `name`. Such a tool is never speculated: its hooks must fire exactly
+    /// once, on the committed dispatch path (`PreToolUse` gates *before*
+    /// execution) — a speculative attempt that later fails would otherwise
+    /// fire phantom hook side effects for a call that never reached the
+    /// transcript (#370). Matching is the same `select_matchers` glob the
+    /// hook runner itself uses, so the two can never disagree. `false`
+    /// whenever hooks are off, keeping hook-free turns byte-identical.
+    fn tool_has_matching_hook(&self, name: &str) -> bool {
+        let Some(handle) = self.hooks else {
+            return false;
+        };
+        [HookEvent::PreToolUse, HookEvent::PostToolUse]
+            .into_iter()
+            .any(|event| {
+                !select_matchers(event, handle.hooks.matchers_for(event), Some(name)).is_empty()
+            })
     }
 
     /// One model call with retry+backoff (`crate::retry`). On commit,
@@ -685,6 +849,7 @@ impl<'a> Engine<'a> {
         messages: &[CompletionMessage],
         budget: &mut BudgetGuard,
         receipts: &mut ReceiptLedger,
+        warnings: &mut BudgetWarnings,
         events: &EventSender,
     ) -> Result<CommittedStep, String> {
         let tools_schema = self.tools.schemas();
@@ -693,23 +858,39 @@ impl<'a> Engine<'a> {
             .filter(|s| s.read_only)
             .map(|s| s.name.clone())
             .collect();
+        // Read-only tools a configured hook matches are excluded from
+        // speculation (they run only on the committed dispatch path so their
+        // hooks fire exactly once — #370). The gate still needs the full
+        // read-only set for its mutation fence, so `hook_gated` is carried
+        // alongside it, not subtracted from it. Empty whenever hooks are off.
+        let hook_gated: HashSet<String> = read_only_tools
+            .iter()
+            .filter(|name| self.tool_has_matching_hook(name))
+            .cloned()
+            .collect();
         let estimated_input_tokens = estimate_conversation_tokens(messages);
         let messages_snapshot = messages.to_vec();
         let req_config = &self.config;
         let speculation_read_only = read_only_tools.clone();
+        let speculation_hook_gated = hook_gated;
         // The gate forwards answer fragments as `TextDelta` previews. Deliberately NOT rolled back
         // on a failed attempt: a retry's deltas re-stream from the start
         // with no reset marker — the eventual `Text` event is authoritative
         // and consumers replace the preview with it (protocol docs).
         let delta_events = events.clone();
+        // The pump reports its discarded read-only work (a failed attempt's
+        // pool, or a hard cancel mid-drain) as `SpeculationDiscarded` events
+        // so I/O that actually ran is never silently lost (#370).
+        let pump_events = events.clone();
         // Each attempt runs the provider call and the speculation pump
         // concurrently: the pump executes read-only calls the moment the
         // adapter announces them (`crate::speculation`), so their wall-clock
         // overlaps the stream instead of following it. The gate (and with
         // it the channel's send half) drops when the provider call resolves,
         // which is what lets the pump finish draining. A failed attempt
-        // drops its pool with the attempt — read-only work is safe to
-        // waste — and the retry builds a fresh channel and pool.
+        // drops its pool with the attempt — safe to waste for the workspace,
+        // but each completed entry emits a `SpeculationDiscarded` event on
+        // the way out (#370) — and the retry builds a fresh channel and pool.
         let attempt: RetryAttemptFn = Box::new(move || {
             let req = CompletionRequest {
                 messages: messages_snapshot.clone(),
@@ -721,12 +902,14 @@ impl<'a> Engine<'a> {
                 tools: tools_schema.clone(),
             };
             let read_only = speculation_read_only.clone();
+            let gated = speculation_hook_gated.clone();
             let delta_tx = delta_events.clone();
+            let pump_tx = pump_events.clone();
             Box::pin(async move {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                let mut pump: SpeculationFuture<'_> = Box::pin(self.pump_speculations(rx));
+                let mut pump: SpeculationFuture<'_> = Box::pin(self.pump_speculations(rx, pump_tx));
                 let mut complete = Box::pin(async move {
-                    let gate = SpeculationGate::new(read_only, tx, delta_tx);
+                    let gate = SpeculationGate::new(read_only, gated, tx, delta_tx);
                     self.provider.complete_observed(req, &gate).await
                     // `gate` (and its sender) drop here → the pump's
                     // stream ends once in-flight executions drain.
@@ -793,7 +976,7 @@ impl<'a> Engine<'a> {
                 return Err(format!("model call failed: {message}"));
             }
         };
-        let budget_outcome = record_settled_cost(budget, result.cost_usd, events);
+        let budget_outcome = record_settled_cost(budget, result.cost_usd, warnings, events);
         let call_duration_ms = call_started.elapsed().as_millis() as u64;
 
         // Deferred-flush: these `Retry` events only reach the wire now
@@ -858,9 +1041,17 @@ impl<'a> Engine<'a> {
     /// the gate drops the send half AND every in-flight execution finishes —
     /// speculated calls are exactly the calls dispatch would run first, so
     /// draining them is never wasted time on the committed path.
+    ///
+    /// Completed executions accumulate inside a [`SpeculationDropGuard`]: on
+    /// the committed path the pump runs to completion and hands the pool to
+    /// dispatch (disarming the guard), but if this future is dropped first —
+    /// its stream attempt failed, or the turn was hard-cancelled mid-drain —
+    /// the guard emits one `SpeculationDiscarded` per already-completed entry
+    /// so the read-only I/O that ran is never lost from the event log (#370).
     async fn pump_speculations(
         &self,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<ToolCall>,
+        events: EventSender,
     ) -> SpeculationPool {
         let announced = futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx));
         let mut in_flight = announced
@@ -871,9 +1062,13 @@ impl<'a> Engine<'a> {
             })
             .buffer_unordered(MAX_CONCURRENT_TOOL_CALLS);
 
-        let mut pool = SpeculationPool::new();
+        let mut guard = SpeculationDropGuard {
+            events,
+            pool: SpeculationPool::new(),
+            armed: true,
+        };
         while let Some((call, output, duration_ms)) = in_flight.next().await {
-            pool.insert(
+            guard.pool.insert(
                 call.call_id.clone(),
                 SpeculativeResult {
                     name: call.name,
@@ -883,7 +1078,20 @@ impl<'a> Engine<'a> {
                 },
             );
         }
-        pool
+        guard.harvest()
+    }
+
+    /// Emit `SpeculationDiscarded` for every entry a committed step's pool
+    /// left un-harvested — read-only calls that ran real I/O off a divergent
+    /// stream but never appeared in the committed transcript (#370).
+    fn discard_speculation_pool(&self, pool: SpeculationPool, events: &EventSender) {
+        for (call_id, result) in pool {
+            let _ = events.send(AgentEvent::SpeculationDiscarded {
+                call_id,
+                name: result.name,
+                reason: SPECULATION_DISCARD_HARVEST_MISMATCH.to_string(),
+            });
+        }
     }
 
     /// Bookkeeping for the call that just committed: drift feedback into
@@ -899,6 +1107,7 @@ impl<'a> Engine<'a> {
         committed: &CommittedStep,
         total_cost_usd: f64,
         messages: &mut Vec<CompletionMessage>,
+        warnings: &mut BudgetWarnings,
         events: &EventSender,
     ) -> Option<TurnOutcome> {
         let result = &committed.result;
@@ -916,10 +1125,15 @@ impl<'a> Engine<'a> {
             );
         }
 
+        // Observed-mode breaches were already surfaced when the cost settled
+        // (`record_settled_cost`); the per-turn ledger dedups, so this is a
+        // no-op after the first breach — present so every Warn observer on
+        // the path honors the contract. Only `enforced` reaches the abort.
+        emit_budget_warning(committed.budget_outcome, warnings, events);
         let BudgetOutcome::AbortTurn {
+            axis,
             spent_usd,
             limit_usd,
-            ..
         } = committed.budget_outcome
         else {
             return None;
@@ -984,8 +1198,13 @@ impl<'a> Engine<'a> {
                 attachments: Vec::new(),
             });
         }
+        let axis = match axis {
+            BudgetAxis::Turn => "turn",
+            BudgetAxis::Session => "session",
+        };
         let reason = format!(
-            "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} limit"
+            "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} \
+             {axis} limit"
         );
         let _ = events.send(AgentEvent::Error {
             message: reason.clone(),
@@ -1026,6 +1245,11 @@ impl<'a> Engine<'a> {
         }
 
         if result.tool_calls.is_empty() {
+            // A committed step that runs no tools can still have speculated
+            // read-only calls off a divergent stream (announced, then dropped
+            // from the commit): none are harvested here, so account for the
+            // discarded I/O rather than dropping the pool silently (#370).
+            self.discard_speculation_pool(speculation, events);
             // A turn that produced neither a tool call NOR any visible text is
             // never a real completion: the model was cut off at its output
             // limit (usually mid-reasoning) or returned nothing at all.
@@ -1166,9 +1390,22 @@ impl<'a> Engine<'a> {
                     .map(|(offset, call)| {
                         let _ = events.send(AgentEvent::ToolStart { call: call.clone() });
                         let index = group_start + offset;
-                        let harvested = speculation
-                            .remove(&call.call_id)
-                            .filter(|s| s.name == call.name && s.input == call.input);
+                        let harvested = match speculation.remove(&call.call_id) {
+                            Some(s) if s.name == call.name && s.input == call.input => Some(s),
+                            Some(stale) => {
+                                // The committed call diverged from what was
+                                // announced: reject the pooled result and
+                                // re-execute below. The speculative execution
+                                // still ran real I/O — record it (#370).
+                                let _ = events.send(AgentEvent::SpeculationDiscarded {
+                                    call_id: call.call_id.clone(),
+                                    name: stale.name,
+                                    reason: SPECULATION_DISCARD_HARVEST_MISMATCH.to_string(),
+                                });
+                                None
+                            }
+                            None => None,
+                        };
                         async move {
                             match harvested {
                                 Some(s) => (index, call, s.output, s.duration_ms, true),
@@ -1203,6 +1440,9 @@ impl<'a> Engine<'a> {
 
             i = group_end;
         }
+        // Any pool entry no committed call ever claimed ran real I/O that
+        // never reached the transcript — account for it, don't drop it (#370).
+        self.discard_speculation_pool(speculation, events);
         indexed.sort_by_key(|(index, _)| *index);
         indexed.into_iter().map(|(_, result)| result).collect()
     }
@@ -1379,34 +1619,144 @@ impl Drop for CancelUsageGuard {
     }
 }
 
+/// Accumulates one attempt's completed speculative executions
+/// (`crate::speculation`) and, if the pump future is dropped before its pool
+/// is harvested, emits one `SpeculationDiscarded` per entry. The drop path
+/// is a failed stream attempt (the retry builds a fresh pool) or a hard
+/// cancel mid-drain: read-only work that already ran real I/O but whose
+/// result never reaches the transcript. The committed path calls
+/// [`Self::harvest`] to disarm the guard and hand the pool to dispatch,
+/// where each entry is instead harvested or discarded per call (#370).
+struct SpeculationDropGuard {
+    events: EventSender,
+    pool: SpeculationPool,
+    armed: bool,
+}
+
+impl SpeculationDropGuard {
+    /// Disarm and hand the accumulated pool to the committed dispatch path.
+    fn harvest(&mut self) -> SpeculationPool {
+        self.armed = false;
+        std::mem::take(&mut self.pool)
+    }
+}
+
+impl Drop for SpeculationDropGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for (call_id, result) in self.pool.drain() {
+            let _ = self.events.send(AgentEvent::SpeculationDiscarded {
+                call_id,
+                name: result.name,
+                reason: SPECULATION_DISCARD_ATTEMPT_FAILED.to_string(),
+            });
+        }
+    }
+}
+
 /// Prefix of the overflow summarizer's marker message
-/// ([`Engine::summarize_overflow_span`]). Shared with [`recent_tool_calls`]:
-/// the marker is User-role on the wire, but it is NOT a real user turn and
-/// must not act as a loop-detection window boundary.
+/// ([`Engine::summarize_overflow_span`]). Shared with
+/// [`recent_call_records`]: the marker is User-role on the wire, but it is
+/// NOT a real user turn and must not act as a loop-detection window
+/// boundary.
 const SUMMARY_MARKER_PREFIX: &str = "[earlier history summarized";
+
+/// Consecutive overflow-summarizer failures this turn that trip the give-up
+/// latch ([`SummarizerHealth`]). Each failed attempt is a wasted completion
+/// and its latency; past this many in a row the pass stops re-firing and
+/// lets the next model call surface one clear overflow instead of N.
+const SUMMARIZER_FAILURE_LATCH: u32 = 2;
+
+/// Per-turn health of the overflow summarizer. A cheap summarizer model that
+/// keeps erroring, timing out, or returning nothing must not re-fire every
+/// remaining step of the turn: this latches after
+/// [`SUMMARIZER_FAILURE_LATCH`] consecutive non-progress results, and a
+/// successful splice clears it. Stack-local to [`Engine::run_turn`] — the
+/// engine holds no summarizer state of its own, so the latch is per-turn.
+#[derive(Default)]
+struct SummarizerHealth {
+    consecutive_failures: u32,
+}
+
+impl SummarizerHealth {
+    fn record_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    fn is_latched(&self) -> bool {
+        self.consecutive_failures >= SUMMARIZER_FAILURE_LATCH
+    }
+}
 
 /// Flatten the tool calls of the CURRENT turn — assistant messages after
 /// the last user message — in chronological order, for
 /// `crate::loop_detect::detect_loop`. Windowing at the user boundary
 /// matters: identical calls across turns are the user re-asking a
+/// Prefix of the engine-injected stuck-loop steering message
+/// ([`Engine::check_loop_detection`]). User-role on the wire like every
+/// steer, but engine-generated, not a real user turn — treating it as a
+/// window boundary would erase the very evidence that triggered it, and
+/// the abort-on-re-detection would need a whole fresh threshold's worth of
+/// looping instead of one more no-progress call.
+const LOOP_STEER_PREFIX: &str = "[stuck-loop warning";
+
+/// Pair the tool calls of the CURRENT turn — assistant messages after the
+/// last user message — with the outputs they produced, in chronological
+/// order, for `crate::loop_detect::detect_loop`. Windowing at the user
+/// boundary matters: identical calls across turns are the user re-asking a
 /// question, not a stuck loop (a REPL session asking the same thing three
 /// times would otherwise trip the exact-repeat detector), and it keeps
 /// this per-step scan O(turn) instead of O(entire history). The overflow
-/// summary is also User-role but is not a real user turn — treating it as
-/// a boundary would truncate the loop window on every summarization pass
-/// and let a stuck loop outrun detection, so it is skipped when locating
-/// the boundary.
-fn recent_tool_calls(messages: &[CompletionMessage]) -> Vec<ToolCall> {
+/// summary and the stuck-loop warning are also User-role but are not real
+/// user turns — treating either as a boundary would truncate the loop
+/// window (on every summarization pass, or right when re-detection needs
+/// the evidence), so both are skipped when locating the boundary.
+///
+/// Results attach to the most recent still-unresolved call with a matching
+/// `call_id` — providers only guarantee ids unique within one step, and a
+/// scripted or misbehaving backend may reuse them across steps. A call
+/// whose result is missing keeps `output: None`, which the detector treats
+/// as unprovable progress, never loop evidence.
+fn recent_call_records(messages: &[CompletionMessage]) -> Vec<CallRecord> {
     let turn_start = messages
         .iter()
-        .rposition(|m| m.role == MessageRole::User && !m.content.starts_with(SUMMARY_MARKER_PREFIX))
+        .rposition(|m| {
+            m.role == MessageRole::User
+                && !m.content.starts_with(SUMMARY_MARKER_PREFIX)
+                && !m.content.starts_with(LOOP_STEER_PREFIX)
+        })
         .map(|i| i + 1)
         .unwrap_or(0);
-    messages[turn_start..]
-        .iter()
-        .filter(|m| m.role == MessageRole::Assistant)
-        .flat_map(|m| m.tool_calls.iter().cloned())
-        .collect()
+    let mut records: Vec<CallRecord> = Vec::new();
+    for message in &messages[turn_start..] {
+        match message.role {
+            MessageRole::Assistant => {
+                records.extend(message.tool_calls.iter().map(|call| CallRecord {
+                    call: call.clone(),
+                    output: None,
+                }));
+            }
+            MessageRole::Tool => {
+                for result in &message.tool_results {
+                    if let Some(record) = records
+                        .iter_mut()
+                        .rev()
+                        .find(|r| r.output.is_none() && r.call.call_id == result.call_id)
+                    {
+                        record.output = Some(result.output.clone());
+                    }
+                }
+            }
+            MessageRole::System | MessageRole::User => {}
+        }
+    }
+    records
 }
 
 /// The [`TurnOutcome::Aborted`] reason of a user-requested soft stop —

@@ -48,20 +48,41 @@ pub struct RetryPolicy {
     /// Maximum number of retries *after* the initial attempt. `0` means the
     /// call is tried exactly once and never retried (L-M4).
     pub max_retries: u32,
-    /// Backoff floor in milliseconds — the delay before the first retry.
+    /// Backoff floor in milliseconds — the delay before the first retry, and
+    /// the floor a server `Retry-After` hint is raised to.
     pub base_delay_ms: u64,
-    /// Backoff ceiling in milliseconds — no computed or server-hinted delay
-    /// is ever slept past this.
+    /// Backoff ceiling in milliseconds — the *computed* exponential delay is
+    /// never slept past this. A server-supplied `Retry-After` hint is not
+    /// bound by it; the hint has its own, much higher [`Self::max_server_hint_ms`]
+    /// ceiling.
     pub max_delay_ms: u64,
+    /// Ceiling in milliseconds on a server-supplied `Retry-After` hint —
+    /// separate from, and far higher than, [`Self::max_delay_ms`]. Providers
+    /// legitimately ask for 30–60s on a hard rate limit; clamping that to the
+    /// computed-backoff cap fires the retry back inside the server's stated
+    /// window and re-429s. A hint at or under this ceiling is honored; a hint
+    /// past it is treated as unreasonable and fails the call fast (surfacing
+    /// the hint value) rather than silently parking the turn.
+    pub max_server_hint_ms: u64,
 }
 
+/// Default ceiling for a server `Retry-After` hint. High enough to obey the
+/// 30–60s waits providers hand out on hard rate limits (well past the 8s
+/// computed-backoff cap), low enough that a runaway multi-minute hint fails
+/// the call fast instead of parking the turn.
+const DEFAULT_MAX_SERVER_HINT_MS: u64 = 120_000;
+
 impl RetryPolicy {
-    /// Build a policy from explicit values.
+    /// Build a policy from explicit values. The server-hint ceiling defaults
+    /// to [`DEFAULT_MAX_SERVER_HINT_MS`] — separate from `max_delay_ms`, so a
+    /// caller that passes a small computed-backoff cap still honors a
+    /// realistic server `Retry-After` rather than clamping it down.
     pub fn new(max_retries: u32, base_delay_ms: u64, max_delay_ms: u64) -> Self {
         Self {
             max_retries,
             base_delay_ms,
             max_delay_ms,
+            max_server_hint_ms: DEFAULT_MAX_SERVER_HINT_MS,
         }
     }
 
@@ -74,16 +95,21 @@ impl RetryPolicy {
             max_retries: 0,
             base_delay_ms: 0,
             max_delay_ms: 0,
+            // Never reached — `max_retries == 0` returns on the first failure
+            // before any delay is computed — but kept zero to match the
+            // policy's all-zeros "never wait, never retry" character.
+            max_server_hint_ms: 0,
         }
     }
 
     /// The default policy for ordinary provider calls: up to 3 retries,
-    /// 250ms floor, 8s ceiling.
+    /// 250ms floor, 8s computed-backoff ceiling, 120s server-hint ceiling.
     pub fn standard() -> Self {
         Self {
             max_retries: 3,
             base_delay_ms: 250,
             max_delay_ms: 8_000,
+            max_server_hint_ms: DEFAULT_MAX_SERVER_HINT_MS,
         }
     }
 }
@@ -155,6 +181,27 @@ pub fn compute_backoff_delay_ms(policy: &RetryPolicy, attempt: u32, rng: &mut im
     rng.random_range(base..=high)
 }
 
+/// Turn a server `Retry-After` hint into the actual delay to sleep: raised to
+/// `base_delay_ms` (a `Retry-After: 0` must still wait the configured floor,
+/// never fire instantly), then nudged upward by a small jitter so a fleet of
+/// workers that all received the same hint don't wake in lockstep and
+/// re-collide on the next attempt.
+///
+/// The jitter is additive and proportional (up to an eighth of the floored
+/// delay) — never a draw down toward `base_delay_ms` like
+/// [`compute_backoff_delay_ms`], because the whole point of honoring a server
+/// hint is to retry *no earlier* than it asked. So the result is always at or
+/// above the floored hint. Pure and synchronous; the only non-determinism is
+/// the injected `rng`.
+fn server_hint_delay_ms(policy: &RetryPolicy, hint_ms: u64, rng: &mut impl Rng) -> u64 {
+    let floored = hint_ms.max(policy.base_delay_ms);
+    let jitter_span = floored / 8;
+    if jitter_span == 0 {
+        return floored;
+    }
+    floored.saturating_add(rng.random_range(0..=jitter_span))
+}
+
 /// Drive `attempt_fn` to completion, retrying retryable
 /// (`ProviderError::is_retryable`) failures with jittered exponential
 /// backoff up to `policy.max_retries`. A terminal error — or a retryable
@@ -163,9 +210,12 @@ pub fn compute_backoff_delay_ms(policy: &RetryPolicy, attempt: u32, rng: &mut im
 /// `is_retryable()`.
 ///
 /// A `RateLimited` error's `retry_after_ms` hint, when present, is honored
-/// verbatim (still capped at `policy.max_delay_ms`) instead of the computed
-/// jittered delay — respecting a server's stated backoff beats guessing at
-/// one.
+/// (floored at `policy.base_delay_ms`, nudged by a small jitter, and bounded
+/// by its own `policy.max_server_hint_ms` ceiling rather than the
+/// computed-backoff cap) instead of the computed jittered delay — respecting
+/// a server's stated backoff beats guessing at one. A hint past that ceiling
+/// fails the call fast (surfacing the hint value) rather than retrying back
+/// inside the server's stated window.
 ///
 /// On success, [`RetryOutcome::retries`] carries the full retry history so
 /// the caller (`driver.rs`) can walk it and emit one
@@ -231,7 +281,17 @@ where
                     ProviderError::RateLimited {
                         retry_after_ms: Some(hint),
                         ..
-                    } => (*hint).min(policy.max_delay_ms),
+                    } => {
+                        if *hint > policy.max_server_hint_ms {
+                            return Err(ProviderError::Terminal(format!(
+                                "rate-limited and the server asked to wait {hint}ms before \
+                                 retrying, past this call's {ceiling}ms server-hint ceiling — \
+                                 failing fast instead of parking the turn",
+                                ceiling = policy.max_server_hint_ms,
+                            )));
+                        }
+                        server_hint_delay_ms(policy, *hint, &mut rand::rng())
+                    }
                     _ => compute_backoff_delay_ms(policy, attempt, &mut rand::rng()),
                 };
 
@@ -506,8 +566,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limited_retry_after_hint_is_honored_and_capped() {
-        let policy = RetryPolicy::new(2, 100, 1_000);
+    async fn server_retry_after_hint_is_honored_above_the_backoff_cap() {
+        // The regression (issue #361): a 30s server hint must NOT be clamped
+        // to the 8s computed-backoff cap — clamping fires the retry back
+        // inside the server's stated window and re-429s.
+        let policy = RetryPolicy::new(2, 250, 8_000);
         let sleeper = NoopSleeper::default();
         let calls = AtomicU32::new(0);
 
@@ -517,7 +580,7 @@ mod tests {
                 if n == 0 {
                     Err(ProviderError::RateLimited {
                         message: "slow down".into(),
-                        retry_after_ms: Some(50_000), // far above the policy cap
+                        retry_after_ms: Some(30_000),
                     })
                 } else {
                     Ok(())
@@ -528,6 +591,120 @@ mod tests {
 
         let delays = sleeper.delays_ms.lock().unwrap();
         assert_eq!(delays.len(), 1);
-        assert_eq!(delays[0], 1_000, "hint must be capped at max_delay_ms");
+        assert!(
+            delays[0] >= 30_000,
+            "a 30s hint must be honored, not clamped to the 8s cap: {}",
+            delays[0]
+        );
+        // Honored, plus at most the small proportional jitter — never the
+        // whole 8s-cap-ignoring exponential envelope or anything unbounded.
+        assert!(
+            delays[0] <= 30_000 + 30_000 / 8,
+            "delay must be the hint plus a small jitter, got {}",
+            delays[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_retry_after_hint_floors_at_base_delay() {
+        // A `Retry-After: 0` must still wait the configured floor, never fire
+        // instantly and hammer the provider.
+        let policy = RetryPolicy::new(2, 250, 8_000);
+        let sleeper = NoopSleeper::default();
+        let calls = AtomicU32::new(0);
+
+        let _ = retry_with_backoff(&policy, &sleeper, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(ProviderError::RateLimited {
+                        message: "slow down".into(),
+                        retry_after_ms: Some(0),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        let delays = sleeper.delays_ms.lock().unwrap();
+        assert_eq!(delays.len(), 1);
+        assert!(
+            delays[0] >= policy.base_delay_ms,
+            "a 0 hint must floor at base_delay_ms, got {}",
+            delays[0]
+        );
+        assert!(
+            delays[0] <= policy.base_delay_ms + policy.base_delay_ms / 8,
+            "floored hint must not balloon past floor + small jitter, got {}",
+            delays[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn server_hint_above_the_ceiling_fails_fast_with_the_hint_value() {
+        // A runaway hint past the server-hint ceiling must fail the call fast
+        // — never sleep for it, never retry back early — and name the value.
+        let policy = RetryPolicy::new(3, 250, 8_000); // 120s hint ceiling
+        let sleeper = NoopSleeper::default();
+        let calls = AtomicU32::new(0);
+
+        let result = retry_with_backoff(&policy, &sleeper, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(ProviderError::RateLimited {
+                    message: "slow down".into(),
+                    retry_after_ms: Some(200_000), // past the 120s ceiling
+                })
+            }
+        })
+        .await;
+
+        match result {
+            Err(ProviderError::Terminal(msg)) => {
+                assert!(
+                    msg.contains("200000"),
+                    "error must name the hint value: {msg}"
+                );
+                assert!(msg.contains("120000"), "error must name the ceiling: {msg}");
+            }
+            other => panic!("expected a fast Terminal failure, got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "must fail fast on the first attempt, not retry"
+        );
+        assert!(
+            sleeper.delays_ms.lock().unwrap().is_empty(),
+            "must never sleep on a hint past the ceiling"
+        );
+    }
+
+    #[test]
+    fn server_hint_delay_floors_and_jitters_within_an_expected_band() {
+        // Floor + additive proportional jitter: every sample lands in
+        // [floored, floored + floored/8], and the draw actually varies so a
+        // fleet decorrelates instead of waking in lockstep.
+        let policy = RetryPolicy::new(3, 250, 8_000);
+        let mut rng = StdRng::seed_from_u64(2024);
+        let hint = 30_000u64;
+        let floor = hint; // hint already above base_delay_ms
+        let ceil = floor + floor / 8;
+        let samples: Vec<u64> = (0..64)
+            .map(|_| server_hint_delay_ms(&policy, hint, &mut rng))
+            .collect();
+        for &d in &samples {
+            assert!(
+                (floor..=ceil).contains(&d),
+                "sample {d} out of band [{floor}, {ceil}]"
+            );
+        }
+        let first = samples[0];
+        assert!(
+            samples.iter().any(|&d| d != first),
+            "expected jitter variance across samples, got {samples:?}"
+        );
     }
 }

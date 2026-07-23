@@ -19,7 +19,7 @@ export XAI_API_KEY="xai-..."
 
 xAI sits fourth in [auto-detection](/docs/api-providers#auto-detection), so the key alone
 is enough. Prefer a file? Store the key in
-[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or rename the
+[`~/.stella/credentials.toml`](/docs/configuration/credentials), or rename the
 env var Stella reads with `providers.xai.api_key_env` — see
 [overriding the key source](/docs/api-providers#overriding-the-key-source).
 
@@ -40,7 +40,7 @@ Being OpenAI-compatible, xAI takes the standard sampling parameters — `tempera
 [settings.json `providers` map](/docs/configuration/settings) can override the base URL
 or default model like any other provider:
 
-```json title="~/.config/stella/settings.json"
+```json title="~/.stella/settings.json"
 {
   "providers": {
     "xai": {

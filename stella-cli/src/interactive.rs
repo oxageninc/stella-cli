@@ -346,7 +346,7 @@ impl<'a> InteractiveToolSet<'a> {
         // produced tree into THIS project's `.stella/skills/` — the exact path
         // the command deck uses. Running the install against the workspace
         // directly lets `npx skills add` write global symlinks
-        // (`~/.config/stella/skills`) that never appear in the project scope, so
+        // (`~/.stella/skills`) that never appear in the project scope, so
         // the tool reported success yet the skill was absent from the list.
         let tmp = match tempfile::Builder::new().prefix("stella-skill-").tempdir() {
             Ok(t) => t,
@@ -792,7 +792,7 @@ mod tests {
     async fn install_skill_lands_in_the_project_scope_not_the_workspace_root() {
         // The agent tool ran the registry CLI directly against the workspace,
         // so the skill was written wherever the
-        // CLI defaults (a global `~/.config/stella/skills` symlink) — the tool
+        // CLI defaults (a global `~/.stella/skills` symlink) — the tool
         // reported success yet the skill never showed up in the project's list.
         // The fix mirrors the command deck: stage the install into a private
         // tempdir, then `adopt_tree` it into `<ws>/.stella/skills/`.

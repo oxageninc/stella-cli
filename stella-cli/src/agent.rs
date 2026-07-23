@@ -174,6 +174,7 @@ async fn run_pipeline_one_shot(
     // and can replay its journal after it ends.
     let mut presence = SessionPresence::announce(cfg, prompt);
     let execution = begin_execution(&store, "pipeline", prompt, cfg, Some(presence.id()));
+    let files_before = registry.files_touched().len();
 
     let (raw_tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (tx, durable_pre_persisted) = event_sender_for_run(raw_tx, format);
@@ -410,6 +411,7 @@ async fn run_pipeline_one_shot(
             store,
             *id,
             &registry,
+            files_before,
             outcome_label,
             cost + reflection_report.cost_usd,
             persistence_complete,
@@ -1516,7 +1518,7 @@ pub fn run_tools_listing() -> Result<(), String> {
     );
     println!(
         "\n  {}",
-        "custom (.stella/tools/, ~/.config/stella/tools/):".dimmed()
+        "custom (.stella/tools/, ~/.stella/tools/):".dimmed()
     );
     if report.tools.is_empty() {
         println!(
@@ -1567,7 +1569,7 @@ pub fn run_tools_validation(dir: Option<&std::path::Path>) -> Result<(), String>
             if !dir.is_dir() {
                 return Err(format!(
                     "`{}` is not a directory — pass a directory of *.toml manifests, or omit \
-                     the value to check .stella/tools/ and ~/.config/stella/tools/",
+                     the value to check .stella/tools/ and ~/.stella/tools/",
                     dir.display()
                 ));
             }
@@ -1578,7 +1580,7 @@ pub fn run_tools_validation(dir: Option<&std::path::Path>) -> Result<(), String>
             println!(
                 "  {} {}",
                 "checking:".dimmed(),
-                ".stella/tools/, ~/.config/stella/tools/".dimmed()
+                ".stella/tools/, ~/.stella/tools/".dimmed()
             );
             validate::validate_default(&workspace_root)
         }
@@ -1640,20 +1642,39 @@ pub fn run_tools_validation(dir: Option<&std::path::Path>) -> Result<(), String>
     }
 }
 
-/// Construct the turn/session budget guard from `--budget`. No limit at
-/// all still meters spend (`BudgetMode::Observed`) so the cost summary and
+/// Construct the budget guard from `--budget`. The limit lands on the
+/// session axis, so it caps cumulative spend across every turn and goal
+/// round of the run — `begin_turn` (called at the top of each turn/round)
+/// resets only the turn-scoped counter while the session accumulator
+/// survives it. The turn axis is left unset on purpose: turn spend can
+/// never exceed session spend (it is a reset-to-zero subset of it), so a
+/// turn limit equal to the session limit could never trip first and would
+/// only mislabel a session breach as a turn one. No limit at all still
+/// meters spend (`BudgetMode::Observed`) so the cost summary and
 /// `BudgetTick` events stay meaningful even when nothing is enforced.
 pub(crate) fn build_budget_guard(budget_limit: Option<f64>) -> BudgetGuard {
     match budget_limit {
-        Some(limit) => BudgetGuard::new(BudgetMode::Enforced, Some(limit), None),
+        Some(limit) => BudgetGuard::new(BudgetMode::Enforced, None, Some(limit)),
         None => BudgetGuard::new(BudgetMode::Observed, None, None),
     }
 }
 
+/// Headroom before the next configured cap trips, in USD — the smaller of
+/// the turn- and session-axis remainders when both are set, so the reported
+/// value is always the binding constraint. `None` when neither axis has a
+/// limit.
 pub(crate) fn remaining_budget(guard: &BudgetGuard) -> Option<f64> {
-    guard
+    let turn = guard
         .turn_limit_usd()
-        .map(|limit| (limit - guard.spent_usd()).max(0.0))
+        .map(|limit| (limit - guard.spent_usd()).max(0.0));
+    let session = guard
+        .session_limit_usd()
+        .map(|limit| (limit - guard.session_spent_usd()).max(0.0));
+    match (turn, session) {
+        (Some(turn), Some(session)) => Some(turn.min(session)),
+        (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
+        (None, None) => None,
+    }
 }
 
 pub(crate) fn settle_reflection_budget(report: &mut ReflectionReport, guard: &mut BudgetGuard) {
@@ -1676,6 +1697,8 @@ pub(crate) fn settle_reflection_budget(report: &mut ReflectionReport, guard: &mu
             spent_usd: guard.spent_usd(),
             limit_usd: guard.turn_limit_usd(),
             mode: guard.mode(),
+            session_spent_usd: None,
+            session_limit_usd: None,
         });
     }
 }
@@ -1863,6 +1886,7 @@ async fn run_turn(
     budget.begin_turn();
     let turn_start = Instant::now();
     let execution = begin_execution(store, kind, prompt, cfg, session);
+    let files_before = registry.files_touched().len();
 
     let (raw_tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (tx, durable_pre_persisted) = event_sender_for_run(raw_tx, format);
@@ -1933,6 +1957,7 @@ async fn run_turn(
             store,
             *id,
             registry,
+            files_before,
             outcome_label,
             cost,
             persistence_complete,
@@ -2015,7 +2040,7 @@ fn print_help() {
         "/files".bright_magenta()
     );
     println!(
-        "  {}      List custom agents (⚡ from .stella/agents or ~/.config/stella/agents)",
+        "  {}      List custom agents (⚡ from .stella/agents or ~/.stella/agents)",
         "/agents".bright_magenta()
     );
     println!(

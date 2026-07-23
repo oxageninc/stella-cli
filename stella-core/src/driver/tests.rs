@@ -306,6 +306,218 @@ async fn a_divergent_committed_call_is_re_executed_not_harvested() {
     );
 }
 
+#[tokio::test]
+async fn a_divergent_committed_call_emits_a_harvest_mismatch_discard() {
+    // The announced read (a.rs) is speculated and runs real I/O; the
+    // committed call (b.rs) diverges, so the pooled result is rejected at
+    // harvest. That discarded execution must leave a trace on the wire so
+    // event-log consumers can reconcile call counts (#370).
+    let executed = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicU32::new(0));
+    let provider = SpeculatingProvider {
+        announce: read_call(serde_json::json!({"path": "a.rs"})),
+        commit: read_call(serde_json::json!({"path": "b.rs"})),
+        executed: executed.clone(),
+        wait_for_execution: true,
+        step: AtomicU32::new(0),
+    };
+    let tools = NotifyingReadTools {
+        calls: calls.clone(),
+        executed,
+    };
+
+    let (outcome, events) = run_speculation_turn(&provider, &tools).await;
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SpeculationDiscarded { call_id, name, reason }
+                if call_id == "c1" && name == "read_file" && reason == "harvest_mismatch"
+        )),
+        "a rejected divergent pool entry must emit SpeculationDiscarded(harvest_mismatch): {events:?}"
+    );
+}
+
+/// Announces `announce` during its stream, FAILS its first attempt with a
+/// retryable transport error (dropping that attempt's speculation pool),
+/// then on the retry commits `commit`; a final step returns plain text. On
+/// the failed attempt it waits (bounded by `first_attempt_wait_ms`) for the
+/// speculative execution to notify: when the call IS speculated the wait
+/// returns as soon as the tool ran, so the dropped attempt deterministically
+/// executed (and fired any hooks) before failing; when it is NOT speculated
+/// nothing notifies and the wait simply times out and the attempt fails.
+struct FlakySpeculatingProvider {
+    announce: ToolCall,
+    commit: ToolCall,
+    executed: Arc<tokio::sync::Notify>,
+    first_attempt_wait_ms: u64,
+    invocation: AtomicU32,
+}
+#[async_trait]
+impl Provider for FlakySpeculatingProvider {
+    fn id(&self) -> &str {
+        "flaky-speculating"
+    }
+    async fn complete(
+        &self,
+        _req: CompletionRequest,
+    ) -> Result<CompletionResultAlias, ProviderError> {
+        unreachable!("the engine must drive complete_observed, never bare complete")
+    }
+    async fn complete_observed(
+        &self,
+        _req: CompletionRequest,
+        observer: &dyn stella_protocol::ToolCallObserver,
+    ) -> Result<CompletionResultAlias, ProviderError> {
+        match self.invocation.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                observer.tool_call_streamed(&self.announce);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(self.first_attempt_wait_ms),
+                    self.executed.notified(),
+                )
+                .await;
+                Err(ProviderError::Transport("blip".into()))
+            }
+            1 => {
+                observer.tool_call_streamed(&self.announce);
+                Ok(CompletionResultAlias {
+                    text: String::new(),
+                    tool_calls: vec![self.commit.clone()],
+                    usage: CompletionUsage::reported_zero(),
+                    model: "flaky-speculating".into(),
+                    cost_usd: 0.0001,
+                    finish_reason: None,
+                })
+            }
+            _ => Ok(text_result("done")),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_attempts_speculative_pool_emits_discarded_events() {
+    // No hooks: the read IS speculated, so the failed first attempt runs it
+    // for real (the wait returns the moment it does) and then drops the
+    // pool. That completed-but-dropped execution must be reported (#370).
+    let executed = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicU32::new(0));
+    let input = serde_json::json!({"path": "a.rs"});
+    let provider = FlakySpeculatingProvider {
+        announce: read_call(input.clone()),
+        commit: read_call(input),
+        executed: executed.clone(),
+        first_attempt_wait_ms: 2_000,
+        invocation: AtomicU32::new(0),
+    };
+    let tools = NotifyingReadTools {
+        calls: calls.clone(),
+        executed,
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+    let mut messages = vec![CompletionMessage::user("read a.rs")];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        engine.run_turn(&mut messages, &mut budget, &tx),
+    )
+    .await
+    .expect("a hung turn means the pump/provider join deadlocked");
+    assert!(
+        matches!(outcome, TurnOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+
+    let events = drain_events(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SpeculationDiscarded { call_id, name, reason }
+                if call_id == "c1" && name == "read_file" && reason == "attempt_failed"
+        )),
+        "the dropped attempt's completed read must emit SpeculationDiscarded(attempt_failed): {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hooked_read_fires_its_hook_once_never_for_a_dropped_speculative_attempt() {
+    // A read-only tool with a configured PreToolUse hook. The first stream
+    // attempt announces it and then fails; the retry commits it. The hook
+    // must fire exactly ONCE — on the committed dispatch path — never for
+    // the dropped attempt. Regression: before the fix the read was
+    // speculated on the doomed attempt too, firing the hook a second time
+    // for a call that never reached the transcript (#370).
+    let executed = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicU32::new(0));
+    let input = serde_json::json!({"path": "a.rs"});
+    let provider = FlakySpeculatingProvider {
+        announce: read_call(input.clone()),
+        commit: read_call(input),
+        executed: executed.clone(),
+        // Pre-fix the dropped attempt speculates the read and fires the hook
+        // before this returns; post-fix the hooked read is never speculated,
+        // so nothing notifies and this bounded wait just times out.
+        first_attempt_wait_ms: 300,
+        invocation: AtomicU32::new(0),
+    };
+    let tools = NotifyingReadTools {
+        calls: calls.clone(),
+        executed,
+    };
+    let sleeper = NoopSleeper;
+    let payloads = Arc::new(TokioMutex::new(Vec::new()));
+    // exit 0: non-blocking, so the tool runs and the hook is a pure
+    // observation — what matters is how many times it is invoked.
+    let runner = RecordingHookRunner {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+        payloads: payloads.clone(),
+    };
+    let hooks = Hooks {
+        pre_tool_use: Some(vec![HookMatcher {
+            matcher: Some("read_file".into()),
+            hooks: vec![HookAction::new("audit-log")],
+        }]),
+        ..Hooks::default()
+    };
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper)
+        .with_hooks(&hooks, &runner);
+    let mut messages = vec![CompletionMessage::user("read a.rs")];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        engine.run_turn(&mut messages, &mut budget, &tx),
+    )
+    .await
+    .expect("a hung turn means the pump/provider join deadlocked");
+    assert!(
+        matches!(outcome, TurnOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+
+    let pre_fires = payloads
+        .lock()
+        .await
+        .iter()
+        .filter(|p| p.contains("\"event\":\"PreToolUse\""))
+        .count();
+    assert_eq!(
+        pre_fires, 1,
+        "PreToolUse must fire once per committed call, never for a dropped speculative attempt"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the hooked read must execute once, on the committed dispatch path"
+    );
+}
+
 /// A provider that streams its answer through the observer before
 /// committing it — the adapter side of token-level streaming.
 struct StreamingTextProvider;
@@ -1015,9 +1227,10 @@ async fn malformed_tool_call_input_is_repaired_not_executed_blindly() {
 
 #[tokio::test]
 async fn stuck_loop_aborts_the_turn_cleanly_before_the_step_cap() {
-    // Every call returns the identical tool call — well past the
-    // default exact-repeat threshold (3) — so loop detection must
-    // abort long before EngineConfig::default()'s 200-step cap.
+    // Every call returns the identical tool call and the tool answers with
+    // identical output — well past the default exact-repeat threshold (3)
+    // — so loop detection must end the turn long before
+    // EngineConfig::default()'s 200-step cap.
     let repeated = tool_call_result("call_1", "bash");
     let provider = ScriptedProvider {
         id: "scripted".into(),
@@ -1047,6 +1260,214 @@ async fn stuck_loop_aborts_the_turn_cleanly_before_the_step_cap() {
 
     let events = drain_events(&mut rx);
     assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+}
+
+#[tokio::test]
+async fn stuck_loop_steers_once_then_aborts_on_re_detection() {
+    // The exact steer-then-abort sequencing: three identical no-progress
+    // calls earn a steering warning, the model ignores it with a fourth
+    // identical call, and only THAT detection aborts. The count also
+    // proves the injected warning (a User-role message) did not reset the
+    // detection window — a reset would demand three more calls, not one.
+    let repeated = tool_call_result("call_1", "bash");
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(vec![Ok(repeated)]),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tool_calls = Arc::new(AtomicU32::new(0));
+    let tools = CountingTools {
+        calls: tool_calls.clone(),
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("hi"),
+    ];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+    assert!(matches!(outcome, TurnOutcome::Aborted { .. }));
+    assert_eq!(
+        tool_calls.load(Ordering::SeqCst),
+        4,
+        "three calls to detect and steer, ONE more no-progress call to abort"
+    );
+
+    let events = drain_events(&mut rx);
+    let steers: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Steered { .. }))
+        .collect();
+    assert_eq!(steers.len(), 1, "exactly one steering warning per turn");
+    assert!(matches!(
+        steers[0],
+        AgentEvent::Steered { text } if text.contains("looping")
+    ));
+    // The warning precedes the abort's Error event — steer first, abort
+    // second.
+    let steer_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }));
+    let error_pos = events.iter().position(|e| {
+        matches!(
+            e,
+            AgentEvent::Error {
+                retryable: false,
+                ..
+            }
+        )
+    });
+    assert!(
+        steer_pos < error_pos,
+        "steer at {steer_pos:?}, abort at {error_pos:?}"
+    );
+    // The warning is in history for the model (and the next turn) to see.
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content.starts_with(LOOP_STEER_PREFIX)),
+        "the steering warning must ride the conversation itself"
+    );
+}
+
+/// A tool whose output changes every invocation — a `read_output`-style
+/// poll of a still-running process.
+struct PollingTools {
+    calls: Arc<AtomicU32>,
+}
+#[async_trait]
+impl ToolExecutor for PollingTools {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        vec![ToolSchema {
+            name: "bash".into(),
+            description: "run a command".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only: false,
+        }]
+    }
+    async fn execute(&self, _name: &str, _input: &Value) -> ToolOutput {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        ToolOutput::Ok {
+            content: format!("[{n}s] still running..."),
+        }
+    }
+}
+
+#[tokio::test]
+async fn identical_polls_with_changing_output_complete_without_abort() {
+    // Six byte-identical calls (same name, same input, no cursor field) —
+    // but every poll returns new output. That is visible progress, not a
+    // loop: the turn must run to completion with no steering and no abort.
+    let mut script: Vec<Result<CompletionResultAlias, ProviderError>> = (0..6)
+        .map(|_| Ok(tool_call_result("call_1", "bash")))
+        .collect();
+    script.push(Ok(text_result("build finished")));
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(script),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tool_calls = Arc::new(AtomicU32::new(0));
+    let tools = PollingTools {
+        calls: tool_calls.clone(),
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("run the build and wait for it"),
+    ];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+    match outcome {
+        TurnOutcome::Completed { text, .. } => assert_eq!(text, "build finished"),
+        other => panic!("polling with changing output must complete, got {other:?}"),
+    }
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 6, "every poll ran");
+    let events = drain_events(&mut rx);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { .. })),
+        "progress must not even draw a steering warning"
+    );
+}
+
+#[tokio::test]
+async fn period_three_cycle_with_no_progress_steers_then_aborts() {
+    // The common real stuck signature: read → failing edit → failing test,
+    // with byte-identical outputs every cycle — invisible to exact-repeat
+    // (no consecutive repeat) and to a two-call-only cycle detector.
+    let cycle_call = |i: usize| {
+        let (name, input) = match i % 3 {
+            0 => ("read_file", serde_json::json!({"path": "a.rs"})),
+            1 => (
+                "edit_file",
+                serde_json::json!({"path": "a.rs", "old": "x", "new": "y"}),
+            ),
+            _ => ("bash", serde_json::json!({"cmd": "cargo test"})),
+        };
+        Ok(CompletionResultAlias {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                call_id: format!("call_{i}"),
+                name: name.into(),
+                input,
+            }],
+            usage: CompletionUsage::reported_zero(),
+            model: "scripted".into(),
+            cost_usd: 0.0001,
+            finish_reason: None,
+        })
+    };
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new((0..12).map(cycle_call).collect()),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tool_calls = Arc::new(AtomicU32::new(0));
+    let tools = CountingTools {
+        calls: tool_calls.clone(),
+    };
+    let sleeper = NoopSleeper;
+    let config = EngineConfig {
+        loop_detection: LoopDetectionConfig {
+            exact_repeat_threshold: 3,
+            short_cycle_repeats: 2,
+        },
+        ..EngineConfig::default()
+    };
+    let engine = Engine::with_sleeper(&provider, &tools, config, &sleeper);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("fix the test"),
+    ];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+    match outcome {
+        TurnOutcome::Aborted { reason, .. } => {
+            assert!(reason.contains("stuck-loop"), "unexpected reason: {reason}")
+        }
+        other => panic!("expected a stuck-loop abort, got {other:?}"),
+    }
+    // Two full cycles (6 calls) to detect and steer, one more no-progress
+    // call to abort — never the 12-entry script (let alone the step cap).
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 7);
+    let events = drain_events(&mut rx);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Steered { .. }))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

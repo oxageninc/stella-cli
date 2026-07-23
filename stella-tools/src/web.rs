@@ -9,7 +9,7 @@
 //! `TAVILY_API_KEY`) — no key, no dead schema, exactly like the media tools.
 //!
 //! Logged-in fetches ride the user's own sessions via
-//! `~/.config/stella/web_auth.toml` (override with `STELLA_WEB_AUTH_FILE`):
+//! `~/.stella/web_auth.toml` (override with `STELLA_WEB_AUTH_FILE`):
 //! per-domain cookies/headers are injected at request time and never appear
 //! in tool output, so the secrets never enter the model's context. reqwest
 //! strips `Cookie`/`Authorization` on a cross-host redirect; a secret placed
@@ -110,17 +110,14 @@ impl std::fmt::Debug for WebAuthConfig {
 }
 
 impl WebAuthConfig {
-    /// Load `$STELLA_WEB_AUTH_FILE`, else `~/.config/stella/web_auth.toml`.
+    /// Load `$STELLA_WEB_AUTH_FILE`, else `~/.stella/web_auth.toml`.
     /// A missing file is the empty config; an unreadable or unparseable one
     /// is the `Err` every web tool then reports.
     pub fn load_default() -> WebAuthState {
         let path = match std::env::var_os("STELLA_WEB_AUTH_FILE") {
             Some(explicit) => PathBuf::from(explicit),
             None => match std::env::var_os("HOME") {
-                Some(home) => PathBuf::from(home)
-                    .join(".config")
-                    .join("stella")
-                    .join("web_auth.toml"),
+                Some(home) => PathBuf::from(home).join(".stella").join("web_auth.toml"),
                 None => return Ok(Self::default()),
             },
         };
@@ -214,7 +211,7 @@ async fn fetch_raw(url_str: &str, auth: &WebAuthConfig, cap: usize) -> Result<Fe
         let hint = if matches!(status.as_u16(), 401 | 403) && authed_domain.is_none() {
             format!(
                 " — if this site needs a login, add a `[domains.\"{host}\"]` entry with your \
-                 session cookie to ~/.config/stella/web_auth.toml"
+                 session cookie to ~/.stella/web_auth.toml"
             )
         } else if matches!(status.as_u16(), 401 | 403) {
             format!(" — the configured auth for `{host}` was sent but rejected; it may be expired")

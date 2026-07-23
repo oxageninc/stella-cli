@@ -56,7 +56,7 @@ tempfile.workspace = true
 rpassword.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 rusqlite.workspace = true
 # The protocol's own conformance suite (§3.6), pinned to the same rev as the
 # types/host we consume. Wired into `contextgraph.rs` tests so "CGP-conformant"

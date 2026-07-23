@@ -55,7 +55,7 @@ The "configured default" above is a real resolution layer with a name:
 sits **between** the `--model` flag and auto-detection — an explicit flag always wins,
 but a settings-configured default beats "first provider with a key":
 
-```json title="~/.config/stella/settings.json"
+```json title="~/.stella/settings.json"
 {
   "agent_engine_config": {
     "default_model": "anthropic/claude-fable-5"
@@ -70,7 +70,7 @@ For the selected provider, Stella resolves the API key in this order — **first
 1. The `--api-key` flag (requires an explicit `--model provider/...`)
 2. The provider's env var, plus aliases — e.g. `GOOGLE_API_KEY` for Gemini
 3. [`settings.json`](/docs/configuration/settings) `providers.<id>.api_key`
-4. `~/.config/stella/credentials.toml`
+4. `~/.stella/credentials.toml`
 5. An interactive prompt (on a TTY) — the entered key is saved to `credentials.toml`, so
    you are only prompted once
 
@@ -94,7 +94,7 @@ Two `settings.json` fields reroute steps 2 and 3 of the chain — every provider
   Fine for a scratch machine; `credentials.toml` is the better home for anything
   long-lived.
 
-```json title="~/.config/stella/settings.json"
+```json title="~/.stella/settings.json"
 {
   "providers": {
     "anthropic": {
@@ -108,7 +108,7 @@ Two `settings.json` fields reroute steps 2 and 3 of the chain — every provider
   Scope matters. In a project's `.stella/settings.json`, the credential-routing fields —
   `base_url`, `api_key`, `api_key_env` — are **ignored** (with a stderr notice) unless
   you export `STELLA_TRUST_PROJECT=1`: a cloned repo must not be able to redirect where
-  your key is sent. User scope (`~/.config/stella/settings.json`) always applies — put
+  your key is sent. User scope (`~/.stella/settings.json`) always applies — put
   personal overrides there. See
   [the project trust boundary](/docs/configuration/settings#the-project-trust-boundary).
 </Callout>

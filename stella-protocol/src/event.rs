@@ -187,6 +187,20 @@ pub enum AgentEvent {
         #[serde(default)]
         speculated: bool,
     },
+    /// A speculatively-executed read-only call (`stella-core::speculation`)
+    /// whose result never reached the transcript: its stream attempt failed
+    /// and the pool was dropped, or the committed call diverged from what
+    /// was announced so the pooled result was rejected at harvest. The
+    /// tool's real I/O still ran — this is the event-log's record of that
+    /// work, so call counts reconcile with what actually executed rather
+    /// than silently diverging. `reason` is a short stable token
+    /// (`"attempt_failed"`, `"harvest_mismatch"`). Additive to the wire
+    /// contract: consumers recorded before speculation existed never see it.
+    SpeculationDiscarded {
+        call_id: String,
+        name: String,
+        reason: String,
+    },
     Retry {
         attempt: u32,
         reason: String,
@@ -226,6 +240,18 @@ pub enum AgentEvent {
         spent_usd: f64,
         limit_usd: Option<f64>,
         mode: BudgetMode,
+        /// Session-scoped spend at this tick — `spent_usd`/`limit_usd` are
+        /// turn-scoped, so a HUD cannot otherwise reconstruct session state
+        /// (or see a session-axis breach) from this stream. `None` when the
+        /// emitter does not track a session axis, and on events serialized
+        /// before these fields existed (hence `serde(default)`, so older
+        /// streams still parse).
+        #[serde(default)]
+        session_spent_usd: Option<f64>,
+        /// The configured per-session limit, when one is set. `None` mirrors
+        /// `session_spent_usd`.
+        #[serde(default)]
+        session_limit_usd: Option<f64>,
     },
     /// One committed model call — the metering record. Emitted exactly once
     /// per step that lands, carrying the normalized usage envelope plus
@@ -773,11 +799,40 @@ mod tests {
     }
 
     #[test]
-    fn budget_tick_roundtrips_with_optional_limit() {
+    fn speculation_discarded_roundtrips_and_names_the_reason() {
+        let event = AgentEvent::SpeculationDiscarded {
+            call_id: "c1".into(),
+            name: "read_file".into(),
+            reason: "attempt_failed".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"type\":\"speculation_discarded\""),
+            "{json}"
+        );
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentEvent::SpeculationDiscarded {
+                call_id,
+                name,
+                reason,
+            } => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(name, "read_file");
+                assert_eq!(reason, "attempt_failed");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budget_tick_roundtrips_with_session_axis() {
         let event = AgentEvent::BudgetTick {
             spent_usd: 0.42,
             limit_usd: Some(2.5),
             mode: BudgetMode::Enforced,
+            session_spent_usd: Some(1.75),
+            session_limit_usd: Some(10.0),
         };
         let json = serde_json::to_string(&event).unwrap();
         let back: AgentEvent = serde_json::from_str(&json).unwrap();
@@ -786,12 +841,35 @@ mod tests {
                 spent_usd,
                 limit_usd,
                 mode,
+                session_spent_usd,
+                session_limit_usd,
             } => {
                 assert_eq!(spent_usd, 0.42);
                 assert_eq!(limit_usd, Some(2.5));
                 assert_eq!(mode, BudgetMode::Enforced);
+                assert_eq!(session_spent_usd, Some(1.75));
+                assert_eq!(session_limit_usd, Some(10.0));
             }
             other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budget_tick_without_session_fields_parses_with_none() {
+        // A stream recorded BEFORE the session axis existed must still parse,
+        // with both new fields defaulting to `None` (not `0.0`, which would
+        // read as a real "spent nothing").
+        let old = r#"{"type":"budget_tick","spent_usd":0.42,"limit_usd":2.5,"mode":"enforced"}"#;
+        match serde_json::from_str::<AgentEvent>(old) {
+            Ok(AgentEvent::BudgetTick {
+                session_spent_usd,
+                session_limit_usd,
+                ..
+            }) => {
+                assert_eq!(session_spent_usd, None);
+                assert_eq!(session_limit_usd, None);
+            }
+            other => panic!("old stream must parse: {other:?}"),
         }
     }
 

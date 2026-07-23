@@ -7,7 +7,7 @@
 //!
 //! Skills live in two directories the loader already reads
 //! ([`crate::memory`]): the **project** scope `<workspace>/.stella/skills` and
-//! the **user** scope `~/.config/stella/skills`. The tab shows both (a
+//! the **user** scope `~/.stella/skills`. The tab shows both (a
 //! same-named skill in each is listed twice, each independently manageable —
 //! unlike the recall loader, which merges by name with the project winning).
 //!
@@ -42,17 +42,14 @@ pub struct ScopeState {
 
 const STATE_FILE: &str = ".stella-skills.json";
 
-/// `<workspace>/.stella/skills` (project) or `~/.config/stella/skills` (user).
+/// `<workspace>/.stella/skills` (project) or `~/.stella/skills` (user).
 /// `None` for the user scope when `$HOME` is unset.
 pub fn scope_root(scope: SkillScope, workspace_root: &Path) -> Option<PathBuf> {
     match scope {
         SkillScope::Project => Some(workspace_root.join(".stella").join("skills")),
-        SkillScope::User => std::env::var_os("HOME").map(|home| {
-            PathBuf::from(home)
-                .join(".config")
-                .join("stella")
-                .join("skills")
-        }),
+        SkillScope::User => {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".stella").join("skills"))
+        }
     }
 }
 
@@ -318,7 +315,7 @@ fn find_skill_md(dir: &Path) -> Option<PathBuf> {
 /// directory (falling back to `id`'s last path segment), copies it to
 /// `<scope>/<slug>/SKILL.md`, and returns the adopted skill's name. Copying
 /// (not moving) into our own dir means a user-scope install lands in
-/// `~/.config/stella/skills` regardless of where the installer wrote — the
+/// `~/.stella/skills` regardless of where the installer wrote — the
 /// scope-destination problem the registry CLI's fixed cwd can't solve.
 pub fn adopt_tree(
     scope: SkillScope,
@@ -606,11 +603,7 @@ mod tests {
         let (td, home, _lock) = scratch();
         let ws = td.path().join("ws");
         write_skill(&ws.join(".stella/skills"), "proj-skill", "a project skill");
-        write_skill(
-            &home.join(".config/stella/skills"),
-            "user-skill",
-            "a user skill",
-        );
+        write_skill(&home.join(".stella/skills"), "user-skill", "a user skill");
         let rows = enumerate(&ws);
         assert!(rows.iter().any(|r| r.name == "proj-skill"
             && r.scope == SkillScope::Project
@@ -842,12 +835,9 @@ mod tests {
 
         let name = adopt_tree(SkillScope::User, &ws, &produced, "acme/auth").unwrap();
         assert_eq!(name, "auth-helper");
-        // It landed in ~/.config/stella/skills, NOT the project — proving the
+        // It landed in ~/.stella/skills, NOT the project — proving the
         // scope is honored regardless of the installer's cwd.
-        assert!(
-            home.join(".config/stella/skills/auth-helper/SKILL.md")
-                .exists()
-        );
+        assert!(home.join(".stella/skills/auth-helper/SKILL.md").exists());
         assert!(
             enumerate(&ws)
                 .iter()
@@ -856,7 +846,7 @@ mod tests {
         // An adopted skill has a real v1 history (not the version-less fallback),
         // so the tab shows a version and edit/pin start from a proper baseline.
         assert!(
-            home.join(".config/stella/skills/auth-helper/versions/v1/SKILL.md")
+            home.join(".stella/skills/auth-helper/versions/v1/SKILL.md")
                 .exists(),
             "adopted skill gets a versions/v1 snapshot"
         );

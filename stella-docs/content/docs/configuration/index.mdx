@@ -10,10 +10,10 @@ key; teams and power users reach for `settings.json`.
 
 | Path | Purpose |
 | --- | --- |
-| `~/.config/stella/settings.json` | User-scope [settings](/docs/configuration/settings): provider overrides, hooks |
+| `~/.stella/settings.json` | User-scope [settings](/docs/configuration/settings): provider overrides, hooks |
 | `<workspace>/.stella/settings.json` | Project-scope settings (highest precedence) |
 | org-managed `settings.json` | Organization defaults ([see below](#the-settings-hierarchy)) |
-| `~/.config/stella/credentials.toml` | Stored [API keys](/docs/configuration/credentials) |
+| `~/.stella/credentials.toml` | Stored [API keys](/docs/configuration/credentials) |
 | `<workspace>/.stella/mcp.toml` | [MCP servers](/docs/agent-tools/mcp) to connect at session start |
 | `<workspace>/.stella/tools/*.toml` | [Custom script tools](/docs/agent-tools/custom-tools) |
 | `<workspace>/.stella/domains.toml` | Domain taxonomy (from `stella init`) |
@@ -27,7 +27,7 @@ specific scope winning:
 
 1. **project** — `<workspace>/.stella/settings.json` (highest preference)
 2. **org-managed** — a system-level managed file (middle)
-3. **user** — `~/.config/stella/settings.json` (lowest preference)
+3. **user** — `~/.stella/settings.json` (lowest preference)
 
 A project entry overrides an org-managed one, which overrides a user one — per field, so a
 project can change just a base URL while inheriting an API key from a higher scope. This is
@@ -85,7 +85,7 @@ is the complete map; each row links to its detail page.
 **Point a Z.ai coding-plan subscription at its endpoint** (user scope — a subscription is
 personal, and project scope would need [`STELLA_TRUST_PROJECT=1`](/docs/configuration/settings#the-project-trust-boundary)):
 
-```json title="~/.config/stella/settings.json"
+```json title="~/.stella/settings.json"
 { "providers": { "zai": { "base_url": "https://api.z.ai/api/coding/paas/v4" } } }
 ```
 

@@ -1146,9 +1146,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(home.join(".config/stella/skills/user")).unwrap();
+        std::fs::create_dir_all(home.join(".stella/skills/user")).unwrap();
         std::fs::write(
-            home.join(".config/stella/skills/user/SKILL.md"),
+            home.join(".stella/skills/user/SKILL.md"),
             "---\nname: user\ndescription: user skill\n---\nUSER_SKILL_BODY",
         )
         .unwrap();

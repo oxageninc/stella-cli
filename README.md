@@ -145,7 +145,7 @@ stella --model local/llama3.3 --base-url http://localhost:11434/v1 chat
 route through the dedicated coding endpoint.
 
 **Credential chain** (first hit wins): `--api-key` flag → provider env var →
-`settings.json` `api_key` → `~/.config/stella/credentials.toml` → interactive prompt.
+`settings.json` `api_key` → `~/.stella/credentials.toml` → interactive prompt.
 
 **Project `.env` files** — so keys can follow the project you're in, Stella
 reads `.env`, `.env.local`, and `.env.<mode>.local` (e.g. `.env.production.local`)
@@ -171,7 +171,7 @@ without a code change, and override built-in defaults, from a `settings.json`:
 |---|---|---|
 | Project | `<workspace>/.stella/settings.json` | org-managed, user |
 | Org-managed | `/Library/Application Support/stella/settings.json` (macOS) · `/etc/stella/settings.json` (Linux) · `$STELLA_MANAGED_SETTINGS` | user |
-| User | `~/.config/stella/settings.json` | — |
+| User | `~/.stella/settings.json` | — |
 
 ```jsonc
 {

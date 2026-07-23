@@ -225,10 +225,11 @@ editing Stella's own code should know what lives where:
 |---|---|
 | `.stella/memories/*.md` | Durable lessons baked into the byte-stable system prompt prefix. Sorted by filename, loaded once per session. (Write side: the `save_memory` tool.) |
 | `.stella/skills/<slug>/SKILL.md` | Auto-promoted skills from recurring reflection lessons. Never enforced — selected and injected as volatile context. |
-| `.stella/tools/*.toml` | Developer-defined custom script tools. Also scanned at `~/.config/stella/tools/`. |
+| `.stella/tools/*.toml` | Developer-defined custom script tools. Also scanned at `~/.stella/tools/`. |
 | `.stella/settings.json` | Project-scope provider config (overrides built-ins or defines new providers) and tool switches (`tools.bash: "on"` opts the shell tool in — it is off by default in every scope). Merged per-field with org-managed and user scopes. |
 | `.stella/mcp.toml` | MCP server config — extra tools merged into the registry at session start. |
 | `.stella/domains.toml` | Domain taxonomy for memory/reflection tagging, inferred by `stella init`. |
+| `.stella/workspace.json` | Durable per-workspace telemetry identity (`workspace_id`), written by `stella cloud register`. Deliberately **outside** `private/` and safe to commit — sharing it makes every clone/machine report under one `workspace_id` to a cloud org. |
 | `.stella/private/` | Owner-only generated local state (`0700`; files `0600`). The generated `.stella/.gitignore` excludes this whole directory. |
 | `.stella/private/reflections.jsonl` | Per-turn reflection mining log (one JSON object per line). |
 | `.stella/private/store.db` | Canonical local SQLite telemetry (executions, events, cost/tokens). Community/default has zero telemetry egress; an enrolled Enterprise seat may derive only the documented content-free operational rollup. |
@@ -241,6 +242,27 @@ Older releases wrote these private artifacts directly under `.stella/`. Path
 resolvers migrate a safe, closed legacy file into `.stella/private/`; unsafe
 permissions or live SQLite WAL/SHM sidecars fail closed with an actionable
 error and leave the legacy files untouched.
+
+Everything **user-global** lives under `~/.stella` on every platform (like
+Claude Code's `~/.claude`) — no OS-specific data dir. `STELLA_HOME` moves the
+whole home; the narrower `STELLA_DATA_DIR` / `STELLA_CONFIG_DIR` still win
+where they always did. Key entries: `settings.json`, `credentials.toml`,
+`skills/`, `agents/`, `rules/`, `tools/` (config); `usage.db` (the
+cross-project telemetry hub), `sessions/`, `notifications/`, `catalog.db`,
+`enterprise-telemetry.db`, `installation-id`, `cloud.json` (data). On first
+run the CLI migrates the legacy split layout (platform data dir +
+`~/.config/stella`) into `~/.stella`, per-entry and best-effort — an entry
+that already exists at the new home is never overwritten.
+
+| Global path | Purpose |
+|---|---|
+| `~/.stella/usage.db` | Cross-project **telemetry hub**: full-fidelity per-call rows replicated from every project's `store.db` via a durable per-project cursor, scoped by `org_id`/`workspace_id`/`repo_id`. Reads never touch project stores. |
+| `~/.stella/cloud.json` | Stub cloud-account registration: `org_id` (+ a reserved `oauth_token` slot for the future login). `org_id`/`workspace_id` are NULL until `stella cloud register`. |
+
+`stella usage report` reads the hub (per org/provider/model totals); `stella
+usage sync [--all]` replicates above the cursor and heals projects whose
+best-effort end-of-turn sync failed; `stella cloud status|register` manages
+the identity that scopes it.
 
 ---
 

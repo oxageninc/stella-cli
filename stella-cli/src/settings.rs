@@ -2,7 +2,7 @@
 //!
 //! Three scopes, merged per provider id, per field, in ascending precedence:
 //!
-//! 1. user:        `~/.config/stella/settings.json`
+//! 1. user:        `~/.stella/settings.json`
 //! 2. org-managed: `/Library/Application Support/stella/settings.json` on
 //!    macOS, `/etc/stella/settings.json` elsewhere (override the path with
 //!    `STELLA_MANAGED_SETTINGS` — also how tests point at a fixture)
@@ -524,16 +524,11 @@ impl AgentEngineConfig {
     }
 }
 
-/// The user-scope settings path (`~/.config/stella/settings.json`), when
+/// The user-scope settings path (`~/.stella/settings.json`), when
 /// `HOME` is known — the TUI save target for user-scope edits and the
 /// first file of [`Settings::load`]'s chain.
 pub fn user_settings_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("stella")
-            .join("settings.json")
-    })
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".stella").join("settings.json"))
 }
 
 /// The project-scope settings path (`<workspace>/.stella/settings.json`).
@@ -1222,7 +1217,7 @@ mod tests {
         let _env = crate::test_env::lock();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let user_dir = home.join(".config/stella");
+        let user_dir = home.join(".stella");
         let managed = dir.path().join("managed-settings.json");
         let workspace = dir.path().join("repo");
         let project_dir = workspace.join(".stella");
@@ -1274,10 +1269,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let workspace = dir.path().join("repo");
-        std::fs::create_dir_all(home.join(".config/stella")).unwrap();
+        std::fs::create_dir_all(home.join(".stella")).unwrap();
         std::fs::create_dir_all(workspace.join(".stella")).unwrap();
         write(
-            &home.join(".config/stella"),
+            &home.join(".stella"),
             "settings.json",
             r#"{
               "tools": {"bash": "off", "web": "off"},
@@ -1337,10 +1332,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let workspace = dir.path().join("repo");
-        std::fs::create_dir_all(home.join(".config/stella")).unwrap();
+        std::fs::create_dir_all(home.join(".stella")).unwrap();
         std::fs::create_dir_all(workspace.join(".stella")).unwrap();
         write(
-            &home.join(".config/stella"),
+            &home.join(".stella"),
             "settings.json",
             r#"{"tools": {"bash": "on", "web": "on"}}"#,
         );

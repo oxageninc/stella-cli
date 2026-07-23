@@ -21,7 +21,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 That is the whole setup — Anthropic sits second in
 [auto-detection](/docs/api-providers#auto-detection), so with the key exported Stella
 picks it up on its own (only a `ZAI_API_KEY` outranks it). Prefer a file? Store the key
-in [`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or rename the
+in [`~/.stella/credentials.toml`](/docs/configuration/credentials), or rename the
 env var Stella reads with `providers.anthropic.api_key_env` — see
 [overriding the key source](/docs/api-providers#overriding-the-key-source).
 
@@ -39,7 +39,7 @@ export STELLA_MODEL=anthropic/claude-fable-5   # pin for the whole shell
 Anthropic-compatible gateways and proxies — a LiteLLM deployment, a corporate egress
 proxy — work by overriding the base URL; the wire dialect stays Anthropic Messages:
 
-```json title="~/.config/stella/settings.json"
+```json title="~/.stella/settings.json"
 {
   "providers": {
     "anthropic": {

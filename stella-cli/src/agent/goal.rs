@@ -365,6 +365,7 @@ pub(crate) async fn run_goal_turn(
 ) -> Result<(), String> {
     let turn_start = Instant::now();
     let execution = begin_execution(store, "goal", goal, cfg, session);
+    let files_before = registry.files_touched().len();
 
     // Route the JUDGE role. `Some` only when a distinct-family judge was
     // selected AND built; the boxed provider must outlive the `run_goal`
@@ -430,6 +431,7 @@ pub(crate) async fn run_goal_turn(
             store,
             *id,
             registry,
+            files_before,
             outcome_label,
             cost,
             persistence_complete,
@@ -506,6 +508,7 @@ async fn run_goal_pipeline_turn(
 ) -> Result<(), String> {
     let turn_start = Instant::now();
     let execution = begin_execution(store, "goal", goal, cfg, session);
+    let files_before = registry.files_touched().len();
     let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
 
     // Role wiring from `agent_engine_config` — the pinned/auto judge (when
@@ -761,6 +764,7 @@ async fn run_goal_pipeline_turn(
             store,
             *id,
             registry,
+            files_before,
             outcome_label,
             total_cost_usd,
             persistence_complete,

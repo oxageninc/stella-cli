@@ -10,7 +10,7 @@ Beyond the [built-in tools](/docs/agent-tools), you can give the agent your own 
 Drop a `<name>.toml` manifest file into one of these directories:
 
 - **Workspace** — `.stella/tools/` (checked in with the project, shared with your team).
-- **User global** — `~/.config/stella/tools/` (personal, available across all your workspaces).
+- **User global** — `~/.stella/tools/` (personal, available across all your workspaces).
 
 If the same tool name is defined in both locations, the **workspace** manifest wins on collision. This lets a project override a personal default while keeping your global tools available everywhere else.
 
@@ -90,7 +90,7 @@ Exit **0** returns the captured stdout as the tool result; a **non-zero** exit r
 Before a run, check every manifest with the strict pre-flight validator:
 
 ```bash
-stella tools --validate            # scans .stella/tools/ and ~/.config/stella/tools/
+stella tools --validate            # scans .stella/tools/ and ~/.stella/tools/
 stella tools --validate ./mytools  # or an explicit directory
 ```
 

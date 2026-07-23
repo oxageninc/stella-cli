@@ -62,6 +62,10 @@ pub(crate) enum SupervisorMsg {
     /// A worker finished (its thread is exiting).
     Ended {
         lane: String,
+        /// Which spawn of this lane ended (from [`SubSessions::started`]) —
+        /// the bookkeeping frees a lane only for the worker that actually
+        /// ended, so a late `Ended` can never tear down a replacement.
+        generation: u64,
         /// The worker's execution row, when the store recorded one — the
         /// driver stamps the post-completion board mirror against it.
         execution_id: Option<i64>,
@@ -78,10 +82,19 @@ pub(crate) enum SupervisorMsg {
 pub(crate) struct SubSessions {
     active: usize,
     next_req: u64,
-    stops: HashMap<String, oneshot::Sender<()>>,
+    /// Monotonic spawn counter: each start stamps its worker, and `ended`
+    /// only frees a lane for the generation that actually ended.
+    next_generation: u64,
+    stops: HashMap<String, (u64, oneshot::Sender<()>)>,
     /// Live workers' pause switches (watch: `true` = parked at the next
     /// step boundary).
     pauses: HashMap<String, watch::Sender<bool>>,
+    /// Lanes whose stop signal was sent but whose `Ended` has not arrived —
+    /// the worker thread is still winding down (forwarder drain, store
+    /// closeout). These still count as live: the slot is not free, and a
+    /// respawn before the old worker settles would put two workers on one
+    /// lane, sharing (and corrupting) its channels.
+    winding_down: HashMap<String, u64>,
     /// Every lane's spec, retained past its end — what Restart respawns.
     specs: HashMap<String, SubSessionSpec>,
     registry_options: RegistryOptions,
@@ -97,8 +110,10 @@ impl SubSessions {
         Self {
             active: 0,
             next_req: 0,
+            next_generation: 0,
             stops: HashMap::new(),
             pauses: HashMap::new(),
+            winding_down: HashMap::new(),
             specs: HashMap::new(),
             registry_options,
         }
@@ -112,24 +127,42 @@ impl SubSessions {
         self.active < MAX_CONCURRENT
     }
 
+    /// Register a spawned worker; returns its generation, which travels
+    /// through [`spawn`] into the worker's `Ended` message.
     fn started(
         &mut self,
         lane: &str,
         stop: oneshot::Sender<()>,
         pause: watch::Sender<bool>,
         spec: SubSessionSpec,
-    ) {
+    ) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation += 1;
         self.active += 1;
-        self.stops.insert(lane.to_string(), stop);
+        self.stops.insert(lane.to_string(), (generation, stop));
         self.pauses.insert(lane.to_string(), pause);
         self.specs.insert(lane.to_string(), spec);
+        generation
     }
 
-    pub(crate) fn ended(&mut self, lane: &str) {
-        self.active = self.active.saturating_sub(1);
-        self.stops.remove(lane);
-        self.pauses.remove(lane);
+    /// Free `lane` — but only for the generation that actually ended.
+    /// `false` (nothing freed) for any other generation: a late `Ended`
+    /// from a replaced worker must not tear down its replacement's channels
+    /// or corrupt the active count.
+    pub(crate) fn ended(&mut self, lane: &str, generation: u64) -> bool {
+        if self.winding_down.get(lane) == Some(&generation) {
+            self.winding_down.remove(lane);
+            self.active = self.active.saturating_sub(1);
+            return true;
+        }
+        if self.stops.get(lane).is_some_and(|(g, _)| *g == generation) {
+            self.stops.remove(lane);
+            self.pauses.remove(lane);
+            self.active = self.active.saturating_sub(1);
+            return true;
+        }
         // `specs` is retained on purpose: Restart respawns an ended lane.
+        false
     }
 
     /// Pause (`true`) or resume (`false`) a live worker at its next step
@@ -141,9 +174,11 @@ impl SubSessions {
         }
     }
 
-    /// Whether `lane` currently has a live worker.
+    /// Whether `lane` currently has a live worker — winding-down included:
+    /// a stopped worker whose `Ended` has not arrived still owns the lane
+    /// (and its slot), so a respawn now must be deferred, not started.
     pub(crate) fn is_live(&self, lane: &str) -> bool {
-        self.stops.contains_key(lane)
+        self.stops.contains_key(lane) || self.winding_down.contains_key(lane)
     }
 
     /// The retained spec for `lane`, for a Restart respawn.
@@ -154,10 +189,26 @@ impl SubSessions {
     /// Signal one worker to stop (clean cancel: its turn future drops at the
     /// next await point, exactly the lead's cancel semantics). `false` when
     /// no such worker is live — a stale stop is a no-op, never an error.
+    /// The lane stays live (winding down) until its `Ended` arrives.
     pub(crate) fn stop(&mut self, lane: &str) -> bool {
         match self.stops.remove(lane) {
-            Some(tx) => tx.send(()).is_ok(),
+            Some((generation, tx)) => {
+                self.winding_down.insert(lane.to_string(), generation);
+                // A winding-down worker cannot be paused; dropping the
+                // sender also releases a currently-parked gate.
+                self.pauses.remove(lane);
+                tx.send(()).is_ok()
+            }
             None => false,
+        }
+    }
+
+    /// Signal every live worker to stop (session teardown). Each lane winds
+    /// down until its `Ended` arrives, exactly like a single stop.
+    pub(crate) fn stop_all(&mut self) {
+        let lanes: Vec<String> = self.stops.keys().cloned().collect();
+        for lane in lanes {
+            self.stop(&lane);
         }
     }
 
@@ -277,6 +328,44 @@ pub(crate) fn task_prompt(req: &SpawnRequest) -> String {
     prompt
 }
 
+/// The panic text a caught worker payload carries (`panic!("…")` is a
+/// `&str`, `panic!("{x}")` a `String` — anything else has no message).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+/// Prefix of the `Failed` reason [`run_caught`] synthesizes — also how
+/// [`spawn`] recognizes the panic path afterward (a panicked worker never
+/// reached its own claim release).
+const PANIC_FAILURE_PREFIX: &str = "worker panicked: ";
+
+/// Run one worker body, converting a panic into a `Failed` ending so the
+/// supervisor ALWAYS receives `Ended` — a panicking tool must cost one
+/// failed worker, not a lane stuck "Running" and a leaked slot. Effective
+/// in unwind builds; under `panic = "abort"` (release) the process dies in
+/// the panic hook before any catch — stella-tui's hook restores the
+/// terminal there, and the deck's journal hook flushes the session journal.
+fn run_caught<F>(body: F) -> (Option<i64>, f64, WorkerEnd)
+where
+    F: FnOnce() -> (Option<i64>, f64, WorkerEnd),
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(ended) => ended,
+        Err(payload) => (
+            None,
+            0.0,
+            WorkerEnd::Failed(format!(
+                "{PANIC_FAILURE_PREFIX}{}",
+                panic_message(payload.as_ref())
+            )),
+        ),
+    }
+}
+
 /// Spawn one worker. Registers its deck lane immediately (the sub-second
 /// acknowledgement — the row exists before any heavy setup), then runs the
 /// session on a dedicated OS thread. Never blocks the caller.
@@ -288,6 +377,7 @@ pub(crate) fn spawn(
     cfg: &Config,
     registry_options: RegistryOptions,
     spec: SubSessionSpec,
+    generation: u64,
     budget_limit: Option<f64>,
     session_id: String,
     workspace_name: String,
@@ -309,26 +399,36 @@ pub(crate) fn spawn(
     let cfg = cfg.clone();
     std::thread::spawn(move || {
         let lane = spec.lane.clone();
-        let (execution_id, cost_usd, end) = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        let (execution_id, cost_usd, end) = run_caught(|| {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt.block_on(run_worker(
+                    &cfg,
+                    registry_options,
+                    &spec,
+                    budget_limit,
+                    &session_id,
+                    &in_tx,
+                    stop_rx,
+                    pause_rx,
+                )),
+                Err(e) => (
+                    None,
+                    0.0,
+                    WorkerEnd::Failed(format!("worker runtime failed to start: {e}")),
+                ),
+            }
+        });
+        // A panic unwound past the worker's own closeout, so its claims are
+        // still held — release them here or they block rivals until the
+        // age-based sweep.
+        if matches!(&end, WorkerEnd::Failed(reason) if reason.starts_with(PANIC_FAILURE_PREFIX))
+            && let Some(store) = agent::open_store(&cfg.workspace_root)
         {
-            Ok(rt) => rt.block_on(run_worker(
-                &cfg,
-                registry_options,
-                &spec,
-                budget_limit,
-                &session_id,
-                &in_tx,
-                stop_rx,
-                pause_rx,
-            )),
-            Err(e) => (
-                None,
-                0.0,
-                WorkerEnd::Failed(format!("worker runtime failed to start: {e}")),
-            ),
-        };
+            let _ = store.release_file_locks_for_holder(&format!("{session_id}/{lane}"));
+        }
 
         // Terminal lane status. On failure the Error event (already on the
         // lane via the forwarder or below) carries the reason.
@@ -375,6 +475,7 @@ pub(crate) fn spawn(
 
         let _ = sup_tx.send(SupervisorMsg::Ended {
             lane,
+            generation,
             execution_id,
             cost_usd,
             end,
@@ -426,6 +527,7 @@ async fn run_worker(
     let calibration = agent::seed_calibration(&store, cfg);
     let execution = agent::begin_execution(&store, "deck-sub", &spec.prompt, cfg, Some(session_id));
     let execution_id = execution.as_ref().map(|(_, id)| *id);
+    let files_before = registry.files_touched().len();
 
     let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let forwarder = spawn_forwarder(
@@ -511,8 +613,15 @@ async fn run_worker(
         ),
     };
     if let Some((store, id)) = &execution {
-        let _ =
-            agent::record_execution_end(store, *id, &registry, label, cost, persistence_complete);
+        let _ = agent::record_execution_end(
+            store,
+            *id,
+            &registry,
+            files_before,
+            label,
+            cost,
+            persistence_complete,
+        );
         // Mirror the worker's final board (its own, session-scoped view) so
         // `tasks` queries see sub-agent boards too.
         let board = registry.task_board();
@@ -567,11 +676,12 @@ pub(crate) fn drain_queue(
             notify_title: format!("reply ready — {}", prompt_line(&text, 40)),
             prompt: text,
         };
-        subs.started(&lane, stop_tx, pause_tx, spec.clone());
+        let generation = subs.started(&lane, stop_tx, pause_tx, spec.clone());
         spawn(
             cfg,
             subs.worker_registry_options(),
             spec,
+            generation,
             budget_limit,
             session_id.to_string(),
             workspace_name.to_string(),
@@ -605,11 +715,12 @@ pub(crate) fn respawn(
     let (stop_tx, stop_rx) = oneshot::channel();
     let (pause_tx, pause_rx) = watch::channel(false);
     let registry_options = subs.worker_registry_options();
-    subs.started(lane, stop_tx, pause_tx, spec.clone());
+    let generation = subs.started(lane, stop_tx, pause_tx, spec.clone());
     spawn(
         cfg,
         registry_options,
         spec,
+        generation,
         budget_limit,
         session_id.to_string(),
         workspace_name.to_string(),
@@ -619,6 +730,12 @@ pub(crate) fn respawn(
         pause_rx,
     );
     true
+}
+
+/// The deck lane a `task_assign` worker runs on — the task's identity, so
+/// the driver can refuse a second worker for a task that already has one.
+pub(crate) fn task_lane(task_id: &str) -> String {
+    format!("sub:{task_id}")
 }
 
 /// Dispatch one `task_assign` spawn request (or park it if no slot is free —
@@ -634,7 +751,7 @@ pub(crate) fn spawn_task_worker(
     in_tx: &UnboundedSender<Inbound>,
     sup_tx: &UnboundedSender<SupervisorMsg>,
 ) {
-    let lane = format!("sub:{}", req.task_id);
+    let lane = task_lane(&req.task_id);
     let (stop_tx, stop_rx) = oneshot::channel();
     let (pause_tx, pause_rx) = watch::channel(false);
     let spec = SubSessionSpec {
@@ -648,11 +765,12 @@ pub(crate) fn spawn_task_worker(
         ),
     };
     let registry_options = subs.worker_registry_options();
-    subs.started(&lane, stop_tx, pause_tx, spec.clone());
+    let generation = subs.started(&lane, stop_tx, pause_tx, spec.clone());
     spawn(
         cfg,
         registry_options,
         spec,
+        generation,
         budget_limit,
         session_id.to_string(),
         workspace_name.to_string(),
@@ -661,6 +779,38 @@ pub(crate) fn spawn_task_worker(
         stop_rx,
         pause_rx,
     );
+}
+
+/// How long Quit waits for stopped workers to settle before abandoning
+/// them. Workers cancel at their next await point and then only close out
+/// (forwarder drain, store writes, claim release), so this is generous —
+/// the bound exists so a wedged worker can never hold the exit hostage.
+pub(crate) const QUIT_JOIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Session teardown: signal every live worker to stop, then wait — bounded
+/// by `deadline` — for their `Ended` messages, so executions close out,
+/// notifications land, and claims release instead of dying mid-tool as
+/// detached threads at process exit. A worker that does not settle in time
+/// is abandoned exactly as every worker used to be; spawn requests arriving
+/// during teardown are dropped (there is no session left to run them).
+pub(crate) async fn shutdown_workers(
+    subs: &mut SubSessions,
+    sup_rx: &mut mpsc::UnboundedReceiver<SupervisorMsg>,
+    deadline: std::time::Duration,
+) {
+    subs.stop_all();
+    let end_by = tokio::time::Instant::now() + deadline;
+    while subs.live() > 0 {
+        match tokio::time::timeout_at(end_by, sup_rx.recv()).await {
+            Ok(Some(SupervisorMsg::Ended {
+                lane, generation, ..
+            })) => {
+                let _ = subs.ended(&lane, generation);
+            }
+            Ok(Some(SupervisorMsg::SpawnTask(_))) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -729,7 +879,7 @@ mod tests {
         let mut subs = SubSessions::new();
         let (stop_tx, _stop_rx) = oneshot::channel();
         let (pause_tx, pause_rx) = watch::channel(false);
-        subs.started("req:1", stop_tx, pause_tx, dummy_spec("req:1"));
+        let generation = subs.started("req:1", stop_tx, pause_tx, dummy_spec("req:1"));
         assert!(subs.set_paused("req:1", true));
         assert!(*pause_rx.borrow());
         assert!(subs.set_paused("req:1", false));
@@ -737,7 +887,7 @@ mod tests {
         assert!(!subs.set_paused("req:404", true), "unknown lane is a no-op");
         // A live lane refuses respawn; its spec survives its end.
         assert!(subs.is_live("req:1"));
-        subs.ended("req:1");
+        assert!(subs.ended("req:1", generation));
         assert!(!subs.is_live("req:1"));
         assert!(subs.spec("req:1").is_some(), "spec retained for Restart");
     }
@@ -745,23 +895,24 @@ mod tests {
     #[test]
     fn slot_bookkeeping_caps_and_recovers() {
         let mut subs = SubSessions::new();
+        let mut generations = Vec::new();
         for i in 0..MAX_CONCURRENT {
             assert!(subs.has_slot());
             let (stop_tx, _stop_rx) = oneshot::channel();
             let (pause_tx, _pause_rx) = watch::channel(false);
-            subs.started(
+            generations.push(subs.started(
                 &format!("req:{i}"),
                 stop_tx,
                 pause_tx,
                 dummy_spec(&format!("req:{i}")),
-            );
+            ));
         }
         assert!(!subs.has_slot());
-        subs.ended("req:0");
+        assert!(subs.ended("req:0", generations[0]));
         assert!(subs.has_slot());
-        // ended() below zero must not underflow.
+        // An Ended nothing started must free nothing (and never underflow).
         let mut fresh = SubSessions::new();
-        fresh.ended("req:none");
+        assert!(!fresh.ended("req:none", 0));
         assert!(fresh.has_slot());
     }
 
@@ -778,6 +929,133 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_lane_winds_down_until_its_ended_arrives() {
+        // stop() must NOT free the lane: the worker thread is still
+        // draining. The lane stays live (so Restart defers via
+        // pending_restarts instead of respawning into a second worker), the
+        // slot stays occupied, and only the matching Ended frees both.
+        let mut subs = SubSessions::new();
+        let (stop_tx, _stop_rx) = oneshot::channel();
+        let (pause_tx, _pause_rx) = watch::channel(false);
+        let generation = subs.started("req:1", stop_tx, pause_tx, dummy_spec("req:1"));
+        assert!(subs.stop("req:1"));
+        assert!(subs.is_live("req:1"), "winding down still counts as live");
+        assert_eq!(subs.live(), 1, "the slot is not free until Ended");
+        assert!(
+            !subs.set_paused("req:1", true),
+            "a winding-down worker cannot be paused"
+        );
+        assert!(subs.ended("req:1", generation));
+        assert!(!subs.is_live("req:1"));
+        assert_eq!(subs.live(), 0);
+    }
+
+    #[test]
+    fn stop_then_restart_leaves_one_worker_with_working_channels() {
+        // The full stop→Ended→respawn sequence, then a stale Ended for the
+        // replaced generation: exactly one live worker must remain, with ITS
+        // stop/pause channels registered and the active count intact.
+        let mut subs = SubSessions::new();
+        let (stop_tx, _stop_rx) = oneshot::channel();
+        let (pause_tx, _pause_rx) = watch::channel(false);
+        let old = subs.started("req:1", stop_tx, pause_tx, dummy_spec("req:1"));
+        subs.stop("req:1");
+        assert!(subs.ended("req:1", old));
+        // The respawn (what pending_restarts triggers on the Ended).
+        let (stop_tx2, mut stop_rx2) = oneshot::channel();
+        let (pause_tx2, pause_rx2) = watch::channel(false);
+        let new = subs.started("req:1", stop_tx2, pause_tx2, dummy_spec("req:1"));
+        assert_ne!(old, new, "each spawn gets its own generation");
+        assert_eq!(subs.live(), 1);
+        // A late Ended from the replaced worker frees nothing.
+        assert!(!subs.ended("req:1", old), "stale Ended must be ignored");
+        assert_eq!(subs.live(), 1, "active count survives the stale Ended");
+        assert!(
+            subs.set_paused("req:1", true),
+            "replacement's pause channel is intact"
+        );
+        assert!(*pause_rx2.borrow());
+        assert!(subs.stop("req:1"), "replacement's stop channel is intact");
+        assert_eq!(stop_rx2.try_recv(), Ok(()));
+        assert!(subs.ended("req:1", new));
+        assert_eq!(subs.live(), 0);
+    }
+
+    #[test]
+    fn a_panicking_worker_body_ends_as_failed_never_silence() {
+        // The supervisor must receive Ended whatever a tool does — a panic
+        // synthesizes Failed with the payload's message, both payload kinds.
+        let (id, cost, end) = run_caught(|| panic!("tool blew up"));
+        assert_eq!(id, None);
+        assert_eq!(cost, 0.0);
+        match end {
+            WorkerEnd::Failed(reason) => {
+                assert!(reason.contains("worker panicked"), "{reason}");
+                assert!(reason.contains("tool blew up"), "{reason}");
+            }
+            _ => panic!("a panic must synthesize WorkerEnd::Failed"),
+        }
+        let (_, _, end) = run_caught(|| panic!("{}", format!("dynamic {}", 7)));
+        match end {
+            WorkerEnd::Failed(reason) => assert!(reason.contains("dynamic 7"), "{reason}"),
+            _ => panic!("a String panic payload must synthesize Failed too"),
+        }
+        // A body that returns normally passes through untouched.
+        let (id, cost, end) = run_caught(|| (Some(7), 1.25, WorkerEnd::Done));
+        assert_eq!(id, Some(7));
+        assert_eq!(cost, 1.25);
+        assert!(matches!(end, WorkerEnd::Done));
+    }
+
+    #[tokio::test]
+    async fn quit_shutdown_stops_workers_and_reaps_their_endings() {
+        // Quit-time teardown: every live worker sees its stop signal and the
+        // drain waits for their Ended messages — no orphaned bookkeeping.
+        let mut subs = SubSessions::new();
+        let (sup_tx, mut sup_rx) = mpsc::unbounded_channel();
+        for lane in ["req:1", "sub:9"] {
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let (pause_tx, _pause_rx) = watch::channel(false);
+            let generation = subs.started(lane, stop_tx, pause_tx, dummy_spec(lane));
+            let sup = sup_tx.clone();
+            let lane = lane.to_string();
+            // A worker's whole quit obligation: see the stop, close out,
+            // send Ended.
+            tokio::spawn(async move {
+                let _ = stop_rx.await;
+                let _ = sup.send(SupervisorMsg::Ended {
+                    lane,
+                    generation,
+                    execution_id: None,
+                    cost_usd: 0.0,
+                    end: WorkerEnd::Stopped,
+                });
+            });
+        }
+        shutdown_workers(&mut subs, &mut sup_rx, std::time::Duration::from_secs(5)).await;
+        assert_eq!(subs.live(), 0, "every worker settled before the deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quit_shutdown_abandons_a_hung_worker_at_the_deadline() {
+        // A worker that never answers its stop must not hold the exit
+        // hostage — the drain returns at the deadline with the lane still
+        // accounted (abandoned, exactly the pre-teardown behavior).
+        let mut subs = SubSessions::new();
+        let (stop_tx, _stop_rx) = oneshot::channel();
+        let (pause_tx, _pause_rx) = watch::channel(false);
+        subs.started("req:1", stop_tx, pause_tx, dummy_spec("req:1"));
+        let (_sup_tx, mut sup_rx) = mpsc::unbounded_channel();
+        shutdown_workers(
+            &mut subs,
+            &mut sup_rx,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(subs.live(), 1, "abandoned, not freed — and no hang");
+    }
+
+    #[test]
     fn req_lanes_are_sequential() {
         let mut subs = SubSessions::new();
         assert_eq!(subs.next_req_lane(), "req:1");
@@ -790,12 +1068,16 @@ mod tests {
         // dashboard row outlives its worker, so `lanes` must too.
         let mut subs = SubSessions::new();
         assert!(subs.lanes().is_empty());
+        let mut generations = std::collections::HashMap::new();
         for lane in ["req:2", "req:1", "sub:7"] {
             let (stop_tx, _stop_rx) = oneshot::channel();
             let (pause_tx, _pause_rx) = watch::channel(false);
-            subs.started(lane, stop_tx, pause_tx, dummy_spec(lane));
+            generations.insert(
+                lane,
+                subs.started(lane, stop_tx, pause_tx, dummy_spec(lane)),
+            );
         }
-        subs.ended("req:1");
+        assert!(subs.ended("req:1", generations["req:1"]));
         assert_eq!(
             subs.lanes(),
             vec![

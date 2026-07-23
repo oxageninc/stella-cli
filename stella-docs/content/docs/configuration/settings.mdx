@@ -17,7 +17,7 @@ its own merge rule across the [scope hierarchy](#the-scope-hierarchy):
 
 The `providers` map lets you override the built-in defaults for any provider — **without
 reaching for a provider-specific environment variable**. In **user scope**
-(`~/.config/stella/settings.json`) it is the recommended way to, for example, route a Z.ai
+(`~/.stella/settings.json`) it is the recommended way to, for example, route a Z.ai
 coding-plan subscription through its dedicated endpoint — see the
 [coding-plan recipe](/docs/examples/zai-coding-plan).
 
@@ -73,7 +73,7 @@ merging), **last-scope-wins** for `mcp` and `tools`, and `hooks` are the excepti
 | --- | --- | --- |
 | Highest | **project** | `<workspace>/.stella/settings.json` |
 | Middle | **org-managed** | `STELLA_MANAGED_SETTINGS`, else the platform default (below) |
-| Lowest | **user** | `~/.config/stella/settings.json` |
+| Lowest | **user** | `~/.stella/settings.json` |
 
 The org-managed path is resolved as:
 
@@ -96,7 +96,7 @@ trust. The legacy `STELLA_PROJECT_HOOKS=1` flag grants hooks only.
 
 Suppose three files are present:
 
-```json title="~/.config/stella/settings.json (user)"
+```json title="~/.stella/settings.json (user)"
 {
   "providers": {
     "zai": {
@@ -153,7 +153,7 @@ The merged result for `zai` — **with the project trusted** (`STELLA_TRUST_PROJ
 `settings.json` `base_url` are set for Z.ai, the env toggle wins.
 
 **API key** — `--api-key` flag &gt; the provider's env var &gt; `settings.json`
-`api_key` &gt; `~/.config/stella/credentials.toml` &gt; interactive prompt. See the
+`api_key` &gt; `~/.stella/credentials.toml` &gt; interactive prompt. See the
 [credential chain](/docs/getting-started/providers#the-credential-chain).
 
 An API key configured **only** in `settings.json` is enough for Stella to auto-detect and
@@ -166,7 +166,7 @@ endpoint instead of setting the bespoke `ZAI_GLM_CODING_PLAN=1` variable. A subs
 is personal, so this belongs in **user scope** — project scope would silently drop the
 `base_url` unless the repo is trusted with `STELLA_TRUST_PROJECT=1`:
 
-```json title="~/.config/stella/settings.json"
+```json title="~/.stella/settings.json"
 {
   "providers": {
     "zai": {
@@ -230,7 +230,7 @@ interactive ones; the agent works through the structured tools (`run_tests`,
 `web_extract_assets`, `web_download`, and (with a `BRAVE_API_KEY` or `TAVILY_API_KEY`)
 `web_search`. It is off by default for the same reason as `bash`: a fetched page is both
 untrusted input and an outbound network channel. Logged-in fetches are configured
-separately in `~/.config/stella/web_auth.toml`.
+separately in `~/.stella/web_auth.toml`.
 
 The values are the strings `"on"`/`"off"` — a bare boolean or a typo is a hard, named
 parse error rather than a silent ignore. Each field merges independently. A project
@@ -284,7 +284,7 @@ file until you opt in with **`STELLA_TRUST_PROJECT=1`**:
   managed authority ceiling permits project prompts.
 - **Workspace custom tools.** Executable manifests under `.stella/tools/` are excluded
   unless full project trust is present and managed policy permits them. User-global
-  manifests under `~/.config/stella/tools/` remain available.
+  manifests under `~/.stella/tools/` remain available.
 
 A stderr notice names skipped hooks and credential-routing fields, so a
 trusted-but-forgotten flag is diagnosable. Cosmetic project fields (`name`,
