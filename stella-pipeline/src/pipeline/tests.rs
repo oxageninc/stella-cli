@@ -1187,27 +1187,43 @@ async fn a_witness_that_never_fails_aborts_and_removes_the_candidate() {
     let provider = ScriptedProvider::new(vec![
         text_result("single"),
         text_result("TEST_COMMAND: cargo test --test witness always_green -- --exact"),
-        // The repair attempt also yields a command that passes.
+        // The repair attempt also yields a command that passes -> useless.
         text_result("TEST_COMMAND: cargo test --test witness still_green -- --exact"),
+        // Then the run degrades to a bare worker turn (+ its verification),
+        // so give the fallback generous responses.
+        text_result("done"),
+        text_result("PASS looks right"),
+        text_result("done"),
+        text_result("PASS looks right"),
     ]);
-    // Pops: witness check (pass), repair check (pass) → discard. Then no
-    // test command exists for the candidate, so no further pops.
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let workspace =
         FakeWorkspace::new(0, vec![true, true], Ok(vec![]), log.clone()).with_repo_status(
             SeqRepoStatus::new(vec![vec![], vec![("tests/witness.rs", "w1")]]),
         );
     let port = FakeWorkspacePort::new(vec![Ok(workspace)], log.clone());
-    let (outcome, _, _) = run_isolated(
+    let (outcome, events) = run_degrade_over_working_session(
         &provider,
         &port,
         PipelineConfig::default(),
         "Fix the retry bug",
     )
     .await;
-    let outcome = outcome.expect("invalid witness is a truthful abort");
-    assert!(matches!(outcome.status, PipelineStatus::Aborted { .. }));
-    assert_eq!(*log.lock().unwrap(), vec!["create", "remove:0"]);
+    let outcome = outcome.expect("a useless witness degrades, it does not error");
+    // A witness that proves nothing couldn't be AUTHORED — the task proceeds
+    // unwitnessed rather than dying.
+    assert!(
+        !matches!(outcome.status, PipelineStatus::Aborted { .. }),
+        "a useless witness must not end the turn: {outcome:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { message, retryable: true }
+                if message.contains("running a bare worker turn")
+        )),
+        "the degradation announces itself: {events:?}"
+    );
 }
 
 /// Tamper exclusion: the worker modified the witness test file after it
@@ -1453,6 +1469,52 @@ async fn a_setup_failure_degrades_to_a_bare_execution_instead_of_aborting() {
     );
 }
 
+/// Like [`run_unisolated_with_router`] but WITH a candidate workspace port,
+/// for exercising the setup-failure -> bare-execution degrade: the candidate
+/// path fails, and the bare fallback must run over these WORKING session
+/// ports (unlike `run_isolated`, whose session ports panic on touch).
+async fn run_degrade_over_working_session(
+    provider: &ScriptedProvider,
+    port: &FakeWorkspacePort,
+    config: PipelineConfig,
+    goal: &str,
+) -> (Result<PipelineOutcome, PipelineRunError>, Vec<AgentEvent>) {
+    let resolver = OneProvider(provider);
+    let runner = ScriptedRunner::new(vec![], "@@ -1 +1 @@\n-a\n+b");
+    let repo_status = SeqRepoStatus::new(vec![vec![]]);
+    let tools = EmptyTools;
+    let recall = NoContextRecall;
+    let repo = NoRepoStructure;
+    let approvals = AutoApproveGate;
+    let sleeper = NoopSleeper;
+    let router = router();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let pipeline = Pipeline::new(
+        PipelinePorts {
+            router: &router,
+            providers: &resolver,
+            tools: &tools,
+            recall: &recall,
+            repo: &repo,
+            repo_status: &repo_status,
+            diagnostics: &runner,
+            tests: &runner,
+            approvals: &approvals,
+            sleeper: &sleeper,
+            hooks: None,
+            candidate_workspaces: Some(port),
+            mcp_prefetch: None,
+            steering: None,
+        },
+        tx,
+        config,
+    );
+    let mut messages = vec![CompletionMessage::system("sys")];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let outcome = pipeline.run(goal, &mut messages, &mut budget).await;
+    (outcome, drain(&mut rx))
+}
+
 async fn run_unisolated_with_router(
     provider: &ScriptedProvider,
     config: PipelineConfig,
@@ -1561,6 +1623,7 @@ fn isolated_config(n: u32) -> PipelineConfig {
 /// Best-of-N candidate isolation tests — see the module doc there for why
 /// the shared infra (`run_isolated`, `isolated_config`, ...) stays here.
 mod best_of_n;
+mod chaos;
 /// The orchestrator MCP pre-fetch hook (issue #248 Phase 1) — split out for
 /// the same file-size reason `tests.rs` itself was split from
 /// `pipeline.rs`; a child module, so it reaches the fakes above via

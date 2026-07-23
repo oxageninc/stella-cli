@@ -1159,13 +1159,18 @@ impl<'a> Pipeline<'a> {
                         .await
                     {
                         Ok(witness) => witness,
-                        Err(reason) => {
-                            // A witness-integrity rejection is fail-closed
-                            // security, not a degradable setup failure — keep
-                            // the abort so the poisoned witness cannot be
-                            // silently traded for an unverified run.
-                            candidates
-                                .push(CandidateResult::aborted(base_messages.to_vec(), reason));
+                        Err(abort) => {
+                            // A witness that couldn't be AUTHORED degrades to a
+                            // bare run (the task needs no witness). An
+                            // artifact-INTEGRITY violation stays fail-closed,
+                            // so a poisoned witness is surfaced, never silently
+                            // traded for an unverified run.
+                            let candidate = if abort.degradable {
+                                CandidateResult::setup_aborted(base_messages.to_vec(), abort.reason)
+                            } else {
+                                CandidateResult::aborted(base_messages.to_vec(), abort.reason)
+                            };
+                            candidates.push(candidate);
                             workspaces.push(Some(ws));
                             continue;
                         }

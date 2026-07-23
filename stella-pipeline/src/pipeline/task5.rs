@@ -21,6 +21,37 @@ impl HookRunner for BoundHookRunner<'_> {
     }
 }
 
+/// Why an authored witness could not be produced or accepted, and whether the
+/// pipeline may degrade past it.
+///
+/// `degradable` = the witness simply couldn't be AUTHORED (no test command,
+/// an unusable command, a test that proves nothing, the author engine getting
+/// stuck). The task needs no witness to proceed, so the run degrades to a
+/// bare worker turn rather than dying. NOT degradable = a resource limit
+/// (budget) or an artifact-INTEGRITY violation (the author modified tracked
+/// files, produced a non-single-file / symlink artifact, or a runner/identity
+/// mismatch) — fail-closed decisions that surface the problem rather than
+/// silently completing unverified.
+pub(super) struct WitnessAbort {
+    pub(super) reason: String,
+    pub(super) degradable: bool,
+}
+
+impl WitnessAbort {
+    pub(super) fn degradable(reason: String) -> Self {
+        Self {
+            reason,
+            degradable: true,
+        }
+    }
+    pub(super) fn rejected(reason: String) -> Self {
+        Self {
+            reason,
+            degradable: false,
+        }
+    }
+}
+
 impl<'a> Pipeline<'a> {
     pub(super) fn engine_config_for(&self, surface: CandidateSurface<'_>) -> EngineConfig {
         let mut config = self.config.engine.clone();
@@ -40,7 +71,7 @@ impl<'a> Pipeline<'a> {
         surface: CandidateSurface<'_>,
         budget: &mut BudgetGuard,
         total: &mut f64,
-    ) -> Result<Option<Witness>, String> {
+    ) -> Result<Option<Witness>, WitnessAbort> {
         self.emit(AgentEvent::Stage {
             name: StageKind::Witness,
         });
@@ -76,19 +107,23 @@ impl<'a> Pipeline<'a> {
             TurnOutcome::Aborted { reason, cost_usd } => {
                 *total += cost_usd;
                 if let Some(abort) = budget_abort(budget.evaluate()) {
-                    return Err(abort.reason);
+                    return Err(WitnessAbort::rejected(abort.reason));
                 }
-                return Err(format!("witness author turn aborted: {reason}"));
+                return Err(WitnessAbort::degradable(format!(
+                    "witness author turn aborted: {reason}"
+                )));
             }
         };
         let Some(mut command) = parse_witness_command(&text) else {
-            return Err("witness author produced no TEST_COMMAND line".to_string());
+            return Err(WitnessAbort::degradable(
+                "witness author produced no TEST_COMMAND line".to_string(),
+            ));
         };
 
         let Ok(mut invocation) = parse_test_invocation(&command) else {
-            return Err(format!(
+            return Err(WitnessAbort::degradable(format!(
                 "witness author produced an unsafe or unsupported test command `{command}`"
-            ));
+            )));
         };
         if surface.tests.run_test(&invocation).await.passed() {
             messages.push(CompletionMessage::user(witness_repair_prompt(&command)));
@@ -110,22 +145,24 @@ impl<'a> Pipeline<'a> {
                 TurnOutcome::Aborted { reason, cost_usd } => {
                     *total += cost_usd;
                     if let Some(abort) = budget_abort(budget.evaluate()) {
-                        return Err(abort.reason);
+                        return Err(WitnessAbort::rejected(abort.reason));
                     }
-                    return Err(format!("witness repair turn aborted: {reason}"));
+                    return Err(WitnessAbort::degradable(format!(
+                        "witness repair turn aborted: {reason}"
+                    )));
                 }
             };
             command = parse_witness_command(&repaired).unwrap_or(command);
             let Ok(repaired_invocation) = parse_test_invocation(&command) else {
-                return Err(format!(
+                return Err(WitnessAbort::degradable(format!(
                     "witness repair produced an unsafe or unsupported test command `{command}`"
-                ));
+                )));
             };
             invocation = repaired_invocation;
             if surface.tests.run_test(&invocation).await.passed() {
-                return Err(
+                return Err(WitnessAbort::degradable(
                     "witness test still passes on the unmodified code after one repair".to_string(),
-                );
+                ));
             }
         }
 
@@ -137,15 +174,16 @@ impl<'a> Pipeline<'a> {
             &untracked_before,
             &untracked_after,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| WitnessAbort::rejected(error.to_string()))?;
         let path = fingerprints
             .keys()
             .next()
             .expect("validated witness artifact contains exactly one path");
-        validate_witness_invocation(path, &invocation).map_err(|error| error.to_string())?;
+        validate_witness_invocation(path, &invocation)
+            .map_err(|error| WitnessAbort::rejected(error.to_string()))?;
         let identity = surface.repo_status.artifact_identity(path).await;
         validate_witness_identity(path, &fingerprints[path], identity.as_ref())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| WitnessAbort::rejected(error.to_string()))?;
         let files = HashMap::from([(
             path.clone(),
             identity.expect("validated witness identity is present"),

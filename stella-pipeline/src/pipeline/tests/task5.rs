@@ -419,7 +419,11 @@ async fn tracked_production_edit_by_witness_author_aborts_without_adoption() {
         vec![("tests/authority_witness.rs", "sha256:test")],
     ])
     .with_tracked(vec![vec![], vec![("src/lib.rs", "sha256:mutated")]]);
-    let workspace = FakeWorkspace::new(0, vec![], Ok(vec![]), log.clone()).with_repo_status(status);
+    // The witness test FAILS on unmodified code (vec![false]) so the flow
+    // reaches the tracked-file mutation check — a fail-closed SECURITY
+    // rejection — rather than the (now degradable) repair path.
+    let workspace =
+        FakeWorkspace::new(0, vec![false], Ok(vec![]), log.clone()).with_repo_status(status);
     let port = FakeWorkspacePort::new(vec![Ok(workspace)], log.clone());
 
     let (outcome, _, _) = run_isolated(

@@ -230,11 +230,16 @@ async fn plan_and_plan_repair_each_emit_one_paid_call_envelope() {
 }
 
 #[tokio::test]
-async fn witness_author_and_repair_are_individually_metered_on_abort() {
+async fn witness_author_and_repair_are_individually_metered_before_degrade() {
     let provider = ScriptedProvider::new(vec![
         text_result("single"),
         text_result("TEST_COMMAND: cargo test --test witness always_green -- --exact"),
         text_result("TEST_COMMAND: cargo test --test witness still_green -- --exact"),
+        // The useless witness degrades to a bare worker turn (+ verification).
+        text_result("done"),
+        text_result("PASS looks right"),
+        text_result("done"),
+        text_result("PASS looks right"),
     ]);
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let workspace =
@@ -242,20 +247,24 @@ async fn witness_author_and_repair_are_individually_metered_on_abort() {
             SeqRepoStatus::new(vec![vec![], vec![("tests/witness.rs", "w1")]]),
         );
     let port = FakeWorkspacePort::new(vec![Ok(workspace)], log);
-    let (outcome, events, _) = run_isolated(
+    let (outcome, events) = run_degrade_over_working_session(
         &provider,
         &port,
         PipelineConfig::default(),
         "Fix the retry bug",
     )
     .await;
-    assert!(matches!(
-        outcome.unwrap().status,
-        PipelineStatus::Aborted { .. }
-    ));
+    // The witness author and its repair are each metered individually, even
+    // though the useless witness then degrades rather than aborts.
+    let roles = usage_roles(&events);
     assert_eq!(
-        usage_roles(&events),
-        ["triage", "witness_author", "witness_repair"]
+        &roles[..3],
+        ["triage", "witness_author", "witness_repair"],
+        "author and repair are individually metered: {roles:?}"
+    );
+    assert!(
+        !matches!(outcome.unwrap().status, PipelineStatus::Aborted { .. }),
+        "a useless witness degrades rather than aborting"
     );
 }
 
