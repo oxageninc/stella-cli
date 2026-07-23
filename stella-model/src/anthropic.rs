@@ -350,8 +350,8 @@ fn attachment_blocks(message: &CompletionMessage) -> Vec<AnthropicContentBlock> 
 /// Streamed SSE payloads from the Messages API's `content_block_delta`
 /// events. Anthropic's stream sends several event *types*
 /// (`message_start`, `content_block_start`, `content_block_delta`,
-/// `message_delta`, `message_stop`); this adapter only needs to aggregate
-/// text deltas and the final usage block.
+/// `message_delta`, `message_stop`); this adapter aggregates text deltas
+/// and the final usage block, and requires the terminal `message_stop`.
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicStreamEvent {
@@ -388,6 +388,12 @@ enum AnthropicStreamEvent {
         delta: AnthropicMessageDeltaBody,
         usage: Option<AnthropicUsage>,
     },
+    /// The stream's terminal event — the Messages API always ends a healthy
+    /// stream with it. Modeled explicitly (not left to `Other`) because its
+    /// absence at EOF is the only evidence that a *clean* connection close
+    /// (close-delimited proxies, LB idle-reaps) cut the message short.
+    #[serde(rename = "message_stop")]
+    MessageStop,
     /// A mid-stream error event. The Messages API can send
     /// `event: error` / `data: {"type":"error","error":{...}}` after already
     /// streaming content — modeled explicitly so it aborts the turn with a
@@ -795,6 +801,7 @@ async fn aggregate_anthropic_stream(
     // sequentially, so only this block can have been cut off by the token
     // limit — a later block starting proves every earlier one closed.
     let mut last_block_index: Option<usize> = None;
+    let mut message_stop_seen = false;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = http::next_with_timeout(&mut stream, http::STREAM_IDLE_TIMEOUT).await? {
@@ -897,6 +904,9 @@ async fn aggregate_anthropic_stream(
                         usage.output_tokens = u.output_tokens;
                     }
                 }
+                Ok(AnthropicStreamEvent::MessageStop) => {
+                    message_stop_seen = true;
+                }
                 Ok(_) => {}
                 Err(_) => {
                     // Unrecognized event shape (e.g. ping/ack events with no
@@ -904,6 +914,18 @@ async fn aggregate_anthropic_stream(
                 }
             }
         }
+    }
+
+    // EOF without `message_stop` is a disconnect, not a completion — and
+    // nothing accumulated from a cut stream (text, stop_reason, tool
+    // fragments) is trustworthy enough to classify further. Retryable
+    // Transport, upholding the same "never a truncated Ok" promise as the
+    // in-stream error path above.
+    if !message_stop_seen {
+        return Err(http::stream_ended_before_terminal(
+            "Anthropic",
+            "message_stop",
+        ));
     }
 
     // The one content block the token limit could have cut: the last block

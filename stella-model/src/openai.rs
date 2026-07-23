@@ -586,6 +586,7 @@ async fn aggregate_openai_stream(
     let mut text = String::new();
     let mut usage = CompletionUsage::default();
     let mut tool_calls: BTreeMap<usize, ToolCallAccumulator> = BTreeMap::new();
+    let mut completed_seen = false;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = http::next_with_timeout(&mut stream, http::STREAM_IDLE_TIMEOUT).await? {
@@ -623,6 +624,7 @@ async fn aggregate_openai_stream(
                         .push_str(&delta);
                 }
                 OpenAiStreamEvent::Completed { response } => {
+                    completed_seen = true;
                     if let Some(u) = response.usage {
                         usage.reported = true;
                         usage.input_tokens = u.input_tokens;
@@ -658,6 +660,17 @@ async fn aggregate_openai_stream(
                 OpenAiStreamEvent::Other => {}
             }
         }
+    }
+
+    // EOF without `response.completed` (and without the failed/incomplete/
+    // error events handled above) is a disconnect, not a completion —
+    // whatever accumulated is a half-answer. Retryable Transport, upholding
+    // the same "never a truncated Ok" promise as the mid-stream error paths.
+    if !completed_seen {
+        return Err(http::stream_ended_before_terminal(
+            "OpenAI",
+            "response.completed",
+        ));
     }
 
     let tool_calls = tool_calls
@@ -1285,6 +1298,50 @@ mod tests {
             ProviderError::Terminal(msg) => assert!(msg.contains("max_output_tokens"), "{msg}"),
             other => panic!("expected Terminal incomplete error, got {other:?}"),
         }
+    }
+
+    /// The clean-EOF twin of the tests above: a well-formed stream that
+    /// simply ENDS without `response.completed` (close-delimited proxies,
+    /// LM-Studio-style local gateways, LB idle-reaps surface a dropped
+    /// connection as clean EOF, not a reqwest error) must fail as a
+    /// retryable Transport disconnect — never commit the partial "Hel" as a
+    /// successful completion.
+    #[tokio::test]
+    async fn complete_returns_transport_err_on_clean_eof_without_completed() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAiProvider::new(ApiKey::new("sk-test"), "gpt-5.5").with_base_url(server.uri());
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage::user("hi")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+            reasoning: None,
+            params: None,
+        };
+
+        let err = provider.complete(req).await.unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Transport(_)),
+            "expected Transport, got {err:?}"
+        );
+        assert!(err.is_retryable(), "a disconnect must be retryable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("response.completed"),
+            "names the missing terminal event: {msg}"
+        );
     }
 
     /// Minimal happy-path SSE body for tests that only inspect the request.
