@@ -1,0 +1,87 @@
+---
+title: Release notes
+description: What's new in Stella. The 0.5.0 minor release lands the read→edit drift oracle, transactional multi-file edits, graph-driven test impact, an adaptive-context engine, and an org/hub telemetry dashboard.
+---
+
+Stella follows [semantic versioning](https://semver.org). Every merge to `main`
+cuts a release and publishes prebuilt binaries plus a Homebrew formula, so
+`brew upgrade stella` always tracks the latest build. This page records the
+notable, user-facing changes; the full commit-level changelog for any tag lives
+on its [GitHub Release](https://github.com/macanderson/stella/releases).
+
+## 0.5.0
+
+The first minor release of the `0.5.x` line. It gathers the stabilization and
+feature work that accumulated across the `0.4.x` patch series into one coherent
+step: a smarter edit path, graph-aware tooling, a durable context engine, and
+fleet-scale telemetry.
+
+### Editing & tools
+
+- **read→edit drift oracle.** `edit_file` now keeps a per-file record of the
+  content the model last *saw* (via a read, or its own successful write). When
+  an edit's `old_string` no longer matches, Stella distinguishes an
+  out-of-band change to the file from a genuine not-found, echoes the current
+  content, and lets the model recover — instead of blindly retrying a stale
+  edit.
+- **`apply_edits` — transactional multi-file edits.** A new tool applies a batch
+  of edits across many files atomically, with a dry-run preflight that reports
+  exactly what would change before anything is written. Either the whole batch
+  applies or none of it does.
+- **`run_tests scope:"impacted"`.** Test selection is now graph-driven: Stella
+  walks the tree-sitter code graph from your changes to the tests that actually
+  exercise them, so a focused change runs a focused suite.
+- **graph-derived planner context.** The planner localizes a goal to the
+  relevant files deterministically from the code graph, giving each turn a
+  tighter, more relevant working set.
+
+### Context engine
+
+- **Adaptive-context baseline (Phase 0 & 1).** The foundation of Stella's
+  durable memory: a typed record taxonomy with scope and temporal axes, and
+  canonical JCS hashing for stable content identity. Context receipts now emit
+  **typed decision events** (loop-detection, budget, retry, and policy
+  decisions) as parseable twins of the prose the agent already narrates, bridged
+  into the policy-plane journal.
+- **compaction preserves the prompt-cache prefix.** When compaction dedupes
+  repeated blocks it now keeps the *earliest* copy, so the stable prefix the
+  provider's prompt cache keys on survives — fewer cache misses, lower bills.
+
+### Fleet & telemetry
+
+- **Observatory: org / hub telemetry dashboard.** A new view aggregates
+  telemetry across an organization's agents and workspaces, with hub-and-spoke
+  scoping for org / workspace / repo.
+- **Benchmark harnesses.** `loop-bench` (a cheap turn-loop + context-query
+  correctness harness) and the **stella arena** arena-bench adapter, which
+  records runs as ContextGraph traces.
+
+### Terminal UI
+
+- **Syntax highlighting in edit mode.** Markdown and TOML are now highlighted
+  when editing skills and agents in the TUI.
+- **Interactive Command Deck.** The docs landing page gained an interactive
+  Command Deck with animated terminals.
+
+### Fixes
+
+- Loop detection now sees through `read_file`'s session-tally footer, so
+  legitimate re-reads are no longer misread as a loop.
+- The conversational fast path no longer authors a witness test for a bare
+  greeting like `hi`.
+- Exhaustive TUI event matches handle `SpeculationDiscarded` cleanly, unbreaking
+  the clippy gate.
+
+### Install & upgrade
+
+```bash
+# Homebrew (macOS / Linux)
+brew install macanderson/tap/stella
+brew upgrade stella
+
+# From a release tarball — pick your target
+# https://github.com/macanderson/stella/releases/latest
+```
+
+Prebuilt binaries are published for `aarch64`/`x86_64` macOS and Linux. Verify a
+download against the `SHA256SUMS` attached to the release.
