@@ -274,6 +274,15 @@ struct CandidateResult {
     final_text: String,
     /// `Some(reason)` if a turn aborted (budget/loop/step-cap).
     aborted: Option<String>,
+    /// Whether this abort is a degradable **infrastructure** setup failure —
+    /// no isolation port, or a workspace that could not be snapshotted. `run`
+    /// degrades these to a bare worker run rather than ending the turn with
+    /// zero work (the "never choose nothing" rule). Deliberately does NOT
+    /// cover a witness-integrity rejection (symlink artifact, language
+    /// mismatch, a witness author touching production code): those are
+    /// fail-closed security decisions and keep their abort. `false` on every
+    /// executed and every verified/unverified result.
+    degradable: bool,
     /// The verification verdict, if verification ran.
     verdict: Option<Verdict>,
     /// This candidate's verification score, for best-of-N selection.
@@ -283,15 +292,31 @@ struct CandidateResult {
 }
 
 impl CandidateResult {
+    /// A candidate that aborted for a reason that is NOT a degradable
+    /// infrastructure setup failure: an execution abort (budget, loop,
+    /// step-cap — the worker ran) or a fail-closed security rejection (a
+    /// poisoned witness). These keep their stop.
     fn aborted(messages: Vec<CompletionMessage>, reason: String) -> Self {
         Self {
             messages,
             final_text: String::new(),
             aborted: Some(reason),
+            degradable: false,
             verdict: None,
             score: CandidateScore::Failed,
             diff_lines: 0,
             revisions: 0,
+        }
+    }
+
+    /// A candidate that aborted on a degradable **infrastructure** setup
+    /// failure — no isolation port, or a tree that could not be snapshotted.
+    /// Flagged so `run` degrades it to a bare worker run rather than ending
+    /// the turn having done nothing.
+    fn setup_aborted(messages: Vec<CompletionMessage>, reason: String) -> Self {
+        Self {
+            degradable: true,
+            ..Self::aborted(messages, reason)
         }
     }
 }
@@ -328,6 +353,7 @@ impl CandidateState {
             messages: self.messages,
             final_text: self.final_text,
             aborted: None,
+            degradable: false,
             verdict: Some(Verdict::from_evidence(passed, evidence)),
             score,
             diff_lines: self.diff_lines,
@@ -341,6 +367,7 @@ impl CandidateState {
             messages: self.messages,
             final_text: self.final_text,
             aborted: None,
+            degradable: false,
             verdict: None,
             score: CandidateScore::Unverified,
             diff_lines: self.diff_lines,
@@ -585,6 +612,35 @@ impl<'a> Pipeline<'a> {
                 Ok(result) => result,
                 Err(cause) => return Err(PipelineRunError::new(cause, total_cost)),
             }
+        };
+
+        // The "never choose nothing" backstop. A candidate that aborted
+        // BEFORE the worker ever ran — a setup failure (no isolation port, no
+        // independent witness author, a tree that could not be snapshotted) —
+        // must not end the turn having executed nothing. The fancy path being
+        // unavailable is a reason to do LESS, never a reason to do nothing:
+        // degrade to a bare worker run on the working tree. Execution aborts
+        // (budget, loop, step-cap) and true resource limits keep their stop —
+        // there the worker DID run, so the abort is honest.
+        let best = if best.aborted.is_some() && best.degradable {
+            match self
+                .degrade_to_bare_execution(
+                    goal,
+                    &base_messages,
+                    plan.as_deref(),
+                    assessment,
+                    budget,
+                    &mut total_cost,
+                )
+                .await
+            {
+                Some(executed) => executed,
+                // Even the bare run could not start (no resolvable worker) —
+                // that is a genuine impossibility, so keep the setup abort.
+                None => best,
+            }
+        } else {
+            best
         };
 
         // Adopt the winning candidate's trajectory.
@@ -858,6 +914,45 @@ impl<'a> Pipeline<'a> {
     /// working tree): the single-shot path, and the shared-tree degradation
     /// of best-of-N when no [`CandidateWorkspacePort`] is wired.
     #[allow(clippy::too_many_arguments)]
+    /// Last-resort execution when candidate setup failed before the worker
+    /// ever ran. Runs exactly one worker turn on the session tree — no
+    /// isolation, no authored witness, the simplest path that still does the
+    /// work. Returns `None` only when there is no resolvable worker provider
+    /// (a true impossibility, not a degradable setup failure), in which case
+    /// the caller keeps the original setup abort.
+    async fn degrade_to_bare_execution(
+        &self,
+        goal: &str,
+        base_messages: &[CompletionMessage],
+        plan: Option<&[PlanStep]>,
+        assessment: TaskAssessment,
+        budget: &mut BudgetGuard,
+        total: &mut f64,
+    ) -> Option<CandidateResult> {
+        let worker = self.resolve_provider(Role::Worker).ok()?;
+        if let Some(fallback) = &worker.fallback {
+            self.emit_fallback(fallback);
+        }
+        self.warn(
+            "candidate setup failed before any execution; running a bare worker turn on the \
+             working tree so the turn still does the work it was asked to"
+                .to_string(),
+        );
+        self.run_shared_candidates(
+            goal,
+            base_messages,
+            plan,
+            assessment,
+            None,
+            &worker,
+            1,
+            budget,
+            total,
+        )
+        .await
+        .pop()
+    }
+
     async fn run_shared_candidates(
         &self,
         goal: &str,
@@ -936,7 +1031,7 @@ impl<'a> Pipeline<'a> {
         let Some(port) = self.candidate_workspaces else {
             if author_witness {
                 return Ok((
-                    CandidateResult::aborted(
+                    CandidateResult::setup_aborted(
                         base_messages.to_vec(),
                         "authored witness requires candidate isolation, but no candidate \
                          workspace port is available"
@@ -1032,7 +1127,7 @@ impl<'a> Pipeline<'a> {
                     // isolated is never run in the shared tree instead: it
                     // scores as aborted and the remaining candidates go on.
                     self.warn(format!("candidate {}/{n} skipped: {e}", i + 1));
-                    candidates.push(CandidateResult::aborted(
+                    candidates.push(CandidateResult::setup_aborted(
                         base_messages.to_vec(),
                         format!("candidate isolation failed: {e}"),
                     ));
@@ -1065,6 +1160,10 @@ impl<'a> Pipeline<'a> {
                     {
                         Ok(witness) => witness,
                         Err(reason) => {
+                            // A witness-integrity rejection is fail-closed
+                            // security, not a degradable setup failure — keep
+                            // the abort so the poisoned witness cannot be
+                            // silently traded for an unverified run.
                             candidates
                                 .push(CandidateResult::aborted(base_messages.to_vec(), reason));
                             workspaces.push(Some(ws));

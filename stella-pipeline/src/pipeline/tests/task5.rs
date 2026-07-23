@@ -333,8 +333,23 @@ async fn sealed_witness_identity_survives_git_reclassification_out_of_untracked_
 }
 
 #[tokio::test]
-async fn authored_witness_isolation_failure_aborts_before_authoring() {
-    let provider = ScriptedProvider::new(vec![text_result("single")]);
+async fn authored_witness_isolation_failure_degrades_to_a_bare_run() {
+    // Isolation is INFRASTRUCTURE, not security: if the authored-witness path
+    // can't snapshot a workspace, the run degrades to a bare worker turn on
+    // the working tree rather than ending having done nothing. (A poisoned
+    // witness is different — that keeps its fail-closed abort; see the
+    // symlink/language/production-edit tests below.)
+    let provider = ScriptedProvider::new(vec![text_result("single"), text_result("done")]);
+    let resolver = OneProvider(&provider);
+    // Working session ports — the bare fallback runs over these.
+    let runner = ScriptedRunner::new(vec![], "@@ -1 +1 @@\n-a\n+b");
+    let repo_status = SeqRepoStatus::new(vec![vec![]]);
+    let tools = EmptyTools;
+    let recall = NoContextRecall;
+    let repo = NoRepoStructure;
+    let approvals = AutoApproveGate;
+    let sleeper = NoopSleeper;
+    let router = router();
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let port = FakeWorkspacePort::new(
         vec![Err(WorkspaceError::Snapshot {
@@ -342,18 +357,52 @@ async fn authored_witness_isolation_failure_aborts_before_authoring() {
         })],
         log.clone(),
     );
-
-    let (outcome, events, _) = run_isolated(
-        &provider,
-        &port,
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let pipeline = Pipeline::new(
+        PipelinePorts {
+            router: &router,
+            providers: &resolver,
+            tools: &tools,
+            recall: &recall,
+            repo: &repo,
+            repo_status: &repo_status,
+            diagnostics: &runner,
+            tests: &runner,
+            approvals: &approvals,
+            sleeper: &sleeper,
+            hooks: None,
+            candidate_workspaces: Some(&port),
+            mcp_prefetch: None,
+            steering: None,
+        },
+        tx,
         PipelineConfig::default(),
-        "Fix the failing test",
-    )
-    .await;
-    let outcome = outcome.expect("isolation failure is a truthful abort");
-    assert!(matches!(outcome.status, PipelineStatus::Aborted { .. }));
-    assert!(!stages(&events).contains(&StageKind::Witness));
+    );
+    let mut messages = vec![CompletionMessage::system("sys")];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let outcome = pipeline
+        .run("Fix the failing test", &mut messages, &mut budget)
+        .await
+        .expect("isolation failure degrades, it does not error");
+
+    assert!(
+        !matches!(
+            outcome.status,
+            PipelineStatus::Aborted { ref reason } if reason.contains("isolation")
+        ),
+        "an isolation failure must not end the turn: {outcome:?}"
+    );
+    // Isolation WAS attempted (once, at n=1) before degrading.
     assert_eq!(*log.lock().unwrap(), vec!["create"]);
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { message, retryable: true }
+                if message.contains("running a bare worker turn")
+        )),
+        "the degradation announces itself: {events:?}"
+    );
 }
 
 #[tokio::test]

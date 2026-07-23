@@ -1364,6 +1364,95 @@ async fn run_isolated(
 /// from a witness author; with no author there is nothing to protect it from,
 /// so no snapshot machinery is engaged — which is what lets Stella work in a
 /// plain directory that is not a git repository.
+/// The "never choose nothing" backstop: when every candidate fails ISOLATION
+/// setup before the worker runs, the pipeline must degrade to a bare
+/// execution on the working tree — not end the turn having done nothing.
+#[tokio::test]
+async fn a_setup_failure_degrades_to_a_bare_execution_instead_of_aborting() {
+    // triage → single; worker → done. No witness-author turn: the failure is
+    // pure isolation setup, and the bare fallback runs the worker once.
+    let provider = ScriptedProvider::new(vec![
+        text_result("CLASS: single\nWITNESS: no\nJUDGE: no"),
+        text_result("done"),
+    ]);
+    let resolver = OneProvider(&provider);
+    let runner = ScriptedRunner::new(vec![], "@@ -1 +1 @@\n-a\n+b");
+    let repo_status = SeqRepoStatus::new(vec![vec![]]);
+    let tools = EmptyTools;
+    let recall = NoContextRecall;
+    let repo = NoRepoStructure;
+    let approvals = AutoApproveGate;
+    let sleeper = NoopSleeper;
+    let router = router();
+    // A candidate port that fails to isolate every candidate. Best-of-N
+    // (n=2) drives it, so both candidates are setup_aborted.
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let port = FakeWorkspacePort::new(
+        vec![
+            Err(WorkspaceError::Snapshot {
+                reason: "not a git repo".into(),
+            }),
+            Err(WorkspaceError::Snapshot {
+                reason: "not a git repo".into(),
+            }),
+        ],
+        log,
+    );
+    let config = PipelineConfig {
+        candidates: Some(2),
+        ..PipelineConfig::default()
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let pipeline = Pipeline::new(
+        PipelinePorts {
+            router: &router,
+            providers: &resolver,
+            tools: &tools,
+            recall: &recall,
+            repo: &repo,
+            repo_status: &repo_status,
+            diagnostics: &runner,
+            tests: &runner,
+            approvals: &approvals,
+            sleeper: &sleeper,
+            hooks: None,
+            candidate_workspaces: Some(&port),
+            mcp_prefetch: None,
+            steering: None,
+        },
+        tx,
+        config,
+    );
+    let mut messages = vec![CompletionMessage::system("sys")];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let outcome = pipeline
+        .run("Fix the retry bug", &mut messages, &mut budget)
+        .await
+        .expect("a setup failure is a degradation, not a run-ending error");
+
+    assert_ne!(
+        outcome.status,
+        PipelineStatus::Aborted {
+            reason: "candidate isolation failed: workspace snapshot failed: not a git repo"
+                .to_string()
+        },
+        "an isolation setup failure must not end the turn: {outcome:?}"
+    );
+    assert!(
+        !matches!(outcome.status, PipelineStatus::Aborted { .. }),
+        "the backstop must produce a real execution, not any abort: {outcome:?}"
+    );
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { message, retryable: true }
+                if message.contains("running a bare worker turn")
+        )),
+        "the degradation announces itself once: {events:?}"
+    );
+}
+
 async fn run_unisolated_with_router(
     provider: &ScriptedProvider,
     config: PipelineConfig,
