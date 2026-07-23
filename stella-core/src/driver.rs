@@ -1796,7 +1796,7 @@ fn recent_call_records(messages: &[CompletionMessage]) -> Vec<CallRecord> {
                         .rev()
                         .find(|r| r.output.is_none() && r.call.call_id == result.call_id)
                     {
-                        record.output = Some(result.output.clone());
+                        record.output = Some(comparable_output(&result.output));
                     }
                 }
             }
@@ -1804,6 +1804,27 @@ fn recent_call_records(messages: &[CompletionMessage]) -> Vec<CallRecord> {
         }
     }
     records
+}
+
+/// Normalize one tool output for loop comparison: strip `read_file`'s
+/// volatile session-tally footer (`\n\n(N/M lines shown · read K× this
+/// session)`). The footer changes on EVERY read by design — it is the
+/// model-facing "you already read this" nudge — but the loop detector
+/// requires byte-identical outputs, so the footer made every reread unique
+/// and blinded detection to the exact thrash it exists to catch (the
+/// read → failing-edit → read cycle the `loop_detect` module doc names).
+/// Comparison-only: the transcript and history keep the footer untouched.
+fn comparable_output(output: &ToolOutput) -> ToolOutput {
+    if let ToolOutput::Ok { content } = output
+        && content.ends_with("\u{d7} this session)")
+        && let Some(idx) = content.rfind("\n\n(")
+        && content[idx..].contains(" lines shown \u{b7} read ")
+    {
+        return ToolOutput::Ok {
+            content: content[..idx].to_string(),
+        };
+    }
+    output.clone()
 }
 
 /// The [`TurnOutcome::Aborted`] reason of a user-requested soft stop —
