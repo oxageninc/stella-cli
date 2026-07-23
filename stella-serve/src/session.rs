@@ -11,7 +11,7 @@
 //!
 //! Scope note: one [`Session`] drives one turn. Multi-turn sessions (retaining
 //! the message history across turns) and per-step checkpointing layer on top of
-//! this without changing the transport — they are the next slice.
+//! this without changing the transport.
 
 use std::thread::JoinHandle;
 
