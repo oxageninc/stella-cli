@@ -544,3 +544,138 @@ async fn repeated_summarizer_failures_emit_events_and_latch() {
         "latched: no further events are emitted"
     );
 }
+
+/// A single observed-mode breach persists across every remaining settled
+/// call of the turn, but it must warn once per axis, not once per call —
+/// otherwise a session-limit breach on a many-step turn floods the stream.
+#[tokio::test]
+async fn observed_budget_breach_warns_once_per_axis_per_turn() {
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        // Two tool-call steps (each settles a cost, each over the limit)
+        // then a final answer: three settled calls in one turn.
+        script: TokioMutex::new(vec![
+            Ok(tool_call_result("call_1", "bash")),
+            Ok(tool_call_result("call_2", "bash")),
+            Ok(text_result("done")),
+        ]),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tools = CountingTools {
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("hi"),
+    ];
+    // Session limit only: the first $0.0001 call already crosses the
+    // $0.00005 session cap, and every later call stays over it.
+    let mut budget = BudgetGuard::new(BudgetMode::Observed, None, Some(0.00005));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = engine.run_turn(&mut messages, &mut budget, &tx).await;
+    assert!(
+        matches!(outcome, TurnOutcome::Completed { .. }),
+        "observed mode never gates: {outcome:?}"
+    );
+    let events = drain_events(&mut rx);
+    let warnings: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::Error {
+                    retryable: true,
+                    message,
+                } if message.contains("budget warning")
+            )
+        })
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "the persistent breach must warn once, not once per settled call: {events:?}"
+    );
+    match warnings[0] {
+        AgentEvent::Error { message, .. } => assert!(
+            message.contains("session limit"),
+            "the breached axis must be named: {message}"
+        ),
+        other => unreachable!("{other:?}"),
+    }
+}
+
+/// An enforced session breach that trips as the just-landed call settles
+/// aborts through `handle_committed_result` — its reason must name the
+/// session axis so the user knows which cap they hit.
+#[tokio::test]
+async fn enforced_session_breach_abort_reason_names_the_axis() {
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(vec![Ok(text_result("done"))]),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tools = CountingTools {
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("hi"),
+    ];
+    // No turn cap, a tiny session cap: the single call breaches the session
+    // axis, not the turn axis.
+    let mut budget = BudgetGuard::new(BudgetMode::Enforced, None, Some(0.00005));
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    match engine.run_turn(&mut messages, &mut budget, &tx).await {
+        TurnOutcome::Aborted { reason, .. } => assert!(
+            reason.contains("session limit"),
+            "the abort reason must name the breached axis: {reason}"
+        ),
+        other => panic!("enforced breach must abort: {other:?}"),
+    }
+}
+
+/// A session already over budget at the turn's opening safe-boundary aborts
+/// through `check_budget` (before any call is dispatched) — that reason must
+/// name the session axis too.
+#[tokio::test]
+async fn enforced_session_breach_at_step_boundary_names_the_axis() {
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(vec![Ok(text_result("done"))]),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let provider_calls = provider.calls.clone();
+    let tools = CountingTools {
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, EngineConfig::default(), &sleeper);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("hi"),
+    ];
+    let mut budget = BudgetGuard::new(BudgetMode::Enforced, None, Some(0.5));
+    // Reseed the session already over its cap (a resumed over-budget
+    // session): the very first between-steps check trips.
+    budget.reseed_session_spend(1.0);
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    match engine.run_turn(&mut messages, &mut budget, &tx).await {
+        TurnOutcome::Aborted { reason, .. } => assert!(
+            reason.contains("session limit"),
+            "the boundary abort reason must name the breached axis: {reason}"
+        ),
+        other => panic!("an over-budget session must abort at the boundary: {other:?}"),
+    }
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        0,
+        "the abort must precede any model call"
+    );
+}

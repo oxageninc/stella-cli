@@ -446,6 +446,7 @@ impl SessionModel {
                 spent_usd,
                 limit_usd,
                 mode,
+                ..
             } => {
                 self.hud.spent_usd = *spent_usd;
                 self.hud.limit_usd = *limit_usd;
@@ -1009,6 +1010,8 @@ mod tests {
             spent_usd: 0.01,
             limit_usd: None,
             mode: BudgetMode::Observed,
+            session_spent_usd: None,
+            session_limit_usd: None,
         });
         model.apply(&text("Hello!"));
         assert!(
@@ -1078,6 +1081,8 @@ mod tests {
                 spent_usd: 0.01,
                 limit_usd: None,
                 mode: BudgetMode::Observed,
+                session_spent_usd: None,
+                session_limit_usd: None,
             },
             text("Hello"),
             AgentEvent::Complete {
@@ -1098,6 +1103,8 @@ mod tests {
             spent_usd: 0.42,
             limit_usd: Some(2.0),
             mode: BudgetMode::Enforced,
+            session_spent_usd: None,
+            session_limit_usd: None,
         });
         assert_eq!(model.hud.spent_usd, 0.42);
         assert_eq!(model.hud.limit_usd, Some(2.0));

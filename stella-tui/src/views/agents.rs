@@ -419,6 +419,8 @@ mod tests {
                 spent_usd: 0.42,
                 limit_usd: Some(2.0),
                 mode: stella_protocol::BudgetMode::Observed,
+                session_spent_usd: None,
+                session_limit_usd: None,
             },
         });
 

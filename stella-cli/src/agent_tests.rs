@@ -1106,6 +1106,8 @@ fn reflection_budget_tick_is_rebased_to_the_caller_session() {
             spent_usd: 0.02,
             limit_usd: Some(0.2),
             mode: BudgetMode::Enforced,
+            session_spent_usd: None,
+            session_limit_usd: None,
         }],
     };
 

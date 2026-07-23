@@ -825,6 +825,8 @@ mod tests {
                 spent_usd: 0.1,
                 limit_usd: None,
                 mode: BudgetMode::Observed,
+                session_spent_usd: None,
+                session_limit_usd: None,
             },
             AgentEvent::ProviderFallback {
                 from: "a".into(),

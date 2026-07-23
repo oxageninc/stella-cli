@@ -125,6 +125,8 @@ pub async fn run_accounted_call(
         spent_usd: budget.spent_usd(),
         limit_usd: budget.turn_limit_usd(),
         mode: budget.mode(),
+        session_spent_usd: Some(budget.session_spent_usd()),
+        session_limit_usd: budget.session_limit_usd(),
     });
     if let BudgetOutcome::Warn {
         spent_usd,

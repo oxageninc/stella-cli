@@ -1697,6 +1697,8 @@ pub(crate) fn settle_reflection_budget(report: &mut ReflectionReport, guard: &mu
             spent_usd: guard.spent_usd(),
             limit_usd: guard.turn_limit_usd(),
             mode: guard.mode(),
+            session_spent_usd: None,
+            session_limit_usd: None,
         });
     }
 }
