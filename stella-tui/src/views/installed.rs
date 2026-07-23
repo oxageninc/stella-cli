@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Widget, Wrap
 use crate::composer;
 use crate::deck_ui::{DeckUi, InstalledMode, InstalledPanel};
 use crate::envelope::InstalledAgentEntry;
+use crate::syntax;
 use crate::theme;
 
 /// Column headers for the browse list, matching `widths` in [`render_list`].
@@ -154,11 +155,20 @@ fn render_editor(panel: &InstalledPanel, area: Rect, buf: &mut Buffer) {
     // Scroll the window so the cursor row is always visible (bottom-anchored
     // once the content exceeds the viewport).
     let start = (layout.cursor_row + 1).saturating_sub(height);
-    for (i, row) in layout.rows.iter().skip(start).take(height).enumerate() {
-        let y = inner.y + i as u16;
-        Paragraph::new(row.as_str())
-            .style(theme::body())
-            .render(Rect::new(inner.x, y, inner.width, 1), buf);
+    // Agent definitions are markdown (`<name>.md`), so rows highlight as
+    // markdown source. Every row feeds the highlighter from the top so
+    // fence/frontmatter state stays right regardless of the scroll window;
+    // a soft-wrapped row scans as its own line (slightly-off coloring on a
+    // wrapped heading, never a wrong character), matching the lexer's
+    // degrade-gracefully contract.
+    let mut hl = syntax::Highlighter::new(Some(syntax::Lang::Markdown));
+    for (i, row) in layout.rows.iter().enumerate() {
+        let spans = hl.spans(row, theme::body());
+        if i < start || i >= start + height {
+            continue;
+        }
+        let y = inner.y + (i - start) as u16;
+        Paragraph::new(Line::from(spans)).render(Rect::new(inner.x, y, inner.width, 1), buf);
     }
     // The cursor cell, reversed — same visual as a terminal caret.
     let cy = inner.y + (layout.cursor_row - start) as u16;
@@ -294,6 +304,23 @@ mod tests {
             .join("\n")
     }
 
+    /// The style of the first cell of the first occurrence of `needle`.
+    fn style_at(buf: &Buffer, needle: &str) -> Style {
+        let area = *buf.area();
+        let want: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        for y in 0..area.height {
+            'col: for x in 0..area.width {
+                for (k, w) in want.iter().enumerate() {
+                    if buf.cell((x + k as u16, y)).map(|c| c.symbol()) != Some(w.as_str()) {
+                        continue 'col;
+                    }
+                }
+                return buf.cell((x, y)).expect("cell in area").style();
+            }
+        }
+        panic!("{needle:?} not on screen");
+    }
+
     fn entry(name: &str, tools: Option<Vec<String>>) -> InstalledAgentEntry {
         InstalledAgentEntry {
             name: name.into(),
@@ -385,6 +412,39 @@ mod tests {
             "the save-is-a-new-version contract is on screen:\n{text}"
         );
         assert!(text.contains("name: reviewer"), "content shown:\n{text}");
+    }
+
+    #[test]
+    fn editor_highlights_markdown_source() {
+        let mut ui = ui_with(vec![entry("reviewer", None)]);
+        ui.installed.mode = InstalledMode::Edit;
+        ui.installed.editing = Some(("reviewer".into(), AgentScope::Project));
+        ui.installed
+            .editor
+            .load("---\nname: reviewer\n---\n# Reviewer\nplain prose");
+        let area = Rect::new(0, 0, 90, 10);
+        let mut buf = Buffer::empty(area);
+        render(&mut ui, area, &mut buf);
+        assert_eq!(
+            style_at(&buf, "---").fg,
+            Some(theme::SYNTAX_COMMENT),
+            "frontmatter delimiter dims"
+        );
+        assert_eq!(
+            style_at(&buf, "name:").fg,
+            Some(theme::SYNTAX_KEYWORD),
+            "frontmatter key lights up"
+        );
+        assert_eq!(
+            style_at(&buf, "# Reviewer").fg,
+            Some(theme::SYNTAX_KEYWORD),
+            "heading lights up"
+        );
+        assert_eq!(
+            style_at(&buf, "plain prose").fg,
+            theme::body().fg,
+            "prose keeps the body style"
+        );
     }
 
     #[test]

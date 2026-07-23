@@ -7,9 +7,10 @@
 //! only — the add/remove/hunk semantics stay consistent with the rest of the
 //! deck (and with any future light variant of the theme) by construction.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use crate::syntax::{Lang, lang_from_path, tok_style, tokenize};
 use crate::theme;
 
 /// Width of the right-aligned line-number gutter, excluding its trailing
@@ -279,18 +280,6 @@ fn with_bg(style: Style, bg: Option<Color>) -> Style {
     }
 }
 
-/// The foreground style for a token class (comments also italicize).
-fn tok_style(t: Tok) -> Style {
-    match t {
-        Tok::Keyword => Style::default().fg(theme::SYNTAX_KEYWORD),
-        Tok::Str => Style::default().fg(theme::SYNTAX_STRING),
-        Tok::Number => Style::default().fg(theme::SYNTAX_NUMBER),
-        Tok::Comment => Style::default()
-            .fg(theme::SYNTAX_COMMENT)
-            .add_modifier(Modifier::ITALIC),
-    }
-}
-
 /// The gutter cell: a right-aligned line number (or blank) plus one space.
 fn gutter(n: Option<u32>) -> Span<'static> {
     let text = match n {
@@ -344,54 +333,11 @@ fn elide_left(text: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-// ── Lightweight syntax highlighting ─────────────────────────────────────────
+// ── Diff-header language inference ──────────────────────────────────────────
 //
-// A compact, dependency-free lexer (no `syntect`, no tree-sitter — stella-tui
-// stays decoupled) that colors keywords, string/char literals, line comments,
-// and numbers for the languages the deck edits most. It is intentionally *not*
-// a parser: one left-to-right scan per line, no cross-line state, so a diff
-// hunk that slices a block comment or a multi-line string in half degrades to
-// slightly-off coloring, never a wrong add/remove or a panic. Unknown
-// extensions never reach here (the caller passes `None`).
-
-/// A language we can syntax-highlight.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Lang {
-    Rust,
-    /// TypeScript / JavaScript (and their `x`/module variants).
-    TsJs,
-    Python,
-}
-
-/// A token class we give a syntax color; `None` runs stay the base color.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Tok {
-    Keyword,
-    Str,
-    Number,
-    Comment,
-}
-
-/// Map a file extension to a language, or `None` if we don't highlight it.
-fn lang_from_ext(ext: &str) -> Option<Lang> {
-    match ext {
-        "rs" => Some(Lang::Rust),
-        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" => Some(Lang::TsJs),
-        "py" | "pyi" => Some(Lang::Python),
-        _ => None,
-    }
-}
-
-/// The language for a file path via its extension (the segment after the last
-/// `.`), guarding against a dot that lives in a parent directory rather than
-/// the filename.
-fn lang_from_path(path: &str) -> Option<Lang> {
-    let (_, ext) = path.rsplit_once('.')?;
-    if ext.contains('/') {
-        return None;
-    }
-    lang_from_ext(ext)
-}
+// The lexer itself lives in [`crate::syntax`], shared with the markdown
+// renderer and the skills/agents definition editors. What stays here is the
+// one diff-specific concern: inferring a language from the diff's own headers.
 
 /// Infer the language from a diff's own header lines (`diff --git a/f.rs …`,
 /// `+++ b/f.rs`, `--- a/f.rs`), scanning only up to the first hunk.
@@ -429,238 +375,10 @@ fn header_path_lang(token: &str) -> Option<Lang> {
     lang_from_path(token)
 }
 
-/// Split one line of source `code` into consecutive runs, each tagged with an
-/// optional token class (`None` = punctuation/whitespace/plain identifier).
-/// Lossless — concatenating the run texts reproduces `code` exactly — and
-/// panic-free.
-fn tokenize(code: &str, lang: Lang) -> Vec<(String, Option<Tok>)> {
-    let chars: Vec<char> = code.chars().collect();
-    let n = chars.len();
-    let mut runs: Vec<(String, Option<Tok>)> = Vec::new();
-    let mut plain = String::new();
-    let mut i = 0;
-
-    while i < n {
-        let c = chars[i];
-
-        // Line comment: `//` (Rust/TS/JS) or `#` (Python) runs to end of line.
-        if is_comment_start(&chars, i, lang) {
-            flush(&mut plain, &mut runs);
-            runs.push((chars[i..].iter().collect(), Some(Tok::Comment)));
-            return runs;
-        }
-
-        // String / char literal.
-        if is_string_start(&chars, i, lang) {
-            let (end, closed) = scan_string(&chars, i);
-            // An unterminated single quote is far more often a contraction in
-            // prose ("Don't" in JSX text or a docstring) than a string the
-            // hunk cut in half — leave it plain instead of swallowing the
-            // rest of the line. Double quotes and backticks keep the
-            // string-to-end-of-line reading (a cut hunk is the likely cause).
-            if closed || c != '\'' {
-                flush(&mut plain, &mut runs);
-                runs.push((chars[i..end].iter().collect(), Some(Tok::Str)));
-                i = end;
-                continue;
-            }
-            plain.push(c);
-            i += 1;
-            continue;
-        }
-
-        // Number literal (only at a run boundary — identifiers below consume
-        // their own trailing digits, so a leading digit here starts a number).
-        if c.is_ascii_digit() {
-            flush(&mut plain, &mut runs);
-            let end = scan_number(&chars, i);
-            runs.push((chars[i..end].iter().collect(), Some(Tok::Number)));
-            i = end;
-            continue;
-        }
-
-        // Identifier / keyword.
-        if is_ident_start(c) {
-            let mut j = i + 1;
-            while j < n && is_ident_continue(chars[j]) {
-                j += 1;
-            }
-            let word: String = chars[i..j].iter().collect();
-            if is_keyword(&word, lang) {
-                flush(&mut plain, &mut runs);
-                runs.push((word, Some(Tok::Keyword)));
-            } else {
-                plain.push_str(&word);
-            }
-            i = j;
-            continue;
-        }
-
-        // Anything else accumulates into the current plain run.
-        plain.push(c);
-        i += 1;
-    }
-    flush(&mut plain, &mut runs);
-    runs
-}
-
-/// Push the accumulated plain run (if any) and clear the buffer.
-fn flush(plain: &mut String, runs: &mut Vec<(String, Option<Tok>)>) {
-    if !plain.is_empty() {
-        runs.push((std::mem::take(plain), None));
-    }
-}
-
-fn is_comment_start(chars: &[char], i: usize, lang: Lang) -> bool {
-    match lang {
-        Lang::Python => chars[i] == '#',
-        Lang::Rust | Lang::TsJs => chars[i] == '/' && chars.get(i + 1) == Some(&'/'),
-    }
-}
-
-/// Whether position `i` opens a string/char literal. Double quotes (and TS/JS
-/// template backticks) always do; the single quote is ambiguous in Rust
-/// (lifetimes like `&'a T`, `derive('...')`), so there it only counts when it
-/// matches a char-literal shape — otherwise the whole line would mis-color.
-fn is_string_start(chars: &[char], i: usize, lang: Lang) -> bool {
-    match chars[i] {
-        '"' => true,
-        '`' => lang == Lang::TsJs,
-        '\'' => lang != Lang::Rust || is_rust_char_literal(chars, i),
-        _ => false,
-    }
-}
-
-/// A Rust char literal at `i`: `'x'` or an escaped `'\n'` / `'\''` / `'\\'`.
-fn is_rust_char_literal(chars: &[char], i: usize) -> bool {
-    if chars.get(i + 1) == Some(&'\\') {
-        chars.get(i + 3) == Some(&'\'')
-    } else {
-        matches!(chars.get(i + 1), Some(c) if *c != '\'') && chars.get(i + 2) == Some(&'\'')
-    }
-}
-
-/// Scan a string opened at `i`, honoring backslash escapes. Returns the end
-/// index (just past the closing quote, or end of line when unterminated) and
-/// whether the closing quote was actually found — the caller uses that to
-/// tell a real string from a lone apostrophe in prose.
-fn scan_string(chars: &[char], i: usize) -> (usize, bool) {
-    let quote = chars[i];
-    let n = chars.len();
-    let mut j = i + 1;
-    while j < n {
-        match chars[j] {
-            '\\' => j = (j + 2).min(n),
-            c if c == quote => return (j + 1, true),
-            _ => j += 1,
-        }
-    }
-    (n, false)
-}
-
-/// Scan a number opened at `i`: a run of alphanumerics/underscores (covering
-/// hex `0xFF`, suffixes `10u64`, separators `1_000`), plus one embedded
-/// decimal point followed by more digits (`1.5`), so a `1..2` range keeps its
-/// `..` intact. Returns the end index.
-fn scan_number(chars: &[char], i: usize) -> usize {
-    let n = chars.len();
-    let mut j = i;
-    while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
-        j += 1;
-    }
-    if j < n && chars[j] == '.' && chars.get(j + 1).is_some_and(|c| c.is_ascii_digit()) {
-        j += 1;
-        while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
-            j += 1;
-        }
-    }
-    j
-}
-
-fn is_ident_start(c: char) -> bool {
-    c.is_alphabetic() || c == '_'
-}
-
-fn is_ident_continue(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-/// Whether `word` is a keyword in `lang`. Linear scans over small, fixed
-/// slices — cheap enough for the handful of identifiers on a diff line.
-fn is_keyword(word: &str, lang: Lang) -> bool {
-    let table: &[&str] = match lang {
-        Lang::Rust => &RUST_KEYWORDS,
-        Lang::TsJs => &TSJS_KEYWORDS,
-        Lang::Python => &PYTHON_KEYWORDS,
-    };
-    table.contains(&word)
-}
-
-const RUST_KEYWORDS: [&str; 39] = [
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
-    "unsafe", "use", "where", "while", "yield",
-];
-
-const TSJS_KEYWORDS: [&str; 45] = [
-    "as",
-    "async",
-    "await",
-    "break",
-    "case",
-    "catch",
-    "class",
-    "const",
-    "continue",
-    "debugger",
-    "default",
-    "delete",
-    "do",
-    "else",
-    "enum",
-    "export",
-    "extends",
-    "false",
-    "finally",
-    "for",
-    "from",
-    "function",
-    "if",
-    "implements",
-    "import",
-    "in",
-    "instanceof",
-    "interface",
-    "let",
-    "new",
-    "null",
-    "of",
-    "readonly",
-    "return",
-    "super",
-    "switch",
-    "this",
-    "throw",
-    "true",
-    "try",
-    "typeof",
-    "undefined",
-    "var",
-    "void",
-    "while",
-];
-
-const PYTHON_KEYWORDS: [&str; 35] = [
-    "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
-    "else", "except", "False", "finally", "for", "from", "global", "if", "import", "in", "is",
-    "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return", "True", "try", "while",
-    "with", "yield",
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
 
     /// Flatten one styled line back to its text content.
     fn line_text(line: &Line<'_>) -> String {
@@ -935,38 +653,6 @@ mod tests {
     }
 
     #[test]
-    fn tokenizer_is_lossless_across_languages() {
-        for (code, lang) in [
-            ("let x = \"a\\\"b\"; // c", Lang::TsJs),
-            ("fn main() { 0xFF_u8; 'z' }", Lang::Rust),
-            ("def f(): return 1.5 # x", Lang::Python),
-            ("<p>Don't have an account?</p>", Lang::TsJs),
-            ("", Lang::Rust),
-        ] {
-            let rebuilt: String = tokenize(code, lang).into_iter().map(|(t, _)| t).collect();
-            assert_eq!(rebuilt, code, "tokenizer dropped/added chars for {code:?}");
-        }
-    }
-
-    #[test]
-    fn a_contraction_apostrophe_does_not_swallow_the_line_as_a_string() {
-        // An unpaired apostrophe in JSX prose must not open a string run —
-        // the old behavior painted everything after "Don" in string sand.
-        let runs = tokenize("<p>Don't have an account?</p>", Lang::TsJs);
-        assert!(
-            runs.iter().all(|(_, tok)| *tok != Some(Tok::Str)),
-            "no string run in prose: {runs:?}"
-        );
-        // A real single-quoted string on the same language still highlights.
-        let runs = tokenize("const x = 'ok';", Lang::TsJs);
-        assert!(
-            runs.iter()
-                .any(|(t, tok)| t == "'ok'" && *tok == Some(Tok::Str)),
-            "terminated strings keep their color: {runs:?}"
-        );
-    }
-
-    #[test]
     fn an_explicit_path_alone_decides_the_language_never_the_diff_content() {
         // Event-path pseudo-diffs have no headers, so their *content* must
         // never be sniffed as one: a removed SQL comment `-- see load.py`
@@ -1016,5 +702,33 @@ mod tests {
         let (all, n) = body_lines_capped(diff, Some("x.rs"), usize::MAX);
         assert_eq!(n, 5);
         assert_eq!(all, body_lines(diff, Some("x.rs")));
+    }
+
+    #[test]
+    fn markdown_and_toml_files_highlight_by_extension() {
+        // A skill/agent definition diff: markdown structure colors, with the
+        // add background preserved under it.
+        let line = body_lines("@@ -1 +1 @@\n+## Setup", Some("skills/x/SKILL.md"))
+            .pop()
+            .unwrap();
+        let kw = span_with(&line, "## Setup").expect("heading is its own span");
+        assert_eq!(kw.style.fg, Some(theme::SYNTAX_KEYWORD), "heading colored");
+        assert_eq!(kw.style.bg, Some(theme::DIFF_ADD_BG), "add tint preserved");
+        // A config diff: TOML keys and values color.
+        let line = body_lines("@@ -1 +1 @@\n+port = 8080", Some(".stella/mcp.toml"))
+            .pop()
+            .unwrap();
+        assert_eq!(
+            span_with(&line, "port").map(|s| s.style.fg),
+            Some(Some(theme::SYNTAX_KEYWORD)),
+            "key colored: {:?}",
+            line.spans
+        );
+        assert_eq!(
+            span_with(&line, "8080").map(|s| s.style.fg),
+            Some(Some(theme::SYNTAX_NUMBER)),
+            "value colored: {:?}",
+            line.spans
+        );
     }
 }
