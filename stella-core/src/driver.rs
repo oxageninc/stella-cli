@@ -81,7 +81,9 @@ use crate::{AccountedCall, AccountedCallError, run_accounted_call};
 use tokio::sync::mpsc::UnboundedSender;
 
 mod settlement;
-use settlement::{check_budget, record_settled_cost};
+use settlement::{
+    BudgetWarnings, axis_label, check_budget, emit_budget_warning, record_settled_cost,
+};
 
 /// Everything about a turn's execution that isn't the provider/tools
 /// themselves: prompt shape, retry/compaction/loop tuning, and hard
@@ -380,6 +382,9 @@ impl<'a> Engine<'a> {
         });
 
         let mut total_cost_usd = 0.0f64;
+        // Observed-mode budget warnings dedup per axis for this turn — a
+        // breach otherwise re-warns on every settled call after it.
+        let mut budget_warnings = BudgetWarnings::default();
         // The model string of the last committed step, for reading the
         // per-model drift correction. `None` until the first result lands —
         // `CalibrationMap::factor` then falls back to the session's single
@@ -418,7 +423,9 @@ impl<'a> Engine<'a> {
                     };
                 }
             }
-            if let Some(aborted) = check_budget(budget, total_cost_usd, events) {
+            if let Some(aborted) =
+                check_budget(budget, total_cost_usd, &mut budget_warnings, events)
+            {
                 return aborted;
             }
             total_cost_usd += self
@@ -432,12 +439,21 @@ impl<'a> Engine<'a> {
             if let Some(aborted) = self.check_loop_detection(messages, total_cost_usd, events) {
                 return aborted;
             }
-            if let Some(aborted) = check_budget(budget, total_cost_usd, events) {
+            if let Some(aborted) =
+                check_budget(budget, total_cost_usd, &mut budget_warnings, events)
+            {
                 return aborted;
             }
 
             let committed = match self
-                .run_model_call(step, messages, budget, &mut receipts, events)
+                .run_model_call(
+                    step,
+                    messages,
+                    budget,
+                    &mut receipts,
+                    &mut budget_warnings,
+                    events,
+                )
                 .await
             {
                 Ok(committed) => committed,
@@ -451,9 +467,14 @@ impl<'a> Engine<'a> {
             calibration_model = Some(committed.result.model.clone());
             total_cost_usd += committed.result.cost_usd;
 
-            if let Some(aborted) =
-                self.handle_committed_result(step, &committed, total_cost_usd, messages, events)
-            {
+            if let Some(aborted) = self.handle_committed_result(
+                step,
+                &committed,
+                total_cost_usd,
+                messages,
+                &mut budget_warnings,
+                events,
+            ) {
                 return aborted;
             }
 
@@ -685,6 +706,7 @@ impl<'a> Engine<'a> {
         messages: &[CompletionMessage],
         budget: &mut BudgetGuard,
         receipts: &mut ReceiptLedger,
+        warnings: &mut BudgetWarnings,
         events: &EventSender,
     ) -> Result<CommittedStep, String> {
         let tools_schema = self.tools.schemas();
@@ -793,7 +815,7 @@ impl<'a> Engine<'a> {
                 return Err(format!("model call failed: {message}"));
             }
         };
-        let budget_outcome = record_settled_cost(budget, result.cost_usd, events);
+        let budget_outcome = record_settled_cost(budget, result.cost_usd, warnings, events);
         let call_duration_ms = call_started.elapsed().as_millis() as u64;
 
         // Deferred-flush: these `Retry` events only reach the wire now
@@ -899,6 +921,7 @@ impl<'a> Engine<'a> {
         committed: &CommittedStep,
         total_cost_usd: f64,
         messages: &mut Vec<CompletionMessage>,
+        warnings: &mut BudgetWarnings,
         events: &EventSender,
     ) -> Option<TurnOutcome> {
         let result = &committed.result;
@@ -916,10 +939,15 @@ impl<'a> Engine<'a> {
             );
         }
 
+        // Observed-mode breaches were already surfaced when the cost settled
+        // (`record_settled_cost`); the per-turn ledger dedups, so this is a
+        // no-op after the first breach — present so every Warn observer on
+        // the path honors the contract. Only `enforced` reaches the abort.
+        emit_budget_warning(committed.budget_outcome, warnings, events);
         let BudgetOutcome::AbortTurn {
+            axis,
             spent_usd,
             limit_usd,
-            ..
         } = committed.budget_outcome
         else {
             return None;
@@ -984,8 +1012,10 @@ impl<'a> Engine<'a> {
                 attachments: Vec::new(),
             });
         }
+        let axis = axis_label(axis);
         let reason = format!(
-            "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} limit"
+            "budget exceeded after this call: spent ${spent_usd:.4} against a ${limit_usd:.2} \
+             {axis} limit"
         );
         let _ = events.send(AgentEvent::Error {
             message: reason.clone(),
