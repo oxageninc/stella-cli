@@ -763,8 +763,15 @@ impl<'a> Pipeline<'a> {
             Ok(r) => r,
             // Triage resolution failure is soft: fall through to the full path
             // via the deterministic floor. Never fail the run on triage.
+            // The conversational route is still resolved deterministically here
+            // (`resolve_conversational(false, goal)`) — a bare greeting must
+            // route to chat even when the triage provider can't be resolved,
+            // since it never depends on a model answer.
             Err(_) => {
-                return Ok(TaskAssessment::from_class(resolve_task_class(None, goal)));
+                return Ok(TaskAssessment {
+                    conversational: resolve_conversational(false, goal),
+                    ..TaskAssessment::from_class(resolve_task_class(None, goal))
+                });
             }
         };
         if let Some(fb) = &resolved.fallback {
