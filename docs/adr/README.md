@@ -13,6 +13,11 @@ Accepted. The ratified resolutions: `SharingScope` is the 4-value set
 2-value set from the 4→2 mapping. The related `Origin`-arity item (ADR 0001) was
 spec-verified as the full 5-value set for all families.
 
+ADR 0009 (Phase 1) resolves the seven decisions flagged in issue #483 that
+blocked the Phase-1 enum/validator freeze — four resolved by existing
+spec/ADRs, three ratified by the owner on 2026-07-24 (including the
+`informational → advisory` edge amended into ADR 0007).
+
 | # | Title | Status |
 |---|---|---|
 | [0001](0001-semantic-taxonomy.md) | Semantic Taxonomy | Accepted (Phase 0) |
@@ -21,5 +26,6 @@ spec-verified as the full 5-value set for all families.
 | [0004](0004-record-revision-identity.md) | Record Revision Identity | Accepted (Phase 0) |
 | [0005](0005-storage-authority.md) | Storage Authority | Accepted (Phase 0) |
 | [0006](0006-contextframe-vs-compiledcontextframe.md) | ContextFrame vs. CompiledContextFrame | Accepted (Phase 0) |
-| [0007](0007-immutable-promotion-history.md) | Immutable Promotion History | Accepted — ratified 2026-07-23 (enforcement 4→2) |
+| [0007](0007-immutable-promotion-history.md) | Immutable Promotion History | Accepted — ratified 2026-07-23 (enforcement 4→2); amended 2026-07-24 (`informational`→advisory) |
 | [0008](0008-markdown-canonical-rules.md) | Markdown Repository Rules Remain Canonical | Accepted (Phase 0) |
+| [0009](0009-enum-freeze-resolutions.md) | Enum-Freeze Resolutions (issue #483) | Accepted — ratified 2026-07-24 |

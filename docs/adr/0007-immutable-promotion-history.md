@@ -34,6 +34,16 @@ enforcement states. Also frame "Context PR" as UX over the
 levels may survive only as UI labels over those two enforcement states, never as
 a second enforcement enum.
 
+**Amendment — legacy `informational` edge (ratified 2026-07-24, ADR 0009):** the
+live legacy enum `RuleEnforcement` (`stella-core/src/rules/metadata.rs:31-38`)
+carries a *third* value, `informational`, present in neither the four-value
+`context-prs-spec.md` vocabulary nor the two-value `DirectiveEnforcement`. It
+migrates as **`informational → advisory`**: `informational` ("inform reviewers
+without adding an enforcement expectation") is semantically the passive tier,
+identical to `observe`, which already maps to `advisory`. This edge exists at
+migration only and adds no value to `DirectiveEnforcement`. See ADR 0009
+(decision 1) for the full derivation.
+
 ## Consequences
 
 Phase 6 emits immutable `PromotionRecorded` events with a re-proposal cooldown;
@@ -47,3 +57,6 @@ locked first.
 Resolved 2026-07-23: the repository owner ratified the **4→2** enforcement
 mapping. `DirectiveEnforcement` freezes on two values (`advisory`, `blocking`);
 the four levels may appear only as UI labels over them.
+
+Resolved 2026-07-24 (ADR 0009): the legacy `RuleEnforcement::Informational`
+value migrates as `informational → advisory`. No enforcement enum gains a value.
