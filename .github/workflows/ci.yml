@@ -16,19 +16,32 @@ on:
       - "package.json"
       - "pnpm-workspace.yaml"
       - "pnpm-lock.yaml"
+  # Merge queue: GitHub tests each queued PR against the current queue tip
+  # before it lands, so two individually-green PRs can't combine into a red
+  # `main` (see #306). The queue evaluates the required checks on the
+  # `merge_group` event, so `check` and `supply-chain` — the two required
+  # contexts — must both fire here or the queue can never go green. Note
+  # `merge_group` does NOT honor `paths-ignore`, so a docs-only PR that skips
+  # the Rust gate on `pull_request` still runs the full gate once queued; that
+  # is deliberate — the required check must report on the merged result.
+  merge_group:
   workflow_dispatch:
 
 concurrency:
-  # PR pushes share a group keyed on the PR ref and cancel-in-progress, so a
-  # rapid string of pushes to the same PR only pays for the latest one. Pushes
-  # to main must NOT share a group across commits: GitHub only keeps one
-  # "in progress" and one "queued" run per concurrency group — a third push
-  # arriving while a prior main run is still queued silently cancels that
-  # queued run rather than running it, so a break can land without a single
-  # red run to point at. Keying the group on github.sha for non-PR events
-  # gives every commit to main its own group, so its full-repo check
-  # (fmt + clippy + test, over ALL tracked files) always runs to completion
-  # and a breaking union goes red within one run.
+  # Three event shapes, three behaviors — the ternary below routes each:
+  #
+  # - pull_request: group by PR ref, cancel-in-progress. A rapid string of
+  #   pushes to the same PR only pays for the latest one.
+  # - push to main: group by github.sha (per-commit), no cancel. GitHub keeps
+  #   only one "in progress" and one "queued" run per group — a third push
+  #   arriving while a prior main run is still queued would silently cancel
+  #   that queued run, so a break could land with no red run to point at.
+  #   Per-commit groups give every commit its own full-repo run to completion.
+  # - merge_group (merge queue, #306): github.sha is the queued merge-group
+  #   head, unique per queue entry, so each entry lands in its own group with
+  #   no cancel — exactly what we want, since cancelling a merge_group run
+  #   would fail that entry in the queue. The non-'pull_request' branch of the
+  #   ternary already covers this; do not fold merge_group into the PR branch.
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
