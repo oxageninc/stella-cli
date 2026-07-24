@@ -200,6 +200,7 @@ name and `dataset.ref` carries the same `sha256:` digest separately.
           "default_model": "openrouter/deepseek/deepseek-v4-pro",
           "allowed_models": ["openrouter/deepseek/deepseek-v4-pro"],
           "auto_mode": "off", "effort_auto": "off", "reasoning_auto": "off",
+          "headless_scope_bypass": "on",
           "agents": {
             "default": {"effort": "high", "reasoning": "on"},
             "worker": {"effort": "high", "reasoning": "on"},
@@ -207,7 +208,7 @@ name and `dataset.ref` carries the same `sha256:` digest separately.
             "triage": {"effort": "low", "reasoning": "off"}
           }
         },
-        "sha256": "fb18233aadf78077bc70fe52cdb1dcacc1f840600473a92226a88e932a138fd6"
+        "sha256": "1740fa2f3f1bea66c348c7ffca151f526019ef0278829d23acb391e7b2f07159"
       },
       "openrouter/z-ai/glm-5.2": {
         "version": "stella-tb21-engine-posture-v1",
@@ -215,6 +216,7 @@ name and `dataset.ref` carries the same `sha256:` digest separately.
           "default_model": "openrouter/z-ai/glm-5.2",
           "allowed_models": ["openrouter/z-ai/glm-5.2"],
           "auto_mode": "off", "effort_auto": "off", "reasoning_auto": "off",
+          "headless_scope_bypass": "on",
           "agents": {
             "default": {"effort": "high", "reasoning": "on"},
             "worker": {"effort": "high", "reasoning": "on"},
@@ -222,7 +224,7 @@ name and `dataset.ref` carries the same `sha256:` digest separately.
             "triage": {"effort": "low", "reasoning": "off"}
           }
         },
-        "sha256": "de2a31097dbb71ba16d5b7e505e2cfcbd837deab387962635d4fe2f438a45860"
+        "sha256": "9b94f231d91e66c9793e2f61dd8c6edbb4472ea38e431681b5e854d9d22191ea"
       },
       "openrouter/x-ai/grok-4.5": {
         "version": "stella-tb21-engine-posture-v1",
@@ -230,6 +232,7 @@ name and `dataset.ref` carries the same `sha256:` digest separately.
           "default_model": "openrouter/x-ai/grok-4.5",
           "allowed_models": ["openrouter/x-ai/grok-4.5"],
           "auto_mode": "off", "effort_auto": "off", "reasoning_auto": "off",
+          "headless_scope_bypass": "on",
           "agents": {
             "default": {"effort": "high", "reasoning": "on"},
             "worker": {"effort": "high", "reasoning": "on"},
@@ -237,7 +240,7 @@ name and `dataset.ref` carries the same `sha256:` digest separately.
             "triage": {"effort": "low", "reasoning": "off"}
           }
         },
-        "sha256": "f43d8a25c68cee0f424e6bb3ce91891c48921ddb2f3231157a2c35dc12d66e07"
+        "sha256": "3c7d61553b7a4665ed974e6b32a7a20c1f8c59acaae2bcab3848eec2a39ca8dc"
       }
     },
     "job_name": "stella-tb21-calibration-20260721",

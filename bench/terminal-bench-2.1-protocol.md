@@ -25,9 +25,34 @@ raw trials, and disclosed comparator below.
 
 ## Immutable system under test
 
-- Stella base source commit: `ec7ee03afc187050d8334403b1893af71f65b053`
-- Stella release lineage: `0.4.49`; the final freeze records the public commit
-  containing the telemetry-only corrections discovered during calibration
+- Stella system-under-test commit: `fa2ec5bdae6db739628f2c37bad2ffb3ce6fe4ef`
+  (release lineage `0.5.1`; `git describe` = `v0.5.1-5-gfa2ec5b`; a public
+  ancestor of `origin/main`). This supersedes the original design anchor
+  `ec7ee03afc187050d8334403b1893af71f65b053` (`0.4.49`). **Honest disclosure:**
+  the finalized SUT is *not* a telemetry-only correction of `ec7ee03`. Between
+  `ec7ee03` and `fa2ec5b`, public `main` advanced 146 commits (+111,716 /
+  -23,110 across 550 files, a `0.4`→`0.5` minor bump) including feature work
+  (transactional `apply_edits`, `stella arena`, adaptive-context Phase 0/1,
+  graph-derived planner, syntax highlighting, HookBus resilience). The SUT is
+  therefore the current public 0.5.1 Stella, frozen deliberately at `fa2ec5b` —
+  the public `main` HEAD at protocol-finalization time that passes the
+  telemetry-completeness gate. It is finalized here **before** any
+  preregistration or paid run: the audit clock has not started, and the earlier
+  `#301` protocol push was pre-publication scaffolding, not the readiness
+  preregistration. The telemetry-completeness blocker demanded by the run-ledger
+  amendment is verified green on `fa2ec5b` — focused usage-completeness tests
+  pass (stella-store 5/5, stella-cli 3/3, stella-pipeline 8/8, including
+  abort-spend retention and per-paid-call metering) and the
+  `STELLA_DISABLE_REFLECTION` opt-out is present. A reference claim binary from
+  the preparation build (see Binary target) is
+  `sha256:9069b990088834af8cf7be17e29aca897cbd5e92b3e153dddaec60fe20b1c047`
+  (`x86_64-unknown-linux-gnu`, glibc 2.17 floor, stripped, stamped
+  `STELLA_BUILD_GIT_SHA=fa2ec5bdae6db739628f2c37bad2ffb3ce6fe4ef`). Because
+  release builds bake in the builder's rustup/cargo source paths, that byte-exact
+  SHA is host-specific and is *not* a reproducible cross-machine identity — the
+  authoritative binary identity is the source-commit stamp above plus the SHA
+  frozen in the run manifest for the exact binary the launcher uploads (the
+  adapter verifies the uploaded binary's SHA against the host binary per trial).
 - Binary target: `x86_64-unknown-linux-gnu`, built against glibc 2.17 from a
   clean checkout equal to its freshly fetched upstream. The claim build exports
   the full `git rev-parse HEAD` value as `STELLA_BUILD_GIT_SHA`; ordinary
@@ -118,8 +143,23 @@ raw trials, and disclosed comparator below.
   after all Harbor extras. Every role inherits the exact selected model from
   `default_model`; default/worker/judge use reasoning `on` at effort `high`,
   triage uses reasoning `off` at effort `low`, all auto modes are `off`, and no
-  role has a provider/model/prompt/parameter override. The canonical JSON and
-  its SHA-256 are emitted in Harbor context and ATIF and claim-gated per trial.
+  role has a provider/model/prompt/parameter override. The posture also sets
+  `headless_scope_bypass: on` (a string toggle) — a **deliberate,
+  score-affecting** setting, disclosed here explicitly. A headless trial has no
+  operator to approve an over-threshold plan; with this flag *off*, any plan
+  exceeding the step threshold (>5 steps) self-terminates the run, which would
+  make most multi-step Terminal-Bench tasks unwinnable. It is kept `on` because
+  a task container is disposable and the per-trial budget cap is the real guard.
+  This flag was added to `AgentEngineConfig` and to the canonical posture in
+  #322, **after** the #301 protocol-scaffolding push and after the original
+  engine-posture hashes were first written; the adapter docstring's claim that
+  the posture "cannot drift across Stella versions" is therefore qualified — the
+  field set itself grew, so the frozen hashes were recomputed for the 0.5.1 SUT
+  (see the calibration manifest below). Stella parses the exact posture through
+  its strict launcher seam (`config::tests::the_benchmark_engine_posture_survives_the_trusted_launcher_seam`),
+  so an unknown key would fail closed rather than run misconfigured. The
+  canonical JSON and its SHA-256 are emitted in Harbor context and ATIF and
+  claim-gated per trial.
 - Agent entry point: `/usr/local/bin/stella run` through
   `stella_harbor:StellaAgent`; the secure launcher requires exactly one
   explicit `--env docker` so its Docker receipt never relies on a Harbor
@@ -453,13 +493,14 @@ checks every `step_usage` record against the explicit mapping; it does not infer
 the mapping from the final envelope model.
 
 The registered engine-posture SHA-256 values (canonical JSON with sorted keys
-and no insignificant whitespace) are:
+and no insignificant whitespace), recomputed for the 0.5.1 SUT posture that
+includes `headless_scope_bypass: on` (see Engine posture above), are:
 
 | Configuration model | Engine-posture SHA-256 |
 |---|---|
-| `openrouter/deepseek/deepseek-v4-pro` | `fb18233aadf78077bc70fe52cdb1dcacc1f840600473a92226a88e932a138fd6` |
-| `openrouter/z-ai/glm-5.2` | `de2a31097dbb71ba16d5b7e505e2cfcbd837deab387962635d4fe2f438a45860` |
-| `openrouter/x-ai/grok-4.5` | `f43d8a25c68cee0f424e6bb3ce91891c48921ddb2f3231157a2c35dc12d66e07` |
+| `openrouter/deepseek/deepseek-v4-pro` | `1740fa2f3f1bea66c348c7ffca151f526019ef0278829d23acb391e7b2f07159` |
+| `openrouter/z-ai/glm-5.2` | `9b94f231d91e66c9793e2f61dd8c6edbb4472ea38e431681b5e854d9d22191ea` |
+| `openrouter/x-ai/grok-4.5` | `3c7d61553b7a4665ed974e6b32a7a20c1f8c59acaae2bcab3848eec2a39ca8dc` |
 
 Each posture differs only in the inherited selected model and its one-entry
 `allowed_models` list. A repository setting or Harbor extra that attempts to
