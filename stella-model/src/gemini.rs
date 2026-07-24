@@ -700,8 +700,25 @@ pub(crate) async fn aggregate_gemini_stream(
         }
     }
 
+    // EOF without a candidate carrying a `finishReason` is a disconnect, not a
+    // completion — a close-delimited HTTP/1.1 proxy, an LB idle-reap, or a
+    // truncating gateway ends the stream cleanly mid-response, and whatever
+    // text accumulated is a half-answer. `usageMetadata` is *not* a reliable
+    // terminal marker here (Gemini can emit it on non-final chunks), so the
+    // `finishReason` is the only trustworthy end-of-turn signal. Return a
+    // retryable Transport error so the existing retry machinery handles it,
+    // upholding #362's "never commit a truncated Ok" promise (mirrors
+    // anthropic/openai/zai). `label` — not a literal — is what makes vertex.rs,
+    // which reuses this aggregator, report against its own name.
+    if finish_raw.is_none() {
+        return Err(http::stream_ended_before_terminal(
+            label,
+            "a terminal finishReason",
+        ));
+    }
+
     let finish_reason = map_gemini_finish_reason(finish_raw.as_deref(), !tool_calls.is_empty());
-    usage.reported = usage_seen && finish_raw.is_some();
+    usage.reported = usage_seen;
     Ok((text, tool_calls, usage, finish_reason))
 }
 
@@ -923,6 +940,55 @@ mod tests {
         assert_eq!(result.model, "gemini-3-pro");
     }
 
+    /// The clean-EOF twin of the streaming test above: a well-formed Gemini
+    /// stream that simply ENDS without any candidate carrying a `finishReason`
+    /// (close-delimited HTTP/1.1 proxies, LB idle-reaps, and truncating gateways
+    /// surface a dropped connection as clean EOF, not a reqwest error) must fail
+    /// as a retryable Transport disconnect — never commit the partial "Hel" as a
+    /// successful completion. Mirrors #362's openai/zai clean-EOF guards.
+    #[tokio::test]
+    async fn complete_returns_transport_err_on_clean_eof_without_finish_reason() {
+        let server = MockServer::start().await;
+        // Text (and even a usageMetadata frame) arrive, then the stream ends —
+        // no candidate ever carries a `finishReason`. `usageMetadata` riding an
+        // early chunk proves it is NOT treated as a terminal marker: Gemini can
+        // emit it before the final chunk, so only `finishReason` ends a turn.
+        let sse_body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}],",
+            "\"usageMetadata\":{\"promptTokenCount\":8,\"candidatesTokenCount\":1}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3-pro:streamGenerateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::new(ApiKey::new("test-gemini-key"), "gemini-3-pro")
+            .with_base_url(server.uri());
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage::user("hi")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+            reasoning: None,
+            params: None,
+        };
+
+        let err = provider.complete(req).await.unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Transport(_)),
+            "expected Transport, got {err:?}"
+        );
+        assert!(err.is_retryable(), "a disconnect must be retryable");
+        let msg = err.to_string();
+        assert!(msg.contains("Gemini"), "names the provider: {msg}");
+        assert!(
+            msg.contains("finishReason"),
+            "names the missing terminal event: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn complete_mints_call_ids_and_captures_thought_signatures() {
         let server = MockServer::start().await;
@@ -930,7 +996,7 @@ mod tests {
         // complete JSON objects (no fragment reassembly) and a Gemini 3
         // thoughtSignature on the first part of the group.
         let sse_body = concat!(
-            "data: {\"candidates\":[{\"content\":{\"parts\":[",
+            "data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[",
             "{\"functionCall\":{\"name\":\"read_file\",\"args\":{\"path\":\"src/lib.rs\"}},\"thoughtSignature\":\"c2ln\"},",
             "{\"functionCall\":{\"name\":\"bash\",\"args\":{\"command\":\"ls\"}}}",
             "]}}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":12}}\n\n",
@@ -980,7 +1046,7 @@ mod tests {
         // malformed-call sentinel `driver.rs::execute_with_repair` checks, so a
         // valid no-arg call reported as null would be wrongly "repaired".
         let sse_body = concat!(
-            "data: {\"candidates\":[{\"content\":{\"parts\":[",
+            "data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[",
             "{\"functionCall\":{\"name\":\"now\"}}",
             "]}}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2}}\n\n",
         );
@@ -1209,7 +1275,9 @@ mod tests {
     async fn complete_sends_generation_config_params_on_the_wire() {
         use stella_protocol::GenerationParams;
         let server = MockServer::start().await;
-        let sse_body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}\n\n";
+        // Carries a terminal `finishReason` so the stream reads as a clean
+        // completion (this test only inspects the outgoing request body).
+        let sse_body = "data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}\n\n";
         Mock::given(method("POST"))
             .and(path("/models/gemini-3-pro:streamGenerateContent"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))

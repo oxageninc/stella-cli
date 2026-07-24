@@ -168,7 +168,7 @@ mod tests {
     async fn complete_sends_a_bearer_token_to_the_project_scoped_path() {
         let server = MockServer::start().await;
         let sse_body = concat!(
-            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi from Vertex\"}]}}],",
+            "data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"Hi from Vertex\"}]}}],",
             "\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":4,\"cachedContentTokenCount\":3}}\n\n",
         );
         Mock::given(method("POST"))
@@ -248,6 +248,54 @@ mod tests {
         assert!(!err.is_retryable());
     }
 
+    /// Vertex reuses `aggregate_gemini_stream`, so #362's clean-EOF guard must
+    /// cover it too: a well-formed stream that ends without a terminal
+    /// `finishReason` must fail as a retryable Transport disconnect, and the
+    /// error must name **Vertex AI** (not Gemini) — proof the shared aggregator
+    /// reports against the calling adapter's label.
+    #[tokio::test]
+    async fn complete_returns_transport_err_on_clean_eof_without_finish_reason() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}],",
+            "\"usageMetadata\":{\"promptTokenCount\":8,\"candidatesTokenCount\":1}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = VertexProvider::new(
+            ApiKey::new("ya29.test-token"),
+            "gemini-3-pro",
+            "my-project",
+            "global",
+        )
+        .with_base_url(server.uri());
+        let req = CompletionRequest {
+            messages: vec![CompletionMessage::user("hi")],
+            max_output_tokens: None,
+            temperature: None,
+            effort: None,
+            tools: vec![],
+            reasoning: None,
+            params: None,
+        };
+
+        let err = provider.complete(req).await.unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Transport(_)),
+            "expected Transport, got {err:?}"
+        );
+        assert!(err.is_retryable(), "a disconnect must be retryable");
+        let msg = err.to_string();
+        assert!(msg.contains("Vertex AI"), "names the adapter, not Gemini: {msg}");
+        assert!(
+            msg.contains("finishReason"),
+            "names the missing terminal event: {msg}"
+        );
+    }
+
     /// Vertex shares `build_generation_config` with `gemini.rs`, so the
     /// params/reasoning mapping (and its byte-stability early-out) is proven
     /// there; this pins that the shared config actually rides the Vertex
@@ -257,7 +305,9 @@ mod tests {
     async fn complete_sends_shared_generation_config_params_on_the_wire() {
         use stella_protocol::GenerationParams;
         let server = MockServer::start().await;
-        let sse_body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}\n\n";
+        // Carries a terminal `finishReason` so the stream reads as a clean
+        // completion (this test only inspects the outgoing request body).
+        let sse_body = "data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}\n\n";
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
             .mount(&server)
