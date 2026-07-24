@@ -592,6 +592,9 @@ impl<'a> Engine<'a> {
                 deduped_blocks: report.deduped_blocks,
                 superseded_blocks: report.superseded_blocks,
                 aged_blocks: report.aged_blocks,
+                // The pure passes never summarize — the overflow fallback below
+                // owns that path and its block identities.
+                summarized_blocks: Vec::new(),
                 effective_budget_tokens: compaction_budget,
                 calibration_factor: factor,
             });
@@ -784,6 +787,18 @@ impl<'a> Engine<'a> {
         events: &EventSender,
     ) {
         let replaced = end - start;
+        // Name which blocks left context (spec §6.2): the identity-bearing
+        // tool-result blocks in the span the summary folds away, keyed the same
+        // way the pure passes key theirs (`receipts::tool_result_block_id`), so
+        // a receipt consumer can reconcile the summary splice against the
+        // manifest. Captured before the splice mutates `messages`. Text
+        // messages in the span carry no block identity, so this is a subset of
+        // the `summarized` count, not a one-for-one list.
+        let summarized_blocks: Vec<String> = messages[start..end]
+            .iter()
+            .flat_map(|m| m.tool_results.iter())
+            .map(|r| crate::receipts::tool_result_block_id(&r.output))
+            .collect();
         let summary = CompletionMessage::user(format!(
             "{SUMMARY_MARKER_PREFIX} to fit context — full detail was compacted away; \
              re-read files or re-run tools for specifics]\n\n{text}"
@@ -797,13 +812,14 @@ impl<'a> Engine<'a> {
             superseded: 0,
             aged: 0,
             summarized: replaced,
-            // The summary splices a new block rather than stubbing existing
-            // ones; naming that summary block is deferred (spec §6.2). It
-            // targets the same effective budget as the pure passes.
+            // The summary path runs none of the pure passes, so their block
+            // vectors stay empty; the folded blocks are named in
+            // `summarized_blocks`. It targets the same effective budget.
             evicted_blocks: Vec::new(),
             deduped_blocks: Vec::new(),
             superseded_blocks: Vec::new(),
             aged_blocks: Vec::new(),
+            summarized_blocks,
             effective_budget_tokens: compaction_budget,
             calibration_factor: factor,
         });

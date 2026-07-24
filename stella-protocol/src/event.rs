@@ -324,8 +324,9 @@ pub enum AgentEvent {
         /// The `block_id`s each pass stubbed (spec §6.2) — identities, not just
         /// counts, so the receipt records *which* blocks left context and a
         /// later pass can prove a block was evicted before it was ever cited or
-        /// referenced (the wasted-carry signal). Each vec's length equals its
-        /// count field. `serde(default)` — absent on pre-identity journals.
+        /// referenced (the wasted-carry signal). For the pure passes each vec's
+        /// length equals its count field (`summarized_blocks` is the documented
+        /// exception). `serde(default)` — absent on pre-identity journals.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         evicted_blocks: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -334,6 +335,16 @@ pub enum AgentEvent {
         superseded_blocks: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         aged_blocks: Vec<String>,
+        /// The `block_id`s of the tool-result blocks folded into an
+        /// overflow-summary splice (spec §6.2). Unlike the pure passes — which
+        /// stub tool-result blocks one-for-one, so their vec length equals the
+        /// count — the summary replaces a whole message span whose `summarized`
+        /// count also covers user/assistant text carrying no block identity;
+        /// this vector is the identity-bearing (tool-result) subset that left
+        /// context, so `summarized_blocks.len()` may be less than `summarized`.
+        /// `serde(default)` — absent on pre-identity journals.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        summarized_blocks: Vec<String>,
         /// The budget this pass actually compared against — the raw compaction
         /// budget divided by the model's calibration factor — and that factor.
         /// The event's `before/after_tokens` are raw estimates; these are the
@@ -994,11 +1005,14 @@ mod tests {
             deduped: 1,
             superseded: 1,
             aged: 1,
-            summarized: 0,
+            summarized: 3,
             evicted_blocks: vec!["blk_ev1".into(), "blk_ev2".into()],
             deduped_blocks: vec!["blk_dd1".into()],
             superseded_blocks: vec!["blk_sup".into()],
             aged_blocks: vec!["blk_age".into()],
+            // Fewer identities than the `summarized` count: the summary folded
+            // three messages but only two were identity-bearing tool results.
+            summarized_blocks: vec!["blk_sum1".into(), "blk_sum2".into()],
             effective_budget_tokens: 136_363,
             calibration_factor: 1.1,
         };
@@ -1010,12 +1024,18 @@ mod tests {
                 before_tokens,
                 after_tokens,
                 evicted_blocks,
+                summarized,
+                summarized_blocks,
                 effective_budget_tokens,
                 ..
             } => {
                 assert!(after_tokens < before_tokens);
                 // Identities, not just counts — which blocks left context.
                 assert_eq!(evicted_blocks, vec!["blk_ev1", "blk_ev2"]);
+                // The summary names its folded tool-result blocks, and the vec
+                // may be shorter than the message count it replaced.
+                assert_eq!(summarized_blocks, vec!["blk_sum1", "blk_sum2"]);
+                assert!(summarized_blocks.len() < summarized);
                 assert_eq!(effective_budget_tokens, 136_363);
             }
             other => panic!("unexpected variant: {other:?}"),

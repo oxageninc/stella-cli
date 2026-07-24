@@ -471,6 +471,97 @@ async fn budget_aborted_summary_is_applied_not_discarded() {
     );
 }
 
+/// #461: the overflow-summary splice names *which* tool-result blocks it
+/// folded away in its `Compaction` receipt (spec §6.2). Before the fix
+/// `summarized_blocks` was hard-coded empty, so the one compaction path that
+/// most changes context reported no block identities. Witness: a tool-result
+/// block in the folded span leaves context and is named in the receipt.
+#[tokio::test]
+async fn overflow_summary_names_the_folded_tool_result_blocks() {
+    let provider = ScriptedProvider {
+        id: "scripted".into(),
+        script: TokioMutex::new(vec![Ok(text_result("SUMMARY"))]),
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let tools = CountingTools {
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let sleeper = NoopSleeper;
+    let engine = Engine::with_sleeper(&provider, &tools, overflow_config(), &sleeper);
+
+    // A tool-result block sits in the interior of the summarizable span,
+    // paired with its assistant tool_call and surrounded by big assistant
+    // texts so neither span bound walks onto a Tool message.
+    let folded_output = ToolOutput::Ok {
+        content: "read 4096 bytes from src/main.rs".into(),
+    };
+    let expected_block = crate::receipts::tool_result_block_id(&folded_output);
+    let mut messages = vec![
+        CompletionMessage::system("sys"),
+        CompletionMessage::user("the task"),
+        big_assistant_text("a0"),
+        CompletionMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                call_id: "c1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({ "path": "src/main.rs" }),
+            }],
+            tool_results: vec![],
+            attachments: Vec::new(),
+        },
+        CompletionMessage {
+            role: MessageRole::Tool,
+            content: String::new(),
+            tool_calls: vec![],
+            tool_results: vec![ToolResult {
+                call_id: "c1".into(),
+                output: folded_output.clone(),
+            }],
+            attachments: Vec::new(),
+        },
+        big_assistant_text("a1"),
+        big_assistant_text("a2"),
+        big_assistant_text("a3"),
+        big_assistant_text("a4"),
+    ];
+
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let mut health = SummarizerHealth::default();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let events = EventSender::new(tx);
+
+    let _ = engine
+        .summarize_overflow_span(&mut messages, &mut budget, 500, 1.0, &mut health, &events)
+        .await;
+
+    assert_eq!(summary_markers(&messages), 1, "the summary was spliced in");
+    assert!(
+        !messages
+            .iter()
+            .any(|m| m.tool_results.iter().any(|r| r.call_id == "c1")),
+        "the tool-result message was folded into the summary, so it left context"
+    );
+
+    let events = drain_events(&mut rx);
+    let summarized_blocks = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Compaction {
+                summarized,
+                summarized_blocks,
+                ..
+            } if *summarized > 0 => Some(summarized_blocks.clone()),
+            _ => None,
+        })
+        .expect("a summary compaction event was emitted");
+    assert!(
+        summarized_blocks.contains(&expected_block),
+        "summarized_blocks {summarized_blocks:?} must name the folded block {expected_block}"
+    );
+}
+
 /// #368.4: a summarizer that keeps failing must surface each failure and,
 /// after enough consecutive misses, latch — a persistently-timing-out cheap
 /// summarizer can't be allowed to re-fire (and re-pay) every remaining step.
