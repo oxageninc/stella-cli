@@ -1,0 +1,48 @@
+name: bench
+
+# The Python benchmark tooling (Terminal-Bench harbor adapter + claim analyzer)
+# is not covered by the Rust `ci.yml` gate, so it silently drifted red once
+# (adapter suite 224/2 — a posture-hash + stale-fixture drift caught only by hand
+# during TB2.1 run prep). This workflow gates those suites so it cannot recur.
+# Scoped to bench/ changes so ordinary Rust PRs don't pay for it.
+
+on:
+  pull_request:
+    paths:
+      - "bench/harbor_adapter/**"
+      - "bench/terminal_bench_analysis/**"
+      - ".github/workflows/bench.yml"
+  push:
+    branches: [main]
+    paths:
+      - "bench/harbor_adapter/**"
+      - "bench/terminal_bench_analysis/**"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: bench-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pytest:
+    name: harbor_adapter + analyzer pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: harbor_adapter — sync (locked) + pytest
+        working-directory: bench/harbor_adapter
+        run: |
+          uv sync --locked --extra dev
+          uv run --no-sync pytest -q
+
+      - name: terminal_bench_analysis — sync (locked) + pytest
+        working-directory: bench/terminal_bench_analysis
+        run: |
+          uv sync --locked --extra dev
+          uv run --no-sync pytest -q

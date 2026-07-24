@@ -79,6 +79,21 @@ pub enum MediaError {
     #[error("artifact store error: {0}")]
     Artifact(String),
 
+    /// A concurrent first-open of the host operation journal was observed
+    /// creating, mutating, or deleting the database's volatile WAL/SHM
+    /// sidecars between this opener's secure preparation and its validation —
+    /// the benign initialization race (a competing first-opener, not an
+    /// untrusted injection). It is handled *entirely internally* by
+    /// `SqliteMediaOperationJournal`'s bounded first-open retry, which re-runs
+    /// the full secure preparation against the now-settled sidecars through
+    /// the identical owner-only 0600 single-link path; a genuine injection
+    /// still fails closed on every attempt. Never surfaced to a caller's
+    /// retry loop — [`MediaError::is_retryable`] stays `false` — and only
+    /// escapes as an error at all if the race never settles within the retry
+    /// budget. The `String` is the human-readable sidecar detail.
+    #[error("host journal sidecar race during concurrent first-open: {0}")]
+    SidecarRace(String),
+
     /// A non-retryable provider failure not covered above (4xx other than
     /// auth/rate-limit, 5xx that exhausted retries upstream).
     #[error("terminal media provider error: {0}")]
@@ -123,6 +138,9 @@ mod tests {
             .is_retryable()
         );
         assert!(!MediaError::Terminal("500".into()).is_retryable());
+        // A concurrent-first-open sidecar race is handled internally by the
+        // journal's own retry, never by a caller's is_retryable loop.
+        assert!(!MediaError::SidecarRace("racing".into()).is_retryable());
     }
 
     #[test]

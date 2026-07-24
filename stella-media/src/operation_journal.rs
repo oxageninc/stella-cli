@@ -384,14 +384,14 @@ impl MediaOperationJournal for SqliteMediaOperationJournal {
 const INIT_RETRY_ATTEMPTS: u32 = 40;
 const INIT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Marker embedded in the sidecar-injection defense's error message so a
-/// first-open race can be told apart from a genuine untrusted injection.
-const SIDECAR_APPEARED: &str = "appeared after secure preparation";
-
-/// Whether `error` is the benign first-open sidecar race (a concurrent
-/// initializer's WAL files appearing mid-preparation), not a real injection.
+/// Whether `error` is the benign first-open sidecar race — a concurrent
+/// initializer creating, mutating, or deleting the shared WAL/SHM sidecars
+/// mid-preparation — rather than a genuine untrusted injection. Typed
+/// ([`MediaError::SidecarRace`]), not a message-substring match: the retry
+/// classification and the sites that raise it are coupled by the variant, so
+/// the compiler catches a divergence a reworded string never would (#456).
 fn is_sidecar_race(error: &MediaError) -> bool {
-    matches!(error, MediaError::Artifact(message) if message.contains(SIDECAR_APPEARED))
+    matches!(error, MediaError::SidecarRace(_))
 }
 
 /// Runs the idempotent first-open statements, absorbing `SQLITE_BUSY`.
@@ -556,24 +556,52 @@ struct PrivateFileGuard {
 
 #[cfg(unix)]
 impl PrivateFileGuard {
+    /// Re-validate that the securely opened file is byte-for-byte the same
+    /// object (device/inode/owner/links/mode) it was at open time. Terminal
+    /// classification: a disappearance or identity change is treated as
+    /// tampering that fails the whole open closed.
     fn validate_path(&self, path: &Path, label: &str) -> Result<(), MediaError> {
+        self.validate_path_classified(path, label, journal_error)
+    }
+
+    /// Same check, but `on_shift` classifies a disappeared/identity-changed
+    /// file. The main database passes [`journal_error`] (terminal tampering);
+    /// a shared SQLite sidecar passes [`MediaError::SidecarRace`], because a
+    /// concurrent first-open legitimately creates, checkpoints, and truncates
+    /// the WAL/SHM out from under a racing opener — a benign race the caller
+    /// retries from scratch, not an injection (#454).
+    fn validate_path_classified(
+        &self,
+        path: &Path,
+        label: &str,
+        on_shift: impl Fn(String) -> MediaError,
+    ) -> Result<(), MediaError> {
         let opened = self.file.metadata().map_err(|error| {
             journal_error(format!(
                 "cannot inspect opened {label} {}: {error}",
                 path.display()
             ))
         })?;
-        let current = std::fs::symlink_metadata(path).map_err(|error| {
-            journal_error(format!(
-                "cannot re-inspect {label} {}: {error}",
-                path.display()
-            ))
-        })?;
+        let current = match std::fs::symlink_metadata(path) {
+            Ok(current) => current,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(on_shift(format!(
+                    "{label} {} disappeared after its secure open",
+                    path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(journal_error(format!(
+                    "cannot re-inspect {label} {}: {error}",
+                    path.display()
+                )));
+            }
+        };
         let opened = private_file_identity(&opened);
         let current = private_file_identity(&current);
         if opened != self.identity || current != self.identity {
-            return Err(journal_error(format!(
-                "{label} {} changed after its secure open; refusing initialization",
+            return Err(on_shift(format!(
+                "{label} {} changed after its secure open",
                 path.display()
             )));
         }
@@ -591,11 +619,22 @@ struct PreparedSidecar {
 impl PreparedSidecar {
     fn validate(&self) -> Result<(), MediaError> {
         match &self.guard {
-            Some(guard) => guard.validate_path(&self.path, "journal SQLite sidecar"),
+            // A sidecar that was present at preparation may be checkpointed,
+            // truncated, or replaced by a concurrent first-open before we
+            // validate it: a disappearance or identity change here is the
+            // benign race, not tampering, so it is retried, not fatal.
+            Some(guard) => guard.validate_path_classified(
+                &self.path,
+                "journal SQLite sidecar",
+                MediaError::SidecarRace,
+            ),
             None => match std::fs::symlink_metadata(&self.path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Ok(_) => Err(journal_error(format!(
-                    "journal SQLite sidecar {} {SIDECAR_APPEARED}; refusing initialization",
+                // A sidecar that was absent at preparation but exists now is a
+                // concurrent first-open's freshly created WAL/SHM appearing
+                // mid-preparation — the benign race the caller retries.
+                Ok(_) => Err(MediaError::SidecarRace(format!(
+                    "journal SQLite sidecar {} appeared after secure preparation",
                     self.path.display()
                 ))),
                 Err(error) => Err(journal_error(format!(
@@ -897,9 +936,30 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> Result<PathBuf, MediaError>
 fn validate_sqlite_sidecars(path: &Path) -> Result<(), MediaError> {
     for suffix in ["-wal", "-shm"] {
         let sidecar = sqlite_sidecar_path(path, suffix)?;
-        validate_existing_private_file(&sidecar, "journal SQLite sidecar")?;
+        validate_existing_private_file(&sidecar, "journal SQLite sidecar")
+            .map_err(|error| sidecar_race_or(&sidecar, error))?;
     }
     Ok(())
+}
+
+/// Re-classify a sidecar preparation/validation failure. A concurrent
+/// first-open constantly creates, checkpoints, and truncates the shared
+/// WAL/SHM, so a secure check can find the file gone the instant after it
+/// saw it — surfacing as an I/O "cannot open/re-inspect … No such file". If
+/// the sidecar is absent when we look again, that was the benign race the
+/// caller retries ([`MediaError::SidecarRace`]); a still-present file that
+/// failed validation (e.g. a stable unsafe mode) is left terminal, so a real
+/// injection and the `open_refuses_unsafe_wal_and_shm_sidecars` guarantee are
+/// unaffected.
+#[cfg(unix)]
+fn sidecar_race_or(sidecar: &Path, error: MediaError) -> MediaError {
+    match std::fs::symlink_metadata(sidecar) {
+        Err(io) if io.kind() == std::io::ErrorKind::NotFound => MediaError::SidecarRace(format!(
+            "journal SQLite sidecar {} vanished during a concurrent first-open",
+            sidecar.display()
+        )),
+        _ => error,
+    }
 }
 
 #[cfg(unix)]
@@ -915,7 +975,10 @@ fn prepare_sqlite_sidecars(path: &Path) -> Result<Vec<PreparedSidecar>, MediaErr
                         sidecar.display()
                     )));
                 }
-                Some(precreate_private_file(&sidecar, "journal SQLite sidecar")?)
+                Some(
+                    precreate_private_file(&sidecar, "journal SQLite sidecar")
+                        .map_err(|error| sidecar_race_or(&sidecar, error))?,
+                )
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
@@ -1021,7 +1084,20 @@ mod security_tests {
             },
         );
 
-        assert!(result.is_err(), "late sidecar must fail closed");
+        // #456: the appeared-sidecar path produces the *typed* `SidecarRace`
+        // variant, and `is_sidecar_race` (the concurrent-first-open retry
+        // classifier) keys on that variant — never on a message substring.
+        let error = result
+            .err()
+            .expect("late sidecar must fail the single attempt closed");
+        assert!(
+            matches!(error, MediaError::SidecarRace(_)),
+            "the appeared-sidecar path must be typed SidecarRace, got {error:?}"
+        );
+        assert!(
+            is_sidecar_race(&error),
+            "the retry loop must classify a late sidecar as a retryable race"
+        );
         assert_eq!(std::fs::read(&injected).unwrap(), b"untrusted-sidecar");
         let connection = Connection::open(&journal_path).unwrap();
         let journal_tables: i64 = connection

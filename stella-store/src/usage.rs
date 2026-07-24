@@ -437,7 +437,7 @@ impl UsageStore {
                     t.step, t.recorded_at, t.provider, t.call_role, t.model, t.input_tokens, \
                     t.estimated_input_tokens, t.output_tokens, t.cache_read_tokens, \
                     t.cache_miss_tokens, t.cache_write_tokens, t.cost_usd, t.duration_ms, \
-                    t.retries, t.tool_calls, t.usage_complete \
+                    t.retries, t.tool_calls, t.usage_complete, t.source_rowid \
              FROM telemetry t \
              WHERE t.org_id = ?1 \
                AND t.rowid > COALESCE((SELECT last_hub_rowid FROM cloud_sync_cursors \
@@ -452,6 +452,7 @@ impl UsageStore {
                 repo_id: r.get(3)?,
                 project_id: r.get(4)?,
                 execution_id: r.get(5)?,
+                source_rowid: r.get(22)?,
                 recorded_at: r.get(7)?,
                 telemetry: crate::TelemetryRow {
                     step: r.get::<_, i64>(6)? as u64,
@@ -524,6 +525,12 @@ pub struct GlobalTelemetryRow {
 }
 
 /// One org-scoped hub row awaiting cloud acknowledgement.
+///
+/// `hub_rowid` addresses the row for the monotonic cloud cursor
+/// ([`UsageStore::ack_cloud_synced`]); `source_rowid` is the per-project id the
+/// wire contract ships as half of the intake's `(workspace_id, source_rowid)`
+/// dedup key (see [`crate::drain`]). They are distinct: the cursor is a hub
+/// concern, the dedup key a wire concern.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CloudTelemetryEvent {
     pub hub_rowid: i64,
@@ -532,6 +539,7 @@ pub struct CloudTelemetryEvent {
     pub repo_id: String,
     pub project_id: String,
     pub execution_id: i64,
+    pub source_rowid: i64,
     pub recorded_at: String,
     pub telemetry: crate::TelemetryRow,
 }
