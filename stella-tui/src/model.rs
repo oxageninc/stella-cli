@@ -220,6 +220,14 @@ pub enum TranscriptEntry {
         summary: String,
         deterministic: bool,
     },
+    /// A goal-check verdict from the judge loop (`AgentEvent::GoalVerdict`) —
+    /// the symmetric scrollback row to [`Self::JudgeVerdict`]. `met` is the
+    /// pass/fail; `round` is the judge iteration it settled on.
+    GoalVerdict {
+        met: bool,
+        round: usize,
+        reasoning: String,
+    },
     /// A scope-review gate was presented (the actionable card is driven off
     /// [`SessionModel::pending_scope_review`]; this line is the scrollback
     /// record of it).
@@ -572,20 +580,29 @@ impl SessionModel {
                         .map(|t| t.subject.clone()),
                 });
             }
+            AgentEvent::GoalVerdict {
+                met, round, reasoning, ..
+            } => {
+                // Symmetric to `JudgeVerdict` above — a scrollback row. The
+                // event's own `cost_usd` is already accounted against the
+                // budget when it fires, so it is dropped here (folding it would
+                // double-count the HUD spend, which `BudgetTick` drives).
+                self.transcript.push(TranscriptEntry::GoalVerdict {
+                    met: *met,
+                    round: *round,
+                    reasoning: reasoning.clone(),
+                });
+            }
             // `StepUsage` is a metering/billing record consumed by
             // `stella-store`; the HUD's live spend is driven by `BudgetTick`,
-            // so folding it here would double-count. `GoalVerdict`'s own
-            // `cost_usd` is likewise already accounted against the budget when
-            // it fires. Neither mutates TUI state today (a goal-verdict
-            // transcript row is a display enhancement, tracked as follow-up).
+            // so folding it here would double-count.
             AgentEvent::StepUsage { .. }
             | AgentEvent::UsageIncomplete { .. }
             // Context receipts (spec §4/§5) are consumed by the store/inspector,
             // not folded into TUI panel state — the model stays a pure function
             // of the user-visible event sequence.
             | AgentEvent::BlockRegistered { .. }
-            | AgentEvent::StepManifest { .. }
-            | AgentEvent::GoalVerdict { .. } => {}
+            | AgentEvent::StepManifest { .. } => {}
             AgentEvent::Error { message, retryable } => {
                 self.pending_scope_review = None;
                 self.pending_ask_user = None;
@@ -1397,6 +1414,38 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Witness for #463: a `GoalVerdict` event lands as its own transcript row
+    /// (it used to fold as a no-op, leaving the transcript empty) — symmetric
+    /// to `JudgeVerdict`. Its `cost_usd` is *not* double-counted into HUD spend.
+    #[test]
+    fn goal_verdict_lands_on_the_transcript_without_touching_spend() {
+        let mut model = SessionModel::new();
+        model.apply(&AgentEvent::GoalVerdict {
+            round: 3,
+            met: true,
+            reasoning: "the witness test passes now".into(),
+            cost_usd: 0.02,
+        });
+        assert_eq!(model.transcript.len(), 1, "goal verdict is recorded");
+        match &model.transcript[0] {
+            TranscriptEntry::GoalVerdict {
+                met,
+                round,
+                reasoning,
+            } => {
+                assert!(*met);
+                assert_eq!(*round, 3);
+                assert_eq!(reasoning, "the witness test passes now");
+            }
+            other => panic!("expected GoalVerdict, got {other:?}"),
+        }
+        // `cost_usd` is billing state, not HUD state (`BudgetTick` drives spend).
+        assert_eq!(
+            model.hud.spent_usd, 0.0,
+            "goal-verdict cost is not folded here"
+        );
     }
 
     #[test]

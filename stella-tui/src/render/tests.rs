@@ -126,6 +126,11 @@ fn every_transcript_entry_renders_in_the_label_gutter() {
             summary: "ok".into(),
             deterministic: true,
         },
+        TranscriptEntry::GoalVerdict {
+            met: false,
+            round: 2,
+            reasoning: "tests still red".into(),
+        },
         TranscriptEntry::ScopeReview {
             summary: "auth".into(),
             steps: 2,
@@ -183,6 +188,7 @@ fn every_transcript_entry_renders_in_the_label_gutter() {
             | TranscriptEntry::MediaProgress { .. }
             | TranscriptEntry::MediaComplete { .. }
             | TranscriptEntry::JudgeVerdict { .. }
+            | TranscriptEntry::GoalVerdict { .. }
             | TranscriptEntry::ScopeReview { .. }
             | TranscriptEntry::AskUser { .. }
             | TranscriptEntry::Commit { .. }

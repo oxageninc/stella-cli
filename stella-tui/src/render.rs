@@ -1297,6 +1297,34 @@ pub(crate) fn entry_lines(
                 out,
             );
         }
+        TranscriptEntry::GoalVerdict {
+            met,
+            round,
+            reasoning,
+        } => {
+            let (glyph, color) = if *met {
+                ("✓", theme::OK)
+            } else {
+                ("○", theme::WARN)
+            };
+            push_labeled(
+                &format!("{glyph} goal"),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+                vec![
+                    Span::styled(
+                        format!("[round {round}] "),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                    Span::raw(if *met {
+                        format!("goal met — {reasoning}")
+                    } else {
+                        format!("not yet met — {reasoning}")
+                    }),
+                ],
+                width,
+                out,
+            );
+        }
         TranscriptEntry::ScopeReview {
             summary,
             steps,
