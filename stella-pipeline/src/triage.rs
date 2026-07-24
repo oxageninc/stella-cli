@@ -684,9 +684,25 @@ mod tests {
     #[test]
     fn is_bare_greeting_matches_whole_message_only() {
         for g in [
-            "hi", "Hi", "  hi  ", "hi!", "hello.", "HELLO", "hey", "yo",
-            "hey there", "thanks", "thank you", "thankyou", "ty", "", "   ",
-            "hi stella", "\"hi\"", "gm", "good morning",
+            "hi",
+            "Hi",
+            "  hi  ",
+            "hi!",
+            "hello.",
+            "HELLO",
+            "hey",
+            "yo",
+            "hey there",
+            "thanks",
+            "thank you",
+            "thankyou",
+            "ty",
+            "",
+            "   ",
+            "hi stella",
+            "\"hi\"",
+            "gm",
+            "good morning",
         ] {
             assert!(is_bare_greeting(g), "{g:?} should be a bare greeting");
         }
@@ -699,7 +715,7 @@ mod tests {
             "hello world function",
             "hey there, add a test",
             "thanks for nothing, delete the file",
-            "high",         // superstring of "hi"
+            "high", // superstring of "hi"
             "history",
         ] {
             assert!(!is_bare_greeting(g), "{g:?} must NOT be a bare greeting");
@@ -711,7 +727,10 @@ mod tests {
         // Model says chat, no task signal, not a bare greeting → chat stands.
         assert!(resolve_conversational(true, "what's your favorite color"));
         // Model silent AND not a greeting → not conversational.
-        assert!(!resolve_conversational(false, "what does the retry policy do?"));
+        assert!(!resolve_conversational(
+            false,
+            "what does the retry policy do?"
+        ));
         // Positive task signal overrules an over-eager `chat`: an enumeration,
         // conjoined imperatives, or cross-cutting scope is real work no matter
         // what the cheap triage model guessed.
