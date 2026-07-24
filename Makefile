@@ -62,6 +62,11 @@ test-cli: ## Test stella-cli only (the shipping binary)
 test-protocol: ## Test stella-protocol only (shared types)
 	cargo test -p stella-protocol
 
+.PHONY: bench-test
+bench-test: ## Test the Python benchmark tooling (TB2.1 adapter + analyzer)
+	cd bench/harbor_adapter && uv sync --locked --extra dev && uv run --no-sync pytest -q
+	cd bench/terminal_bench_analysis && uv sync --locked --extra dev && uv run --no-sync pytest -q
+
 .PHONY: gate
 gate: format-check lint test ## Full CI gate: fmt-check + clippy + test
 

@@ -116,10 +116,11 @@ every other digest is an external dataset/comparator/fixture value, unchanged).
    `stella init` (code-graph indexing added after the fixture was written). Added
    the attribute. The posture assertion was updated to the recomputed hash.
 
-> ⚠️ **CI gap discovered:** stella's CI is Rust-only (`fmt + clippy + test`), so
-> the Python adapter/analyzer suites are **not CI-gated** — which is how the
-> adapter suite drifted red unnoticed. Recommend adding these `pytest` suites to
-> CI before or alongside publication.
+> ✅ **CI gap fixed:** stella's CI was Rust-only (`fmt + clippy + test`), so the
+> Python adapter/analyzer suites were **not gated** — which is how the adapter
+> suite drifted red unnoticed. Added `.github/workflows/bench.yml` (gates both
+> `pytest` suites on `bench/**` changes) and a `make bench-test` target for local
+> parity, so this drift class cannot recur silently.
 
 ---
 
