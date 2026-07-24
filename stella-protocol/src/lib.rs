@@ -10,6 +10,7 @@
 pub mod attachment;
 pub mod cache;
 pub mod completion;
+pub mod context_event;
 pub mod error;
 pub mod event;
 pub mod provider;
