@@ -11,7 +11,7 @@
 # Background companions (informative, not normative):
 #   context-frame-spec.md, directive-schema.md
 # Excluded from this plan by the build prompt ("do not edit
-# context-graph-protocol from this repository"): the CGEP protocol work —
+# context-graph-protocol from this repository"): the CGP protocol work —
 # context-graph-protocol-build-prompt.md runs in that repo separately.
 #
 # HOW TO RUN
@@ -32,7 +32,7 @@
 #     everything, so every prompt instructs the worker to RECONCILE with
 #     already-landed work instead of duplicating it.
 #   - Tasks map 1:1 onto the implementation plan's phases and their gates
-#     (Phase 0 → t00 ... Phase 9 → t20/t21). Phase 10 (CGEP interop) is
+#     (Phase 0 → t00 ... Phase 9 → t20/t21). Phase 10 (CGP interop) is
 #     deliberately absent: separate repo, separate handoff prompt, and gated
 #     on a second provider use case.
 #
@@ -1260,11 +1260,10 @@ Deliver:
    decisions individual tasks recorded in commit bodies (JCS strategy,
    json_schema checker choice, tokenizer_ref naming, deferred items:
    cached base/delta frames, intent taxonomy, workspace provider, Phase 10
-   CGEP adapter).
+   CGP adapter).
 3. AGENTS.md: extend the .stella table (context lifecycle records in
    context.db, .stella/context-snapshots/), note the settings tuple, and
-   correct the external-protocol row: the protocol is Context Graph
-   Exchange Protocol (repo context-graph-protocol, renamed from
+   correct the external-protocol row: the protocol is Context Graph Protocol (repo context-graph-protocol, renamed from
    opencontextprotocol); Stella still depends on the pre-rename
    ocp-types/ocp-host coordinates at a pinned rev, and repointing is a
    Phase 10 prerequisite. Do NOT touch the context-graph-protocol

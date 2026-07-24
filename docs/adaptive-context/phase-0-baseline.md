@@ -56,7 +56,7 @@ stella-mcp  stella-media    stella-model stella-observatory stella-pipeline
 stella-protocol stella-serve stella-store stella-tools stella-tui
 ```
 
-The Context Graph Exchange Protocol types are consumed as a **pinned git
+The Context Graph Protocol types are consumed as a **pinned git
 dependency**, not a path dep on the sibling checkout:
 
 ```toml
@@ -69,7 +69,7 @@ contextgraph-conformance = { git = ".../context-graph-protocol", rev = "9fb559aa
 The pinned rev (`9fb559a`) equals the sibling repo's current `main` HEAD.
 `ContextQuery`, `ContextFrame`, and `Representation` come from that checkout, not
 from `stella-*` — the types below are quoted from the rev that actually
-compiles. **Phase 10 (CGEP export) is gated on this rev pin being allowed to
+compiles. **Phase 10 (CGP export) is gated on this rev pin being allowed to
 move**; treat it as fixed until then.
 
 ## 3. Two SQLite authorities (do not cross-wire)

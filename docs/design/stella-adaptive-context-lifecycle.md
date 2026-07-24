@@ -2,7 +2,7 @@
 
 **Status:** Draft architecture specification  
 **Target product:** Stella  
-**Related protocol:** Context Graph Exchange Protocol (CGEP; proposed public name, current repository `context-graph-protocol`)  
+**Related protocol:** Context Graph Protocol (CGP; proposed public name, current repository `context-graph-protocol`)  
 **Serialized naming:** lowercase snake_case  
 **Canonical record time fields:** observed_at, valid_from, valid_until
 
@@ -50,7 +50,7 @@ This separation prevents several common failures:
 
 Stella owns learning policy, local storage, trace mining, governance, context
 compilation, prompt rendering, artifact validation, and user experience.
-Context Graph Exchange Protocol owns only portable wire semantics, provider
+Context Graph Protocol owns only portable wire semantics, provider
 capability negotiation, temporal and provenance semantics, lifecycle exchange,
 compact frame representations, rehydration, errors, and conformance.
 
@@ -66,7 +66,7 @@ The complete local-first learning loop is implemented in Stella. A new protocol
 release is not required for Stella to begin extracting observations, compiling
 frames, validating contracts, or governing local directives.
 
-### 2.2 Context Graph Exchange Protocol remains general
+### 2.2 Context Graph Protocol remains general
 
 The protocol may exchange typed records and frame representations, but it does
 not decide:
@@ -82,7 +82,7 @@ not decide:
 
 ### 2.3 The protocol ContextFrame remains canonical
 
-Context Graph Exchange Protocol already defines ContextFrame as an atomic provider-returned
+Context Graph Protocol already defines ContextFrame as an atomic provider-returned
 retrieval item. It remains the canonical protocol frame.
 
 Stella defines a separate CompiledContextFrame: the complete bounded package
@@ -164,7 +164,7 @@ project identity exists.
 - Uploading traces, preferences, source code, or evidence.
 - Replacing Stella's rule engine, code graph, execution store, or verifier.
 - Making every raw observation retrievable by the model.
-- Defining Stella governance inside Context Graph Exchange Protocol.
+- Defining Stella governance inside Context Graph Protocol.
 - Requiring GitHub, cloud sync, or organization infrastructure.
 - Making cached context snapshots authoritative.
 - Solving authorization through learned directives.
@@ -223,7 +223,7 @@ optional commercial provider/control plane:
 Stella local/BYOK host and context data plane
   complete individual learning without an account
         ^
-        | policy-bound CGEP exchange
+        | policy-bound CGP exchange
         v
 provider implementations
         +-- local or third-party provider
@@ -374,7 +374,7 @@ non-instructional.
 
 The draft lifecycle operations provide export and provider retrieval, not a
 complete replication protocol. Oxagen may implement product-specific encrypted
-sync outside the portable core. CGEP must not claim portable synchronization
+sync outside the portable core. CGP must not claim portable synchronization
 until an optional sync capability specifies stable cursors, ordered change
 feeds, acknowledgements, tombstones, conflict handling, deletion propagation,
 and offline replay.
@@ -587,8 +587,7 @@ Promotion is not assumed to be a single linear state machine.
 
 ### 6.11 Context frame terms
 
-- **ContextFrame:** canonical atomic retrieval item defined by Context Graph
-  Exchange Protocol.
+- **ContextFrame:** canonical atomic retrieval item defined by Context Graph Protocol.
 - **CompiledContextFrame:** Stella's complete bounded task-specific package.
 - **PromptContext:** the final token-optimized rendering supplied to a model.
 - **FrameManifest:** immutable explanation of inputs, selections, exclusions,
@@ -2769,7 +2768,7 @@ With an approved contract, Stella:
 
 Memory reminds; a contract verifies.
 
-## 17. Context Graph Exchange Protocol boundary
+## 17. Context Graph Protocol boundary
 
 ### 17.1 Existing query surface
 
@@ -2805,10 +2804,11 @@ consent_required, and content_hash_mismatch.
 
 ### 17.3 Optional lifecycle extension
 
-Target capability identifier after the separate CGEP naming migration:
+Lifecycle capability identifier (§23 — no rename; the `contextgraph/*` stem is
+canonical):
 
 ~~~text
-cgep/lifecycle/1.0-draft
+contextgraph/lifecycle/1.0-draft
 ~~~
 
 Until that migration lands, an implementation preserves the protocol's current
@@ -3116,58 +3116,32 @@ selection and attribution, a growing contract/validator library, and trusted
 local governance. Optimize the implementation and product instrumentation for
 that compound asset rather than for raw memory count.
 
-## 23. Name decision: Context Graph Exchange Protocol
+## 23. Name decision: Context Graph Protocol (CGP)
 
-Context graph is the correct architectural term because typed relationships,
+**Decided (2026-07-23): the protocol is named Context Graph Protocol (CGP). There
+is no rename and no `cgep/*` namespace.**
+
+An earlier draft of this section proposed renaming the protocol to "Context Graph
+**Exchange** Protocol (CGEP)" — with a `cgep/1.0-draft` wire namespace and a
+`context-graph-exchange-protocol` repository — on the grounds that the exact name
+"Context Graph Protocol" is used publicly for an overlapping provenance-oriented
+protocol by [AgentSpeak](https://www.agentspeak.io/solutions/context-graph). That
+proposal was **considered and rejected.** The owner confirmed the canonical name.
+
+- Public name: **Context Graph Protocol**, abbreviated **CGP** (spell it out on
+  first use in public docs, then use CGP freely).
+- Repository: `macanderson/context-graph-protocol` (unchanged — no migration).
+- Wire identifiers: `contextgraph/1.0-draft`; lifecycle capability
+  `contextgraph/lifecycle/1.0-draft`.
+
+"Context graph" is the correct architectural term: typed relationships,
 provenance, lineage, temporal reconstruction, and traversal are first-class. It
 describes the information model, not a requirement to use a graph database.
 
-Do not retain **Context Graph Protocol** as the long-term public name. The exact
-name is already used publicly for an overlapping provenance-oriented protocol
-by [AgentSpeak](https://www.agentspeak.io/solutions/context-graph).
-The recommended name is **Context Graph Exchange Protocol**, abbreviated
-**CGEP**. Exchange describes the neutral boundary among Stella, Oxagen, and
-third-party providers without claiming that the protocol owns learning policy,
-storage, or continuous synchronization.
-
-Recommended positioning:
-
-> Context Graph Exchange Protocol is a vendor-neutral protocol for querying,
-> exchanging, and resolving provenance-rich context records and frames. It
-> defines graph semantics, not a graph-database requirement or host learning
-> policy.
-
-Recommended target identifiers:
-
-~~~text
-public name: Context Graph Exchange Protocol
-abbreviation: CGEP
-current repository: context-graph-protocol
-target repository after approved migration: context-graph-exchange-protocol
-target base wire identifier: cgep/1.0-draft
-target lifecycle capability: cgep/lifecycle/1.0-draft
-~~~
-
-The rename is a separate compatibility-aware change and should land before new
-lifecycle identifiers stabilize. Until it lands, existing published repository,
-package, and wire identifiers remain authoritative. Target `cgep/*` identifiers
-are not aliases that implementations may emit interchangeably with the current
-namespace. If adoption is already material, publish redirects, package aliases,
-a deprecation window, and explicit version negotiation.
-
-Nearby names are less suitable:
-
-- **Context Exchange Protocol** is already an established
-  [WCF term](https://learn.microsoft.com/en-us/dotnet/framework/wcf/feature-details/context-exchange-protocol)
-  and loses the graph semantics;
-- **Agent Context Distribution Protocol** is already used by an
-  [adjacent standard](https://www.agentcontextdistributionprotocol.io/) and
-  emphasizes distribution artifacts rather than provider-backed graph queries
-  and lifecycle records;
-- **Context Lifecycle Protocol** overemphasizes the optional writeback extension
-  and understates retrieval and relationships;
-- **Context Graph Interface** sounds like a library API rather than an
-  interoperable protocol.
+This rejection is recorded normatively in the protocol repo:
+`docs/adr/0007-protocol-product-boundary.md` §5 and the reconciliation delta
+table (`docs/adaptive-context-reconciliation.md`), tracked in
+[context-graph-protocol#27](https://github.com/macanderson/context-graph-protocol/issues/27).
 
 ## 24. Open decisions
 
@@ -3183,10 +3157,12 @@ Before schema stabilization:
 7. Define contradiction UX for oscillating preferences and reversed decisions.
 8. Define semantic-validator cost, privacy, and version policy.
 9. Define the optional portable sync profile—cursor, change feed, tombstone,
-   acknowledgement, conflict, and deletion semantics—before describing CGEP
+   acknowledgement, conflict, and deletion semantics—before describing CGP
    append/get as synchronization.
-10. Complete name, package, repository, wire-namespace, and trademark clearance
-    for CGEP in a separate naming change.
+10. ~~Complete name, package, repository, wire-namespace, and trademark
+    clearance in a separate naming change.~~ **Resolved (§23): the name is
+    Context Graph Protocol (CGP); repository, package, and `contextgraph/*` wire
+    identifiers are unchanged. No rename.**
 11. Define signed organization-policy distribution without violating
     no-phone-home defaults.
 
@@ -3208,4 +3184,4 @@ outcome assessment = what can responsibly be concluded
 Keep canonical records complete. Compact them only as inspectable,
 content-addressed projections. Keep repository steering in existing Markdown
 rules. Add only the minimal portable representation and lifecycle mechanisms to
-Context Graph Exchange Protocol.
+Context Graph Protocol.

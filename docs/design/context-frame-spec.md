@@ -1,5 +1,27 @@
 # Context Frame Specification
 
+<!-- NORMATIVE-HOME: macanderson/context-graph-protocol @ 6f8d7ef (contextgraph/1.0-draft) -->
+
+> **Normative home — read this first.** The *atomic* Context Frame (one retrieval
+> envelope: a single snippet/symbol/fact/doc/memory/episode/graph node with its
+> provenance, score, `token_cost`, citation label, temporal profile, and
+> representation) and **all wire semantics** are defined normatively by the
+> **Context Graph Protocol (CGP)** — not by this document. Stella consumes the CGP
+> types directly (`contextgraph-types`, pinned in `stella-cli/Cargo.toml`; used by
+> `stella-graph` and `stella-context`). See CGP `SPEC.md`, `docs/adr/0007-protocol-product-boundary.md`,
+> and the reconciliation delta table (`docs/adaptive-context-reconciliation.md`),
+> tracked in [context-graph-protocol#27](https://github.com/macanderson/context-graph-protocol/issues/27).
+>
+> **What this document is.** A host-side design doc for Stella's *adaptive-context
+> runtime*. The "Context Frame" it describes below is the **task-wide compiled
+> aggregate** — in the boundary vocabulary a host-owned **`CompiledContextFrame`**,
+> *not* the protocol's atomic `ContextFrame`. The live record/directive model is
+> `stella-core/src/context_record` (four directive kinds; `memory`/`fact` are
+> **not** directive kinds), which supersedes the six directive buckets sketched
+> here. On the wire, temporal fields use CGP's names (`valid_from`/`valid_to`/
+> `recorded_at` + query `as_of`), **not** `as_of_valid_at`/`as_of_observed_at`.
+> Where this doc diverges from the code or from CGP, treat it as stale.
+
 ## 1. Purpose
 
 A **Context Frame** is the bounded, task-specific package of trusted information

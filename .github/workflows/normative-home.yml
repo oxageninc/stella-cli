@@ -1,0 +1,32 @@
+name: normative-home
+
+# Boundary drift guard for context-graph-protocol#27: the adaptive-context docs
+# reference CGP as the normative home for frame/wire semantics instead of
+# restating them. This check keeps the pinned CGP revision in those docs in sync
+# with the contextgraph-* rev stella actually builds against (stella-cli/Cargo.toml).
+# Isolated from ci.yml / docs.yml so it can never block the core build.
+on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - "stella-cli/Cargo.toml"
+      - "scripts/check-normative-home.sh"
+      - ".github/workflows/normative-home.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "stella-cli/Cargo.toml"
+      - "scripts/check-normative-home.sh"
+      - ".github/workflows/normative-home.yml"
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: normative-home pin check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check NORMATIVE-HOME pins match the CGP rev stella builds against
+        run: bash scripts/check-normative-home.sh

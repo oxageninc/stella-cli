@@ -1,5 +1,18 @@
 # Directive schema
 
+<!-- NORMATIVE-HOME: macanderson/context-graph-protocol @ 6f8d7ef (contextgraph/1.0-draft) -->
+
+> **Superseded — do not implement from the six-type table below.** Those six types
+> (`memory, fact, rule, preference, constraint, procedure`) predate the
+> adaptive-context reconciliation ([context-graph-protocol#27](https://github.com/macanderson/context-graph-protocol/issues/27)).
+> The **live model is four directive kinds** — `preference, rule, constraint,
+> procedure` — in `stella-core/src/context_record/kind.rs`; **`memory` and `fact`
+> are not directive kinds** (`memory` is its own record kind, `fact` is a
+> `knowledge` kind). Portable directive semantics are owned by the **Context Graph
+> Protocol** exchange-provider profile (CGP #28), not by this document. Kept for
+> history; see CGP `docs/adaptive-context-reconciliation.md` and
+> `docs/adr/0007-protocol-product-boundary.md`.
+
 A **Directive** is the single, typed unit of information in the context engine. It represents information that may affect an agent's decisions or behavior without calling the unit itself "context."
 
 The supported directive types are:

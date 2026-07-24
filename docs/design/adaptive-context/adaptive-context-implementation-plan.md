@@ -5,8 +5,7 @@ Primary repository: `macanderson/stella`
 Companion specification: `stella-adaptive-context-lifecycle.md`
 
 This plan turns the adaptive-context specification into a staged Stella
-implementation. It is intentionally repository-specific. Context Graph
-Exchange Protocol (CGEP; proposed public name, current repository
+implementation. It is intentionally repository-specific. Context Graph Protocol (CGP; repository
 `context-graph-protocol`) changes are a later interoperability layer, not a
 prerequisite for local learning.
 
@@ -31,7 +30,7 @@ Stella should be able to:
 9. remain local-first and fully functional without a server or protocol
    lifecycle provider; and
 10. exchange portable lifecycle records when a provider advertises the
-    relevant Context Graph Exchange Protocol capabilities.
+    relevant Context Graph Protocol capabilities.
 
 ## 2. Decisions to freeze before implementation
 
@@ -283,7 +282,7 @@ Stella owns:
 - efficacy attribution, staleness, and pruning;
 - local SQLite schema and Git publication.
 
-Context Graph Exchange Protocol owns only portable exchange mechanisms:
+Context Graph Protocol owns only portable exchange mechanisms:
 
 - typed lifecycle records and links;
 - scope, sharing, provenance, and temporal semantics;
@@ -329,7 +328,7 @@ widening requires a new decision.
 
 Call this portable behavior export and provider retrieval in v1. The current
 append/get/query/resolve surface is not a complete synchronization protocol.
-Oxagen may provide product-specific encrypted sync, but CGEP must not claim
+Oxagen may provide product-specific encrypted sync, but CGP must not claim
 portable sync until a capability defines cursors, ordered change feeds,
 acknowledgements, tombstones, conflict rules, deletion propagation, and offline
 replay.
@@ -377,7 +376,7 @@ Preserve the existing Cargo dependency graph:
 - do not make `stella-protocol` depend on `stella-context`;
 - use stable IDs and small protocol-local payloads when importing a core type
   would create a cycle;
-- do not make external Context Graph Exchange Protocol structs Stella's internal domain
+- do not make external Context Graph Protocol structs Stella's internal domain
   model;
 - keep every new behavior behind settings until its phase gates pass;
 - make event replay idempotent before enabling automated learning.
@@ -496,7 +495,7 @@ Examples:
 
 ### `stella-protocol`
 
-Add internal, replay-safe events without changing public Context Graph Exchange Protocol
+Add internal, replay-safe events without changing public Context Graph Protocol
 wire semantics yet:
 
 ```text
@@ -1415,7 +1414,7 @@ Add views for:
 - Suppressed records are excluded from automatic retrieval.
 - Safety and blocking directives are never withheld for experiments.
 
-## 14. Phase 10 — Context Graph Exchange Protocol interoperability
+## 14. Phase 10 — Context Graph Protocol interoperability
 
 Do this only after the local schema passes replay evaluation and a second
 provider use case validates portability.

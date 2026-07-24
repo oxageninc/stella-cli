@@ -1,4 +1,17 @@
-# Context Graph Exchange Protocol Lifecycle Build Prompt
+# Context Graph Protocol Lifecycle Build Prompt
+
+> **Reconciled — historical input.** This build prompt was addressed at the
+> `macanderson/context-graph-protocol` repo. Its protocol-side items have been
+> reconciled against the CGP spec and routed to normative-track issues:
+> lifecycle record taxonomy / capabilities / scope → **CGP #28**; append write
+> path → **#5**; resolve + reference-frame budget → **#50**; digest + provenance
+> → **#12**; RFC 3339 temporal → **#10**; `SPEC.md` completeness → **#49**. See
+> the CGP reconciliation delta table (`docs/adaptive-context-reconciliation.md`)
+> and `docs/adr/0007-protocol-product-boundary.md`, tracked in
+> [context-graph-protocol#27](https://github.com/macanderson/context-graph-protocol/issues/27).
+> **The CGEP rename this prompt proposed is rejected** — the protocol is Context
+> Graph Protocol (CGP) on the `contextgraph/*` namespace. Read this prompt as the
+> design input the issues capture, not as pending instructions.
 
 Use the following as the system/developer handoff prompt for the agent working
 in `macanderson/context-graph-protocol`.
@@ -6,7 +19,7 @@ in `macanderson/context-graph-protocol`.
 ---
 
 You are the senior Rust protocol engineer responsible for extending Context
-Graph Exchange Protocol (CGEP), currently housed in the
+Graph Protocol (CGP), currently housed in the
 `macanderson/context-graph-protocol` repository, with portable context-record
 lifecycle and frame-representation mechanisms.
 
@@ -19,7 +32,7 @@ Stella's learning engine.
 
 Use this boundary throughout:
 
-> Context Graph Exchange Protocol exchanges provenance-rich context frames and immutable
+> Context Graph Protocol exchanges provenance-rich context frames and immutable
 > lifecycle records. Hosts decide how to infer, promote, enforce, compact,
 > expire, prune, validate, and present them.
 
@@ -39,7 +52,7 @@ Use this boundary throughout:
    account requirement, or Stella dependency.
 8. Do not push, commit, publish, open a pull request, or mutate a remote unless
    the user explicitly authorizes it.
-9. Treat the recommended CGEP naming migration as a separate compatibility-aware
+9. Treat the recommended CGP naming migration as a separate compatibility-aware
    change. Do not mix repository, package, or wire-namespace renames into a
    lifecycle implementation change.
 
@@ -1078,15 +1091,15 @@ unsupported_representation
 ## Capability negotiation
 
 Use the repository's existing capability mechanism. The target identifier after
-the separate CGEP naming migration is:
+the separate CGP naming migration is:
 
 ```text
-cgep/lifecycle/1.0-draft
+contextgraph/lifecycle/1.0-draft
 ```
 
 Before adding a public identifier, inspect the current published namespace. If
-the separate CGEP migration has landed, use `cgep/*`. Otherwise preserve the
-existing namespace consistently and document `cgep/*` only as the target. Never
+the separate CGP migration has landed, use `contextgraph/*`. Otherwise preserve the
+existing namespace consistently and document `contextgraph/*` only as the target. Never
 emit current and target identifiers as interchangeable unversioned aliases.
 
 Advertise at least:
@@ -1200,7 +1213,7 @@ an unfinished phase under work from a later one.
 
 1. **Baseline and naming precondition:** inventory current repository, package,
    operation, capability, and wire identifiers; run baseline checks; add an ADR
-   or consume the already-landed separate CGEP naming decision. Gate: no mixed
+   or consume the already-landed separate CGP naming decision. Gate: no mixed
    current/target namespace and baseline fixtures are recorded.
 2. **Frame representations:** add additive full, compact, and reference fields,
    legacy full-frame fixtures, and representation negotiation. Gate: existing
@@ -1248,7 +1261,7 @@ Do not claim checks passed unless you ran them and saw their results.
 
 ## Name and positioning
 
-The recommended public name is **Context Graph Exchange Protocol (CGEP)**.
+The recommended public name is **Context Graph Protocol (CGP)**.
 Context graph is accurate because relations, provenance, lineage, temporal
 reconstruction, and traversal are first-class; it describes the information
 model rather than a graph-database requirement. Exchange describes the neutral
@@ -1256,13 +1269,13 @@ Stella/Oxagen/third-party boundary without promising continuous replication.
 
 Use this positioning sentence after the separate naming migration lands:
 
-> Context Graph Exchange Protocol is a vendor-neutral protocol for querying,
+> Context Graph Protocol is a vendor-neutral protocol for querying,
 > exchanging, and resolving provenance-rich context records and frames. It
 > defines graph semantics, not a graph-database requirement or host learning
 > policy.
 
 Current repository: `context-graph-protocol`. Recommended target repository:
-`context-graph-exchange-protocol`. Target base namespace: `cgep/1.0-draft`.
+`context-graph-protocol`. Target base namespace: `contextgraph/1.0-draft`.
 Keep current published identifiers authoritative until the compatibility-aware
 rename lands; do not introduce a half-renamed protocol in this feature work.
 
