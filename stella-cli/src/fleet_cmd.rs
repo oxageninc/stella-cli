@@ -34,7 +34,9 @@
 //! its PR status is reconciled live, and a red branch fails the command.
 
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::Path;
+use std::time::Duration;
 
 use colored::Colorize;
 use stella_core::{Engine, TurnOutcome};
@@ -44,9 +46,10 @@ use stella_fleet::{
     WatchConfig, WorkerControls, WorkerOutcome, WorktreeManager,
 };
 use stella_protocol::{AgentEvent, CompletionMessage, PrStatus};
+use stella_tui::{FleetDashResult, FleetMsg, FleetStatus};
 use stella_tools::ToolRegistry;
 use stella_tools::hook_runner::ShellHookRunner;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::agent;
 use crate::config::Config;
@@ -68,6 +71,7 @@ pub async fn run_fleet(
     budget_limit: Option<f64>,
     watch: bool,
     use_pipeline: bool,
+    output_format: crate::OutputFormat,
 ) -> Result<(), String> {
     crate::enterprise_telemetry::authorize_execution_surface(
         crate::enterprise_telemetry::ExecutionSurface::Fleet,
@@ -120,6 +124,32 @@ pub async fn run_fleet(
         .map_err(|_| "system clock is before the Unix epoch — cannot mint a unique fleet run id")?
         .as_millis();
     let run_id = format!("fleet-{now_ms}-{}", std::process::id());
+
+    // The live grid takes over the terminal only on a fully interactive TTY
+    // (both stdin AND stdout) running the default (Text) output format.
+    // `--output-format json|stream-json`, a piped stdout, or a redirected stdin
+    // (`… < /dev/null`, some CI wrappers) all keep the headless path untouched —
+    // the workers still persist telemetry and the end-of-run report prints as
+    // before. Requiring an interactive stdin also means the dashboard's key
+    // reader can never immediately hit EOF (which would otherwise spin the draw
+    // loop). This is what preserves the machine-readable contract.
+    let live = std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && output_format == crate::OutputFormat::Text;
+    let mut dash_rx = None;
+    let mut done_rx = None;
+    let mut done_tx = None;
+    let worker_dash = if live {
+        let (tx, rx) = mpsc::unbounded_channel::<FleetMsg>();
+        let (dt, dr) = oneshot::channel::<()>();
+        dash_rx = Some(rx);
+        done_rx = Some(dr);
+        done_tx = Some(dt);
+        Some(tx)
+    } else {
+        None
+    };
+
     let worker = EngineWorker {
         cfg: cfg.clone(),
         // Divide the aggregate cap across the concurrency width so one wave's
@@ -127,6 +157,7 @@ pub async fn run_fleet(
         per_child_budget: budget_limit.map(|b| b / max_concurrency.max(1) as f64),
         use_pipeline,
         run_id: run_id.clone(),
+        dash: worker_dash,
     };
     let fleet = Fleet::new(
         worker,
@@ -153,10 +184,45 @@ pub async fn run_fleet(
         fleet
     };
 
-    let report = fleet
-        .run_plan(&plan)
-        .await
-        .map_err(|e| format!("fleet run failed: {e}"))?;
+    let report = if live {
+        // Paint the live grid over the alternate screen while `run_plan` fans
+        // the workers out. The dashboard exits when the run returns (the
+        // `done` signal) or the user detaches with `q`; either way it restores
+        // the terminal before we print the end-of-run report below.
+        let seed: Vec<(String, String)> = plan
+            .tasks
+            .iter()
+            .map(|t| (t.id.clone(), t.title.clone()))
+            .collect();
+        let label = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("stella")
+            .to_string();
+        let dash_rx = dash_rx.take().expect("live implies a dashboard channel");
+        let done_rx = done_rx.take().expect("live implies a done channel");
+        let done_tx = done_tx.take().expect("live implies a done sender");
+        let run_and_signal = async {
+            let r = fleet.run_plan(&plan).await;
+            // Tell the dashboard the run has settled so it exits its loop.
+            let _ = done_tx.send(());
+            r
+        };
+        let (run_result, dash_result) = tokio::join!(
+            run_and_signal,
+            stella_tui::run_fleet_dashboard(label, seed, dash_rx, done_rx)
+        );
+        let report = run_result.map_err(|e| format!("fleet run failed: {e}"))?;
+        if let Ok(res) = dash_result {
+            print_dash_summary(&res);
+        }
+        report
+    } else {
+        fleet
+            .run_plan(&plan)
+            .await
+            .map_err(|e| format!("fleet run failed: {e}"))?
+    };
 
     render_report(&plan, &report, &ledger_path);
     if report.budget_aborted {
@@ -363,6 +429,11 @@ struct EngineWorker {
     /// fleet's declared-claim acquisition uses, so a task's tool-level
     /// claim-on-first-write is re-entrant with its declared claims.
     run_id: String,
+    /// The live-dashboard channel, present only when `stella fleet` runs on an
+    /// interactive TTY. When set, the worker announces its lifecycle
+    /// (Running → Done/Failed) and its `run_task` tees every `AgentEvent` to
+    /// the grid. `None` keeps the headless path untouched.
+    dash: Option<mpsc::UnboundedSender<FleetMsg>>,
 }
 
 #[async_trait::async_trait]
@@ -385,6 +456,17 @@ impl FleetWorker for EngineWorker {
         let task = task.clone();
         let root = workspace_root.to_path_buf();
         let claim_holder = format!("{}/{}", self.run_id, task.id);
+        let task_id = task.id.clone();
+
+        // Dispatch → the row flips to Running the instant the wave picks it up.
+        if let Some(d) = &self.dash {
+            let _ = d.send(FleetMsg::Status {
+                id: task_id.clone(),
+                status: FleetStatus::Running,
+            });
+        }
+
+        let worker_dash = self.dash.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let result = tokio::runtime::Builder::new_current_thread()
@@ -400,6 +482,7 @@ impl FleetWorker for EngineWorker {
                         &root,
                         &claim_holder,
                         controls,
+                        worker_dash,
                     ))
                 });
             let _ = tx.send(result);
@@ -410,13 +493,27 @@ impl FleetWorker for EngineWorker {
             summary: reason,
             success: false,
         };
-        match rx.await {
+        let outcome = match rx.await {
             Ok(Ok(outcome)) => outcome,
             // A worker that can't even start (provider, git) is a failed
             // attempt with a named reason — never a panic, never a hang.
             Ok(Err(e)) => failed(format!("worker error: {e}")),
             Err(_) => failed("worker thread died before reporting".to_string()),
+        };
+        // The worker's own verdict is the authoritative terminal state — more
+        // reliable than inferring done/failed from the event stream.
+        if let Some(d) = &self.dash {
+            let status = if outcome.success {
+                FleetStatus::Done
+            } else {
+                FleetStatus::Failed
+            };
+            let _ = d.send(FleetMsg::Status {
+                id: task_id.clone(),
+                status,
+            });
         }
+        outcome
     }
 }
 
@@ -449,6 +546,7 @@ impl stella_core::ports::TurnGate for WatchGate {
 /// `use_pipeline` is true (the default), the turn runs through the staged
 /// pipeline (triage → recall → plan → witness → execute → verify → judge);
 /// otherwise it falls back to the raw `Engine::run_turn` step-loop.
+#[allow(clippy::too_many_arguments)] // one caller (EngineWorker::run); composition wiring
 async fn run_task(
     cfg: &Config,
     budget_limit: Option<f64>,
@@ -457,6 +555,7 @@ async fn run_task(
     root: &Path,
     claim_holder: &str,
     controls: WorkerControls,
+    dash: Option<mpsc::UnboundedSender<FleetMsg>>,
 ) -> Result<WorkerOutcome, String> {
     // Snapshot where this workspace starts so the commit report is
     // exactly this worker's commits — correct for isolated worktrees
@@ -505,14 +604,46 @@ async fn run_task(
     let mut budget = agent::build_budget_guard(budget_limit);
     budget.begin_turn();
 
+    // The engine emits `AgentEvent`s into `tx`. The `Json` renderer stays the
+    // sink in both modes: it persists telemetry to the store (what `stella
+    // observe` reads) and, crucially, prints nothing per-event. When the live
+    // grid is up, a forwarder tees each event to the dashboard (tagged by task
+    // id) on its way to that silent renderer — telemetry persistence is never
+    // sacrificed for the live view.
     let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let renderer = agent::spawn_renderer(
-        rx,
-        crate::OutputFormat::Json,
-        execution.clone(),
-        cfg.provider.id.to_string(),
-        false,
-    );
+    let renderer = match &dash {
+        Some(dash) => {
+            let (render_tx, render_rx) = mpsc::unbounded_channel::<AgentEvent>();
+            let dash = dash.clone();
+            let id = task.id.clone();
+            let mut src = rx;
+            tokio::spawn(async move {
+                while let Some(ev) = src.recv().await {
+                    let _ = dash.send(FleetMsg::Event {
+                        id: id.clone(),
+                        event: ev.clone(),
+                    });
+                    if render_tx.send(ev).is_err() {
+                        break;
+                    }
+                }
+            });
+            agent::spawn_renderer(
+                render_rx,
+                crate::OutputFormat::Json,
+                execution.clone(),
+                cfg.provider.id.to_string(),
+                false,
+            )
+        }
+        None => agent::spawn_renderer(
+            rx,
+            crate::OutputFormat::Json,
+            execution.clone(),
+            cfg.provider.id.to_string(),
+            false,
+        ),
+    };
 
     // The task's control lines (stella-fleet's `WorkerControls`). The stop
     // wait mirrors `subsession.rs::run_worker` exactly: a dropped sender
@@ -548,8 +679,12 @@ async fn run_task(
             // same worker/triage/judge pins and per-role overrides as `stella run`.
             let configured = crate::config::discover_configured_providers();
             let wiring = agent::resolve_engine_wiring(&cfg, &model_ref, &configured);
-            for notice in &wiring.notices {
-                eprintln!("  ! {notice}");
+            // Suppress stderr notices while the live grid owns the screen —
+            // they would tear the alternate-screen buffer.
+            if dash.is_none() {
+                for notice in &wiring.notices {
+                    eprintln!("  ! {notice}");
+                }
             }
             let resolver = agent::RoleProviderResolver::new(
                 &*provider,
@@ -767,6 +902,48 @@ fn truncate(s: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// The live grid's one-screen recap, printed on the normal screen after the
+/// dashboard restores it: each task's final status, wall-clock ELAPSED, and
+/// tool-call count, then the total SESSION time. The `render_report` below
+/// follows with the durable details (spend, commits, worktrees).
+fn print_dash_summary(res: &FleetDashResult) {
+    let fmt_elapsed = |d: Duration| {
+        let s = d.as_secs();
+        format!("{:02}:{:02}", s / 60, s % 60)
+    };
+    let fmt_session = |d: Duration| {
+        let s = d.as_secs();
+        format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    };
+    println!();
+    for t in &res.tasks {
+        let glyph = match t.status {
+            FleetStatus::Done => t.status.glyph().green(),
+            FleetStatus::Failed | FleetStatus::Killed => t.status.glyph().red(),
+            FleetStatus::Blocked => t.status.glyph().yellow(),
+            _ => t.status.glyph().normal(),
+        };
+        println!(
+            "  {glyph} {} — {} ({}, {} tool call{})",
+            t.id.bold(),
+            t.title,
+            fmt_elapsed(t.elapsed),
+            t.tool_calls,
+            if t.tool_calls == 1 { "" } else { "s" },
+        );
+    }
+    let tail = if res.detached {
+        " (detached — run continued to completion)"
+    } else {
+        ""
+    };
+    println!(
+        "  {} session {}{tail}",
+        "·".dimmed(),
+        fmt_session(res.session_elapsed).bold()
+    );
 }
 
 /// The end-of-run report: per task its outcome, spend, commits, and (when

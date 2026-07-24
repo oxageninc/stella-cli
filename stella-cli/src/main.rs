@@ -1373,6 +1373,7 @@ fn run(cli: Cli, loaded_env: &env_files::Loaded) -> Result<(), String> {
                 cli.globals.budget,
                 watch,
                 !no_pipeline,
+                cli.globals.output_format,
             ))?;
         }
         Command::Monitor { target } => {

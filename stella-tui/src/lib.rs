@@ -49,6 +49,7 @@ pub mod deck_shell;
 pub mod deck_ui;
 pub mod diff;
 pub mod envelope;
+pub mod fleet_dashboard;
 pub mod fx;
 pub mod graph;
 pub mod invaders;
@@ -82,6 +83,9 @@ pub use deck::{
 };
 pub use deck_render::render_deck;
 pub use deck_shell::{DeckOptions, run_deck};
+pub use fleet_dashboard::{
+    FleetDashResult, FleetMsg, FleetStatus, TaskSummary, run as run_fleet_dashboard,
+};
 pub use deck_ui::{
     DeckAction, DeckUi, IssueField, IssuesMode, IssuesPanel, ScopeAction, SkillPrompt, SkillsFocus,
     SkillsPanel, TypeAhead, handle_deck_key, ingest_inbound,
