@@ -622,6 +622,81 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    /// The stable discriminant tag for this event — identical to the string
+    /// `serde` writes as the `"type"` field on the stream-json wire (this enum
+    /// is `#[serde(tag = "type", rename_all = "snake_case")]`). Allocation-free,
+    /// so logs, metrics, and tests can name an event without serializing it.
+    ///
+    /// This match is deliberately **exhaustive, with no wildcard arm**: it is
+    /// the cheap compile-time guard for the additive-only `AgentEvent`
+    /// vocabulary. Adding a variant fails `cargo build -p stella-protocol` (and
+    /// `-p stella-core`, which compiles this crate) with `E0004` right here — a
+    /// scoped per-crate build, not only a full `--workspace` build discovered
+    /// post-merge (#455). When that fires, add the arm AND propagate the new
+    /// variant to every downstream matcher:
+    ///
+    /// **Compile-enforced** — also exhaustive, so they will not build until you
+    /// add an arm; but each break surfaces one crate at a time (CI stops at the
+    /// first failing crate), which is exactly how #415's variant reached `main`
+    /// before breaking `stella-pipeline` (#421) then `stella-tui` (#422):
+    ///   - `stella-pipeline` `replay::event_signature`
+    ///   - `stella-tui` `model::Model::apply`
+    ///   - `stella-tui` `textline::event_line`
+    ///   - `stella-tui` `deck::trace_of`
+    ///
+    /// **Silent** — wildcard / `matches!` arms the compiler CANNOT catch, so a
+    /// new variant falls through to a default and is wrong only at runtime.
+    /// These are the real trap; audit them by hand:
+    ///   - `stella-pipeline` `replay::structural_diff` volatile keep-set: add
+    ///     the variant if it is a run-to-run artifact absent from older golden
+    ///     streams, or it will shift every aligned position of the diff.
+    ///   - `stella-tui` `deck::event_intensity` and `deck::status_from_event`:
+    ///     give the variant an intensity / agent status if it should register
+    ///     on the fleet deck.
+    ///
+    /// The same duty applies to the other exhaustively-matched cross-crate
+    /// enums this pattern warns about (`ToolOutput`, `BudgetOutcome`).
+    pub fn type_tag(&self) -> &'static str {
+        match self {
+            AgentEvent::Stage { .. } => "stage",
+            AgentEvent::Text { .. } => "text",
+            AgentEvent::TextDelta { .. } => "text_delta",
+            AgentEvent::Reasoning { .. } => "reasoning",
+            AgentEvent::ToolStart { .. } => "tool_start",
+            AgentEvent::ToolResult { .. } => "tool_result",
+            AgentEvent::SpeculationDiscarded { .. } => "speculation_discarded",
+            AgentEvent::Retry { .. } => "retry",
+            AgentEvent::Steered { .. } => "steered",
+            AgentEvent::LoopDetected { .. } => "loop_detected",
+            AgentEvent::BudgetDenied { .. } => "budget_denied",
+            AgentEvent::RetriesExhausted { .. } => "retries_exhausted",
+            AgentEvent::PolicyDecision { .. } => "policy_decision",
+            AgentEvent::Compaction { .. } => "compaction",
+            AgentEvent::BudgetTick { .. } => "budget_tick",
+            AgentEvent::StepUsage { .. } => "step_usage",
+            AgentEvent::UsageIncomplete { .. } => "usage_incomplete",
+            AgentEvent::GoalVerdict { .. } => "goal_verdict",
+            AgentEvent::ProviderFallback { .. } => "provider_fallback",
+            AgentEvent::FileChange { .. } => "file_change",
+            AgentEvent::ContextRecall { .. } => "context_recall",
+            AgentEvent::ContextWrite { .. } => "context_write",
+            AgentEvent::BlockRegistered { .. } => "block_registered",
+            AgentEvent::StepManifest { .. } => "step_manifest",
+            AgentEvent::JudgeVerdict { .. } => "judge_verdict",
+            AgentEvent::ScopeReview { .. } => "scope_review",
+            AgentEvent::AskUser { .. } => "ask_user",
+            AgentEvent::MediaProgress { .. } => "media_progress",
+            AgentEvent::MediaComplete { .. } => "media_complete",
+            AgentEvent::Commit { .. } => "commit",
+            AgentEvent::Pr { .. } => "pr",
+            AgentEvent::TaskUpdate { .. } => "task_update",
+            AgentEvent::Error { .. } => "error",
+            AgentEvent::Complete { .. } => "complete",
+        }
+    }
+}
+
 /// What happened to a file in a `FileChange` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1601,5 +1676,130 @@ mod tests {
         assert_eq!(kind, BlockKind::Other);
         let zone: CacheZone = serde_json::from_str("\"some_future_zone\"").unwrap();
         assert_eq!(zone, CacheZone::Other);
+    }
+
+    #[test]
+    fn type_tag_matches_the_serde_type_wire_tag() {
+        // `type_tag()` must return exactly the `"type"` string serde writes,
+        // since both come from the same `snake_case` variant name. The match's
+        // exhaustiveness is compiler-enforced (a new variant cannot escape a
+        // tag), so this only pins that the hand-written strings are correct —
+        // cross-checked against serde for a representative sample, weighted to
+        // the recently added variants most prone to a copy-paste tag.
+        let sample = vec![
+            AgentEvent::Stage {
+                name: StageKind::Triage,
+            },
+            AgentEvent::Text { delta: "hi".into() },
+            AgentEvent::TextDelta { text: "h".into() },
+            AgentEvent::Reasoning { delta: "r".into() },
+            AgentEvent::SpeculationDiscarded {
+                call_id: "c".into(),
+                name: "n".into(),
+                reason: "attempt_failed".into(),
+            },
+            AgentEvent::Retry {
+                attempt: 1,
+                reason: "x".into(),
+            },
+            AgentEvent::Steered { text: "s".into() },
+            AgentEvent::LoopDetected {
+                turn_instance: 1,
+                kind: "exact_repeat".into(),
+                pattern: vec!["read".into()],
+                repeats: 2,
+                evidence: "e".into(),
+                aborted: false,
+            },
+            AgentEvent::BudgetDenied {
+                scope: BudgetScope::Turn,
+                spent_usd: 1.0,
+                limit_usd: 0.5,
+                mode: BudgetMode::Enforced,
+            },
+            AgentEvent::RetriesExhausted {
+                turn_instance: 1,
+                attempts: 3,
+                reasons: vec!["t".into()],
+            },
+            AgentEvent::PolicyDecision {
+                kind: PolicyKind::Blocked,
+                subject: "write_file".into(),
+                outcome: "deny".into(),
+            },
+            AgentEvent::BudgetTick {
+                spent_usd: 0.1,
+                limit_usd: None,
+                mode: BudgetMode::Off,
+                session_spent_usd: None,
+                session_limit_usd: None,
+            },
+            AgentEvent::UsageIncomplete {
+                role: ModelCallRole::Worker,
+                provider: "z".into(),
+                model: "m".into(),
+                reason: UsageIncompleteReason::Timeout,
+                duration_ms: 1,
+                retries: None,
+            },
+            AgentEvent::GoalVerdict {
+                round: 1,
+                met: true,
+                reasoning: "ok".into(),
+                cost_usd: 0.0,
+            },
+            AgentEvent::ProviderFallback {
+                from: "a".into(),
+                to: "b".into(),
+                reason: "r".into(),
+            },
+            AgentEvent::Commit {
+                sha: "abc".into(),
+                message: "m".into(),
+            },
+            AgentEvent::Pr {
+                url: "u".into(),
+                status: PrStatus::Open,
+                number: None,
+                ci: None,
+            },
+            AgentEvent::Error {
+                message: "m".into(),
+                retryable: false,
+            },
+            AgentEvent::Complete {
+                model: "m".into(),
+                cost_usd: 0.0,
+            },
+        ];
+        for event in &sample {
+            let value = serde_json::to_value(event).unwrap();
+            let wire = value
+                .get("type")
+                .and_then(|tag| tag.as_str())
+                .unwrap_or_else(|| panic!("event has no string `type` tag: {event:?}"));
+            assert_eq!(
+                event.type_tag(),
+                wire,
+                "type_tag disagrees with the serde wire tag for {event:?}"
+            );
+        }
+        // Pin two exact tags so a wholesale serde-rename change is caught too.
+        assert_eq!(
+            AgentEvent::TextDelta {
+                text: String::new()
+            }
+            .type_tag(),
+            "text_delta"
+        );
+        assert_eq!(
+            AgentEvent::SpeculationDiscarded {
+                call_id: String::new(),
+                name: String::new(),
+                reason: String::new(),
+            }
+            .type_tag(),
+            "speculation_discarded"
+        );
     }
 }
