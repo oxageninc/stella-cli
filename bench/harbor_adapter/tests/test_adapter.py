@@ -393,8 +393,11 @@ class TestForwardedEnv:
             "reasoning": "off",
         }
         assert json.loads(normalized) == posture
+        # 0.5.1 SUT posture: includes `headless_scope_bypass: "on"` (added in
+        # #322, after the #301 freeze). See bench/terminal-bench-2.1-protocol.md
+        # "Engine posture" prose + calibration table for the recomputed hashes.
         assert digest == (
-            "fb18233aadf78077bc70fe52cdb1dcacc1f840600473a92226a88e932a138fd6"
+            "1740fa2f3f1bea66c348c7ffca151f526019ef0278829d23acb391e7b2f07159"
         )
 
     def test_excludes_all_provider_keys_and_selects_only_effective_provider(
@@ -901,6 +904,12 @@ class TestInstall:
         root_commands: list[str] = []
 
         class _Environment:
+            # install() -> _build_code_graph() reads task_env_config.workdir to
+            # run `stella init` in the task workspace (code-graph indexing added
+            # after this fixture was written). Provide it like the other env
+            # stubs so install() reaches its binary/commit assertions.
+            task_env_config = SimpleNamespace(workdir="/workspace")
+
             async def upload_file(self, source: str, destination: str) -> None:
                 uploads.append((source, destination))
 
